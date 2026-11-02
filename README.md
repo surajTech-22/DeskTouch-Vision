@@ -2,12 +2,15 @@
 
 This is the **official standalone repository** for the experimental DeskTouch Vision Windows application. It is separate from DeskSpace.
 
-## Verified build status
+## Verified build and installation
 
-GitHub Actions compiled and packaged the app on a Windows runner:
-https://github.com/surajTech-22/Desk-space/actions/runs/41448407511
+- The **first independent Windows build and release succeeded**: https://github.com/surajTech-22/DeskTouch-Vision/actions/runs/41449397062
+- Official preview release: https://github.com/surajTech-22/DeskTouch-Vision/releases/tag/v0.1.0
+- Installer: https://github.com/surajTech-22/DeskTouch-Vision/releases/download/v0.1.0/DeskTouchVision-win-x64.zip
+- Matching checksum: https://github.com/surajTech-22/DeskTouch-Vision/releases/download/v0.1.0/DeskTouchVision-win-x64.zip.sha256
+- Release ZIP SHA-256: `055ebbdc99cee88d9a4e24d4af2e4c46e9e68ca913f8fd1571f20ae55f490036`
 
-The ZIP is a Windows x64 **preview installer**, not proof that webcam vision can detect physical key presses or mouse clicks. No live camera-on-hardware functional testing has been performed.
+The ZIP is a Windows x64 preview installer. CI verified compilation, packaging and release publishing, **not real-world recognition accuracy or automatic update installation on a laptop**.
 
 ## Critical feasibility requirements
 
@@ -26,8 +29,8 @@ The laptop's built-in webcam **must be able to see** the physical keyboard, mous
 
 ## Install preview (Windows x64)
 
-1. Open the successful GitHub Actions run linked above.
-2. Download artifact `DeskTouchVision-Installer-win-x64`.
+1. Open the official v0.1.0 release linked above.
+2. Download asset `DeskTouchVision-win-x64.zip`.
 3. Extract the ZIP.
 4. Double-click `INSTALL_DESKTOUCH.cmd`.
 5. It installs under `%LOCALAPPDATA%\Programs\DeskTouchVision` and creates a desktop shortcut.

@@ -1,0 +1,72 @@
+name: DeskTouch Vision - Build, Install, Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "DeskTouchVision/**"
+      - ".github/workflows/desktouch-vision.yml"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Publish self-contained Windows app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o DeskTouchVision/dist/app
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+      - name: Package installer + SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item DeskTouchVision/Install-DeskTouch.ps1 DeskTouchVision/dist/
+          Copy-Item DeskTouchVision/INSTALL_DESKTOUCH.cmd DeskTouchVision/dist/
+          New-Item -ItemType Directory -Force DeskTouchVision/published | Out-Null
+          $zip = "DeskTouchVision/published/DeskTouchVision-win-x64.zip"
+          Compress-Archive -Path DeskTouchVision/dist/* -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$zip.sha256", "$hash  DeskTouchVision-win-x64.zip" + [Environment]::NewLine, [Text.Encoding]::ASCII)
+          if (-not (Test-Path "DeskTouchVision/dist/app/DeskTouchVision.exe")) { throw "App executable missing" }
+      - name: Upload installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouchVision-Installer-win-x64
+          path: DeskTouchVision/published/*
+          if-no-files-found: error
+      - name: Publish release for this app version (only once)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [xml]$proj = Get-Content "DeskTouchVision/DeskTouchVision.csproj"
+          $appVersion = ([string]$proj.Project.PropertyGroup.Version).Split("-")[0]
+          if ([string]::IsNullOrWhiteSpace($appVersion)) { throw "App version not set" }
+          $tag = "v$appVersion"
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne $tag) {
+            throw "Version/tag mismatch: $tag vs ${{ github.ref_name }}"
+          }
+          gh release view $tag --repo "${{ github.repository }}" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$tag already published; not altering the release"
+          } else {
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL: offline webcam preview, manual keyboard/mouse zone calibration and motion study only. Does not emulate disconnected devices yet. Hardware validation pending."
+            if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
+            Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
+            Write-Host "Release event sent: $tag"
+          }

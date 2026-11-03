@@ -41,6 +41,7 @@ internal sealed class DisplayArrangementControl : Control
 
     internal DisplayArrangementControl()
     {
+        Name = "DisplayDiagram";
         Dock = DockStyle.Fill;
         BackColor = Color.FromArgb(30, 31, 36);
         ForeColor = Color.White;

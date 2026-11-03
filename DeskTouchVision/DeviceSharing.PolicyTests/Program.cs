@@ -19,6 +19,16 @@ Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
 Check(DisplayArrangementControl.CleanDeviceName("Phone\r\nName", "Unknown") ==
     "Phone  Name", "Device title may not introduce an extra line into the diagram.");
 Console.WriteLine("PASS: actual computer names, per-device native Windows display numbers and Android 1.");
+var testDisplay = new MonitorTopology(new[] {
+    new MonitorRect("Android screen",0,0,1080,2400,true)
+});
+Check(!ReceiverServer.AllowsForwardInput(new ConnectedPeer("Phone",testDisplay,
+    SupportsReverseInput:true,Platform:"Android")),
+    "One-way Android mode must not claim Windows keyboard/mouse authority");
+Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Desktop",testDisplay,
+    SupportsReverseInput:true,Platform:"Windows")),
+    "Windows PCs must retain duplex authority where locally approved");
+Console.WriteLine("PASS: Android one-way policy cannot control Windows; PC duplex preserved.");
 
 // A LAN with two Windows PCs and one Android phone must not be collapsed to
 // a single PC, and busy receivers must be visible but not connectable.

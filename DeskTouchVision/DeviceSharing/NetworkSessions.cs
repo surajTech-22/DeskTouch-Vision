@@ -10,8 +10,10 @@ using System.Text.Json;
 
 namespace DeskTouch.DeviceShare;
 
-internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors);
-internal sealed record PeerHello(string Name, string Layout);
+internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
+    bool SupportsReverseInput = true);
+internal sealed record PeerHello(string Name, string Layout,
+    bool? ReverseInputSupported = null);
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -288,7 +290,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         string name = hello.Name.Trim();
         if (name.Length is < 1 or > 60 || name.Any(char.IsControl))
             throw new InvalidDataException("Invalid peer name.");
-        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout));
+        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
+            hello.ReverseInputSupported ?? true);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)

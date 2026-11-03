@@ -13,7 +13,7 @@ internal sealed record NearbyComputer(string Name, string Address, string Finger
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
-/// Android phones remain visible in Add devices. A busy PC is clearly marked
+/// Android phones remain visible in Add devices. A full-capacity PC is clearly marked
 /// rather than silently disappearing. No IP address is remembered as identity.
 /// </summary>
 internal sealed class NearbyComputerDiscovery : IDisposable

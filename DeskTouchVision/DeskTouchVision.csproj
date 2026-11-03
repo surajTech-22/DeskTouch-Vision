@@ -16,4 +16,8 @@
     <None Include="Install-DeskTouch.ps1" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Update-DeskTouch.ps1" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="DeviceSharing/**/*.cs" />
+    <Compile Remove="DeviceSharing.PolicyTests/**/*.cs" />
+  </ItemGroup>
 </Project>

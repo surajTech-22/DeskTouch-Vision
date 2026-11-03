@@ -89,6 +89,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ForeColor = Color.FromArgb(188, 190, 198), AutoEllipsis = true };
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
+        _manageTrusted.Text = "Trusted devices";
+        _manageTrusted.Width = 128;
+        _manageTrusted.Dock = DockStyle.Right;
+        _manageTrusted.Margin = new Padding(5);
+        header.Controls.Add(_manageTrusted);
         header.Controls.Add(_checkUpdates);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
@@ -99,8 +104,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _trustDevice, _manageTrusted,
-            _autoConnectToggle, _copyCode, _disconnect, _nativeDisplaySettings })
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -196,7 +200,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ShowFromTray();
             await UpdateClient.CheckManuallyAsync(this);
         });
-        _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectAndListen());
+        _trayMenu.Items.Add("Trusted devices", null, (_, _) =>
+        {
+            ShowFromTray();
+            ManageTrustedDevices();
+        });
+        _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 
@@ -311,6 +320,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (IsDisposed) return;
         _trustDevice.Enabled = _trusted != null && _host != null &&
+            !string.IsNullOrEmpty(_currentFingerprint) &&
+            !_trusted.IsTrustedReceiver(_currentFingerprint);
+        _trustDevice.Visible = _trusted != null && _host != null &&
             !string.IsNullOrEmpty(_currentFingerprint) &&
             !_trusted.IsTrustedReceiver(_currentFingerprint);
         _manageTrusted.Enabled = _trusted != null;

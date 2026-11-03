@@ -31,6 +31,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private View cursor;
     private WindowManager.LayoutParams cursorParams;
     private volatile int x,y;
+    private volatile int pendingX,pendingY;
+    private volatile Runnable pendingApplied;
+    private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
+        new java.util.concurrent.atomic.AtomicBoolean();
     private int downX,downY;
     private boolean held,shift,control,alt,remoteGesture;
 
@@ -115,12 +119,25 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     static boolean pointer(int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return false;
-        service.ui.post(()->{
-            if(!ready(service))return;
-            service.showPointer(px,py);
-            if(service.cursor!=null && applied!=null)applied.run();
-        });
+        // Retain the newest position on fast mice/touchpads instead of
+        // filling Android's UI queue with hundreds of obsolete moves.
+        service.pendingX=px;
+        service.pendingY=py;
+        if(applied!=null)service.pendingApplied=applied;
+        if(service.moveScheduled.compareAndSet(false,true))
+            service.ui.post(service::flushPointer);
         return true;
+    }
+    private void flushPointer(){
+        int px=pendingX,py=pendingY;
+        if(ready(this))showPointer(px,py);
+        Runnable ack=pendingApplied;
+        pendingApplied=null;
+        moveScheduled.set(false);
+        if(cursor!=null&&ack!=null&&ready(this))ack.run();
+        if(ready(this)&&(px!=pendingX||py!=pendingY) &&
+            moveScheduled.compareAndSet(false,true))
+            ui.post(this::flushPointer);
     }
     static void endRemote(){
         DeskTouchAccessibilityService service=instance;

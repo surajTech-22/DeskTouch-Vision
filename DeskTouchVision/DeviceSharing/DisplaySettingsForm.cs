@@ -859,6 +859,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             () => _capture == null ||
                 (!_capture.RemoteActive && !_capture.IsClaimPending));
         session.AuthorityDiagnostic += Status;
+        session.InputDeliveryWarning += Status;
         _captureUsesInbound = false;
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
             preserveRawInput: true);
@@ -1103,6 +1104,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _host.AuthorityControlPacket -= HandleRemoteState;
             _host.AuthorityDiagnostic -= Status;
+            _host.InputDeliveryWarning -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;
             _host.RemotePlacementChanged -= HandleRemotePlacement;

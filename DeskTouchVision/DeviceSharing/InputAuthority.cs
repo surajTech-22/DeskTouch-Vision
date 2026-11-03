@@ -27,7 +27,7 @@ internal static class ReverseInputProtocol
         // Only known input and lease operations are accepted. No approval,
         // certificate, trust or arbitrary protocol messages can be injected.
         if (operation is not ("claim" or "release" or "reset" or "move" or
-            "key" or "button" or "wheel"))
+            "key" or "button" or "wheel" or "text"))
             return false;
         input = packet with { Type = operation };
         return true;

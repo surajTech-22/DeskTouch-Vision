@@ -103,3 +103,51 @@ jobs:
           name: DeskTouch-Android-PreRelease-Verification
           path: android-verify.txt
           if-no-files-found: error
+
+  android-emulator-smoke:
+    name: Android emulator - launch shared-environment UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build debug APK for emulator launch
+        working-directory: AndroidDeskTouch
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+      - name: Enable emulator hardware virtualization
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Launch Android app and verify core controls
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          script: |
+            adb install AndroidDeskTouch/app/build/outputs/apk/debug/app-debug.apk
+            adb shell pm grant com.desktouch.vision android.permission.POST_NOTIFICATIONS
+            adb shell am start -n com.desktouch.vision/.MainActivity
+            sleep 5
+            adb shell dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity|com.desktouch.vision'
+            adb shell uiautomator dump /sdcard/desktouch-ui.xml
+            adb shell cat /sdcard/desktouch-ui.xml | grep -F 'DeskTouch Vision'
+            adb shell cat /sdcard/desktouch-ui.xml | grep -F 'Find devices'
+            adb shell cat /sdcard/desktouch-ui.xml | grep -F 'Take control of active environment screen'
+            echo "PASS: Android 35 emulator launched DeskTouch shared environment UI; no pairing or release performed"

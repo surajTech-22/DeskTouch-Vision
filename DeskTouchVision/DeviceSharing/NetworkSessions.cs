@@ -35,6 +35,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private Packet? _latestReverseMove;
     private int _reverseMoveSignaled;
     private int _forwardLease;
+    private int _forwardAppliedLease;
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
@@ -114,6 +115,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock (_inputGate) _currentInjector?.ReleaseAll();
         });
         int revokedLease = Interlocked.Exchange(ref _forwardLease, 0);
+        Interlocked.Exchange(ref _forwardAppliedLease, 0);
         _status("Local physical keyboard/mouse has priority; forward authority revoked.");
         _ = Task.Run(async () =>
         {
@@ -342,7 +344,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     continue;
                 }
 
-                if (p.Type is "reverse-granted" or "reverse-busy" or "reverse-local-active")
+                if (p.Type is "reverse-granted" or "reverse-busy" or
+                    "reverse-local-active" or "reverse-active")
                 {
                     ReverseControlMessage?.Invoke(p);
                     continue;
@@ -353,7 +356,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // Never issue forward and reverse authority at once.
                     bool allowed = p.A > 0 && (AllowForwardClaim?.Invoke() ?? true);
                     bool granted = allowed && _priority.TryClaim();
-                    if (granted) Volatile.Write(ref _forwardLease, p.A);
+                    if (granted)
+                    {
+                        Volatile.Write(ref _forwardLease, p.A);
+                        Volatile.Write(ref _forwardAppliedLease, 0);
+                    }
                     await SendControlAsync(new Packet(granted ? "granted" : "busy", p.A), token);
                     continue;
                 }
@@ -361,18 +368,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     (p.Type == "release" && p.A > 0 && p.A == Volatile.Read(ref _forwardLease)))
                 {
                     Interlocked.Exchange(ref _forwardLease, 0);
+                    Interlocked.Exchange(ref _forwardAppliedLease, 0);
                     _priority.ReleaseRemote();
                     lock (_inputGate) injector.ReleaseAll();
                     continue;
                 }
                 if (p.Type == "ping") continue;
+                int lease = Volatile.Read(ref _forwardLease);
+                bool cursorApplied = false;
                 lock (_inputGate)
                 {
-                    // An unacknowledged, expired or native-overridden lease
-                    // cannot inject a cursor or keys into this Windows PC.
-                    if (Volatile.Read(ref _forwardLease) > 0 &&
-                        _priority.CanApplyRemote) injector.Handle(p);
+                    if (lease > 0 && _priority.CanApplyRemote &&
+                        p.Type is ("move" or "button" or "key" or "wheel"))
+                    {
+                        injector.Handle(p);
+                        cursorApplied = p.Type == "move";
+                    }
                 }
+                if (cursorApplied && _priority.CanApplyRemote &&
+                    Volatile.Read(ref _forwardLease) == lease &&
+                    Interlocked.CompareExchange(ref _forwardAppliedLease, lease, 0) == 0)
+                    await SendControlAsync(new Packet("active", lease), token);
             }
         }
         catch (EndOfStreamException)
@@ -397,6 +413,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             Interlocked.Exchange(ref _latestReverseMove, null);
             Interlocked.Exchange(ref _reverseMoveSignaled, 0);
             Interlocked.Exchange(ref _forwardLease, 0);
+            Interlocked.Exchange(ref _forwardAppliedLease, 0);
             _priority.ReleaseRemote();
             Volatile.Write(ref _currentStream, null);
             lock (_inputGate)
@@ -446,6 +463,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private readonly object _reverseInputGate = new();
     private InputInjector? _reverseInjector;
     private int _reverseLease;
+    private int _reverseAppliedLease;
     internal event Action<Packet>? AuthorityControlPacket;
     internal event Action<string>? AuthorityDiagnostic;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
@@ -464,6 +482,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private void OnReverseNativeActivity()
     {
         int revoked = Interlocked.Exchange(ref _reverseLease, 0);
+        Interlocked.Exchange(ref _reverseAppliedLease, 0);
         if (revoked <= 0) return;
         // Native input immediately revokes permissions on the same thread;
         // release injected held keys asynchronously outside the hook callback.
@@ -478,6 +497,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private void ReleaseReverseAuthority()
     {
         Interlocked.Exchange(ref _reverseLease, 0);
+        Interlocked.Exchange(ref _reverseAppliedLease, 0);
         _reversePriority?.ReleaseRemote();
         lock (_reverseInputGate) _reverseInjector?.ReleaseAll();
     }
@@ -493,6 +513,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             if (permitted)
             {
                 Volatile.Write(ref _reverseLease, request.A);
+                Volatile.Write(ref _reverseAppliedLease, 0);
                 permitted = _reversePriority?.CanApplyRemote == true;
                 if (!permitted) ReleaseReverseAuthority();
             }
@@ -508,12 +529,20 @@ internal sealed class HostSession : IInputSession, IDisposable
         }
         if (Volatile.Read(ref _reverseLease) <= 0 ||
             _reversePriority?.CanApplyRemote != true) return;
+        int active = Volatile.Read(ref _reverseLease);
+        bool cursorApplied = false;
         lock (_reverseInputGate)
         {
-            if (Volatile.Read(ref _reverseLease) > 0 &&
-                _reversePriority?.CanApplyRemote == true)
+            if (active > 0 && _reversePriority?.CanApplyRemote == true)
+            {
                 _reverseInjector?.Handle(request);
+                cursorApplied = request.Type == "move";
+            }
         }
+        if (cursorApplied && _reversePriority?.CanApplyRemote == true &&
+            Volatile.Read(ref _reverseLease) == active &&
+            Interlocked.CompareExchange(ref _reverseAppliedLease, active, 0) == 0)
+            TrySend(new Packet("reverse-active", active));
     }
 
     private HostSession(TcpClient client, SslStream ssl,

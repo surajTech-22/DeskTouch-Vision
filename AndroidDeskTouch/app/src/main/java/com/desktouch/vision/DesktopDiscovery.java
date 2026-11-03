@@ -30,6 +30,10 @@ final class DesktopDiscovery {
             ready,!ready&&!busy);
     }
 
+    static boolean isRemoteDevice(Device device,String localFingerprint){
+        return device!=null && !(device.android &&
+            device.fingerprint.equalsIgnoreCase(localFingerprint));
+    }
     static List<Device> scan() throws Exception {
         // These IPs exist only during the current discovery and TCP connection;
         // saved identities always use cryptographic fingerprints, never IP.
@@ -74,8 +78,7 @@ final class DesktopDiscovery {
                 String ip=result.getAddress().getHostAddress();
                 Device device=parse(message,ip);
                 if(device==null)continue;
-                if(device.android && device.fingerprint.equalsIgnoreCase(ownAndroidIdentity))
-                    continue;
+                if(!isRemoteDevice(device,ownAndroidIdentity))continue;
                 if(result.getAddress().isLoopbackAddress()||
                    result.getAddress().isAnyLocalAddress())continue;
                 String key=(device.android?"android:":"windows:")+device.fingerprint;

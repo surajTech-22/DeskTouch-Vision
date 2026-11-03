@@ -1007,9 +1007,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Discovery finds CURRENT network addresses; the saved file has
             // NO IP address, only the receiver's persistent TLS fingerprint.
             var peers = await NearbyComputerDiscovery.FindAsync(_closing.Token);
-            var found = peers.Select(p => new { Peer = p,
-                Saved = _trusted.FindAutoConnect(p.Fingerprint) })
-                .FirstOrDefault(x => x.Saved != null);
+            var remembered = peers.Select(p => new { Peer = p,
+                Saved = _trusted.FindAutoConnect(p.Fingerprint) }).ToArray();
+            // Reconnect to the existing environment hub; never silently
+            // start a second, isolated PC-to-PC session with a leaf when a
+            // real hub is discoverable but has not yet been approved.
+            bool hubAvailable = peers.Any(p => p.IsHub && p.CanReceive);
+            var found = remembered.FirstOrDefault(x =>
+                x.Saved != null && x.Peer.IsHub);
+            if(found == null && !hubAvailable)
+                found = remembered.FirstOrDefault(x => x.Saved != null);
             if (found == null || _host != null ||
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;

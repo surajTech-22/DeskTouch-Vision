@@ -54,7 +54,7 @@ internal sealed class DisplaySettingsForm : Form
         BackColor = Color.FromArgb(31, 32, 36);
         ForeColor = Color.WhiteSmoke;
         ClientSize = new Size(1000, 690);
-        MinimumSize = new Size(760, 540);
+        MinimumSize = new Size(780, 600);
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         DoubleBuffered = true;
@@ -71,7 +71,7 @@ internal sealed class DisplaySettingsForm : Form
         header.Controls.Add(title);
         header.Controls.Add(_checkUpdates);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 183,
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52,
             FlowDirection = FlowDirection.LeftToRight, AutoSize = false, WrapContents = true };
@@ -89,15 +89,15 @@ internal sealed class DisplaySettingsForm : Form
         _summary.Font = new Font("Segoe UI Semibold", 11);
         _summary.ForeColor = Color.FromArgb(230, 231, 234);
         _summary.AutoEllipsis = true;
-        deviceInfo.Controls.Add(_summary);
-
         var explanation = new Label { Dock = DockStyle.Fill,
             Text = "Your built-in or connected keyboard and mouse always take priority when used. " +
                    "Drag the connected PC in the diagram to choose its screen edge. " +
                    "Emergency return: Ctrl + Alt + Shift + F12.",
             ForeColor = Color.FromArgb(179, 184, 193) };
+        // WinForms docks in reverse z-order: add Fill before Top to give
+        // the title its own space instead of covering the explanation.
         deviceInfo.Controls.Add(explanation);
-        explanation.BringToFront();
+        deviceInfo.Controls.Add(_summary);
         _status.Dock = DockStyle.Bottom;
         _status.Height = 43;
         _status.Padding = new Padding(10, 9, 10, 6);

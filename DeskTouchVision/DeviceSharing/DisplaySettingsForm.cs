@@ -428,7 +428,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                         .FirstOrDefault(m => m.Id==0)?.Name ?? _remoteAddress)));
                 foreach(var member in _host.EnvironmentMembers)
                 {
-                    if(member.Id==0 || !member.SupportsReverseInput) continue;
+                    if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId ||
+                        !member.SupportsReverseInput) continue;
                     _targetChoice.Items.Add(new TargetOption(-member.Id,
                         "In same environment  •  " + member.Platform + "  •  " + member.Name));
                 }

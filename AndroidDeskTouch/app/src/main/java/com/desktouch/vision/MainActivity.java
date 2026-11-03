@@ -156,19 +156,19 @@ public final class MainActivity extends Activity {
             }
             @Override public boolean onCapturedPointerEvent(MotionEvent e){
                 if(e.getActionMasked()==MotionEvent.ACTION_MOVE){
-                    session.moveBy(e.getX()*pointerSpeed,e.getY()*pointerSpeed);
+                    DeskTouchRuntime.session(MainActivity.this).moveBy(e.getX()*pointerSpeed,e.getY()*pointerSpeed);
                     return true;
                 }
                 if(e.getActionMasked()==MotionEvent.ACTION_SCROLL){
-                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_VSCROLL)*120),false);
-                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_HSCROLL)*120),true);
+                    DeskTouchRuntime.session(MainActivity.this).wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_VSCROLL)*120),false);
+                    DeskTouchRuntime.session(MainActivity.this).wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_HSCROLL)*120),true);
                     return true;
                 }
                 if(e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS ||
                     e.getActionMasked()==MotionEvent.ACTION_BUTTON_RELEASE){
                     int button=e.getActionButton()==MotionEvent.BUTTON_SECONDARY?2:
                         e.getActionButton()==MotionEvent.BUTTON_TERTIARY?3:1;
-                    session.button(button,e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS);
+                    DeskTouchRuntime.session(MainActivity.this).button(button,e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS);
                     return true;
                 }
                 return super.onCapturedPointerEvent(e);
@@ -185,10 +185,10 @@ public final class MainActivity extends Activity {
                     float dx=event.getX()-prevX,dy=event.getY()-prevY;
                     if(Math.abs(event.getX()-downX)+Math.abs(event.getY()-downY)>dp(9))
                         dragged=true;
-                    session.moveBy(dx*pointerSpeed,dy*pointerSpeed);
+                    DeskTouchRuntime.session(MainActivity.this).moveBy(dx*pointerSpeed,dy*pointerSpeed);
                     prevX=event.getX();prevY=event.getY();return true;
                 case MotionEvent.ACTION_UP:
-                    if(!dragged)session.click(1);
+                    if(!dragged)DeskTouchRuntime.session(MainActivity.this).click(1);
                     v.performClick();return true;
                 default:return true;
             }
@@ -213,14 +213,14 @@ public final class MainActivity extends Activity {
             public void afterTextChanged(Editable editable){
                 if(suppressTypedText)return;
                 String next=editable.toString();
-                if(session!=null&&session.isActive()){
+                if(session!=null&&DeskTouchRuntime.session(MainActivity.this).isActive()){
                     int common=0;
                     while(common<previousTyped[0].length()&&common<next.length()&&
                         previousTyped[0].charAt(common)==next.charAt(common))common++;
                     for(int n=common;n<previousTyped[0].length();n++){
-                        session.key(8,true);session.key(8,false);
+                        DeskTouchRuntime.session(MainActivity.this).key(8,true);DeskTouchRuntime.session(MainActivity.this).key(8,false);
                     }
-                    if(common<next.length())session.text(next.substring(common));
+                    if(common<next.length())DeskTouchRuntime.session(MainActivity.this).text(next.substring(common));
                 }
                 previousTyped[0]=next;
                 if(next.length()>800){
@@ -382,13 +382,13 @@ public final class MainActivity extends Activity {
         // The Android IME EditText handles composed Unicode text through
         // TextWatcher. Hardware keyboards control Windows when the touchpad
         // has focus, without stealing typing from the IME.
-        if(session!=null && session.isActive() &&
+        if(session!=null && DeskTouchRuntime.session(MainActivity.this).isActive() &&
             !(getCurrentFocus() instanceof EditText) &&
             (e.getSource()&InputDevice.SOURCE_KEYBOARD)==InputDevice.SOURCE_KEYBOARD){
             int vk=toWindowsKey(e.getKeyCode());
             if(vk!=0 && (e.getAction()==KeyEvent.ACTION_DOWN ||
                 e.getAction()==KeyEvent.ACTION_UP)){
-                if(e.getRepeatCount()==0)session.key(vk,
+                if(e.getRepeatCount()==0)DeskTouchRuntime.session(MainActivity.this).key(vk,
                     e.getAction()==KeyEvent.ACTION_DOWN);
                 return true;
             }
@@ -423,8 +423,10 @@ public final class MainActivity extends Activity {
     }
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);
-        // Do not revoke the remote input lease simply because the Android
-        // user opened an app to be controlled. Physical touch revokes it.
+        // An Android->Windows controller cannot remain armed after its
+        // touchpad/keyboard UI is backgrounded. Windows->Android Accessibility
+        // leases remain separately governed by real phone touch priority.
+        if(!focus)DeskTouchRuntime.releaseAll();
     }
     @Override protected void onDestroy(){
         DeskTouchRuntime.setListener(null);

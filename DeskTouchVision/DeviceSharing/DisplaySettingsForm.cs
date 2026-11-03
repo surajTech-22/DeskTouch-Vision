@@ -39,6 +39,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private ContextMenuStrip? _trayMenu;
     private bool _exitRequested;
     private bool _trayTipShown;
+    private readonly bool _startInTray;
+    private bool _isHiddenInTray;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
     private PhysicalInputMonitor? _nativeInput;
@@ -53,8 +55,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "DeskTouchVision", "device-sharing-layout.json");
 
-    internal DisplaySettingsForm()
+    internal DisplaySettingsForm(bool startInTray = false)
     {
+        _startInTray = startInTray;
         Text = "DeskTouch Vision — Displays";
         Font = new Font("Segoe UI", 10);
         BackColor = Color.FromArgb(31, 32, 36);
@@ -151,6 +154,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             RefreshDisplays();
             StartListening();
             UpdateClient.StartEventUpdates(this);
+            if (_startInTray) HideToTray(showBalloon: false);
         };
         InitializeTray();
         FormClosing += OnDeskTouchFormClosing;
@@ -183,6 +187,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     internal void ShowFromTray()
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
+        _isHiddenInTray = false;
         ShowInTaskbar = true;
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
@@ -190,14 +195,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         BringToFront();
     }
 
-    private void HideToTray()
+    private void HideToTray(bool showBalloon = true)
     {
+        _isHiddenInTray = true;
         // Hiding a WinForms form must NOT destroy its HWND. The existing
         // HWND processes WM_INPUT and owns the physical keyboard/mouse hooks.
         // The same UI message loop also hosts independent SSE auto-updates.
         ShowInTaskbar = false;
         Hide();
-        if (!_trayTipShown && _trayIcon != null)
+        if (showBalloon && !_trayTipShown && _trayIcon != null)
         {
             _trayTipShown = true;
             _trayIcon.BalloonTipTitle = "DeskTouch keeps sharing in the tray";
@@ -228,6 +234,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _exitRequested = true;
         Close();
     }
+
+    bool IUpdateCloseHost.IsHiddenInTray => _isHiddenInTray;
 
     void IUpdateCloseHost.CloseForVerifiedUpdate() => ExitDeskTouch();
 

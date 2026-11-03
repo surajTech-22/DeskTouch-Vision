@@ -13,6 +13,7 @@ internal sealed class SourceCapture : IDisposable
     private readonly Control _owner;
     private readonly IInputSession _session;
     private readonly bool _preserveRawInput;
+    private readonly int _mouseSpeed;
     private readonly AuthorityRequestTracker _claims = new();
     private int _activeClaim;
     private int _awaitingAppliedClaim;
@@ -46,6 +47,7 @@ internal sealed class SourceCapture : IDisposable
     {
         _owner = owner;
         _preserveRawInput = preserveRawInput;
+        _mouseSpeed = Win.CurrentMouseSpeed();
         _edge = exitEdge;
         _session = session;
         _status = status;
@@ -427,7 +429,8 @@ internal sealed class SourceCapture : IDisposable
             if (RemoteActive)
             {
                 _lastRawMs = Environment.TickCount64;
-                MoveRemote(input.Mouse.LastX, input.Mouse.LastY);
+                MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
+                    ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
             }
             else
             {
@@ -442,6 +445,17 @@ internal sealed class SourceCapture : IDisposable
             }
         }
         finally { Marshal.FreeHGlobal(memory); }
+    }
+
+    internal static int ScaleRawDelta(int raw, int systemMouseSpeed)
+    {
+        // Raw Input omits the OS's pointer sensitivity. Cap extreme device
+        // reports while preserving even one slow pixel of physical movement.
+        if (raw == 0) return 0;
+        int bounded = Math.Clamp(raw, -400, 400);
+        double gain = Math.Clamp(systemMouseSpeed, 1, 20) / 10.0 * 1.45;
+        int scaled = (int)Math.Round(bounded * gain, MidpointRounding.AwayFromZero);
+        return scaled == 0 ? Math.Sign(raw) : scaled;
     }
 
     private void MoveRemote(int dx, int dy)

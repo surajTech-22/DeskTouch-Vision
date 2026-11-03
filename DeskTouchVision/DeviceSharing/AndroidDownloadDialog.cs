@@ -102,7 +102,8 @@ internal sealed class AndroidDownloadDialog : Form
                 using var code = QRCodeGenerator.GenerateQrCode(_url, QRCodeGenerator.ECCLevel.Q);
                 using var bytes = new PngByteQRCode(code);
                 using var stream = new MemoryStream(bytes.GetGraphic(12));
-                _qr.Image = new Bitmap(stream);
+                using var bitmap = new Bitmap(stream);
+                _qr.Image = new Bitmap(bitmap);
                 _qr.Visible = true;
                 _description.Text = "Scan this QR using your Android Camera.\n" +
                     $"DeskTouch Android {tag} preview — Android installs the APK.\n" +

@@ -388,6 +388,16 @@ var uiThread = new Thread(() =>
             .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
         Check(!actionRow.WrapContents && actionRow.AutoScroll,
             "High-DPI action buttons must not collapse into an invisible second row");
+        var trustButton = view.Controls.Find("TrustedDevicesButton", true)
+            .OfType<System.Windows.Forms.Button>().Single();
+        Check(trustButton.Visible && trustButton.Width >= 110,
+            "Trusted-device settings must remain visible without hiding existing controls");
+        var headerLinks = trustButton.Parent?.Controls
+            .OfType<System.Windows.Forms.LinkLabel>().ToArray() ??
+            Array.Empty<System.Windows.Forms.LinkLabel>();
+        foreach (var link in headerLinks)
+            Check(!trustButton.Bounds.IntersectsWith(link.Bounds),
+                "Trusted devices must not overlap the existing Check for updates link");
         var diagram = view.Controls.Find("DisplayDiagram", true)
             .OfType<DisplayArrangementControl>().Single();
         diagram.Local = extended;

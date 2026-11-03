@@ -32,6 +32,7 @@ internal sealed class ReceiverServer : IDisposable
     internal event Action<ConnectedPeer>? PeerConnected;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
+    internal event Action<MonitorEdge>? PeerPlacementChanged;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
@@ -137,6 +138,16 @@ internal sealed class ReceiverServer : IDisposable
 
     internal void DisconnectPeer() => Volatile.Read(ref _currentClient)?.Close();
 
+    internal void PublishPlacement(MonitorEdge side)
+    {
+        if (Volatile.Read(ref _currentStream) == null) return;
+        _ = Task.Run(async () =>
+        {
+            try { await SendControlAsync(new Packet("placement", Text: side.ToString()), _cancel.Token); }
+            catch (Exception) { }
+        });
+    }
+
     internal void PublishLocalTopology(MonitorTopology monitors)
     {
         if (Volatile.Read(ref _currentStream) == null) return;
@@ -201,6 +212,7 @@ internal sealed class ReceiverServer : IDisposable
             screen.Width, screen.Height, topology.ToWire()), token);
         // BOTH PCs receive their peer's monitor layout. The original sender
         // alone had a remote display group; the receiver never got a hello.
+        ConnectedPeer? incoming = null;
         using (var helloTimeout = CancellationTokenSource.CreateLinkedTokenSource(token))
         {
             helloTimeout.CancelAfter(TimeSpan.FromSeconds(10));
@@ -208,6 +220,7 @@ internal sealed class ReceiverServer : IDisposable
             if (helloPacket.Type != "hello")
                 throw new InvalidDataException("Missing authenticated peer hello.");
             var peer = ReadHello(helloPacket.Text);
+            incoming = peer;
             Volatile.Write(ref _currentClient, client);
             PeerConnected?.Invoke(peer);
         }
@@ -215,7 +228,6 @@ internal sealed class ReceiverServer : IDisposable
         var injector = new InputInjector();
         Volatile.Write(ref _currentInjector, injector);
         Volatile.Write(ref _currentStream, ssl);
-        ConnectedPeer? incoming = null;
         try
         {
             while (!token.IsCancellationRequested)
@@ -234,17 +246,14 @@ internal sealed class ReceiverServer : IDisposable
                 if (p.Type == "topology")
                 {
                     var topology = MonitorTopology.FromWire(p.Text);
-                    var current = incoming;
-                    if (current == null)
-                    {
-                        // The sender's name is supplied once by authenticated hello.
-                        // UI must never infer it from a claimed broadcast label.
-                        current = new ConnectedPeer(
-                            (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "Connected computer",
-                            topology);
-                    }
-                    incoming = current with { Monitors = topology };
+                    incoming = incoming! with { Monitors = topology };
                     PeerTopologyChanged?.Invoke(incoming);
+                    continue;
+                }
+                if (p.Type == "placement" &&
+                    Enum.TryParse<MonitorEdge>(p.Text, true, out var sourceEdge))
+                {
+                    PeerPlacementChanged?.Invoke(sourceEdge);
                     continue;
                 }
 
@@ -316,6 +325,7 @@ internal sealed class HostSession : IDisposable
     internal MonitorTopology RemoteMonitors => Volatile.Read(ref _remoteMonitors);
     internal event Action<string>? RemoteControlState;
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
+    internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
     private Packet? _latestMove;
     private int _moveSignaled;
@@ -448,6 +458,9 @@ internal sealed class HostSession : IDisposable
     internal void PublishSourceTopology(MonitorTopology layout) =>
         TrySend(new Packet("topology", Text: layout.ToWire()));
 
+    internal void PublishSourcePlacement(MonitorEdge edge) =>
+        TrySend(new Packet("placement", Text: edge.ToString()));
+
     private async Task ReceiveLoopAsync()
     {
         try
@@ -461,6 +474,9 @@ internal sealed class HostSession : IDisposable
                     Volatile.Write(ref _remoteMonitors, layout);
                     RemoteTopologyChanged?.Invoke(layout);
                 }
+                else if (p.Type == "placement" &&
+                    Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
+                    RemotePlacementChanged?.Invoke(changedEdge);
                 else if (p.Type is "granted" or "busy" or "local-active")
                     RemoteControlState?.Invoke(p.Type);
             }

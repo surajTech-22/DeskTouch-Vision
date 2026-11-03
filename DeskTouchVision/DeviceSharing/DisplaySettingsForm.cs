@@ -495,6 +495,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
             _incomingPeer = peer;
             RefreshDisplays();
+            if (!peer.SupportsReverseInput)
+            {
+                Status($"Android device {peer.Name} connected. Windows accepts its keyboard/mouse input; Android system-wide reverse input is unavailable.");
+                return;
+            }
             if (_receiver != null && _capture == null)
             {
                 try

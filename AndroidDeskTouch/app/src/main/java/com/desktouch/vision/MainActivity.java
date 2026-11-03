@@ -201,8 +201,25 @@ public final class MainActivity extends Activity {
                     connectionSummary.setText("Connected devices: "+
                         DeskTouchRuntime.connectedCount()+" / 8");
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
-                    else status.setText("Select a ready Windows PC below. Busy peers and Android phones are shown for discovery.");
+                    else status.setText("DeskTouch found "+list.size()+" nearby device(s). "+
+                        "Interconnected PCs are grouped; choose a member to connect.");
+                    java.util.Map<String,Integer> groupSizes=new java.util.HashMap<>();
+                    for(DesktopDiscovery.Device device:list)
+                        if(!device.android)
+                            groupSizes.put(device.groupId,
+                                groupSizes.getOrDefault(device.groupId,0)+1);
+                    java.util.Set<String> shownGroups=new java.util.HashSet<>();
                     for(DesktopDiscovery.Device d:list){
+                        if(!d.android && groupSizes.getOrDefault(d.groupId,1)>1 &&
+                            shownGroups.add(d.groupId)){
+                            TextView group=new TextView(this);
+                            group.setText("Linked DeskTouch network • "+
+                                groupSizes.get(d.groupId)+" Windows PCs");
+                            group.setTextColor(Color.rgb(158,221,205));
+                            group.setTextSize(17);
+                            group.setPadding(0,dp(10),0,dp(6));
+                            deviceList.addView(group);
+                        }
                         boolean connected=DeskTouchRuntime.isConnected(d.fingerprint);
                         addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
                             (connected?" • Connected (select)":

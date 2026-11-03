@@ -20,14 +20,16 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private const string ReplyPrefix = "DT1-READY|";
     private readonly CancellationTokenSource _stop = new();
     private readonly string _fingerprint;
+    private readonly Func<bool> _canAcceptConnections;
     private UdpClient? _listener;
     private Task? _loop;
 
-    internal NearbyComputerDiscovery(string fingerprint)
+    internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A pinned SHA-256 certificate is required.");
         _fingerprint = fingerprint;
+        _canAcceptConnections = canAcceptConnections ?? (() => true);
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -56,7 +58,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             try
             {
                 var msg = await _listener!.ReceiveAsync(_stop.Token);
-                if (!IsPrivateLan(msg.RemoteEndPoint.Address)) continue;
+                if (!IsPrivateLan(msg.RemoteEndPoint.Address) || !_canAcceptConnections()) continue;
                 if (msg.Buffer.Length != Probe.Length ||
                     Encoding.ASCII.GetString(msg.Buffer) != Probe) continue;
                 await _listener.SendAsync(reply, msg.RemoteEndPoint, _stop.Token);

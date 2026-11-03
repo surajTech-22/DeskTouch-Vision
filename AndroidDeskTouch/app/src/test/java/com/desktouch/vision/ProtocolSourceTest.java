@@ -15,9 +15,9 @@ public final class ProtocolSourceTest {
         assertFalse(DeskTouchSession.allowedInputType("goodbye"));
     }
     @Test public void multipleDevicesAndBusyPeersAreRecognized() {
-        String a=new String(new char[64]).replace('\\0','A');
-        String b=new String(new char[64]).replace('\\0','B');
-        String c=new String(new char[64]).replace('\\0','C');
+        String a="A".repeat(64);
+        String b="B".repeat(64);
+        String c="C".repeat(64);
         DesktopDiscovery.Device pc1=DesktopDiscovery.parse("DT1-READY|PC1|"+a,"192.168.1.11");
         DesktopDiscovery.Device pc2=DesktopDiscovery.parse("DT1-BUSY|PC2|"+b,"192.168.1.12");
         DesktopDiscovery.Device android=DesktopDiscovery.parse("DT1-MOBILE|Phone|"+c,"192.168.1.2");

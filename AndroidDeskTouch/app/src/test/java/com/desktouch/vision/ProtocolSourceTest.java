@@ -12,6 +12,7 @@ public final class ProtocolSourceTest {
         assertFalse(DeskTouchSession.allowedInputType("reverse-claim"));
         assertTrue(DeskTouchSession.allowedInputType("move"));
         assertTrue(DeskTouchSession.allowedInputType("key"));
+        assertTrue(DeskTouchSession.allowedInputType("text")); // Android IME
         assertFalse(DeskTouchSession.allowedInputType("goodbye"));
     }
     @Test public void multipleDevicesAndBusyPeersAreRecognized() {
@@ -84,7 +85,7 @@ public final class ProtocolSourceTest {
         assertEquals("\\",WindowsKeyText.printable(220,false));
         assertNull(WindowsKeyText.apply("x",1,1,112,false)); // F1 is not text
     }
-    @Test public void linkedPcsUseOneNetworkCardAndOneGateway() {
+    @Test public void linkedPcsUseOneCardWithDistinctApprovedSessions() {
         DesktopDiscovery.Device one=DesktopDiscovery.parse(
             "DT1-READY|Desktop A|"+"A".repeat(64),"192.168.1.21");
         DesktopDiscovery.Device two=DesktopDiscovery.parse(

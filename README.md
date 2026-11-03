@@ -2,7 +2,29 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.6 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.7 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.7 — permanent installation mutex / duplicate-download correction
+
+**Confirmed on a Windows PC:** after a successful v0.2.5 install at 14:40:50 IST, subsequent v0.2.6 attempts at 14:59:09 and 15:14:44 were skipped with "Another DeskTouch installer is already running". The machine remained on v0.2.5. This is an update lifecycle defect; successful ZIP download and SHA-256 verification are not equivalent to installation.
+
+The independent updater previously wrote an "Update installed and restarted" message but then kept the **named installation mutex held while deleting a large backup and extracted folder**. A cleanup operation that stalls can therefore block every later update indefinitely. v0.2.7 now releases the mutex immediately after a successful install or rollback, **before** any backup, package or extraction cleanup, which is outside the serialized installation phase.
+
+The UI's release client probes that mutex *without keeping ownership across an async call*. When another installer is running, it reports **installation busy** and leaves the current Displays window alone rather than downloading yet another ZIP, closing the window and silently abandoning the new installer. Competing independent installers can wait up to 90 seconds for the critical phase, and they log the updater PIDs if it remains blocked.
+
+### One-time recovery for an installed v0.2.5 or v0.2.6
+
+A running older version cannot gain its corrected updater until the application is actually installed. Download the latest official ZIP and run the included `INSTALL_DESKTOUCH.cmd` only when no older update host is active; or use the current standalone `RECOVER_DESKTOUCH.ps1`, which downloads and verifies the official v0.2.7 release and checks the updater lock *before closing the installed app*.
+
+```powershell
+$script = "$env:USERPROFILE\Downloads\RECOVER_DESKTOUCH.ps1"
+Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/surajTech-22/DeskTouch-Vision/main/DeskTouchVision/RECOVER_DESKTOUCH.ps1" -OutFile $script
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script
+```
+
+If recovery reports another updater still running, it leaves the installed application untouched. Use the included read-only `CHECK_UPDATE_LOCK.ps1` to inspect its Process ID, installed version, mutex ownership, and the last updater logs; **do not indiscriminately force-kill PowerShell or input sharing processes**.
+
+A Windows PowerShell 5.1 regression test checks that two separate updater processes can acquire the mutex in sequence even while the earlier process remains alive doing slow cleanup. This source and CI test cannot prove unattended updating succeeded on a user's physical computer; check the installed executable version (target `0.2.7.0`) after recovery.
 
 ## v0.2.6 — reliable screen-edge mouse handoff and stable Displays layout
 

@@ -268,7 +268,7 @@ public final class MainActivity extends Activity {
                         DeskTouchRuntime.connectedCount()+" / 8");
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
                     else status.setText("DeskTouch found "+list.size()+" nearby device(s). "+
-                        "Interconnected PCs are grouped; choose a member to connect.");
+                        "Interconnected PCs are grouped; connect the network once.");
                     // One visible connection card per linked Windows network.
                     // Direct TLS identities remain separate underneath; a group
                     // must never be substituted for a certificate fingerprint.
@@ -286,51 +286,83 @@ public final class MainActivity extends Activity {
                         .count();
                     connectionSummary.setText("Connected Windows networks: "+
                         activeGroups+" / "+groups.size());
+                    DeskTouchRuntime.rememberGroups(groups);
                     for(List<DesktopDiscovery.Device> members:groups.values()){
-                        DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
-                            members,connectedFingerprints,approved);
-                        if(gateway==null)continue;
-                        boolean connected=members.stream().anyMatch(
-                            m->connectedFingerprints.contains(m.fingerprint));
+                        long online=members.stream().filter(m->
+                            DeskTouchRuntime.isConnected(m.fingerprint)).count();
                         String names=String.join(" + ",members.stream()
                             .map(m->m.name).toArray(String[]::new));
                         String label=(members.size()>1?"Linked Windows network":"Windows PC")
-                            +" • "+names
-                            +(connected?" • Connected via "+gateway.name:
-                              gateway.ready?" • Connect":" • At capacity");
+                            +" • "+names+" • "+online+"/"+members.size()+" connected";
                         addButton(deviceList,label,()->{
-                            if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
-                                session=DeskTouchRuntime.select(this,gateway.fingerprint);
-                                status.setText("Connected to "+names+" through "+gateway.name+
-                                    ". Network members keep their own TLS identities. "+
-                                    "This connection does not automatically relay Android "+
-                                    "keyboard input through another PC.");
+                            if(online==members.size()){
+                                DesktopDiscovery.Device first=DesktopDiscovery.chooseGateway(
+                                    members,connectedFingerprints,approved);
+                                if(first!=null){
+                                    session=DeskTouchRuntime.select(this,first.fingerprint);
+                                    session.claimControl();
+                                    status.setText("Windows network connected. Selected "+first.name+
+                                        " for keyboard and mouse.");
+                                }
                                 return;
                             }
-                            if(!gateway.ready){
-                                status.setText("No available Windows gateway. Rescan after the "+
-                                    "connected PCs start DeskTouch or release a session.");
-                                return;
-                            }
-                            new AlertDialog.Builder(this).setTitle(
-                                members.size()>1?"Connect to linked Windows network":"Secure pairing")
-                                .setMessage("DeskTouch will pair with "+gateway.name+
-                                    " as this network's gateway. Approve the pairing on "+
-                                    "that Windows PC. Other linked PCs remain separately "+
-                                    "authenticated; selecting a group does not install "+
-                                    "a transparent keyboard relay.")
+                            new AlertDialog.Builder(this)
+                                .setTitle("Connect the linked Windows network")
+                                .setMessage("Connect "+names+" using one group action. " +
+                                    "Each Windows PC will verify its own permanent TLS " +
+                                    "identity and require its own first-time pairing approval. " +
+                                    "All connected members remain online together.")
                                 .setNegativeButton("Cancel",null)
-                                .setPositiveButton("Connect",(dialog,which)->{
+                                .setPositiveButton("Connect all",(dialog,which)->{
                                     android.graphics.Point size=new android.graphics.Point();
                                     getWindowManager().getDefaultDisplay().getRealSize(size);
                                     AutoConnectService.setReconnect(this,true);
-                                    AutoConnectService.resumePeer(this,gateway.fingerprint);
-                                    session=DeskTouchRuntime.select(this,gateway.fingerprint);
-                                    session.connect(gateway,size.x,size.y);
-                                    status.setText("Connecting to "+names+" via "+
-                                        gateway.name+"; authorize on that Windows PC.");
+                                    int requested=0;
+                                    for(DesktopDiscovery.Device member:members){
+                                        if(DeskTouchRuntime.isConnected(member.fingerprint)||
+                                            DeskTouchRuntime.isConnecting(member.fingerprint))
+                                            continue;
+                                        if(!member.ready)continue;
+                                        try {
+                                            AutoConnectService.resumePeer(this,member.fingerprint);
+                                            DeskTouchRuntime.forPeer(this,member.fingerprint)
+                                                .connect(member,size.x,size.y);
+                                            requested++;
+                                        }catch(IllegalStateException limit){
+                                            status.setText("Eight device limit reached; " +
+                                                "existing connections remain available.");
+                                            break;
+                                        }
+                                    }
+                                    DesktopDiscovery.Device preferred=DesktopDiscovery.chooseGateway(
+                                        members,connectedFingerprints,approved);
+                                    if(preferred!=null)
+                                        session=DeskTouchRuntime.select(this,preferred.fingerprint);
+                                    status.setText("Connecting "+requested+" Windows network " +
+                                        "member(s); accept first-time pairing on each PC.");
                                 }).show();
                         });
+                        if(members.size()>1){
+                            addButton(deviceList,"Choose active Windows screen (same network)",()->{
+                                String[] choices=members.stream().map(m->m.name+
+                                    (DeskTouchRuntime.isConnected(m.fingerprint)
+                                        ?" • ready":" • not connected"))
+                                    .toArray(String[]::new);
+                                new AlertDialog.Builder(this)
+                                    .setTitle("Active screen in "+names)
+                                    .setItems(choices,(dialog,index)->{
+                                        DesktopDiscovery.Device member=members.get(index);
+                                        if(!DeskTouchRuntime.isConnected(member.fingerprint)){
+                                            status.setText("Connect this member through the " +
+                                                "linked network first.");
+                                            return;
+                                        }
+                                        session=DeskTouchRuntime.select(this,member.fingerprint);
+                                        session.claimControl();
+                                        status.setText("Requesting mouse and keyboard on "+member.name);
+                                    }).show();
+                            });
+                        }
                     }
                     // Android peers remain individually identifiable: only
                     // interconnected Windows PCs share a network grouping.

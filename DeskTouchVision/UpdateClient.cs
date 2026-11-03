@@ -21,14 +21,14 @@ internal static class UpdateClient
     private const string Topic = "desktouch-vision-surajtech22-qrp9f4x2";
     private const string ArchiveName = "DeskTouchVision-win-x64.zip";
     private const string ChecksumName = "DeskTouchVision-win-x64.zip.sha256";
-    private static readonly Version CurrentVersion = new(0, 2, 0);
+    private static readonly Version CurrentVersion = new(0, 2, 1);
     private static readonly HttpClient Http = MakeHttp();
     private static int _updateStarted;
 
     private static HttpClient MakeHttp()
     {
         var c = new HttpClient { Timeout = TimeSpan.FromMinutes(4) };
-        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskTouchVision", "0.2.0"));
+        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskTouchVision", "0.2.1"));
         return c;
     }
 
@@ -136,6 +136,11 @@ internal static class UpdateClient
             if (!actual.Equals(hash, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("Release archive failed SHA-256 verification.");
             string dir = AppContext.BaseDirectory;
+            // v0.2.1 opens the stand-alone DeviceSharing process as the main
+            // visible window. Its update root is the enclosing app directory.
+            if (string.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(dir)),
+                "DeviceSharing", StringComparison.OrdinalIgnoreCase))
+                dir = Directory.GetParent(Path.TrimEndingDirectorySeparator(dir))!.FullName;
             string script = Path.Combine(dir, "Update-DeskTouch.ps1");
             if (!File.Exists(script)) throw new FileNotFoundException("Updater not installed", script);
             var psi = new ProcessStartInfo("powershell.exe")

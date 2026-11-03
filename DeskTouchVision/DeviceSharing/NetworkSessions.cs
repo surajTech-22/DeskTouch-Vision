@@ -18,6 +18,7 @@ internal sealed class ReceiverServer : IDisposable
     private Task? _serverTask;
     private int _active;
     private readonly LocalInputPriority _priority;
+    private readonly Func<string, CancellationToken, Task<bool>>? _requestApproval;
     private readonly object _inputGate = new();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private InputInjector? _currentInjector;
@@ -25,10 +26,12 @@ internal sealed class ReceiverServer : IDisposable
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
-    internal ReceiverServer(Action<string> status, LocalInputPriority priority)
+    internal ReceiverServer(Action<string> status, LocalInputPriority priority,
+        Func<string, CancellationToken, Task<bool>>? requestApproval = null)
     {
         _status = status;
         _priority = priority;
+        _requestApproval = requestApproval;
         _priority.PhysicalOverride += OnPhysicalOverride;
         _key = RSA.Create(2048);
         var req = new CertificateRequest("CN=DeskTouch-LAN", _key,
@@ -107,10 +110,26 @@ internal sealed class ReceiverServer : IDisposable
             CertificateRevocationCheckMode = X509RevocationMode.NoCheck
         }, handshakeLimit.Token);
         var request = await Wire.ReadAsync(ssl, handshakeLimit.Token);
-        if (request.Type != "auth" || !ConstantTimeSecret(request.Text, Secret))
+        bool approved = request.Type == "auth" &&
+            ConstantTimeSecret(request.Text, Secret);
+        if (!approved && request.Type == "auth-request" && _requestApproval != null)
         {
-            _status("Pairing rejected; check the 32-character secret.");
-            await Task.Delay(250, token);
+            // Discovery advertises only a public certificate fingerprint.
+            // Any first connection must be explicitly approved on this PC.
+            using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
+            approvalLimit.CancelAfter(TimeSpan.FromSeconds(40));
+            string peerIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString()
+                ?? "Unknown address";
+            string claimedName = (request.Text ?? "Unknown PC").Trim();
+            if (claimedName.Length > 60) claimedName = claimedName[..60];
+            try { approved = await _requestApproval(
+                $"{claimedName} ({peerIp})", approvalLimit.Token); }
+            catch (OperationCanceledException) { approved = false; }
+        }
+        if (!approved)
+        {
+            _status("Unapproved pairing attempt rejected. No remote input granted.");
+            await Wire.WriteAsync(ssl, new Packet("denied"), token);
             return;
         }
 
@@ -208,15 +227,25 @@ internal sealed class HostSession : IDisposable
         _ = Task.Run(ReceiveLoopAsync);
     }
 
-    internal static async Task<HostSession> ConnectAsync(
+    internal static Task<HostSession> ConnectAsync(
         string ip, string pinnedFingerprint, string secret, Action<string> onFailure,
-        CancellationToken cancellation)
+        CancellationToken cancellation) =>
+            ConnectCoreAsync(ip, pinnedFingerprint, secret, false, onFailure, cancellation);
+
+    internal static Task<HostSession> ConnectWithApprovalAsync(
+        string ip, string pinnedFingerprint, Action<string> onFailure,
+        CancellationToken cancellation) =>
+            ConnectCoreAsync(ip, pinnedFingerprint, "", true, onFailure, cancellation);
+
+    private static async Task<HostSession> ConnectCoreAsync(
+        string ip, string pinnedFingerprint, string secret, bool askReceiver,
+        Action<string> onFailure, CancellationToken cancellation)
     {
         pinnedFingerprint = new string(pinnedFingerprint.Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
         secret = secret.Trim().ToUpperInvariant();
         if (pinnedFingerprint.Length != 64 || !pinnedFingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("Enter the receiver's complete 64-digit SHA-256 fingerprint.");
-        if (secret.Length != 32 || !secret.All(Uri.IsHexDigit))
+        if (!askReceiver && (secret.Length != 32 || !secret.All(Uri.IsHexDigit)))
             throw new ArgumentException("Enter the receiver's 32-digit pairing secret.");
         if (!IPAddress.TryParse(ip.Trim(), out var address) ||
             address.AddressFamily != AddressFamily.InterNetwork)
@@ -242,11 +271,16 @@ internal sealed class HostSession : IDisposable
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck
             }, timeout.Token);
-            await Wire.WriteAsync(ssl, new Packet("auth", Text: secret), timeout.Token);
-            var ready = await Wire.ReadAsync(ssl, timeout.Token);
+            await Wire.WriteAsync(ssl, new Packet(
+                askReceiver ? "auth-request" : "auth",
+                Text: askReceiver ? Environment.MachineName : secret), timeout.Token);
+            // The receiver may need time for the owner to click Approve.
+            using var acceptedLimit = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            acceptedLimit.CancelAfter(TimeSpan.FromSeconds(45));
+            var ready = await Wire.ReadAsync(ssl, acceptedLimit.Token);
             if (ready.Type != "ready" || ready.C < 200 || ready.D < 100 ||
                 ready.C > 50000 || ready.D > 50000)
-                throw new AuthenticationException("Receiver did not accept pairing.");
+                throw new AuthenticationException("The other computer did not approve the connection.");
             var monitors = MonitorTopology.FromWire(ready.Text);
             if (monitors.Bounds != new System.Drawing.Rectangle(ready.A, ready.B, ready.C, ready.D))
                 throw new AuthenticationException("Receiver monitor geometry failed validation.");

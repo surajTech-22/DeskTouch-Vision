@@ -763,6 +763,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void AdoptHost(HostSession session, string name, string fingerprint)
     {
+        if (_capture != null)
+        {
+            _capture.Dispose();
+            _capture = null;
+        }
         _host = session;
         _remoteAddress = name;
         _currentFingerprint = fingerprint;
@@ -867,6 +872,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             catch (Exception ex) { Status("Could not pause automatic reconnect: " + ex.Message); }
         }
         DisconnectAndListen();
+        _receiver?.DisconnectAllPeers();
         UpdateButtons();
     }
 
@@ -886,11 +892,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             var found = peers.Select(p => new { Peer = p,
                 Saved = _trusted.FindAutoConnect(p.Fingerprint) })
                 .FirstOrDefault(x => x.Saved != null);
-            if (found == null || _host != null || _incomingPeer != null ||
+            if (found == null || _host != null ||
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;
             _connecting = true;
-            StopListening(preserveDiscovery: true);
+            // Do not stop other TLS peers or discovery for an outgoing reconnect.
             Status($"Trusted {found.Saved!.Name} discovered. Verifying persistent device identity...");
             try
             {
@@ -1021,12 +1027,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void DisconnectAndListen()
     {
         DisconnectHost();
-        if (_incomingPeer != null)
-        {
-            _receiver?.DisconnectPeer();
-            _incomingPeer = null;
-            RefreshDisplays();
-        }
+        // A failed outgoing session must NOT disconnect other Android/PC peers.
         if (!_closing.IsCancellationRequested) StartListening();
         if (_receiver != null && _incomingPeers.Count > 0 &&
             _incomingPeer is ConnectedPeer selected)

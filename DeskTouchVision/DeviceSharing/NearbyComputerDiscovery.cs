@@ -6,18 +6,23 @@ using System.Text;
 
 namespace DeskTouch.DeviceShare;
 
-internal sealed record NearbyComputer(string Name, string Address, string Fingerprint);
+/// <summary>Discovery-only information. The advertised fingerprint is never
+/// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
+internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
+    bool IsAndroid = false, bool CanReceive = true);
 
 /// <summary>
-/// LAN-only peer detection. Broadcast responses expose machine name and the
-/// ephemeral TLS certificate fingerprint; NEVER advertise pairing secrets.
-/// Pairing still requires explicit consent on the receiving Windows computer.
+/// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
+/// Android phones remain visible in Add devices. A busy PC is clearly marked
+/// rather than silently disappearing. No IP address is remembered as identity.
 /// </summary>
 internal sealed class NearbyComputerDiscovery : IDisposable
 {
     internal const int DiscoveryPort = 37378;
     private const string Probe = "DT1-DISCOVER";
-    private const string ReplyPrefix = "DT1-READY|";
+    private const string ReadyPrefix = "DT1-READY|";
+    private const string BusyPrefix = "DT1-BUSY|";
+    private const string MobilePrefix = "DT1-MOBILE|";
     private readonly CancellationTokenSource _stop = new();
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
@@ -27,7 +32,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
-            throw new ArgumentException("A pinned SHA-256 certificate is required.");
+            throw new ArgumentException("A stable TLS fingerprint is required.");
         _fingerprint = fingerprint;
         _canAcceptConnections = canAcceptConnections ?? (() => true);
     }
@@ -51,16 +56,23 @@ internal sealed class NearbyComputerDiscovery : IDisposable
 
     private async Task ReplyLoopAsync()
     {
-        var reply = Encoding.ASCII.GetBytes(ReplyPrefix +
-            Environment.MachineName.Replace("|", "-") + "|" + _fingerprint);
+        var name = Environment.MachineName.Replace("|", "-");
         while (!_stop.IsCancellationRequested)
         {
             try
             {
                 var msg = await _listener!.ReceiveAsync(_stop.Token);
-                if (!IsPrivateLan(msg.RemoteEndPoint.Address) || !_canAcceptConnections()) continue;
+                if (!IsPrivateLan(msg.RemoteEndPoint.Address)) continue;
                 if (msg.Buffer.Length != Probe.Length ||
                     Encoding.ASCII.GetString(msg.Buffer) != Probe) continue;
+
+                // IMPORTANT: discovery must survive a TCP session. While a PC
+                // controls another PC, report it as busy, not as a missing PC.
+                bool accepting = false;
+                try { accepting = _canAcceptConnections(); }
+                catch (ObjectDisposedException) { }
+                var prefix = accepting ? ReadyPrefix : BusyPrefix;
+                byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
                 await _listener.SendAsync(reply, msg.RemoteEndPoint, _stop.Token);
             }
             catch (OperationCanceledException) { return; }
@@ -69,6 +81,33 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             catch (IOException) { }
         }
     }
+
+    internal static NearbyComputer? ParseReply(string response, IPAddress address)
+    {
+        if (!IsPrivateLan(address) || response.Length is < 75 or > 260) return null;
+        bool isMobile = response.StartsWith(MobilePrefix, StringComparison.Ordinal);
+        bool busy = response.StartsWith(BusyPrefix, StringComparison.Ordinal);
+        if (!isMobile && !busy &&
+            !response.StartsWith(ReadyPrefix, StringComparison.Ordinal)) return null;
+        string prefix = isMobile ? MobilePrefix : busy ? BusyPrefix : ReadyPrefix;
+        var parts = response[prefix.Length..].Split('|');
+        if (parts.Length != 2 || parts[0].Length is < 1 or > 100 ||
+            parts[0].Any(char.IsControl) ||
+            parts[1].Length != 64 || !parts[1].All(Uri.IsHexDigit)) return null;
+        // Android currently initiates outgoing TLS toward Windows. It must
+        // never be presented as a Windows TCP receiver on port 37377.
+        return new NearbyComputer(parts[0], address.ToString(),
+            parts[1].ToUpperInvariant(), isMobile, !busy && !isMobile);
+    }
+
+    internal static IReadOnlyList<NearbyComputer> DistinctDevices(IEnumerable<NearbyComputer> peers) =>
+        peers.GroupBy(p => (p.IsAndroid, p.Fingerprint), 
+                EqualityComparer<(bool, string)>.Default)
+            .Select(g => g.OrderByDescending(p => p.CanReceive).First())
+            .OrderBy(p => p.IsAndroid)
+            .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(p => p.Address, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
     internal static async Task<IReadOnlyList<NearbyComputer>> FindAsync(CancellationToken cancel)
     {
@@ -95,43 +134,47 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 destinations.Add(new IPAddress(broadcast).ToString());
             }
         }
-        var query = Encoding.ASCII.GetBytes(Probe);
-        foreach (string host in destinations)
-        {
-            try { await udp.SendAsync(query,
-                new IPEndPoint(IPAddress.Parse(host), DiscoveryPort), cancel); }
-            catch (SocketException) { /* unavailable adapter */ }
-        }
-
+        byte[] probe = Encoding.ASCII.GetBytes(Probe);
+        // Retry two cycles, not just one shot. Both Wi-Fi broadcast filtering
+        // and waking Android phones can discard the first datagram.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel);
-        deadline.CancelAfter(TimeSpan.FromMilliseconds(1750));
+        deadline.CancelAfter(TimeSpan.FromMilliseconds(3700));
+        var sendAt = DateTime.UtcNow;
+        int attempts = 0;
         while (!deadline.IsCancellationRequested)
         {
+            if (attempts < 3 && DateTime.UtcNow >= sendAt)
+            {
+                attempts++;
+                sendAt = DateTime.UtcNow.AddMilliseconds(900);
+                foreach (string host in destinations)
+                {
+                    try { await udp.SendAsync(probe,
+                        new IPEndPoint(IPAddress.Parse(host), DiscoveryPort), deadline.Token); }
+                    catch (SocketException) { /* adapter not available */ }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
+            using var slice = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
+            slice.CancelAfter(TimeSpan.FromMilliseconds(300));
             try
             {
-                var response = await udp.ReceiveAsync(deadline.Token);
-                if (!IsPrivateLan(response.RemoteEndPoint.Address) ||
-                    response.Buffer.Length is < 75 or > 260) continue;
-                string data = Encoding.ASCII.GetString(response.Buffer);
-                if (!data.StartsWith(ReplyPrefix, StringComparison.Ordinal)) continue;
-                var parts = data[ReplyPrefix.Length..].Split('|');
-                if (parts.Length != 2 || parts[0].Length is < 1 or > 100 ||
-                    parts[1].Length != 64 || !parts[1].All(Uri.IsHexDigit)) continue;
-                var address = response.RemoteEndPoint.Address.ToString();
-                found[address] = new NearbyComputer(parts[0], address,
-                    parts[1].ToUpperInvariant());
+                var packet = await udp.ReceiveAsync(slice.Token);
+                var peer = ParseReply(Encoding.ASCII.GetString(packet.Buffer),
+                    packet.RemoteEndPoint.Address);
+                if (peer is not null)
+                    found[(peer.IsAndroid ? "android:" : "windows:") + peer.Fingerprint] = peer;
             }
+            catch (OperationCanceledException) when (!deadline.IsCancellationRequested) { }
             catch (OperationCanceledException) { break; }
             catch (SocketException) { break; }
         }
-        return found.Values.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        return DistinctDevices(found.Values);
     }
 
     public void Dispose()
     {
         _stop.Cancel();
         _listener?.Dispose();
-        // The receive task ends on cancellation; leave token source alive
-        // briefly to avoid racing async callbacks during shutdown.
     }
 }

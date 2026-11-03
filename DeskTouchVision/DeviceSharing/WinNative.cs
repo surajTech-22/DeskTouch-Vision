@@ -40,6 +40,18 @@ internal static class Win
     internal static extern IntPtr GetModuleHandle(string? moduleName);
     [DllImport("user32.dll")]
     internal static extern short GetAsyncKeyState(int vkCode);
+    [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW",
+        CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SystemParametersInfo(
+        uint action, uint param, out uint value, uint flags);
+    internal static int CurrentMouseSpeed()
+    {
+        const uint SPI_GETMOUSESPEED = 0x0070;
+        return SystemParametersInfo(SPI_GETMOUSESPEED, 0, out var speed, 0)
+            ? (int)Math.Clamp(speed, 1u, 20u) : 10;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetCursorPos(int x, int y);

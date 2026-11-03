@@ -503,6 +503,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private int _reverseAppliedLease;
     internal event Action<Packet>? AuthorityControlPacket;
     internal event Action<string>? AuthorityDiagnostic;
+    internal event Action? HeartbeatAcknowledged;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -756,6 +757,8 @@ internal sealed class HostSession : IInputSession, IDisposable
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
                     RemotePlacementChanged?.Invoke(changedEdge);
+                else if (p.Type == "pong")
+                    HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
                 else if (p.Type is "granted" or "busy" or "local-active" or "active")

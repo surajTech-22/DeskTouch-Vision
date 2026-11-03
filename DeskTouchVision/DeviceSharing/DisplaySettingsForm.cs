@@ -336,7 +336,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             $"Connected computer  ·  {_host.RemoteMonitors.Monitors.Count} display(s)";
         else if (_incomingPeer != null)
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
-                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  Receiving";
+                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  Two-way sharing";
         else
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -366,6 +366,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerDisconnected += OnIncomingPeerDisconnected;
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
+            _receiver.ReverseControlMessage += HandleReverseState;
+            _receiver.AllowForwardClaim = () =>
+                _capture == null || (!_capture.RemoteActive && !_capture.IsClaimPending);
             _receiver.Start();
             try
             {
@@ -389,6 +392,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void StopListening()
     {
+        // Receiving PC also owns a SourceCapture when paired. Always unhook
+        // before disposing its LocalInputPriority and raw input registration.
+        if (_host == null)
+        {
+            _capture?.Dispose();
+            _capture = null;
+        }
         _discovery?.Dispose();
         _discovery = null;
         if (_receiver != null)
@@ -397,6 +407,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerDisconnected -= OnIncomingPeerDisconnected;
             _receiver.PeerTopologyChanged -= OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged -= OnIncomingPeerPlacementChanged;
+            _receiver.ReverseControlMessage -= HandleReverseState;
             _receiver.Dispose();
         }
         _receiver = null;
@@ -421,7 +432,24 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _incomingPeer = peer;
             RefreshDisplays();
-            Status($"Paired with {peer.Name}. Local keyboard and mouse retain priority.");
+            if (_receiver != null && _capture == null)
+            {
+                try
+                {
+                    // The receiver MUST also be able to become the source
+                    // without opening a second TLS socket or re-pairing.
+                    _capture = new SourceCapture(this, _receiver, Status,
+                        _preferredEdge, preserveRawInput: true);
+                    _capture.Arm();
+                    Status($"Two-way authority ready with {peer.Name}. Both PCs can initiate an edge handoff.");
+                }
+                catch (Exception ex)
+                {
+                    _capture?.Dispose();
+                    _capture = null;
+                    Status("Reverse keyboard/mouse capture unavailable: " + ex.Message);
+                }
+            }
         });
     }
 
@@ -429,9 +457,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
+            // Active reverse authority must stop immediately on network loss;
+            // never leave hooks swallowing physical keyboard/mouse input.
+            if (_host == null)
+            {
+                _capture?.Dispose();
+                _capture = null;
+            }
             _incomingPeer = null;
             RefreshDisplays();
-            Status("Connected computer went offline. This computer remains ready for another connection.");
+            Status("Two-way peer disconnected. Local keyboard/mouse remain available.");
         });
     }
 
@@ -440,8 +475,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         PostToUi(() =>
         {
             _incomingPeer = peer;
+            _capture?.UpdateLayouts(MonitorTopology.Capture(), peer.Monitors);
             RefreshDisplays();
-            Status($"Windows monitor layout synchronized with {peer.Name}; pairing retained.");
+            Status($"Two-way Windows monitor layout synchronized with {peer.Name}; pairing retained.");
         });
     }
 
@@ -452,7 +488,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _preferredEdge = Opposite(sourceEdge);
             _display.RemoteEdge = _preferredEdge;
             SavePreferredEdge();
-            Status("Display placement synchronized with the connected computer.");
+            _capture?.SetEdge(_preferredEdge);
+            Status("Both computers' outside-edge handoff positions synchronized.");
         });
     }
 
@@ -588,8 +625,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host = session;
         _remoteAddress = name;
         _currentFingerprint = fingerprint;
-        _capture = new SourceCapture(this, session, Status, _preferredEdge);
-        session.RemoteControlState += HandleRemoteState;
+        _nativeInput = new PhysicalInputMonitor(this);
+        _nativeInput.Start();
+        session.AttachReverseInput(_nativeInput.Priority,
+            () => _capture == null ||
+                (!_capture.RemoteActive && !_capture.IsClaimPending));
+        session.AuthorityDiagnostic += Status;
+        _capture = new SourceCapture(this, session, Status, _preferredEdge,
+            preserveRawInput: true);
+        session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemotePlacementChanged += HandleRemotePlacement;
         RefreshDisplays();
@@ -750,20 +794,26 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         finally { _scanningTrusted = false; }
     }
 
-    private void HandleRemoteState(string result)
+    private void HandleRemoteState(Packet packet) =>
+        PostToUi(() => ApplyAuthorityState(packet, reverse: false));
+
+    private void HandleReverseState(Packet packet) =>
+        PostToUi(() => ApplyAuthorityState(packet, reverse: true));
+
+    private void ApplyAuthorityState(Packet packet, bool reverse)
     {
-        if (!IsHandleCreated || IsDisposed) return;
-        try
+        if (_capture == null) return;
+        // Reverse packets travel over the authenticated server-side stream.
+        // Both handlers call exactly the same lease-checked state machine.
+        string operation = reverse && packet.Type.StartsWith("reverse-",
+            StringComparison.Ordinal) ? packet.Type["reverse-".Length..] : packet.Type;
+        switch (operation)
         {
-            BeginInvoke(() =>
-            {
-                if (IsDisposed) return;
-                if (result == "granted") _capture?.GrantRemote();
-                else if (result == "busy") _capture?.ReceiverBusy();
-                else if (result == "local-active") _capture?.ReceiverNativePriority();
-            });
+            case "granted": _capture.GrantRemote(packet.A); break;
+            case "active": _capture.ConfirmRemoteAuthority(packet.A); break;
+            case "busy": _capture.ReceiverBusy(packet.A); break;
+            case "local-active": _capture.ReceiverNativePriority(packet.A); break;
         }
-        catch (InvalidOperationException) { }
     }
 
     private void HandleRemoteTopology(MonitorTopology topology)
@@ -801,9 +851,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void DisconnectHost()
     {
+        bool hadHost = _host != null;
         if (_host != null)
         {
-            _host.RemoteControlState -= HandleRemoteState;
+            _host.AuthorityControlPacket -= HandleRemoteState;
+            _host.AuthorityDiagnostic -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
@@ -811,6 +863,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture = null;
         _host?.Dispose();
         _host = null;
+        // Outgoing controller also hosts a native priority monitor for
+        // incoming reverse claims. It belongs to this host session.
+        if (hadHost)
+        {
+            _nativeInput?.Dispose();
+            _nativeInput = null;
+        }
         _remoteAddress = "";
         _currentFingerprint = "";
         _display.Remote = null;
@@ -876,7 +935,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _host.PublishSourceTopology(current);
             }
             if (_receiver != null)
+            {
+                if (_incomingPeer != null)
+                    _capture?.UpdateLayouts(current, _incomingPeer.Monitors);
                 _receiver.PublishLocalTopology(current);
+            }
             UpdateButtons();
             Status("Windows monitors changed; synchronized display layout without reconnecting.");
         }
@@ -895,8 +958,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         if (message.Msg == Win.WM_INPUT)
         {
-            if (_nativeInput != null) _nativeInput.HandleRawInput(message.LParam);
-            else _capture?.OnRawInput(message.LParam);
+            // Crucial for TWO-WAY input: native priority detection AND mouse
+            // capture must see the same real raw event on either computer.
+            // Previously receiving mode discarded it before SourceCapture.
+            _nativeInput?.HandleRawInput(message.LParam);
+            _capture?.OnRawInput(message.LParam);
         }
         if (message.Msg == 0x007E && IsHandleCreated && !Disposing)
         {

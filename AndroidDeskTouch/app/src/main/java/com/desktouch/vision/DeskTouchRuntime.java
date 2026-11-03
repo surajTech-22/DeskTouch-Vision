@@ -93,6 +93,7 @@ final class DeskTouchRuntime {
         if(target==null||!target.isConnected())return false;
         source.releaseControl();
         selectedFingerprint=id;
+        target.prepareGroupEntry(direction);
         target.claimControl();
         return true;
     }

@@ -23,6 +23,16 @@
         </activity>
         <service android:name=".AutoConnectService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+        <!-- Explicit opt-in from Android Settings is always required. -->
+        <service android:name=".DeskTouchAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true" android:label="DeskTouch Windows control">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/desktouch_accessibility" />
+        </service>
         <receiver android:name=".BootReceiver" android:enabled="true" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />

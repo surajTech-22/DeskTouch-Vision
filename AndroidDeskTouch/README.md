@@ -1,6 +1,6 @@
 # DeskTouch Vision for Android (same product and repository)
 
-**Android release 0.3.8** reuses the Windows DeskTouch LAN discovery (UDP 37378),
+**Android release 0.3.9** reuses the Windows DeskTouch LAN discovery (UDP 37378),
 TLS endpoint (TCP 37377), existing approval prompt, monitor geometry, Wire
 framing and two-phase authority handoff. There is **no separate remote-desktop
 protocol, login system, or replacement keyboard/mouse settings**.
@@ -28,67 +28,66 @@ Android package installer approval. See
 `ANDROID_UPDATES_AND_SIGNING.md` for the pinned public certificate and
 one-time secret configuration. Do **not** commit the private keystore.
 
-## Use
+## Use (v0.3.9 one-way mode: Windows controls Android)
 
-1. Run DeskTouch Vision v0.3.8 or newer on Windows and keep it visible or in tray.
-2. Install the APK via Android's own package installer after scanning Windows QR.
-3. Open the Android app and **Find devices** on the same private LAN.
-4. Select Windows PC and approve the pairing prompt on **Windows**.
-5. Tap **Take control of Windows** when the physical Windows keyboard/mouse is idle.
-   Only after a matching `granted` and cursor-applied `active` ACK will Android
-   send movement, clicks, keyboard and scroll.
-6. Use the touchpad area or connected Android hardware keyboard/mouse. For the
-   latter, select **Capture connected physical mouse**; Android's
-   `requestPointerCapture` requires the app to retain focus.
-7. To remember the paired PC independently of IP, select **Trust connected PC**
-   and approve the second Windows prompt. A per-peer token is encrypted with
-   Android Keystore and tied to the Windows certificate SHA-256 fingerprint.
-8. Use **Android keyboard settings** / **Android connected device settings**
-   to open Android's built-in system settings. The app does not implement
-   duplicate keyboard/mouse configuration.
-9. **Startup and reconnect** are enabled by default after the first launch.
-   The foreground connection notification persists when the app is backgrounded.
-   After Windows has approved a trusted device token, the Android background
-   service scans the local LAN every 10 seconds and securely reconnects to that
-   exact TLS identity (no saved IP). Reconnection does **not** steal input
-   authority; take control deliberately after bringing the app to the front.
-   The startup checkbox can disable boot launch; the Disconnect button pauses
-   trusted reconnection until manually re-enabled.
-10. **Two or more PCs** on the LAN appear in Add devices even if one is busy.
-   Android phones also advertise their presence. Windows receiver sessions are
-   currently limited to one active remote-control peer at a time; switching
-   to a different PC requires explicit disconnect/confirmation. Presence does
-   not imply two simultaneous input-control connections.
-11. On Windows, **Launch in tray when Windows starts** is enabled for the
-   current Windows user; the tray menu can disable it. To fix a refused TCP
-   connection, open Windows Add devices → Fix LAN access (UAC consent required).
-   This adds only application-scoped TCP 37377/UDP 37378 inbound rules on
-   Private, LocalSubnet networks; it never opens a Public network rule.
+1. Install **v0.3.9 on both Windows PCs and the Android phone**.
+2. On the phone, open DeskTouch Vision and select **Allow approved Windows PCs to
+   control this Android screen**. Open Android **Accessibility settings**, find
+   **DeskTouch Windows control**, and manually enable it. Android always owns
+   this permission. Some Android 13+ devices require the app's own **Allow
+   restricted settings** option in App info before sideloaded services appear.
+   The app does not bypass that restriction.
+3. Use **Find devices** and connect Android to a Windows PC using the existing
+   TLS fingerprint verification and Windows pairing approval. Enable **Trust**
+   if you want it to reconnect automatically after future launches.
+4. Reconnect the phone if it was paired before enabling Accessibility; the
+   advertised `ReverseInputSupported` capability is negotiated in TLS hello.
+5. In **Windows DeskTouch → Displays**, choose the phone in the new
+   **Connected device target** selector. The arrangement diagram shows the
+   actual Windows computer name and Android manufacturer/model **at the top of
+   each screen**, and independent numbering for each system. Drag the Android
+   screen to the outer left/right/top/bottom edge.
+6. Move the Windows physical cursor to that outside edge. The first
+   authenticated claim is acknowledged by Android **only after** its virtual
+   pointer is shown. Windows then forwards mouse movement, taps, swipes,
+   scrolling and text into ordinary editable Android fields over the **same
+   existing connection**. The Windows keyboard is not forwarded to Android
+   until this claim/first-frame ACK succeeds.
+7. Android physical touch, revoking Accessibility permission, or selecting
+   **Stop Windows control on this phone** immediately cancels remote authority.
+   Windows retains its physical keyboard and cursor. The other trusted devices
+   remain connected and do not acquire control automatically.
+8. The stable Android signing certificate introduced in v0.3.8 is unchanged.
+   Use **Get updates / Update existing application** to update v0.3.8→v0.3.9
+   without uninstalling or clearing trust records.
 
+The original Android touchpad-to-Windows control buttons are removed for now;
+this release intentionally uses **Windows → Android** only. Windows-to-Windows
+behavior remains on the existing shared listener with one input lease per
+controlled desktop. Multiple secure identities may be visible in the same
+linked network; a visual group **is not** a transparent network relay.
 
 ## Known limitations / fail-safe behavior
 
-- Android does **not** expose unrestricted system-wide cursor injection to an
-  ordinary third-party app. Windows-to-Android reverse claims are explicitly
-  rejected rather than falsely acknowledged; this is not yet full two-way
-  control. Android accessibility gestures alone cannot guarantee hardware-cursor
-  movement ACK or 1:1 mouse event behavior.
-- Pointer capture and physical keyboard forwarding are available **while the
-  Android activity has focus**. Leaving the app returns Windows control.
-  An Android connectedDevice foreground service now continues LAN
-  discovery and trusted-device reconnection while backgrounded, where the OS
-  allows. It starts after boot without opening the Android UI. Some OEM power
-  managers can defer or stop this service; app/notification permissions may
-  need adjustment through Android's own Settings.
-- No screen streaming, file transfer or Android screen takeover is implemented.
-- Network discovery may be blocked by router isolation; same-routed-LAN
-  connectivity and Windows firewall TCP/UDP rules are required.
-- Tests in Actions validate compilation/unit tests; physical Android+Windows
-  input, Android brand/driver quirks and Windows two-PC authority handoff
-  require on-device validation.
-- First pairing pins the discovered TLS fingerprint; the Windows owner must
-  also explicitly approve pairing. The authenticated trust token is never
-  identified by the phone's hostname or IP address.
+- Android Accessibility can perform approved tap/swipe gestures and
+  `ACTION_SET_TEXT` edits in accessible, non-password fields. It does **not**
+  provide an unrestricted native Android hardware cursor/keyboard driver,
+  arbitrary key injection, screen streaming or root permission. Some
+  apps/web pages may not support Accessibility text editing, and this is not
+  guaranteed to replicate every Windows key shortcut.
+- The visible Android pointer is an **Accessibility overlay**, not the OS's
+  hardware pointer. It receives remote movement without taking touch focus.
+  Phone-local touch has authority priority and can end a remote lease.
+- A linked pair of Windows PCs remains **two cryptographically distinct
+  devices**. The selection list reuses authenticated connections without
+  creating a new socket when changing the target, but this build does not
+  relay Android control transparently through an unrelated Windows PC's TLS
+  link. Doing so would require a separately approved, identity-bound relay.
+- The foreground service may be restricted by OEM Android battery rules.
+  Network discovery requires the same routed LAN and Windows firewall
+  Private LocalSubnet permissions. No antivirus exclusion is required.
+- GitHub CI verifies protocol, input policy and package compilation. A real
+  test with the Android Accessibility service and both physical Windows PCs
+  is required to confirm device-specific behavior.
 
-These are explicit preview limits, not hidden workarounds or promises of
-unrestricted Android OS control.
+**Never commit the private Android signing keystore or its password.**

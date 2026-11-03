@@ -26,15 +26,18 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
+    private readonly Func<IEnumerable<string>> _connectedFingerprints;
     private UdpClient? _listener;
     private Task? _loop;
 
-    internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null)
+    internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
+        Func<IEnumerable<string>>? connectedFingerprints = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A stable TLS fingerprint is required.");
         _fingerprint = fingerprint;
         _canAcceptConnections = canAcceptConnections ?? (() => true);
+        _connectedFingerprints = connectedFingerprints ?? (() => Array.Empty<string>());
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -73,7 +76,22 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 catch (ObjectDisposedException) { }
                 var prefix = accepting ? ReadyPrefix : BusyPrefix;
                 byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
-                await _listener.SendAsync(reply, msg.RemoteEndPoint, _stop.Token);
+                await _listener.SendAsync(reply,msg.RemoteEndPoint,_stop.Token);
+                // Optional second datagram announces connected PC membership.
+                // The original READY/BUSY packet is untouched for older apps.
+                // These hints are VISUAL only and never authorize pairing.
+                IEnumerable<string> related;
+                try { related=_connectedFingerprints(); }
+                catch { related=Array.Empty<string>(); }
+                foreach(string other in related.Distinct(StringComparer.OrdinalIgnoreCase).Take(6))
+                {
+                    if(other.Length!=64 || !other.All(Uri.IsHexDigit) ||
+                       other.Equals(_fingerprint,StringComparison.OrdinalIgnoreCase))
+                       continue;
+                    byte[] link=Encoding.ASCII.GetBytes("DT1-LINK|"+_fingerprint+
+                        "|"+other.ToUpperInvariant());
+                    await _listener.SendAsync(link,msg.RemoteEndPoint,_stop.Token);
+                }
             }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }

@@ -40,18 +40,24 @@ Branch/pull-request CI can still build **debug artifacts for tests only**.
 
 **One-time owner setup:**
 
-1. Download the privately supplied `DeskTouch_Android_Permanent_Signing_Setup.zip`
-   and the **separate private password file** in the ChatGPT conversation.
-2. Extract the ZIP on a trusted Windows computer. Install GitHub CLI
-   (`winget install --id GitHub.cli --exact --source winget`) if needed.
-3. Launch `SETUP_SIGNING.cmd`. Log in to GitHub in your browser if prompted.
-   It uploads the **same** keystore and password as **encrypted repository
-   Actions secrets** (no secrets in Git history):
+1. Retrieve the privately stored `DeskTouch_Android_PrivateSigning_NoCLI.zip`
+   from your private ChatGPT Library folder **DeskTouch Vision Private**.
+   Keep the separate `DeskTouch_Android_Signing_Password.txt` private.
+2. Extract the ZIP on a trusted Windows PC. No GitHub CLI is required.
+3. Launch `SETUP_SIGNING_IN_BROWSER.cmd`. It opens GitHub's official
+   **Settings -> Secrets and variables -> Actions** page, displays each
+   secret name, and copies its value briefly to the clipboard for you to
+   paste into GitHub's **New repository secret** form. Turn off clipboard
+   history/sync while doing this. Add all four encrypted repository secrets
+   (the private keystore/password are never added to a Git code file):
    - `DESKTOUCH_ANDROID_KEYSTORE_BASE64`
    - `DESKTOUCH_ANDROID_STORE_PASSWORD`
    - `DESKTOUCH_ANDROID_KEY_ALIAS`
    - `DESKTOUCH_ANDROID_KEY_PASSWORD`
-4. After all four secrets are configured, merge the staged v0.3.8 release PR.
+4. Verify all four names appear in the GitHub Actions repository secrets
+   settings. The connected GitHub integration cannot set secrets itself;
+   access via the owner-authenticated GitHub browser is required.
+   Then merge the staged v0.3.8 release PR.
    The regular Windows release workflow automatically triggers an Android
    release build; only its permanently signed APK is attached to the release.
 5. On Android, the installed v0.3.7 **debug-signed** APK does not have the
@@ -66,6 +72,9 @@ Branch/pull-request CI can still build **debug artifacts for tests only**.
    normal system installation approval; this is not silent installation.
 
 **Keep two independent, secure backups of the keystore and its password.**
+The private keystore backup is held in the user's private ChatGPT Library,
+which GitHub Actions cannot read directly. GitHub Actions reads only the
+encrypted secrets after the owner adds them through GitHub Settings.
 Store them separately, preferably with the password in a password manager.
 Loss of the private signing identity prevents normal in-place upgrades.
 Never share either private file or password in issues, pull requests, public

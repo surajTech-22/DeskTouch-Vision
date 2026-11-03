@@ -71,16 +71,26 @@ $backup = $null
 $movedOriginal = $false
 $activated = $false
 try {
+  # Wait briefly for another authorized updater to finish the critical
+  # install phase. Old versions used to keep this lock through slow backup
+  # deletion, leaving an "already running" loop for many minutes.
   try {
-    $hasInstallMutex = $installMutex.WaitOne(0)
+    $hasInstallMutex = $installMutex.WaitOne(90000)
   } catch [System.Threading.AbandonedMutexException] {
     $hasInstallMutex = $true
+    Log 'Recovered an abandoned installer mutex after its owner exited.'
   }
   if (-not $hasInstallMutex) {
-    Log 'Another DeskTouch installer is already running; skipping duplicate attempt.'
-    return
+    $active = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.ProcessId -ne $PID -and
+        $_.CommandLine -match '(?i)Update-DeskTouch[.]ps1' } |
+      Select-Object ProcessId, CreationDate)
+    foreach ($owner in $active) {
+      Log ("Other updater process PID={0} created={1}" -f $owner.ProcessId, $owner.CreationDate)
+    }
+    throw 'Another installer still holds the install lock after 90 seconds. Existing installation was not modified by this attempt.'
   }
-  Log "Installer launched with outside working directory: $independentWorkingDirectory"
+  Log "INSTALL LOCK ACQUIRED PID=$PID; working directory outside app: $independentWorkingDirectory"
   $targetFull = [IO.Path]::GetFullPath($Target).TrimEnd('\')
   $expectedTarget = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision')).TrimEnd('\')
   if (-not [string]::Equals($targetFull, $expectedTarget, [StringComparison]::OrdinalIgnoreCase)) {
@@ -121,14 +131,7 @@ try {
   }
   Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe')
   $activated = $true
-  Log "Update installed and restarted. Settings preserved in %LOCALAPPDATA%\DeskTouchVision."
-  if ($movedOriginal) { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }
-  # Downloaded release archive and extracted payload are transient after success.
-  Remove-Item -LiteralPath $pkg -Force -ErrorAction SilentlyContinue
-  $downloadFolder = Split-Path -Path $pkg -Parent
-  if ($downloadFolder -like (Join-Path $env:TEMP 'DeskTouchVision-Update*')) {
-    Remove-Item -LiteralPath $downloadFolder -Force -ErrorAction SilentlyContinue
-  }
+  Log "INSTALL COMMITTED PID=$PID. Settings preserved; releasing mutex before cleanup."
 }
 catch {
   Log "FAILED: $($_.Exception.Message)"
@@ -157,11 +160,35 @@ catch {
   throw
 }
 finally {
+  # Windows PowerShell can spend many minutes removing a 176-MB .NET
+  # single-file backup or extracted directory. Never hold the global
+  # installation mutex while deleting ANY of those old files. This was
+  # the cause of subsequent release attempts getting skipped.
+  if ($hasInstallMutex) {
+    try {
+      $installMutex.ReleaseMutex()
+      Log "INSTALL LOCK RELEASED PID=$PID before package/backup cleanup."
+    } catch { Log "Installer mutex release error: $($_.Exception.Message)" }
+  }
+  $installMutex.Dispose()
+
+  if ($activated) {
+    # Unique backup and TEMP folders do not overlap a newer release's
+    # staging paths, so cleanup is safe after the critical lock is free.
+    if ($movedOriginal -and $backup -and (Test-Path -LiteralPath $backup)) {
+      Log "Cleanup started for previous application backup."
+      Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($pkg -and (Test-Path -LiteralPath $pkg)) {
+      Remove-Item -LiteralPath $pkg -Force -ErrorAction SilentlyContinue
+      $downloadFolder = Split-Path -Path $pkg -Parent
+      if ($downloadFolder -like (Join-Path $env:TEMP 'DeskTouchVision-Update*')) {
+        Remove-Item -LiteralPath $downloadFolder -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
   if ($stage -and (Test-Path -LiteralPath $stage)) {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   }
-  if ($hasInstallMutex) {
-    try { $installMutex.ReleaseMutex() } catch { }
-  }
-  $installMutex.Dispose()
+  if ($activated) { Log "POST-INSTALL CLEANUP FINISHED PID=$PID." }
 }

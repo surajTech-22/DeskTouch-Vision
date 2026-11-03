@@ -29,7 +29,8 @@ jobs:
         run: |
           foreach ($path in @('DeskTouchVision/Install-DeskTouch.ps1',
                               'DeskTouchVision/Update-DeskTouch.ps1',
-                              'DeskTouchVision/CHECK_DESKTOUCH.ps1')) {
+                              'DeskTouchVision/CHECK_DESKTOUCH.ps1',
+                              'DeskTouchVision/CHECK_CONNECTION.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -59,6 +60,7 @@ jobs:
           Copy-Item DeskTouchVision/Install-DeskTouch.ps1 DeskTouchVision/dist/
           Copy-Item DeskTouchVision/INSTALL_DESKTOUCH.cmd DeskTouchVision/dist/
           Copy-Item DeskTouchVision/CHECK_DESKTOUCH.ps1 DeskTouchVision/dist/
+          Copy-Item DeskTouchVision/CHECK_CONNECTION.ps1 DeskTouchVision/dist/
           New-Item -ItemType Directory -Force DeskTouchVision/published | Out-Null
           $zip = "DeskTouchVision/published/DeskTouchVision-win-x64.zip"
           Compress-Archive -Path DeskTouchVision/dist/* -DestinationPath $zip -CompressionLevel Optimal
@@ -68,6 +70,7 @@ jobs:
           if (-not (Test-Path "DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe")) { throw "Input-sharing executable missing" }
           if (-not (Test-Path "DeskTouchVision/dist/app/Update-DeskTouch.ps1")) { throw "Installed updater script missing" }
           if (-not (Test-Path "DeskTouchVision/dist/CHECK_DESKTOUCH.ps1")) { throw "Diagnostics script missing" }
+          if (-not (Test-Path "DeskTouchVision/dist/CHECK_CONNECTION.ps1")) { throw "TCP pairing diagnostic missing" }
       - name: Upload installable ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -91,7 +94,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.2: fixes updater falsely reporting no newer release during an active automatic download, adds per-version update checks, checksum and error logs, an atomic repair installer with rollback, and read-only update diagnostics. The Windows-style Displays window remains the default. Please run INSTALL_DESKTOUCH.cmd manually once if an old v0.2.0/v0.2.1 installation cannot upgrade itself. Input sharing still requires testing on real Windows PCs."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.3: fixes Windows SslStream pairing failure caused by unsupported ephemeral TLS private keys. Authenticated LAN pairing is now tested on the Windows CI runner using both receiver approval and manual secret modes. Includes stage-specific TCP/TLS/approval diagnostics and a read-only CHECK_CONNECTION.ps1 for Windows Firewall on PRIVATE networks. Install the same version on both Windows PCs. Actual two-PC hardware behavior still requires user validation."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

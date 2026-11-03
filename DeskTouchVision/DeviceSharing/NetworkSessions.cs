@@ -126,7 +126,12 @@ internal sealed class ReceiverServer : IDisposable
         {
             while (!token.IsCancellationRequested)
             {
-                var p = await Wire.ReadAsync(ssl, token);
+                // If Wi-Fi disappears without closing TCP, release any
+                // remotely held keys/buttons rather than retaining control.
+                // The source sends keepalive every 1.5 seconds.
+                using var receiveDeadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+                receiveDeadline.CancelAfter(TimeSpan.FromSeconds(6));
+                var p = await Wire.ReadAsync(ssl, receiveDeadline.Token);
                 if (p.Type == "goodbye") break;
 
                 if (p.Type == "claim")
@@ -154,6 +159,7 @@ internal sealed class ReceiverServer : IDisposable
         }
         catch (EndOfStreamException) { }
         catch (IOException) { }
+        catch (OperationCanceledException) { } // shut down or heartbeat timed out
         finally
         {
             _priority.ReleaseRemote();

@@ -109,15 +109,29 @@ public final class AutoConnectService extends Service {
                 .getStringSet("pausedPeers",java.util.Collections.emptySet());
             if(verified.isEmpty()) return; // no silent first-time pairing
             android.util.DisplayMetrics display=getResources().getDisplayMetrics();
-            // Connect EVERY approved device, not just the first discovered PC.
-            // Each connection has its own socket, token and two-phase authority.
-            for(DesktopDiscovery.Device device:DesktopDiscovery.scan()) {
-                if(!device.ready || device.android ||
-                    !verified.contains(device.fingerprint)||
-                    paused.contains(device.fingerprint))continue;
-                DeskTouchSession session=DeskTouchRuntime.forPeer(this,device.fingerprint);
+            // One AUTO-RECONNECT gateway per linked network. Older versions
+            // silently reconnected every trusted PC and created separate
+            // Android TLS sessions to members of the same PC-to-PC link.
+            java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
+                DesktopDiscovery.windowsGroups(DesktopDiscovery.scan());
+            for(java.util.List<DesktopDiscovery.Device> members:groups.values()){
+                boolean hasGateway=false;
+                for(DesktopDiscovery.Device member:members){
+                    if(DeskTouchRuntime.isConnected(member.fingerprint) ||
+                        DeskTouchRuntime.isConnecting(member.fingerprint)){
+                        hasGateway=true;break;
+                    }
+                }
+                if(hasGateway)continue;
+                java.util.Set<String> eligible=new java.util.HashSet<>(verified);
+                eligible.removeAll(paused);
+                DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
+                    members,java.util.Collections.emptySet(),eligible);
+                if(gateway==null||!gateway.ready||
+                    !eligible.contains(gateway.fingerprint))continue;
+                DeskTouchSession session=DeskTouchRuntime.forPeer(this,gateway.fingerprint);
                 if(session.isConnected()||session.isConnecting())continue;
-                session.connect(device,Math.max(200,display.widthPixels),
+                session.connect(gateway,Math.max(200,display.widthPixels),
                     Math.max(100,display.heightPixels));
             }
         }catch(Exception error){

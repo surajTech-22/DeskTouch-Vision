@@ -865,6 +865,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal IReadOnlyList<EnvironmentMember> EnvironmentMembers =>
         Volatile.Read(ref _environmentMembers);
     internal int SelectedEnvironmentTargetId => Volatile.Read(ref _environmentTargetId);
+    internal int OwnEnvironmentMemberId => Volatile.Read(ref _environmentOwnId);
     internal event Action? EnvironmentRosterChanged;
     internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;

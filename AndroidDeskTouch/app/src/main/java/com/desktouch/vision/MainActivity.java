@@ -14,6 +14,7 @@ public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList;
     private DeskTouchSession session;
+    private MobileDiscoveryResponder mobileDiscovery;
     private View pointerPad;
     private float prevX,prevY,downX,downY;
     private boolean dragged;
@@ -135,6 +136,14 @@ public final class MainActivity extends Activity {
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
+        mobileDiscovery = new MobileDiscoveryResponder();
+        new Thread(() -> {
+            try { mobileDiscovery.start(getApplicationContext()); }
+            catch (Exception error) {
+                runOnUiThread(() -> status.setText(
+                    "Android device discovery unavailable: " + error.getMessage()));
+            }
+        }, "DeskTouch mobile responder start").start();
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){
@@ -211,6 +220,7 @@ public final class MainActivity extends Activity {
         if(!focus&&session!=null)session.releaseControl();
     }
     @Override protected void onDestroy(){
+        if(mobileDiscovery!=null)mobileDiscovery.close();
         if(session!=null)session.close();
         super.onDestroy();
     }

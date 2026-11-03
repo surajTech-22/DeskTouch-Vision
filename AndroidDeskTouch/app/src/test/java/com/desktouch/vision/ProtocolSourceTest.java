@@ -60,4 +60,19 @@ public final class ProtocolSourceTest {
         assertNotEquals(pc1.groupId,pc3.groupId);
         assertNotEquals(pc1.fingerprint,pc2.fingerprint);
     }
+    @Test public void windowsKeyboardTypesIntoAndroidTextFields() {
+        WindowsKeyText.Edit a=WindowsKeyText.apply("",0,0,65,false);
+        assertEquals("a",a.text);
+        WindowsKeyText.Edit capital=WindowsKeyText.apply(a.text,1,1,66,true);
+        assertEquals("aB",capital.text);
+        assertEquals(2,capital.cursor);
+        WindowsKeyText.Edit erase=WindowsKeyText.apply(capital.text,2,2,8,false);
+        assertEquals("a",erase.text);
+        WindowsKeyText.Edit space=WindowsKeyText.apply("hello",5,5,32,false);
+        assertEquals("hello ",space.text);
+        assertEquals("!",WindowsKeyText.printable(49,true));
+        assertEquals("2",WindowsKeyText.printable(50,false));
+        assertEquals("\\",WindowsKeyText.printable(220,false));
+        assertNull(WindowsKeyText.apply("x",1,1,112,false)); // F1 is not text
+    }
 }

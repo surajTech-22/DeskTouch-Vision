@@ -5,8 +5,13 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Channels;
+using System.Text.Json;
 
 namespace DeskTouch.DeviceShare;
+
+internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors);
+
+internal sealed record PeerHello(string Name, string Layout);
 
 internal sealed class ReceiverServer : IDisposable
 {
@@ -23,6 +28,10 @@ internal sealed class ReceiverServer : IDisposable
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private InputInjector? _currentInjector;
     private SslStream? _currentStream;
+    private TcpClient? _currentClient;
+    internal event Action<ConnectedPeer>? PeerConnected;
+    internal event Action? PeerDisconnected;
+    internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
@@ -112,13 +121,42 @@ internal sealed class ReceiverServer : IDisposable
     {
         // Native activity immediately blocks new remote inputs before any
         // asynchronous notification. Never await network I/O in an input hook.
-        lock (_inputGate) _currentInjector?.ReleaseAll();
+        // A physical event always revokes the grant synchronously. Release
+        // injected keys away from the low-level keyboard/mouse callback thread.
+        _ = Task.Run(() =>
+        {
+            lock (_inputGate) _currentInjector?.ReleaseAll();
+        });
         _status("Local physical keyboard/mouse has priority; remote input paused.");
         _ = Task.Run(async () =>
         {
             try { await SendControlAsync(new Packet("local-active"), _cancel.Token); }
             catch (Exception) { } // Source connection may already have ended.
         });
+    }
+
+    internal void DisconnectPeer() => Volatile.Read(ref _currentClient)?.Close();
+
+    internal void PublishLocalTopology(MonitorTopology monitors)
+    {
+        if (Volatile.Read(ref _currentStream) == null) return;
+        _ = Task.Run(async () =>
+        {
+            try { await SendControlAsync(new Packet("topology", Text: monitors.ToWire()), _cancel.Token); }
+            catch (Exception) { /* session cleanup handles half-open transport */ }
+        });
+    }
+
+    private static ConnectedPeer ReadHello(string? helloJson)
+    {
+        if (string.IsNullOrWhiteSpace(helloJson) || helloJson.Length > 6000)
+            throw new InvalidDataException("Peer did not describe its monitor layout.");
+        var hello = JsonSerializer.Deserialize<PeerHello>(helloJson)
+            ?? throw new InvalidDataException("Unrecognized peer hello.");
+        string name = hello.Name.Trim();
+        if (name.Length is < 1 or > 60 || name.Any(char.IsControl))
+            throw new InvalidDataException("Invalid peer computer name.");
+        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout));
     }
 
     private async Task ServeAsync(TcpClient client, CancellationToken token)
@@ -161,10 +199,23 @@ internal sealed class ReceiverServer : IDisposable
         var screen = topology.Bounds;
         await Wire.WriteAsync(ssl, new Packet("ready", screen.Left, screen.Top,
             screen.Width, screen.Height, topology.ToWire()), token);
+        // BOTH PCs receive their peer's monitor layout. The original sender
+        // alone had a remote display group; the receiver never got a hello.
+        using (var helloTimeout = CancellationTokenSource.CreateLinkedTokenSource(token))
+        {
+            helloTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+            var helloPacket = await Wire.ReadAsync(ssl, helloTimeout.Token);
+            if (helloPacket.Type != "hello")
+                throw new InvalidDataException("Missing authenticated peer hello.");
+            var peer = ReadHello(helloPacket.Text);
+            Volatile.Write(ref _currentClient, client);
+            PeerConnected?.Invoke(peer);
+        }
         _status("Authenticated Windows peer connected; waiting for requested control.");
         var injector = new InputInjector();
         Volatile.Write(ref _currentInjector, injector);
         Volatile.Write(ref _currentStream, ssl);
+        ConnectedPeer? incoming = null;
         try
         {
             while (!token.IsCancellationRequested)
@@ -173,9 +224,29 @@ internal sealed class ReceiverServer : IDisposable
                 // remotely held keys/buttons rather than retaining control.
                 // The source sends keepalive every 1.5 seconds.
                 using var receiveDeadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-                receiveDeadline.CancelAfter(TimeSpan.FromSeconds(6));
+                // A six-second watchdog caused unnecessary disconnects on
+                // congested Windows/Wi-Fi systems despite a live pairing.
+                // The sender pings every 1.5 s. 18 s permits brief stalls but
+                // still releases remote held keys after an actual link failure.
+                receiveDeadline.CancelAfter(TimeSpan.FromSeconds(18));
                 var p = await Wire.ReadAsync(ssl, receiveDeadline.Token);
                 if (p.Type == "goodbye") break;
+                if (p.Type == "topology")
+                {
+                    var topology = MonitorTopology.FromWire(p.Text);
+                    var current = incoming;
+                    if (current == null)
+                    {
+                        // The sender's name is supplied once by authenticated hello.
+                        // UI must never infer it from a claimed broadcast label.
+                        current = new ConnectedPeer(
+                            (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "Connected computer",
+                            topology);
+                    }
+                    incoming = current with { Monitors = topology };
+                    PeerTopologyChanged?.Invoke(incoming);
+                    continue;
+                }
 
                 if (p.Type == "claim")
                 {
@@ -212,7 +283,9 @@ internal sealed class ReceiverServer : IDisposable
                 injector.ReleaseAll();
                 Volatile.Write(ref _currentInjector, null);
             }
-            _status("Peer disconnected. Native keyboard/mouse always available.");
+            Volatile.Write(ref _currentClient, null);
+            PeerDisconnected?.Invoke();
+            _status("Peer connection ended. Native keyboard/mouse always available.");
         }
     }
 
@@ -222,6 +295,7 @@ internal sealed class ReceiverServer : IDisposable
         _priority.ReleaseRemote();
         _cancel.Cancel();
         _listener.Stop();
+        DisconnectPeer();
         _certificate.Dispose();
         _key.Dispose();
         _cancel.Dispose();
@@ -239,13 +313,17 @@ internal sealed class HostSession : IDisposable
     private readonly Action<string> _onFailure;
     private int _closed;
     internal System.Drawing.Rectangle Screen => RemoteMonitors.Bounds;
-    internal MonitorTopology RemoteMonitors { get; }
+    internal MonitorTopology RemoteMonitors => Volatile.Read(ref _remoteMonitors);
     internal event Action<string>? RemoteControlState;
+    internal event Action<MonitorTopology>? RemoteTopologyChanged;
+    private MonitorTopology _remoteMonitors;
+    private Packet? _latestMove;
+    private int _moveSignaled;
 
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
     {
-        _client = client; _ssl = ssl; RemoteMonitors = monitors; _onFailure = onFailure;
+        _client = client; _ssl = ssl; _remoteMonitors = monitors; _onFailure = onFailure;
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
@@ -312,6 +390,14 @@ internal sealed class HostSession : IDisposable
             var monitors = MonitorTopology.FromWire(ready.Text);
             if (monitors.Bounds != new System.Drawing.Rectangle(ready.A, ready.B, ready.C, ready.D))
                 throw new AuthenticationException("Receiver monitor geometry failed validation.");
+            // Send the SOURCE topology too so the receiver can display an
+            // identical two-computer arrangement without initiating a second
+            // TCP connection (which would race the existing receiver).
+            var mine = MonitorTopology.Capture();
+            var hello = JsonSerializer.Serialize(
+                new PeerHello(Environment.MachineName, mine.ToWire()));
+            await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
+                acceptedLimit.Token);
             return new HostSession(client, ssl, monitors, onFailure);
         }
         catch (Exception ex)
@@ -343,10 +429,24 @@ internal sealed class HostSession : IDisposable
     internal bool TrySend(Packet p)
     {
         if (Volatile.Read(ref _closed) != 0) return false;
+        if (p.Type == "move")
+        {
+            // Keep the newest pointer coordinate rather than queuing every
+            // intermediate movement. A full move queue previously caused
+            // disconnect loops and seconds of unwanted pointer lag.
+            Interlocked.Exchange(ref _latestMove, p);
+            if (Interlocked.CompareExchange(ref _moveSignaled, 1, 0) == 0 &&
+                !_queue.Writer.TryWrite(new Packet("move-flush")))
+                Interlocked.Exchange(ref _moveSignaled, 0);
+            return true;
+        }
         if (_queue.Writer.TryWrite(p)) return true;
-        _onFailure("Input queue overloaded: local controls restored for safety.");
+        _onFailure("Control queue overloaded; local control restored safely.");
         return false;
     }
+
+    internal void PublishSourceTopology(MonitorTopology layout) =>
+        TrySend(new Packet("topology", Text: layout.ToWire()));
 
     private async Task ReceiveLoopAsync()
     {
@@ -355,7 +455,13 @@ internal sealed class HostSession : IDisposable
             while (!_cancel.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
-                if (p.Type is "granted" or "busy" or "local-active")
+                if (p.Type == "topology")
+                {
+                    var layout = MonitorTopology.FromWire(p.Text);
+                    Volatile.Write(ref _remoteMonitors, layout);
+                    RemoteTopologyChanged?.Invoke(layout);
+                }
+                else if (p.Type is "granted" or "busy" or "local-active")
                     RemoteControlState?.Invoke(p.Type);
             }
         }
@@ -385,7 +491,21 @@ internal sealed class HostSession : IDisposable
         try
         {
             await foreach (Packet p in _queue.Reader.ReadAllAsync(_cancel.Token))
+            {
+                if (p.Type == "move-flush")
+                {
+                    Interlocked.Exchange(ref _moveSignaled, 0);
+                    var move = Interlocked.Exchange(ref _latestMove, null);
+                    if (move != null)
+                        await Wire.WriteAsync(_ssl, move, _cancel.Token);
+                    continue;
+                }
+                // Rare full queue race: never lose a final movement.
+                var latest = Interlocked.Exchange(ref _latestMove, null);
+                if (latest != null)
+                    await Wire.WriteAsync(_ssl, latest, _cancel.Token);
                 await Wire.WriteAsync(_ssl, p, _cancel.Token);
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)

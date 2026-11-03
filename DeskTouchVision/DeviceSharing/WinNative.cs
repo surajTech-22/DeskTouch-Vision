@@ -130,6 +130,18 @@ internal sealed class InputInjector
                     Data = new Win.INPUTUNION { Key = new Win.KEYBDINPUT {
                         Scan = scan, Vk = scan != 0 ? (ushort)0 : vk, Flags = flags } } };
                 bool ok = Inject(e);
+                // A small number of remapped keyboards/remote keyboard
+                // layouts reject scan-code injection even when VK is valid.
+                // Retry as virtual-key input only when SendInput explicitly
+                // fails. Never mark a key as held if both attempts fail.
+                if (!ok && vk != 0)
+                {
+                    uint fallbackFlags = (extended ? Win.KEYEVENTF_EXTENDEDKEY : 0) |
+                        (!down ? Win.KEYEVENTF_KEYUP : 0);
+                    ok = Inject(new Win.INPUT { Type = Win.INPUT_KEYBOARD,
+                        Data = new Win.INPUTUNION { Key = new Win.KEYBDINPUT {
+                            Vk = vk, Scan = 0, Flags = fallbackFlags } } });
+                }
                 if (ok)
                 {
                     var id = (scan, vk, extended);

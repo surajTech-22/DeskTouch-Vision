@@ -15,10 +15,12 @@ final class DeskTouchRuntime {
     private static volatile Consumer<String> listener;
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
+    private static DeskTouchSession androidController;
     private DeskTouchRuntime(){}
 
     private static DeskTouchSession newSession(Context context,String id) {
-        return new DeskTouchSession(new TrustedWindows(context.getApplicationContext()),message->{
+        return new DeskTouchSession(context.getApplicationContext(),
+            new TrustedWindows(context.getApplicationContext()),message->{
             lastStatus=message;
             Consumer<String> current=listener;
             if(current!=null)current.accept(message);
@@ -78,6 +80,19 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isConnected())count++;
         return count;
     }
+    // Multiple trusted PCs remain connected, but only one may remotely
+    // control Android at any moment. Switching needs a fresh lease handshake.
+    static synchronized boolean claimAndroidControl(DeskTouchSession requester){
+        if(androidController!=null && androidController!=requester)return false;
+        androidController=requester;
+        return true;
+    }
+    static synchronized void releaseAndroidControl(DeskTouchSession requester){
+        if(androidController==requester)androidController=null;
+    }
+    static void remoteNativeTouch(){
+        for(DeskTouchSession s:sessions.values())s.revokeRemoteFromNative();
+    }
     static void releaseAll() {
         for(DeskTouchSession s:sessions.values())if(s.hasClaim())s.releaseControl();
     }
@@ -87,6 +102,6 @@ final class DeskTouchRuntime {
     }
     static synchronized void clear(){
         for(DeskTouchSession s:sessions.values())s.close();
-        sessions.clear();selectedFingerprint=null;listener=null;
+        sessions.clear();selectedFingerprint=null;androidController=null;listener=null;
     }
 }

@@ -5,6 +5,31 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// Native Windows DISPLAYn identifiers must be stable PER computer. The
+// previous UI incorrectly numbered every PC and phone in one running sequence.
+Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
+    @"\\.\DISPLAY2", 0, 0, 1920, 1080, true), 1) == 2,
+    "Windows display 2 must remain number 2, even when primary.");
+Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
+    @"\\.\DISPLAY1", 0, 0, 1920, 1080, true), 8) == 1,
+    "Remote Windows monitor numbering must not inherit local count.");
+Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
+    "Android screen", 0, 0, 1080, 2400, true), 1) == 1,
+    "Android screen gets its own first display number.");
+Check(DisplayArrangementControl.CleanDeviceName("Phone\r\nName", "Unknown") ==
+    "Phone  Name", "Device title may not introduce an extra line into the diagram.");
+Console.WriteLine("PASS: actual computer names, per-device native Windows display numbers and Android 1.");
+var testDisplay = new MonitorTopology(new[] {
+    new MonitorRect("Android screen",0,0,1080,2400,true)
+});
+Check(!ReceiverServer.AllowsForwardInput(new ConnectedPeer("Phone",testDisplay,
+    SupportsReverseInput:true,Platform:"Android")),
+    "One-way Android mode must not claim Windows keyboard/mouse authority");
+Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Desktop",testDisplay,
+    SupportsReverseInput:true,Platform:"Windows")),
+    "Windows PCs must retain duplex authority where locally approved");
+Console.WriteLine("PASS: Android one-way policy cannot control Windows; PC duplex preserved.");
+
 // A LAN with two Windows PCs and one Android phone must not be collapsed to
 // a single PC, and busy receivers must be visible but not connectable.
 var fpOne = new string('A', 64);

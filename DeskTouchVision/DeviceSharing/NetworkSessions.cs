@@ -11,9 +11,11 @@ using System.Text.Json;
 namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
-    bool SupportsReverseInput = true, string? DeviceFingerprint = null);
+    bool SupportsReverseInput = true, string? DeviceFingerprint = null,
+    string Platform = "Windows");
 internal sealed record PeerHello(string Name, string Layout,
-    bool? ReverseInputSupported = null, string? Fingerprint = null);
+    bool? ReverseInputSupported = null, string? Fingerprint = null,
+    string? Platform = null);
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -64,12 +66,25 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
+    internal event Action? PeerListChanged;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
+    internal static bool AllowsForwardInput(ConnectedPeer peer) =>
+        peer.Platform != "Android";
+    internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
+        _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
+    internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+    internal bool SelectConnectedPeer(int id)
+    {
+        if (!_sessions.TryGetValue(id, out var session)) return false;
+        // Selection is ONLY routing over the already authenticated TLS stream.
+        // It cannot grant authority and it never initiates another connection.
+        return Select(session);
+    }
     // Only labels for LAN display grouping; individual peer trust remains
     // pinned to its own approved TLS certificate/fingerprint.
     internal IReadOnlyList<string> ConnectedDeviceFingerprints =>
@@ -300,8 +315,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // it to authenticate the source or grant remote keyboard authority.
         string? hint = hello.Fingerprint is { Length:64 } id &&
             id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
+        string platform = string.Equals(hello.Platform, "Android",
+            StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true, hint);
+            hello.ReverseInputSupported ?? true, hint, platform);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -346,10 +363,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var hello=await Wire.ReadAsync(ssl,helloTimeout.Token);
         if(hello.Type!="hello") throw new InvalidDataException("Missing authenticated hello.");
         var peer=ReadHello(hello.Text);
-        if(trustedSource!=null) peer=peer with { Name=trustedSource.Name };
+        // The authenticated hello carries the current computer/phone name.
+        // A saved trusted-device alias may be stale after the PC was renamed;
+        // keep the actual announced system name in the display diagram.
         var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
         if(!_sessions.TryAdd(id,session))
             throw new InvalidOperationException("Duplicate peer session ID");
+        PeerListChanged?.Invoke();
         using var linked=CancellationTokenSource.CreateLinkedTokenSource(token);
         var sendTask=Task.Run(()=>ReverseSendLoopAsync(session,linked.Token));
         try
@@ -358,6 +378,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock(_authorityGate) first=_selected==null;
             if(first) Select(session);
             _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
+            // The server advertises its CURRENT system name after successful
+            // pairing. Do not rely on a stale saved alias on the other PC.
+            await SendToAsync(session,new Packet("peer-name",
+                Text:Environment.MachineName),token);
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -412,7 +436,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     bool granted=false;
                     lock(_authorityGate)
                     {
-                        if(p.A>0 && (_owner==null || ReferenceEquals(_owner,session)) &&
+                        // One-way Android mode: never accept Android->Windows
+                        // keyboard/mouse claims. Android remains paired for
+                        // Windows->Android control via reverse-* packets.
+                        if(p.A>0 && AllowsForwardInput(session.Peer) &&
+                           (_owner==null || ReferenceEquals(_owner,session)) &&
                            (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
                         {
                             _owner=session;
@@ -488,6 +516,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            PeerListChanged?.Invoke();
             Session? previous=null, next=null;
             bool released=false;
             lock(_authorityGate)
@@ -542,6 +571,9 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal MonitorTopology RemoteMonitors => Volatile.Read(ref _remoteMonitors);
     internal event Action<string>? RemoteControlState;
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
+    internal event Action<string>? RemoteNameChanged;
+    private string? _remoteSystemName;
+    internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
     private Packet? _latestMove;
@@ -740,7 +772,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             string sourceId = Convert.ToHexString(
                 SHA256.HashData(identity.RawData));
             var hello = JsonSerializer.Serialize(
-                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId));
+                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId, "Windows"));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             return new HostSession(client, ssl, monitors, onFailure);
@@ -803,7 +835,15 @@ internal sealed class HostSession : IInputSession, IDisposable
             while (!_cancel.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
-                if (p.Type == "topology")
+                if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
+                    !name.Any(char.IsControl))
+                {
+                    // Cache even if the UI subscribes after the TLS reader
+                    // receives this first metadata frame.
+                    Volatile.Write(ref _remoteSystemName,name);
+                    RemoteNameChanged?.Invoke(name);
+                }
+                else if (p.Type == "topology")
                 {
                     var layout = MonitorTopology.FromWire(p.Text);
                     Volatile.Write(ref _remoteMonitors, layout);

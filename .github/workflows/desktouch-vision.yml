@@ -33,6 +33,7 @@ jobs:
                               'DeskTouchVision/CHECK_CONNECTION.ps1',
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
+                              'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
                               'DeskTouchVision/TEST_INSTALL_MUTEX.ps1',
                               'DeskTouchVision/CHECK_UPDATE_LOCK.ps1')) {
             $tokens = $null
@@ -52,6 +53,11 @@ jobs:
           # A PowerShell script throws on failure; LASTEXITCODE is not
           # defined by a successfully invoked .ps1 and may be stale.
           & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
+      - name: Verify both Windows tray and auto-update paths (PowerShell 5.1)
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_TRAY_UPDATES.ps1'
+          if ($LASTEXITCODE -ne 0) { throw "DeskTouch tray auto-update integration regression failed" }
       - name: Check local hardware priority regression tests
         shell: pwsh
         run: |

@@ -12,7 +12,7 @@ namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     bool SupportsReverseInput = true, string? DeviceFingerprint = null,
-    string Platform = "Windows", bool SupportsForwardInput = true);
+    string Platform = "Windows", bool SupportsForwardInput = false);
 internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
     string? Platform = null, bool? ForwardInputSupported = null);

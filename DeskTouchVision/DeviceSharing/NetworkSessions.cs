@@ -830,6 +830,15 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
     internal event Action<string>? RemoteNameChanged;
     private string? _remoteSystemName;
+    private string? _environmentHubName;
+    private readonly MonitorTopology _environmentHubMonitors;
+    private EnvironmentMember[] _environmentMembers = [];
+    private int _environmentOwnId;
+    private int _environmentTargetId;
+    internal IReadOnlyList<EnvironmentMember> EnvironmentMembers =>
+        Volatile.Read(ref _environmentMembers);
+    internal int SelectedEnvironmentTargetId => Volatile.Read(ref _environmentTargetId);
+    internal event Action? EnvironmentRosterChanged;
     internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
@@ -848,6 +857,30 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<string>? InputDeliveryWarning;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
+
+    internal bool SelectEnvironmentTarget(int id)
+    {
+        if (Volatile.Read(ref _closed)!=0 || id<0) return false;
+        var members=Volatile.Read(ref _environmentMembers);
+        EnvironmentMember? chosen=members.FirstOrDefault(m=>m.Id==id);
+        if (id!=0 && (chosen==null || id==_environmentOwnId ||
+            !chosen.SupportsReverseInput)) return false;
+        // The hub's real monitor information is retained separately from the
+        // chosen member's display geometry. Changing targets never opens TCP.
+        MonitorTopology topology=id==0 ? _environmentHubMonitors :
+            MonitorTopology.FromWire(chosen!.Layout);
+        string name=id==0 ? _environmentHubName??"Environment hub" : chosen!.Name;
+        if (id!=SelectedEnvironmentTargetId)
+        {
+            if (!TrySend(new Packet("environment-select",id))) return false;
+            Volatile.Write(ref _environmentTargetId,id);
+        }
+        Volatile.Write(ref _remoteMonitors,topology);
+        Volatile.Write(ref _remoteSystemName,name);
+        RemoteTopologyChanged?.Invoke(topology);
+        RemoteNameChanged?.Invoke(name);
+        return true;
+    }
 
     internal void AttachReverseInput(LocalInputPriority priority, Func<bool> allowClaim)
     {
@@ -928,7 +961,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
     {
-        _client = client; _ssl = ssl; _remoteMonitors = monitors; _onFailure = onFailure;
+        _client = client; _ssl = ssl; _remoteMonitors = monitors;
+        _environmentHubMonitors = monitors; _onFailure = onFailure;
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
@@ -1093,19 +1127,51 @@ internal sealed class HostSession : IInputSession, IDisposable
             while (!_cancel.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
-                if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
+                if (p.Type == "environment-roster" &&
+                    p.Text is { Length: > 1 and <= 7800 } roster)
+                {
+                    var members = JsonSerializer.Deserialize<EnvironmentMember[]>(roster)
+                        ?? Array.Empty<EnvironmentMember>();
+                    if (members.Length is < 1 or > 9 ||
+                        !members.Any(m=>m.Id==0 && m.Platform=="Windows") ||
+                        members.Select(m=>m.Id).Distinct().Count()!=members.Length ||
+                        members.Any(m=>m.Id<0 || m.Name.Length is < 1 or > 100 ||
+                            m.Name.Any(char.IsControl) ||
+                            m.Platform is not ("Windows" or "Android")))
+                        throw new InvalidDataException("Invalid authenticated environment roster.");
+                    Volatile.Write(ref _environmentMembers,members);
+                    Volatile.Write(ref _environmentOwnId,p.A);
+                    int current=SelectedEnvironmentTargetId;
+                    if (current!=0 && !members.Any(m=>m.Id==current &&
+                        m.SupportsReverseInput))
+                        SelectEnvironmentTarget(0);
+                    EnvironmentRosterChanged?.Invoke();
+                }
+                else if (p.Type == "environment-unavailable")
+                {
+                    if (p.A==SelectedEnvironmentTargetId)
+                        SelectEnvironmentTarget(0);
+                    InputDeliveryWarning?.Invoke(
+                        "Selected environment member is unavailable; returned to the hub.");
+                }
+                else if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
                     !name.Any(char.IsControl))
                 {
-                    // Cache even if the UI subscribes after the TLS reader
-                    // receives this first metadata frame.
-                    Volatile.Write(ref _remoteSystemName,name);
-                    RemoteNameChanged?.Invoke(name);
+                    _environmentHubName=name;
+                    if (SelectedEnvironmentTargetId==0)
+                    {
+                        Volatile.Write(ref _remoteSystemName,name);
+                        RemoteNameChanged?.Invoke(name);
+                    }
                 }
                 else if (p.Type == "topology")
                 {
                     var layout = MonitorTopology.FromWire(p.Text);
-                    Volatile.Write(ref _remoteMonitors, layout);
-                    RemoteTopologyChanged?.Invoke(layout);
+                    if (SelectedEnvironmentTargetId==0)
+                    {
+                        Volatile.Write(ref _remoteMonitors, layout);
+                        RemoteTopologyChanged?.Invoke(layout);
+                    }
                 }
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))

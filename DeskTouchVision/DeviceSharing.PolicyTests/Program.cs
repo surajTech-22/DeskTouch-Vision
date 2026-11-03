@@ -48,6 +48,25 @@ Check(!InputClaimLifecyclePolicy.CanGrant(true, false, true),
     "Forward remote claim must be refused during pending reverse handoff.");
 Console.WriteLine("PASS: discovery-only startup cannot grant input; global monitoring required for sharing.");
 
+// Multiple authenticated TCP sessions may coexist, but only a single remote
+// device is ever allowed to drive this Windows cursor and keyboard at once.
+long multiClock = 200000;
+var multiPriority = new LocalInputPriority(() => multiClock);
+var shared = new SharedPeerAuthority(multiPriority);
+multiClock += LocalInputPriority.IdleBeforeRemoteMilliseconds;
+Check(shared.TryClaim(101), "First Android phone should acquire input");
+Check(!shared.TryClaim(202), "Second phone must not inject while the first controls Windows");
+Check(shared.IsOwner(101) && !shared.IsOwner(202), "Authority must be peer-specific");
+shared.Release(202);
+Check(shared.IsOwner(101), "Non-owner disconnect may not revoke active controller");
+shared.Release(101);
+Check(shared.TryClaim(202), "Waiting phone can take control when previous peer releases");
+multiPriority.RecordPhysicalActivity();
+Check(!multiPriority.CanApplyRemote, "Physical Windows mouse immediately revokes remote injection");
+shared.ReleaseAll();
+Check(shared.Owner == 0, "All peer claims removed on native override");
+Console.WriteLine("PASS: simultaneous connections with exclusive controller, safe disconnect and local override.");
+
 long fakeClock = 100000;
 var priority = new LocalInputPriority(() => fakeClock);
 int nativePreemptions = 0;

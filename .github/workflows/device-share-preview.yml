@@ -20,6 +20,11 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      - name: Verify native-input priority state machine
+        shell: pwsh
+        run: |
+          dotnet run --project DeskTouchVision/DeviceSharing.PolicyTests/DeviceSharing.PolicyTests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Local physical input priority tests failed" }
       - name: Compile standalone Windows device sharing
         shell: pwsh
         run: |

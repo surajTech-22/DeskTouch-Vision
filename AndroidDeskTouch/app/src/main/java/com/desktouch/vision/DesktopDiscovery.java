@@ -103,7 +103,7 @@ final class DesktopDiscovery {
                     StandardCharsets.US_ASCII);
                 String ip=result.getAddress().getHostAddress();
                 if(message.startsWith("DT1-LINK|")){
-                    String[] link=message.split("\\\\|",-1);
+                    String[] link=message.split("\\|",-1);
                     if(link.length==3&&link[1].matches("[A-Fa-f0-9]{64}")&&
                         link[2].matches("[A-Fa-f0-9]{64}"))
                         pendingLinks.add(new String[]{link[1].toUpperCase(Locale.ROOT),

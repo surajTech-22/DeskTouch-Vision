@@ -31,6 +31,9 @@ $csproj = Get-Content -LiteralPath (Join-Path $root 'DeskTouchVision.csproj') -R
 $publishedVersion = [regex]::Match($csproj,
   '<Version>([0-9]+\.[0-9]+\.[0-9]+)-preview</Version>').Groups[1].Value
 if (-not $publishedVersion) { throw 'DeskTouch project version not found.' }
-RequireText 'RECOVER_DESKTOUCH.ps1' ("\u0060$release = 'v" + $publishedVersion + "'")
+RequireText 'RECOVER_DESKTOUCH.ps1' ('
+Write-Host 'PASS: both Windows executables share the release-event auto-updater.'
+Write-Host 'PASS: X-to-tray retains window; verified update closes it and restarts quietly in tray.'
+ + "release = 'v" + $publishedVersion + "'")
 Write-Host 'PASS: both Windows executables share the release-event auto-updater.'
 Write-Host 'PASS: X-to-tray retains window; verified update closes it and restarts quietly in tray.'

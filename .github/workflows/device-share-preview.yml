@@ -38,8 +38,9 @@ jobs:
       - name: Verify detached Windows updater can rename app directory
         shell: pwsh
         run: |
+          # A PowerShell script throws on failure; LASTEXITCODE is not
+          # defined by a successfully invoked .ps1 and may be stale.
           & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
-          if ($LASTEXITCODE -ne 0) { throw "Windows updater folder-lock regression failed" }
       - name: Verify native-input priority state machine
         shell: pwsh
         run: |

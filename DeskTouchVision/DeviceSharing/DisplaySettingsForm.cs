@@ -498,7 +498,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_capture != null) return;
         try
         {
-            _capture = new SourceCapture(this, _receiver, Status,
+            _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
             _capture.Arm();
             Status("Windows controls " + _incomingPeer.Name +

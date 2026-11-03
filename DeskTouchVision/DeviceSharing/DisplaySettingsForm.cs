@@ -13,7 +13,7 @@ namespace DeskTouch.DeviceShare;
 /// retain Windows ownership; paired PCs are supplemental keyboard/mouse
 /// targets, not virtual Windows monitors or hardware replacements.
 /// </summary>
-internal sealed class DisplaySettingsForm : Form
+internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 {
     private readonly DisplayArrangementControl _display = new();
     private readonly Label _status = new();
@@ -35,6 +35,10 @@ internal sealed class DisplaySettingsForm : Form
     };
 
     private readonly CancellationTokenSource _closing = new();
+    private NotifyIcon? _trayIcon;
+    private ContextMenuStrip? _trayMenu;
+    private bool _exitRequested;
+    private bool _trayTipShown;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
     private PhysicalInputMonitor? _nativeInput;
@@ -148,14 +152,84 @@ internal sealed class DisplaySettingsForm : Form
             StartListening();
             UpdateClient.StartEventUpdates(this);
         };
-        FormClosing += (_, _) =>
-        {
-            _closing.Cancel();
-            DisconnectHost();
-            StopListening();
-        };
+        InitializeTray();
+        FormClosing += OnDeskTouchFormClosing;
         UpdateButtons();
     }
+
+    internal static bool ShouldStayInTray(CloseReason reason, bool intentionalExit) =>
+        reason == CloseReason.UserClosing && !intentionalExit;
+
+    private void InitializeTray()
+    {
+        _trayMenu = new ContextMenuStrip();
+        _trayMenu.Items.Add("Show Displays", null, (_, _) => ShowFromTray());
+        _trayMenu.Items.Add("Check for updates", null, async (_, _) =>
+            await UpdateClient.CheckManuallyAsync(this));
+        _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectAndListen());
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
+
+        _trayIcon = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "DeskTouch Vision - Windows device sharing",
+            ContextMenuStrip = _trayMenu,
+            Visible = true
+        };
+        _trayIcon.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    internal void ShowFromTray()
+    {
+        if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
+        ShowInTaskbar = true;
+        if (!Visible) Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+        BringToFront();
+    }
+
+    private void HideToTray()
+    {
+        // Hiding a WinForms form must NOT destroy its HWND. The existing
+        // HWND processes WM_INPUT and owns the physical keyboard/mouse hooks.
+        // The same UI message loop also hosts independent SSE auto-updates.
+        ShowInTaskbar = false;
+        Hide();
+        if (!_trayTipShown && _trayIcon != null)
+        {
+            _trayTipShown = true;
+            _trayIcon.BalloonTipTitle = "DeskTouch keeps sharing in the tray";
+            _trayIcon.BalloonTipText =
+                "The computers stay paired. Double-click the tray icon to show Displays.";
+            _trayIcon.ShowBalloonTip(2500);
+        }
+    }
+
+    private void OnDeskTouchFormClosing(object? sender, FormClosingEventArgs args)
+    {
+        if (ShouldStayInTray(args.CloseReason, _exitRequested))
+        {
+            args.Cancel = true;
+            HideToTray();
+            return;
+        }
+        _closing.Cancel();
+        // Revoke remote control and close the TLS peer before destroying
+        // Windows input hooks or receiver listening state.
+        DisconnectHost();
+        StopListening();
+        if (_trayIcon != null) _trayIcon.Visible = false;
+    }
+
+    private void ExitDeskTouch()
+    {
+        _exitRequested = true;
+        Close();
+    }
+
+    void IUpdateCloseHost.CloseForVerifiedUpdate() => ExitDeskTouch();
 
     private static Button Button(string name, bool primary = false) => new()
     {
@@ -593,6 +667,11 @@ internal sealed class DisplaySettingsForm : Form
 
     protected override void WndProc(ref Message message)
     {
+        if (message.Msg == Program.ShowDisplaysMessage && !_exitRequested)
+        {
+            ShowFromTray();
+            return;
+        }
         if (message.Msg == Win.WM_INPUT)
         {
             if (_nativeInput != null) _nativeInput.HandleRawInput(message.LParam);
@@ -611,6 +690,14 @@ internal sealed class DisplaySettingsForm : Form
         if (disposing)
         {
             _closing.Cancel();
+            if (_trayIcon != null)
+            {
+                _trayIcon.Visible = false;
+                _trayIcon.Dispose();
+                _trayIcon = null;
+            }
+            _trayMenu?.Dispose();
+            _trayMenu = null;
             _closing.Dispose();
         }
         base.Dispose(disposing);

@@ -24,6 +24,7 @@ public final class AutoConnectService extends Service {
     private MobileDiscoveryResponder responder;
     private TrustedWindows trust;
     private volatile boolean scanning;
+    private ScheduledExecutorService updateScheduler;
 
     static boolean enabled(Context context) {
         return context.getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -78,6 +79,13 @@ public final class AutoConnectService extends Service {
         }
         scheduler=Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleWithFixedDelay(this::autoConnect,0,10,TimeUnit.SECONDS);
+        updateScheduler=Executors.newSingleThreadScheduledExecutor();
+        updateScheduler.scheduleWithFixedDelay(() -> {
+            try{
+                new AndroidUpdateClient(this).check(true,message ->
+                    Log.i("DeskTouch update",message));
+            }catch(Exception problem){Log.w("DeskTouch","Auto-update check deferred",problem);}
+        },60,21600,TimeUnit.SECONDS);
     }
     private void autoConnect() {
         if(scanning || !reconnectEnabled(this) || !enabled(this)) return;
@@ -105,6 +113,7 @@ public final class AutoConnectService extends Service {
     @Override public android.os.IBinder onBind(Intent intent) {return null;}
     @Override public void onDestroy() {
         if(scheduler!=null)scheduler.shutdownNow();
+        if(updateScheduler!=null)updateScheduler.shutdownNow();
         if(responder!=null)responder.close();
         // An active Android UI may still hold this same session when the user
         // disables startup. Stop background work without closing their UI session.

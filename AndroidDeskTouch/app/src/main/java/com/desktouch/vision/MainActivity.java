@@ -206,8 +206,8 @@ public final class MainActivity extends Activity {
         keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
             android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         page.addView(keyboardInput);
+        final String[] previousTyped={""};
         keyboardInput.addTextChangedListener(new TextWatcher(){
-            private String last="";
             public void beforeTextChanged(CharSequence text,int start,int count,int after){}
             public void onTextChanged(CharSequence text,int start,int before,int count){}
             public void afterTextChanged(Editable editable){
@@ -215,23 +215,25 @@ public final class MainActivity extends Activity {
                 String next=editable.toString();
                 if(session!=null&&session.isActive()){
                     int common=0;
-                    while(common<last.length()&&common<next.length()&&
-                        last.charAt(common)==next.charAt(common))common++;
-                    for(int n=common;n<last.length();n++){
+                    while(common<previousTyped[0].length()&&common<next.length()&&
+                        previousTyped[0].charAt(common)==next.charAt(common))common++;
+                    for(int n=common;n<previousTyped[0].length();n++){
                         session.key(8,true);session.key(8,false);
                     }
                     if(common<next.length())session.text(next.substring(common));
                 }
-                last=next;
+                previousTyped[0]=next;
                 if(next.length()>800){
                     suppressTypedText=true;
-                    editable.clear();last="";
+                    editable.clear();previousTyped[0]="";
                     suppressTypedText=false;
                 }
             }
         });
         addButton(page,"Clear mobile typing field",()->{
-            suppressTypedText=true;keyboardInput.setText("");suppressTypedText=false;
+            suppressTypedText=true;
+            keyboardInput.setText("");previousTyped[0]="";
+            suppressTypedText=false;
         });
         addButton(page,"Android keyboard settings",()->
             startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
@@ -375,6 +377,49 @@ public final class MainActivity extends Activity {
             }catch(Exception e){runOnUiThread(()->status.setText("LAN scan failed: "+e.getMessage()));}
             finally{scanning=false;}
         },"DeskTouch LAN discovery").start();
+    }
+    @Override public boolean dispatchKeyEvent(KeyEvent e){
+        // The Android IME EditText handles composed Unicode text through
+        // TextWatcher. Hardware keyboards control Windows when the touchpad
+        // has focus, without stealing typing from the IME.
+        if(session!=null && session.isActive() &&
+            !(getCurrentFocus() instanceof EditText) &&
+            (e.getSource()&InputDevice.SOURCE_KEYBOARD)==InputDevice.SOURCE_KEYBOARD){
+            int vk=toWindowsKey(e.getKeyCode());
+            if(vk!=0 && (e.getAction()==KeyEvent.ACTION_DOWN ||
+                e.getAction()==KeyEvent.ACTION_UP)){
+                if(e.getRepeatCount()==0)session.key(vk,
+                    e.getAction()==KeyEvent.ACTION_DOWN);
+                return true;
+            }
+        }
+        return super.dispatchKeyEvent(e);
+    }
+    private static int toWindowsKey(int c){
+        if(c>=KeyEvent.KEYCODE_A&&c<=KeyEvent.KEYCODE_Z)
+            return 0x41+c-KeyEvent.KEYCODE_A;
+        if(c>=KeyEvent.KEYCODE_0&&c<=KeyEvent.KEYCODE_9)
+            return 0x30+c-KeyEvent.KEYCODE_0;
+        if(c>=KeyEvent.KEYCODE_F1&&c<=KeyEvent.KEYCODE_F12)
+            return 0x70+c-KeyEvent.KEYCODE_F1;
+        switch(c){
+            case KeyEvent.KEYCODE_ENTER:return 0x0D;
+            case KeyEvent.KEYCODE_DEL:return 0x08;
+            case KeyEvent.KEYCODE_TAB:return 0x09;
+            case KeyEvent.KEYCODE_ESCAPE:return 0x1B;
+            case KeyEvent.KEYCODE_SPACE:return 0x20;
+            case KeyEvent.KEYCODE_DPAD_LEFT:return 0x25;
+            case KeyEvent.KEYCODE_DPAD_UP:return 0x26;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:return 0x27;
+            case KeyEvent.KEYCODE_DPAD_DOWN:return 0x28;
+            case KeyEvent.KEYCODE_SHIFT_LEFT:return 0xA0;
+            case KeyEvent.KEYCODE_SHIFT_RIGHT:return 0xA1;
+            case KeyEvent.KEYCODE_CTRL_LEFT:return 0xA2;
+            case KeyEvent.KEYCODE_CTRL_RIGHT:return 0xA3;
+            case KeyEvent.KEYCODE_ALT_LEFT:return 0xA4;
+            case KeyEvent.KEYCODE_ALT_RIGHT:return 0xA5;
+            default:return 0;
+        }
     }
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);

@@ -81,19 +81,18 @@ public final class AutoConnectService extends Service {
     }
     private void autoConnect() {
         if(scanning || !reconnectEnabled(this) || !enabled(this)) return;
-        DeskTouchSession session=DeskTouchRuntime.session(this);
-        if(session.isConnected() || session.isConnecting())return;
+        MobileSessionHub session=DeskTouchRuntime.session(this);
         scanning=true;
         try {
             Set<String> verified=trust.fingerprints();
             if(verified.isEmpty()) return; // no silent first-time pairing
             for(DesktopDiscovery.Device device:DesktopDiscovery.scan()) {
                 if(!device.ready||device.android||!verified.contains(device.fingerprint))continue;
-                if(session.isConnected()||session.isConnecting())break;
+                if(session.isConnectedTo(device.fingerprint)||
+                   session.isConnectingTo(device.fingerprint))continue;
                 android.util.DisplayMetrics display=getResources().getDisplayMetrics();
                 session.connect(device,Math.max(200,display.widthPixels),
                     Math.max(100,display.heightPixels));
-                break;
             }
         }catch(Exception error){
             Log.w("DeskTouch","Trusted LAN reconnect deferred",error);

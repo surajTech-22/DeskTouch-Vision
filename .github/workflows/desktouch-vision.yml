@@ -34,6 +34,7 @@ jobs:
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
                               'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
+                              'DeskTouchVision/DeviceSharing/ALLOW_PRIVATE_LAN.ps1',
                               'DeskTouchVision/TEST_INSTALL_MUTEX.ps1',
                               'DeskTouchVision/CHECK_UPDATE_LOCK.ps1')) {
             $tokens = $null
@@ -119,7 +120,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.3.1: Windows v0.3.0 two-way authority retained. Displays and tray add an Android APK QR-download scanner which links only to an APK verified in the same official GitHub release. Android preview uses the same TLS pairing protocol, existing Windows approval and Android native keyboard/mouse settings. Android-to-Windows control is an early preview requiring physical Android/Windows validation. Android debug signing is not stable across CI runs, so Android APK updates may require uninstall/reinstall; do not assume auto-update."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.3.2: DeskTouch now lists nearby Windows PCs and Android phones via repeated LAN discovery, shows busy rather than disappearing Windows endpoints, and adds Windows sign-in tray startup with trusted identity auto-reconnect. Android uses an OS-authorized connectedDevice foreground service on boot with trusted certificate identity reconnection and no stored IP addresses. Windows Add devices includes an administrator-approved Private LocalSubnet firewall repair option for TCP 37377 and UDP 37378. One active input-control peer per app remains the current limitation; Android system-wide reverse control is not implemented. Both platforms still require real-device testing. Android debug APK signatures can change between builds."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

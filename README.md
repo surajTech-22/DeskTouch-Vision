@@ -2,7 +2,19 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.7 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.8 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.8 — slow cursor handoff, persistent tray mode and per-PC automatic updates
+
+The old physical-edge logic could miss a **very slow mouse/touchpad crossing**, because Windows clamps the visible pointer at the final display pixel and no further ordinary `WM_MOUSEMOVE` is guaranteed. The new `SlowEdgeApproach` remembers a **recent deliberate outward movement** near the external native screen boundary and, after a short 170 ms approach interval, completes the handoff when the pointer is within three physical pixels of that boundary. The approach expires after 1.1 seconds; inward movement, idle hovering, internal Windows monitor seams, and moving away cancel the attempt. Fast raw movement and precision-touchpad fallback remain available.
+
+**The X / Close button now hides the existing Displays window to the Windows notification area**. This preserves the same receiver TCP listener, TLS pairing, user-controlled mouse capture, monitor arrangement and app-wide release-event listener. The tray icon's double-click or **Show Displays** opens the existing window (no duplicate device hooks); its menu offers **Check for updates**, **Disconnect**, and **Exit DeskTouch**. Exit deliberately releases the native input hooks and disconnects the peer. Windows shutdown also closes correctly.
+
+Each Windows PC runs the **same event-driven GitHub release listener independently** while DeskTouch is open or in the tray. After a verified download and SHA-256 check, the standalone updater invokes an explicit, controlled close (not ordinary X-to-tray) and can replace both executables with rollback protection. If the app was hidden before updating, its `--tray` state survives restart. The launcher's second-instance message reopens hidden Displays even while an update temporarily changes the window title.
+
+**Install v0.2.8 on both computers.** Neither PC requires the other to launch or receive its auto-update. Both must actually have DeskTouch running (visible or tray) to receive the SSE event; the application does not install a system service or silently enable start-on-login. If upgrading from an older installation whose update host is stuck, use the one-time `RECOVER_DESKTOUCH.ps1` after `CHECK_UPDATE_LOCK.ps1` reports no active old updater; the recovery target is v0.2.8.
+
+The CI regression suite now includes slow cursor clamping, deliberate-outward gesture freshness, all four outside edges, internal native seams, WinForms simulated X-to-tray followed by explicit update close, Windows shutdown semantics, TLS pairing, installer-lock handling and Windows PowerShell 5.1 checksum processing. Actual end-to-end hardware handoffs between two PCs still require field validation. A real app upgrade intentionally releases an active peer session briefly; it cannot keep a TCP session open while replacing the process executable.
 
 ## v0.2.7 — permanent installation mutex / duplicate-download correction
 

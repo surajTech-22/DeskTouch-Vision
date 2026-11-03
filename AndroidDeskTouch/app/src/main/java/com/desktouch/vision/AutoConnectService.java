@@ -78,6 +78,11 @@ public final class AutoConnectService extends Service {
         }
         scheduler=Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleWithFixedDelay(this::autoConnect,0,10,TimeUnit.SECONDS);
+        // Updates are downloaded only from official GitHub and SHA-256 checked.
+        // Android's own installer must still be approved by the user.
+        scheduler.scheduleWithFixedDelay(
+            ()->AndroidUpdater.checkBackground(getApplicationContext()),
+            30,2*60*60,TimeUnit.SECONDS);
     }
     private void autoConnect() {
         if(scanning || !reconnectEnabled(this) || !enabled(this)) return;

@@ -70,6 +70,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
+    // Only labels for LAN display grouping; individual peer trust remains
+    // pinned to its own approved TLS certificate/fingerprint.
+    internal IReadOnlyList<string> ConnectedDeviceFingerprints =>
+        _sessions.Values.Select(s=>s.Peer.DeviceFingerprint)
+            .Where(id=>!string.IsNullOrWhiteSpace(id)).Cast<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
     internal ReceiverServer(Action<string> status, LocalInputPriority priority,
         Func<string,CancellationToken,Task<bool>>? requestApproval = null,

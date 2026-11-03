@@ -15,14 +15,14 @@ internal sealed class SourceCapture : IDisposable
     private readonly Win.HookProc _keyboardDelegate;
     private readonly Win.HookProc _mouseDelegate;
     private readonly Action<string> _status;
-    private readonly MonitorTopology _localMonitors, _remoteMonitors;
-    private readonly System.Drawing.Rectangle _local;
+    private MonitorTopology _localMonitors, _remoteMonitors;
+    private System.Drawing.Rectangle _local;
     private MonitorEdge _edge;
     private IntPtr _keyHook, _mouseHook;
     private int _armed, _active, _switchPending, _pending;
     private System.Drawing.Point _pendingPoint;
     private int _remoteX, _remoteY;
-    private readonly int _anchorX, _anchorY;
+    private int _anchorX, _anchorY;
     private long _cooldownUntil;
     private long _lastRawMs;
     private bool _controlPressed, _altPressed, _shiftPressed;
@@ -53,6 +53,22 @@ internal sealed class SourceCapture : IDisposable
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
         _edge = side;
+    }
+
+    internal void UpdateLayouts(MonitorTopology local, MonitorTopology remote)
+    {
+        // A real Windows monitor change never needs to destroy an authenticated
+        // TCP pairing. Release remote input first, then re-map the active
+        // screen boundaries against the actual native Windows geometry.
+        ReturnLocal();
+        Interlocked.Exchange(ref _pending, 0);
+        _localMonitors = local;
+        _remoteMonitors = remote;
+        _local = local.Bounds;
+        var home = local.Monitors.FirstOrDefault(m => m.Primary) ?? local.Monitors[0];
+        _anchorX = home.X + home.Width / 2;
+        _anchorY = home.Y + home.Height / 2;
+        _status("Native Windows monitor layout refreshed. Connection remains paired.");
     }
 
     private static MonitorEdge Opposite(MonitorEdge edge) => edge switch

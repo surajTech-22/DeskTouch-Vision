@@ -39,6 +39,7 @@ internal sealed class DisplaySettingsForm : Form
     private NearbyComputerDiscovery? _discovery;
     private PhysicalInputMonitor? _nativeInput;
     private HostSession? _host;
+    private ConnectedPeer? _incomingPeer;
     private SourceCapture? _capture;
     private MonitorEdge _preferredEdge = MonitorEdge.Right;
     private bool _connecting;
@@ -194,13 +195,17 @@ internal sealed class DisplaySettingsForm : Form
     private void UpdateButtons()
     {
         if (IsDisposed) return;
-        _add.Enabled = _host == null && !_connecting;
-        _copyCode.Enabled = _receiver != null && !_connecting && _host == null;
-        _disconnect.Enabled = _host != null || _connecting;
+        _add.Enabled = _host == null && _incomingPeer == null && !_connecting;
+        _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
+            !_connecting && _host == null;
+        _disconnect.Enabled = _host != null || _incomingPeer != null || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
         if (_host != null)
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
                             $"Connected computer  ·  {_host.RemoteMonitors.Monitors.Count} display(s)";
+        else if (_incomingPeer != null)
+            _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
+                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  Receiving";
         else
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -211,7 +216,7 @@ internal sealed class DisplaySettingsForm : Form
         try
         {
             _display.Local = MonitorTopology.Capture();
-            _display.Remote = _host?.RemoteMonitors;
+            _display.Remote = _host?.RemoteMonitors ?? _incomingPeer?.Monitors;
             UpdateButtons();
         }
         catch (Exception ex) { Status("Windows display detection failed: " + ex.Message); }
@@ -225,6 +230,10 @@ internal sealed class DisplaySettingsForm : Form
             _nativeInput = new PhysicalInputMonitor(this);
             _nativeInput.Start();
             _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync);
+            _receiver.PeerConnected += OnIncomingPeerConnected;
+            _receiver.PeerDisconnected += OnIncomingPeerDisconnected;
+            _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
+            _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
             _receiver.Start();
             try
             {
@@ -250,11 +259,82 @@ internal sealed class DisplaySettingsForm : Form
     {
         _discovery?.Dispose();
         _discovery = null;
-        _receiver?.Dispose();
+        if (_receiver != null)
+        {
+            _receiver.PeerConnected -= OnIncomingPeerConnected;
+            _receiver.PeerDisconnected -= OnIncomingPeerDisconnected;
+            _receiver.PeerTopologyChanged -= OnIncomingPeerTopologyChanged;
+            _receiver.PeerPlacementChanged -= OnIncomingPeerPlacementChanged;
+            _receiver.Dispose();
+        }
         _receiver = null;
+        _incomingPeer = null;
         _nativeInput?.Dispose();
         _nativeInput = null;
         UpdateButtons();
+    }
+
+    private static MonitorEdge Opposite(MonitorEdge edge) => edge switch
+    {
+        MonitorEdge.Left => MonitorEdge.Right,
+        MonitorEdge.Right => MonitorEdge.Left,
+        MonitorEdge.Top => MonitorEdge.Bottom,
+        MonitorEdge.Bottom => MonitorEdge.Top,
+        _ => MonitorEdge.Right
+    };
+
+    private void OnIncomingPeerConnected(ConnectedPeer peer)
+    {
+        PostToUi(() =>
+        {
+            _incomingPeer = peer;
+            RefreshDisplays();
+            Status($"Paired with {peer.Name}. Local keyboard and mouse retain priority.");
+        });
+    }
+
+    private void OnIncomingPeerDisconnected()
+    {
+        PostToUi(() =>
+        {
+            _incomingPeer = null;
+            RefreshDisplays();
+            Status("Connected computer went offline. This computer remains ready for another connection.");
+        });
+    }
+
+    private void OnIncomingPeerTopologyChanged(ConnectedPeer peer)
+    {
+        PostToUi(() =>
+        {
+            _incomingPeer = peer;
+            RefreshDisplays();
+            Status($"Windows monitor layout synchronized with {peer.Name}; pairing retained.");
+        });
+    }
+
+    private void OnIncomingPeerPlacementChanged(MonitorEdge sourceEdge)
+    {
+        PostToUi(() =>
+        {
+            _preferredEdge = Opposite(sourceEdge);
+            _display.RemoteEdge = _preferredEdge;
+            SavePreferredEdge();
+            Status("Display placement synchronized with the connected computer.");
+        });
+    }
+
+    private void PostToUi(Action action)
+    {
+        if (IsDisposed || !IsHandleCreated || _closing.IsCancellationRequested) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (!IsDisposed && !_closing.IsCancellationRequested) action();
+            });
+        }
+        catch (InvalidOperationException) { }
     }
 
     private async Task<bool> ConfirmPeerAsync(string peer, CancellationToken cancellation)
@@ -316,7 +396,7 @@ internal sealed class DisplaySettingsForm : Form
 
     private async Task AddComputerAsync()
     {
-        if (_host != null || _connecting || _closing.IsCancellationRequested) return;
+        if (_host != null || _incomingPeer != null || _connecting || _closing.IsCancellationRequested) return;
         using var dialog = new PairComputerDialog();
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         _connecting = true;
@@ -345,8 +425,11 @@ internal sealed class DisplaySettingsForm : Form
             _remoteAddress = dialog.ComputerName;
             _capture = new SourceCapture(this, _host, Status, _preferredEdge);
             _host.RemoteControlState += HandleRemoteState;
+            _host.RemoteTopologyChanged += HandleRemoteTopology;
+            _host.RemotePlacementChanged += HandleRemotePlacement;
             RefreshDisplays();
-            _capture.Arm(); // authorized pairing arms edge switching, not remote control itself
+            _capture.Arm();
+            _host.PublishSourcePlacement(_preferredEdge); // authorized pairing arms edge switching, not remote control itself
             Status($"Connected to {_remoteAddress}. Move to the {_preferredEdge.ToString().ToLowerInvariant()} outer edge to share input.");
         }
         catch (Exception ex)
@@ -385,18 +468,47 @@ internal sealed class DisplaySettingsForm : Form
         catch (InvalidOperationException) { }
     }
 
+    private void HandleRemoteTopology(MonitorTopology topology)
+    {
+        PostToUi(() =>
+        {
+            _capture?.UpdateLayouts(MonitorTopology.Capture(), topology);
+            RefreshDisplays();
+            Status("Remote Windows monitor layout updated without disconnecting.");
+        });
+    }
+
+    private void HandleRemotePlacement(MonitorEdge sourceEdge)
+    {
+        PostToUi(() =>
+        {
+            _preferredEdge = sourceEdge;
+            _display.RemoteEdge = sourceEdge;
+            SavePreferredEdge();
+            _capture?.SetEdge(sourceEdge);
+            Status("Display placement synchronized; connection remains active.");
+        });
+    }
+
     private void OnRemoteEdgeChanged(MonitorEdge edge)
     {
         _preferredEdge = edge;
         SavePreferredEdge();
         _capture?.SetEdge(edge);
+        _host?.PublishSourcePlacement(edge);
+        if (_incomingPeer != null) _receiver?.PublishPlacement(Opposite(edge));
         Status($"Connected computer placed {_preferredEdge.ToString().ToLowerInvariant()}. " +
                "Move to that outside edge to switch between computers.");
     }
 
     private void DisconnectHost()
     {
-        if (_host != null) _host.RemoteControlState -= HandleRemoteState;
+        if (_host != null)
+        {
+            _host.RemoteControlState -= HandleRemoteState;
+            _host.RemoteTopologyChanged -= HandleRemoteTopology;
+            _host.RemotePlacementChanged -= HandleRemotePlacement;
+        }
         _capture?.Dispose();
         _capture = null;
         _host?.Dispose();
@@ -409,6 +521,12 @@ internal sealed class DisplaySettingsForm : Form
     private void DisconnectAndListen()
     {
         DisconnectHost();
+        if (_incomingPeer != null)
+        {
+            _receiver?.DisconnectPeer();
+            _incomingPeer = null;
+            RefreshDisplays();
+        }
         if (!_closing.IsCancellationRequested) StartListening();
         Status("Disconnected. Windows keyboard and mouse remain local.");
     }
@@ -445,11 +563,28 @@ internal sealed class DisplaySettingsForm : Form
 
     private void OnDisplayChanged()
     {
-        DisconnectHost();
-        StopListening();
-        RefreshDisplays();
-        StartListening();
-        Status("Windows monitor configuration changed. Layout refreshed; re-pair a connected computer if needed.");
+        if (IsDisposed || _closing.IsCancellationRequested) return;
+        try
+        {
+            var current = MonitorTopology.Capture();
+            // Windows sometimes broadcasts WM_DISPLAYCHANGE without any
+            // actual topology change. It must NEVER tear down pairing.
+            if (_display.Local?.ToWire() == current.ToWire()) return;
+            _display.Local = current;
+            if (_host != null)
+            {
+                _capture?.UpdateLayouts(current, _host.RemoteMonitors);
+                _host.PublishSourceTopology(current);
+            }
+            if (_receiver != null)
+                _receiver.PublishLocalTopology(current);
+            UpdateButtons();
+            Status("Windows monitors changed; synchronized display layout without reconnecting.");
+        }
+        catch (Exception ex)
+        {
+            Status("Unable to refresh Windows display layout: " + ex.Message);
+        }
     }
 
     protected override void WndProc(ref Message message)

@@ -30,4 +30,18 @@ public final class ProtocolSourceTest {
         assertFalse(android.ready);
         assertNull(DesktopDiscovery.parse("DT1-READY|Fake|BAD","192.168.1.9"));
     }
+    @Test public void androidDoesNotDisplayItsOwnBeacon() {
+        DesktopDiscovery.Device self=DesktopDiscovery.parse(
+            "DT1-MOBILE|My Android|"+"F".repeat(64),"192.168.1.2");
+        DesktopDiscovery.Device other=DesktopDiscovery.parse(
+            "DT1-MOBILE|Another Android|"+"E".repeat(64),"192.168.1.3");
+        assertFalse(DesktopDiscovery.isRemoteDevice(self,"F".repeat(64)));
+        assertTrue(DesktopDiscovery.isRemoteDevice(other,"F".repeat(64)));
+    }
+    @Test public void newerVersionsAreComparedNumerically() {
+        assertTrue(AndroidUpdateClient.isNewer("v0.3.6","0.3.5"));
+        assertFalse(AndroidUpdateClient.isNewer("v0.3.6","0.3.6"));
+        assertFalse(AndroidUpdateClient.isNewer("v0.3.9","0.4.0"));
+        assertTrue(AndroidUpdateClient.isNewer("v1.0.0","0.9.99"));
+    }
 }

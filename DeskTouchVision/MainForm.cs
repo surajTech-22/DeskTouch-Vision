@@ -35,6 +35,7 @@ public sealed class MainForm : Form
     private readonly Button _reference = MakeButton("Capture idle reference");
     private readonly Button _save = MakeButton("Save calibration");
     private readonly Button _updates = MakeButton("Check updates");
+    private readonly Button _sharing = MakeButton("Windows device sharing");
     private readonly Button _stop = MakeButton("Stop / privacy");
     private Rectangle? _keyboardRect, _mouseRect;
     private System.Drawing.Point? _first;
@@ -54,7 +55,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "DeskTouch Vision 0.1.0 — offline feasibility preview";
+        Text = "DeskTouch Vision 0.2.0 — offline Windows sharing preview";
         BackColor = Color.FromArgb(16, 25, 40);
         ClientSize = new System.Drawing.Size(1080, 680);
         MinimumSize = new System.Drawing.Size(850, 540);
@@ -62,9 +63,9 @@ public sealed class MainForm : Form
 
         var sidebar = new Panel { Dock = DockStyle.Right, Width = 320, BackColor = Color.FromArgb(27, 40, 61),
             Padding = new Padding(14) };
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 335, FlowDirection = FlowDirection.TopDown,
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 388, FlowDirection = FlowDirection.TopDown,
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _start, _keyboard, _mouse, _reference, _save, _updates, _stop })
+        foreach (var b in new[] { _start, _keyboard, _mouse, _reference, _save, _sharing, _updates, _stop })
         {
             b.Width = 275;
             b.Height = 38;
@@ -90,6 +91,17 @@ public sealed class MainForm : Form
         _reference.Click += (_, _) => CaptureReference();
         _save.Click += (_, _) => SaveCalibration();
         _updates.Click += async (_, _) => await UpdateClient.CheckManuallyAsync(this);
+        _sharing.Click += (_, _) =>
+        {
+            var exe = Path.Combine(AppContext.BaseDirectory, "DeviceSharing", "DeskTouch.DeviceShare.exe");
+            if (!File.Exists(exe))
+            {
+                MessageBox.Show(this, "Windows Device Sharing module not installed. Use the v0.2 preview package.",
+                    "DeskTouch Vision", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = true });
+        };
         _preview.MouseClick += PreviewClick;
         FormClosing += (_, _) => StopCamera();
         Shown += (_, _) => UpdateClient.StartEventUpdates(this);

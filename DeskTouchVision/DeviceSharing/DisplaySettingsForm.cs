@@ -36,6 +36,7 @@ internal sealed class DisplaySettingsForm : Form
 
     private readonly CancellationTokenSource _closing = new();
     private ReceiverServer? _receiver;
+    private NearbyComputerDiscovery? _discovery;
     private PhysicalInputMonitor? _nativeInput;
     private HostSession? _host;
     private SourceCapture? _capture;
@@ -211,9 +212,20 @@ internal sealed class DisplaySettingsForm : Form
         {
             _nativeInput = new PhysicalInputMonitor(this);
             _nativeInput.Start();
-            _receiver = new ReceiverServer(Status, _nativeInput.Priority);
+            _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync);
             _receiver.Start();
-            Status("Ready. On another computer, copy its pairing code, then select Add a computer here.");
+            try
+            {
+                _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint);
+                _discovery.Start();
+                Status("Ready. Nearby PCs can find this computer. Select Add a computer to connect.");
+            }
+            catch (Exception ex)
+            {
+                _discovery?.Dispose();
+                _discovery = null;
+                Status("Ready to pair by code. LAN device discovery unavailable: " + ex.Message);
+            }
         }
         catch (Exception ex)
         {
@@ -224,11 +236,44 @@ internal sealed class DisplaySettingsForm : Form
 
     private void StopListening()
     {
+        _discovery?.Dispose();
+        _discovery = null;
         _receiver?.Dispose();
         _receiver = null;
         _nativeInput?.Dispose();
         _nativeInput = null;
         UpdateButtons();
+    }
+
+    private async Task<bool> ConfirmPeerAsync(string peer, CancellationToken cancellation)
+    {
+        if (IsDisposed || !IsHandleCreated || cancellation.IsCancellationRequested)
+            return false;
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = cancellation.Register(() => completion.TrySetResult(false));
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (IsDisposed || cancellation.IsCancellationRequested)
+                {
+                    completion.TrySetResult(false);
+                    return;
+                }
+                var safePeer = peer.Replace("\r", " ").Replace("\n", " ");
+                var result = MessageBox.Show(this,
+                    $"Allow {safePeer} to share its keyboard and mouse with this computer?\n\n" +
+                    "Your own keyboard, mouse and touchpad always have priority. " +
+                    "You can disconnect at any time.",
+                    "DeskTouch - Allow connection?",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2);
+                completion.TrySetResult(result == DialogResult.Yes);
+            });
+        }
+        catch (InvalidOperationException) { completion.TrySetResult(false); }
+        return await completion.Task;
     }
 
     private void CopyPairingCode()
@@ -260,23 +305,27 @@ internal sealed class DisplaySettingsForm : Form
         _connecting = true;
         StopListening();
         UpdateButtons();
-        Status("Pairing with the selected Windows computer over the local network...");
+        Status("Connecting securely. The other computer may ask its user to approve...");
         try
         {
-            var candidate = await HostSession.ConnectAsync(dialog.Address, dialog.Fingerprint,
-                dialog.Secret, reason =>
-                {
-                    Status(reason);
-                    try { if (IsHandleCreated && !IsDisposed) BeginInvoke(DisconnectAndListen); }
-                    catch (InvalidOperationException) { }
-                }, _closing.Token);
+            void OnFailure(string reason)
+            {
+                Status(reason);
+                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(DisconnectAndListen); }
+                catch (InvalidOperationException) { }
+            }
+            var candidate = dialog.UseRemoteApproval
+                ? await HostSession.ConnectWithApprovalAsync(dialog.Address,
+                    dialog.Fingerprint, OnFailure, _closing.Token)
+                : await HostSession.ConnectAsync(dialog.Address, dialog.Fingerprint,
+                    dialog.Secret, OnFailure, _closing.Token);
             if (IsDisposed || _closing.IsCancellationRequested)
             {
                 candidate.Dispose();
                 return;
             }
             _host = candidate;
-            _remoteAddress = dialog.Address;
+            _remoteAddress = dialog.ComputerName;
             _capture = new SourceCapture(this, _host, Status, _preferredEdge);
             _host.RemoteControlState += HandleRemoteState;
             RefreshDisplays();

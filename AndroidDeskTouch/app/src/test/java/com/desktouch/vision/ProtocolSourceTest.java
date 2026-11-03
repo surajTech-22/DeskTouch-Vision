@@ -60,6 +60,15 @@ public final class ProtocolSourceTest {
         assertNotEquals(pc1.groupId,pc3.groupId);
         assertNotEquals(pc1.fingerprint,pc2.fingerprint);
     }
+    @Test public void windowsToAndroidAuthorityIsExplicitlyWhitelisted() {
+        assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-claim"));
+        assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-move"));
+        assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-key"));
+        assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-release"));
+        assertFalse(DeskTouchSession.allowedWindowsControlType("auth-trusted"));
+        assertFalse(DeskTouchSession.allowedWindowsControlType("reverse-auth-request"));
+        assertFalse(DeskTouchSession.allowedWindowsControlType("claim"));
+    }
     @Test public void windowsKeyboardTypesIntoAndroidTextFields() {
         WindowsKeyText.Edit a=WindowsKeyText.apply("",0,0,65,false);
         assertEquals("a",a.text);

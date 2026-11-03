@@ -1,0 +1,47 @@
+name: Device Share Windows preview build (no release)
+
+on:
+  push:
+    branches: [feature/native-lan-kvm]
+    paths:
+      - 'DeskTouchVision/**'
+      - '.github/workflows/device-share-preview.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-kvm-preview:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Compile standalone Windows device sharing
+        shell: pwsh
+        run: |
+          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out/DeviceSharing
+          if ($LASTEXITCODE -ne 0) { throw "Device share compile failed" }
+      - name: Compile existing DeskTouch Vision shell
+        shell: pwsh
+        run: |
+          dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out
+          if ($LASTEXITCODE -ne 0) { throw "App shell compile failed" }
+      - name: Stage beta ZIP for laboratory testing only
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out/DeviceSharing | Out-Null
+          if (!(Test-Path out/DeviceSharing/DeskTouch.DeviceShare.exe)) { throw "Device share app missing" }
+          if (!(Test-Path out/DeskTouchVision.exe)) { throw "DeskTouch Vision app missing" }
+          Compress-Archive -Path out/* -DestinationPath DeskTouch-Windows-KVM-UNTESTED.zip -CompressionLevel Optimal
+          (Get-FileHash DeskTouch-Windows-KVM-UNTESTED.zip -Algorithm SHA256).Hash | Out-File -FilePath DeskTouch-Windows-KVM-UNTESTED.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouch-Windows-KVM-UNTESTED
+          path: |
+            DeskTouch-Windows-KVM-UNTESTED.zip
+            DeskTouch-Windows-KVM-UNTESTED.zip.sha256
+          if-no-files-found: error

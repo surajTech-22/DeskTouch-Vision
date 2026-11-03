@@ -63,6 +63,20 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         Fingerprint = Convert.ToHexString(SHA256.HashData(_certificate.RawData));
     }
 
+    // Discovery must not advertise a Windows PC whose TCP server is gone,
+    // already paired, or transitioning to an outgoing controller session.
+    // Being visible over UDP is never proof that port 37377 can be accepted.
+    internal bool CanAcceptNewPeer
+    {
+        get
+        {
+            if (_cancel.IsCancellationRequested || Volatile.Read(ref _active) != 0)
+                return false;
+            try { return _listener.Server.IsBound; }
+            catch (ObjectDisposedException) { return false; }
+        }
+    }
+
     internal void Start()
     {
         _listener.Start(1);

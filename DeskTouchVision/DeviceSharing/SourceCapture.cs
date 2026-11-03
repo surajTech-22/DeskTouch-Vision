@@ -54,6 +54,7 @@ internal sealed class SourceCapture : IDisposable
     {
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
+        _hasLastPhysicalPointer = false;
         _edge = side;
     }
 
@@ -67,6 +68,7 @@ internal sealed class SourceCapture : IDisposable
         _localMonitors = local;
         _remoteMonitors = remote;
         _local = local.Bounds;
+        _hasLastPhysicalPointer = false;
         var home = local.Monitors.FirstOrDefault(m => m.Primary) ?? local.Monitors[0];
         _anchorX = home.X + home.Width / 2;
         _anchorY = home.Y + home.Height / 2;
@@ -211,7 +213,7 @@ internal sealed class SourceCapture : IDisposable
         return false;
     }
 
-    private void RequestAtOuterEdge(System.Drawing.Point cursor)
+    private void RequestAtOuterEdge(System.Drawing.Point cursor, string source)
     {
         if (!IsArmed || RemoteActive || Volatile.Read(ref _pending) != 0 ||
             Environment.TickCount64 < _cooldownUntil ||
@@ -226,7 +228,10 @@ internal sealed class SourceCapture : IDisposable
                 if (IsArmed && !RemoteActive &&
                     _localMonitors.IsExternalEdge(Cursor.Position, _edge,
                         EdgeHandoffPolicy.EdgeZonePixels + 2))
+                {
+                    _status($"Outward {source} detected at {_edge.ToString().ToLowerInvariant()} external Windows screen edge.");
                     EnterRemote(cursor);
+                }
             }
             finally { Interlocked.Exchange(ref _switchPending, 0); }
         }))
@@ -278,7 +283,7 @@ internal sealed class SourceCapture : IDisposable
             // Fallback for laptop touchpads which provide ordinary mouse
             // messages but no usable Raw Input relative motion.
             if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor, _edge, dx, dy))
-                RequestAtOuterEdge(cursor);
+                RequestAtOuterEdge(cursor, "mouse-hook movement");
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
@@ -341,7 +346,7 @@ internal sealed class SourceCapture : IDisposable
                 var cursor = Cursor.Position;
                 if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
                     _edge, input.Mouse.LastX, input.Mouse.LastY))
-                    RequestAtOuterEdge(cursor);
+                    RequestAtOuterEdge(cursor, "raw-mouse movement");
             }
         }
         finally { Marshal.FreeHGlobal(memory); }

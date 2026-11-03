@@ -16,6 +16,7 @@ internal static class Win
     internal const uint MOUSEEVENTF_RIGHTDOWN = 8, MOUSEEVENTF_RIGHTUP = 16;
     internal const uint MOUSEEVENTF_MIDDLEDOWN = 32, MOUSEEVENTF_MIDDLEUP = 64;
     internal const uint MOUSEEVENTF_WHEEL = 0x0800, MOUSEEVENTF_HWHEEL = 0x1000;
+    internal const uint MOUSEEVENTF_VIRTUALDESK = 0x4000, MOUSEEVENTF_ABSOLUTE = 0x8000;
     internal const uint KEYEVENTF_EXTENDEDKEY = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_SCANCODE = 8;
     internal const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1;
 
@@ -90,12 +91,32 @@ internal sealed class InputInjector
         return Win.SendInput(1, [input], Marshal.SizeOf<Win.INPUT>()) == 1;
     }
 
+    private static bool InjectAbsolutePosition(int x, int y)
+    {
+        // SendInput marks synthetic pointer movement as injected, so local
+        // physical-activity monitoring can distinguish actual touchpad motion.
+        var v = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var point = new System.Drawing.Point(x, y);
+        if (!System.Windows.Forms.Screen.AllScreens.Any(s => s.Bounds.Contains(point)))
+            return false;
+        long dx = v.Width > 1 ? (long)(x - v.Left) * 65535L / (v.Width - 1) : 0;
+        long dy = v.Height > 1 ? (long)(y - v.Top) * 65535L / (v.Height - 1) : 0;
+        return Inject(new Win.INPUT
+        {
+            Type = Win.INPUT_MOUSE,
+            Data = new Win.INPUTUNION { Mouse = new Win.MOUSEINPUT {
+                X = (int)Math.Clamp(dx, 0, 65535),
+                Y = (int)Math.Clamp(dy, 0, 65535),
+                Flags = Win.MOUSEEVENTF_MOVE | Win.MOUSEEVENTF_ABSOLUTE | Win.MOUSEEVENTF_VIRTUALDESK } }
+        });
+    }
+
     internal bool Handle(Packet p)
     {
         switch (p.Type)
         {
             case "move":
-                return Win.SetCursorPos(p.A, p.B);
+                return InjectAbsolutePosition(p.A, p.B);
             case "key":
             {
                 if (p.A is < 0 or > 255 || p.D is < 0 or > 255) return false;

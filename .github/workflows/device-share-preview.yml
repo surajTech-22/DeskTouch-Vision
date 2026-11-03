@@ -25,7 +25,8 @@ jobs:
         run: |
           foreach ($path in @('DeskTouchVision/Install-DeskTouch.ps1',
                               'DeskTouchVision/Update-DeskTouch.ps1',
-                              'DeskTouchVision/CHECK_DESKTOUCH.ps1')) {
+                              'DeskTouchVision/CHECK_DESKTOUCH.ps1',
+                              'DeskTouchVision/CHECK_CONNECTION.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(

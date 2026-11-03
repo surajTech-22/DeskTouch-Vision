@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032, fix/windows-install-quarantine-integrity-v033]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -28,6 +28,9 @@ jobs:
                               'DeskTouchVision/CHECK_DESKTOUCH.ps1',
                               'DeskTouchVision/CHECK_CONNECTION.ps1',
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
+                              'DeskTouchVision/VERIFY_DESKTOUCH_PAYLOAD.ps1',
+                              'DeskTouchVision/CHECK_SECURITY_STATUS.ps1',
+                              'DeskTouchVision/TEST_PAYLOAD_INTEGRITY.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
                               'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
                               'DeskTouchVision/DeviceSharing/ALLOW_PRIVATE_LAN.ps1',
@@ -60,6 +63,10 @@ jobs:
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_TRAY_UPDATES.ps1'
           if ($LASTEXITCODE -ne 0) { throw "DeskTouch tray auto-update integration regression failed" }
+      - name: Test executable integrity checks including missing and modified binary
+        shell: pwsh
+        run: |
+          & 'DeskTouchVision/TEST_PAYLOAD_INTEGRITY.ps1'
       - name: Verify native-input priority state machine
         shell: pwsh
         run: |

@@ -112,6 +112,9 @@ try {
   if (-not (Test-Path (Join-Path $payload 'DeviceSharing\DeskTouch.DeviceShare.exe') -PathType Leaf)) {
     throw 'Invalid package: missing Windows sharing module'
   }
+  # The official ZIP SHA-256 protects transport; the per-file manifest also
+  # diagnoses a missing/quarantined DLL or executable after extraction.
+  & (Join-Path $payload 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $payload
 
   $parent = Get-Process -Id $CurrentPid -ErrorAction SilentlyContinue
   if ($parent -and -not $parent.WaitForExit(15000)) {
@@ -130,6 +133,9 @@ try {
   if (-not (Test-Path (Join-Path $targetFull 'DeskTouchVision.exe'))) {
     throw 'Updated application not found after install'
   }
+  # A late antivirus quarantine must not be treated as update success:
+  # restore the previous directory under the existing rollback path.
+  & (Join-Path $targetFull 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $targetFull
   $restartArgs = if ($StartInTray) { @('--tray') } else { @() }
   if ($restartArgs.Count -gt 0) {
     Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ArgumentList $restartArgs

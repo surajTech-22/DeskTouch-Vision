@@ -27,11 +27,19 @@ internal static class Program
             // Never show the old camera experiment for a damaged installation:
             // this made the user think the v0.2.0 UI was still the main app.
             MessageBox.Show(
-                "DeskTouch Windows Displays is missing from this installation.\\n\\n" +
-                "Repair using the complete latest ZIP from:\\n" +
-                "https://github.com/surajTech-22/DeskTouch-Vision/releases/latest\\n\\n" +
-                "Extract it and run INSTALL_DESKTOUCH.cmd.",
-                "DeskTouch Vision — repair installation",
+                "The Windows Displays component is missing from this installation." +
+                Environment.NewLine + Environment.NewLine +
+                "Missing: " + share + Environment.NewLine + Environment.NewLine +
+                "The download or installation may be incomplete, or antivirus may have " +
+                "quarantined the file." + Environment.NewLine +
+                "Check Windows Security > Virus & threat protection > Protection history." +
+                Environment.NewLine + Environment.NewLine +
+                "Run CHECK_SECURITY_STATUS.ps1 from the official DeskTouch ZIP to " +
+                "create a read-only report in Downloads." + Environment.NewLine +
+                "Official package: https://github.com/surajTech-22/DeskTouch-Vision/releases/latest" +
+                Environment.NewLine + Environment.NewLine +
+                "Do not disable antivirus protection or add a blanket folder exclusion.",
+                "DeskTouch Vision — Windows Displays file missing",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }

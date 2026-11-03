@@ -44,11 +44,12 @@ try {
   if (-not (Test-Path -LiteralPath (Join-Path $source 'DeviceSharing\DeskTouch.DeviceShare.exe') -PathType Leaf)) {
     throw 'Incomplete installer package: Windows Displays module not found.'
   }
+  # Verify every published executable against the release manifest before any
+  # existing installation or input-sharing process is touched.
+  & (Join-Path $source 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $source
   New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
   Copy-Item -Path (Join-Path $source '*') -Destination $stage -Recurse -Force -ErrorAction Stop
-  if (-not (Test-Path -LiteralPath (Join-Path $stage 'DeviceSharing\DeskTouch.DeviceShare.exe'))) {
-    throw 'Staged installation is missing the Windows Displays module.'
-  }
+  & (Join-Path $stage 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $stage
 
   Stop-DeskTouchGracefully $target
   if (Test-Path -LiteralPath $target) {
@@ -56,7 +57,9 @@ try {
     $movedOriginal = $true
   }
   Move-Item -LiteralPath $stage -Destination $target -ErrorAction Stop
-  $activated = $true
+  # Antivirus can quarantine a file between staging and activation; do not
+  # declare the install successful or delete the backup until this passes.
+  & (Join-Path $target 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $target
 
   $exe = Join-Path $target 'DeskTouchVision.exe'
   $shortcutPath = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'DeskTouch Vision.lnk'
@@ -66,7 +69,8 @@ try {
   $shortcut.WorkingDirectory = $target
   $shortcut.Save()
   Start-Process -FilePath $exe -ErrorAction Stop
-  Log "Installed Windows Displays application from package under $target"
+  $activated = $true
+  Log "Verified and installed Windows Displays application from package under $target"
   if ($movedOriginal) {
     Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
   }
@@ -74,7 +78,7 @@ try {
 }
 catch {
   Log "Installation FAILED: $($_.Exception.Message)"
-  if ($movedOriginal -and (Test-Path -LiteralPath $backup)) {
+  if (-not $activated -and $movedOriginal -and (Test-Path -LiteralPath $backup)) {
     try {
       if (Test-Path -LiteralPath $target) {
         Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop

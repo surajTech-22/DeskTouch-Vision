@@ -99,6 +99,63 @@ Check(EdgeHandoffPolicy.ShouldRequest(nonrectangular,
     new System.Drawing.Point(-1920, -450), MonitorEdge.Left, -3, 0),
     "Negative-coordinate multi-monitor layouts must recognize edges");
 
+// Slow physical mouse movement can end with the cursor clamped at the
+// final Windows pixel. No further WM_MOUSEMOVE is guaranteed, so a recent
+// outward approach must survive until a short UI timer tick completes it.
+var slow = new SlowEdgeApproach();
+slow.Observe(extended, new System.Drawing.Point(4464, 600),
+    MonitorEdge.Right, 1, 0, 1000);
+Check(!slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 1100), "Slow edge must not switch immediately on hover");
+Check(slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 1190), "Slow outward movement must switch when cursor is clamped");
+Check(!slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 1240), "Slow edge intent is consumed once, not a repeated hover trigger");
+slow.Observe(extended, new System.Drawing.Point(4466, 600),
+    MonitorEdge.Right, 1, 0, 2000);
+slow.Observe(extended, new System.Drawing.Point(4464, 600),
+    MonitorEdge.Right, -2, 0, 2010);
+Check(!slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 2400), "Moving back inward cancels edge handoff intent");
+slow.Observe(extended, new System.Drawing.Point(4466, 600),
+    MonitorEdge.Right, 1, 0, 3000);
+Check(!slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 4500), "Stale edge intent cannot switch after a pause");
+slow.Observe(extended, new System.Drawing.Point(1919, 600),
+    MonitorEdge.Right, 1, 0, 6000);
+Check(!slow.Ready(extended, new System.Drawing.Point(1919, 600),
+    MonitorEdge.Right, 6250), "Internal Windows extended-monitor seam must never switch");
+slow.Observe(extended, new System.Drawing.Point(3, 600),
+    MonitorEdge.Left, -1, 0, 7000);
+Check(slow.Ready(extended, new System.Drawing.Point(0, 600),
+    MonitorEdge.Left, 7230), "Slow outward left crossing must switch");
+slow.Observe(extended, new System.Drawing.Point(300, 4),
+    MonitorEdge.Top, 0, -1, 8000);
+Check(slow.Ready(extended, new System.Drawing.Point(300, 0),
+    MonitorEdge.Top, 8200), "Slow outward top crossing must switch");
+slow.Observe(extended, new System.Drawing.Point(300, 1075),
+    MonitorEdge.Bottom, 0, 1, 9000);
+Check(slow.Ready(extended, new System.Drawing.Point(300, 1079),
+    MonitorEdge.Bottom, 9200), "Slow outward bottom crossing must switch");
+slow.Reset();
+Check(!slow.Ready(extended, new System.Drawing.Point(4479, 600),
+    MonitorEdge.Right, 9300), "Resetting session removes all edge intent");
+Console.WriteLine("PASS: slow-pixel edge handoff with Windows cursor clamp, four directions, intent expiry and native seams.");
+
+Check(DisplaySettingsForm.ShouldStayInTray(
+    System.Windows.Forms.CloseReason.UserClosing, false),
+    "Clicking the user X button must stay in tray and preserve pairing");
+Check(!DisplaySettingsForm.ShouldStayInTray(
+    System.Windows.Forms.CloseReason.UserClosing, true),
+    "Explicit tray Exit must close and disconnect");
+Check(!DisplaySettingsForm.ShouldStayInTray(
+    System.Windows.Forms.CloseReason.WindowsShutDown, false),
+    "Windows shutdown must release hooks and close cleanly");
+Check(!DisplaySettingsForm.ShouldStayInTray(
+    System.Windows.Forms.CloseReason.ApplicationExitCall, false),
+    "Verified update or application exit must release sharing input hooks");
+Console.WriteLine("PASS: user Close hides to tray; intentional Exit/update shuts down.");
+
 var monitorTile = new System.Drawing.RectangleF(640, 130, 130, 85);
 var rightClamped = DisplayArrangementControl.ConstrainDrag(
     monitorTile, new System.Drawing.Size(800, 350), new System.Drawing.Point(300, 0));

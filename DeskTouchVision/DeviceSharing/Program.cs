@@ -27,6 +27,9 @@ internal sealed class ShareForm : Form
     private readonly Button _disconnect = Btn("Disconnect / return local");
     private readonly Button _arm = Btn("Arm right-edge switching");
     private readonly Button _return = Btn("Return cursor to local PC");
+    private readonly MonitorMap _localMonitorMap = new();
+    private readonly MonitorMap _remoteMonitorMap = new();
+    private readonly MonitorMap _receiverMonitorMap = new();
     private readonly CheckBox _accept = new() { Text = "I understand control leaves this computer until I return it",
         ForeColor = Color.White, AutoSize = true, Padding = new Padding(3, 6, 0, 0) };
 
@@ -49,8 +52,8 @@ internal sealed class ShareForm : Form
             Font = new Font("Segoe UI Semibold", 23), ForeColor = Color.White,
             Padding = new Padding(18, 12, 0, 0) };
         var subtitle = new Label {
-            Text = "One keyboard and mouse across TWO Windows PCs on the same LAN.\n" +
-                   "Use this preview only with computers you own or are authorized to control. No screen streaming.",
+            Text = "Native Windows Extend displays are preserved on each PC. Only external monitor edges switch computers.\n" +
+                   "Two-PC experimental LAN input sharing; no screen streaming or virtual monitor drivers.",
             Dock = DockStyle.Top, Height = 73, ForeColor = Color.FromArgb(186, 208, 229),
             Padding = new Padding(22, 1, 15, 4) };
         var columns = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
@@ -73,13 +76,20 @@ internal sealed class ShareForm : Form
         _disconnect.Click += (_, _) => DisconnectHost();
         _arm.Click += (_, _) => Arm();
         _return.Click += (_, _) => _capture?.ReturnLocal();
-        Shown += (_, _) => Status("Not connected. Start receiver on PC 2; connect from PC 1.");
+        Shown += (_, _) =>
+        {
+            RefreshMonitorMaps();
+            Status("Windows extended displays detected. Start receiver on PC 2; connect from PC 1.");
+        };
         FormClosing += (_, _) => { DisconnectHost(); StopReceiver(); };
     }
 
     private Control ReceiverColumn()
     {
         var panel = MakeColumn("PC 2 — RECEIVE input", "Run this app on the computer you want to control.");
+        panel.Controls.Add(new Label { Text = "This PC's native Windows monitor layout",
+            AutoSize = true, ForeColor = Color.White });
+        panel.Controls.Add(_receiverMonitorMap);
         Add(panel, "Receiver LAN IPv4 (copy to PC 1)", _localIPs);
         Add(panel, "Receiver certificate SHA-256 (copy to PC 1)", _fingerprint);
         Add(panel, "Secret pairing key (copy to PC 1; keep private)", _secret);
@@ -96,6 +106,12 @@ internal sealed class ShareForm : Form
     {
         var panel = MakeColumn("PC 1 — SHARE keyboard + mouse",
             "Physical keyboard and mouse stay connected to this source PC.");
+        panel.Controls.Add(new Label { Text = "Local extended displays (read directly from Windows)",
+            AutoSize = true, ForeColor = Color.White });
+        panel.Controls.Add(_localMonitorMap);
+        panel.Controls.Add(new Label { Text = "Remote extended displays (after pairing)",
+            AutoSize = true, ForeColor = Color.White });
+        panel.Controls.Add(_remoteMonitorMap);
         Add(panel, "PC 2 receiver IPv4", _remoteIp);
         Add(panel, "PC 2 fingerprint", _remoteFingerprint);
         Add(panel, "PC 2 secret pairing key", _remoteSecret);
@@ -147,6 +163,31 @@ internal sealed class ShareForm : Form
             return;
         }
         _status.Text = "STATUS — " + msg;
+    }
+
+    private void RefreshMonitorMaps()
+    {
+        try
+        {
+            var topology = MonitorTopology.Capture();
+            _localMonitorMap.Layout = topology;
+            _receiverMonitorMap.Layout = topology;
+            _remoteMonitorMap.Layout = _host?.RemoteMonitors;
+        }
+        catch (Exception ex)
+        {
+            Status("Windows display enumeration failed: " + ex.Message);
+        }
+    }
+
+    private void HandleDisplayChange()
+    {
+        // Windows may move, remove, resize, rotate or add a native monitor.
+        // Do not keep using stale geometry, or the cursor could jump off-screen.
+        DisconnectHost();
+        StopReceiver();
+        RefreshMonitorMaps();
+        Status("Windows extended-monitor layout changed. Pair again to refresh both PCs' display coordinates.");
     }
 
     private void StartReceiver()
@@ -201,6 +242,7 @@ internal sealed class ShareForm : Form
                 }, CancellationToken.None);
             if (IsDisposed) { _host.Dispose(); return; }
             _capture = new SourceCapture(this, _host, Status);
+            RefreshMonitorMaps();
             _arm.Enabled = _disconnect.Enabled = true;
             _return.Enabled = true;
             Status("Connected to PC 2. Press ARM, then cross the RIGHT edge of this PC.");
@@ -229,6 +271,7 @@ internal sealed class ShareForm : Form
         _host?.Dispose();
         _host = null;
         _connect.Enabled = _receiver == null;
+        _remoteMonitorMap.Layout = null;
         _disconnect.Enabled = _arm.Enabled = _return.Enabled = false;
         Status("Disconnected. Keyboard and mouse stay local.");
     }
@@ -236,6 +279,11 @@ internal sealed class ShareForm : Form
     protected override void WndProc(ref Message m)
     {
         if (m.Msg == Win.WM_INPUT) _capture?.OnRawInput(m.LParam);
+        if (m.Msg == 0x007E && IsHandleCreated) // WM_DISPLAYCHANGE
+        {
+            // Do not mutate connection / controls during a Windows message callback.
+            BeginInvoke(HandleDisplayChange);
+        }
         base.WndProc(ref m);
     }
 }

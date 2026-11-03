@@ -79,9 +79,11 @@ public final class MainActivity extends Activity {
         addButton(page,"Return control to this device",()->session.releaseControl());
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
         addButton(page,"Disconnect selected device",()->{
-            AutoConnectService.setReconnect(this,false);
+            AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
             session.releaseControl();
             session.disconnect();
+            status.setText("Selected device disconnected. Other peers stay connected; "+
+                "auto reconnect paused only for this device.");
         });
         android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
         autoStart.setText("Launch on Android startup and reconnect trusted devices");
@@ -227,6 +229,7 @@ public final class MainActivity extends Activity {
                                 android.graphics.Point size=new android.graphics.Point();
                                 getWindowManager().getDefaultDisplay().getRealSize(size);
                                 AutoConnectService.setReconnect(this,true);
+                                AutoConnectService.resumePeer(this,d.fingerprint);
                                 session=DeskTouchRuntime.select(this,d.fingerprint);
                                 session.connect(d,size.x,size.y);
                                 connectionSummary.setText("Connecting to "+d.name+" • "+

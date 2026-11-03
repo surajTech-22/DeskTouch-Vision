@@ -28,7 +28,32 @@ internal static class UpdateClient
     private static readonly SemaphoreSlim UpdateGate = new(1, 1);
     private static int _started;
 
-    private enum CheckResult { UpToDate, NoReleases, InstallationStarted }
+    private enum CheckResult { UpToDate, NoReleases, InstallationStarted, InstallationBusy }
+
+    // Probed synchronously. Mutex ownership is thread-affine: NEVER await
+    // between WaitOne and ReleaseMutex; that would strand the lock and cause
+    // subsequent DeskTouch upgrades to be rejected as duplicates.
+    private static bool IsInstallationRunning()
+    {
+        using var gate = new Mutex(false, @"Local\DeskTouchVision.Installer");
+        bool acquired = false;
+        try
+        {
+            acquired = gate.WaitOne(0);
+            return !acquired;
+        }
+        catch (AbandonedMutexException)
+        {
+            // Windows automatically releases mutexes when the owner dies.
+            // This attempt now owns the abandoned mutex; unlock it below.
+            acquired = true;
+            return false;
+        }
+        finally
+        {
+            if (acquired) gate.ReleaseMutex();
+        }
+    }
 
     private static HttpClient MakeHttp(bool stream)
     {
@@ -138,6 +163,8 @@ internal static class UpdateClient
             {
                 CheckResult.NoReleases =>
                     "No published releases were returned by the official DeskTouch repository.",
+                CheckResult.InstallationBusy =>
+                    "Another verified DeskTouch installer is active. This check did not download another copy or close your Displays window. Check the updater log if the installer remains busy.",
                 _ => $"This installation is already current (v{CurrentVersion.ToString(3)})."
             };
             SetStatus(window, "Displays");
@@ -177,6 +204,11 @@ internal static class UpdateClient
             if (!Version.TryParse(tag?.TrimStart('v', 'V'), out var latest))
                 throw new InvalidDataException("GitHub returned an invalid DeskTouch release version.");
             if (latest <= CurrentVersion) return CheckResult.UpToDate;
+            if (IsInstallationRunning())
+            {
+                Log($"Installer lock already owned; skipping redundant download for v{latest.ToString(3)}.");
+                return CheckResult.InstallationBusy;
+            }
 
             string? archiveUrl = null, checksumUrl = null;
             foreach (var item in root.GetProperty("assets").EnumerateArray())
@@ -266,6 +298,12 @@ internal static class UpdateClient
                     "-CurrentPid", Environment.ProcessId.ToString(),
                     "-ExpectedHash", expectedHash })
                     process.ArgumentList.Add(arg);
+                if (IsInstallationRunning())
+                {
+                    Log($"Another installer acquired the lock while v{latest.ToString(3)} was downloading; no second host launched.");
+                    try { Directory.Delete(downloadFolder, true); } catch { }
+                    return CheckResult.InstallationBusy;
+                }
                 if (Process.Start(process) == null)
                     throw new InvalidOperationException("Unable to start the independent update installer.");
                 Log("Checksum verified; detached TEMP updater launched outside installed directory. Closing old DeskTouch window.");

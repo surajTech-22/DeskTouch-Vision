@@ -25,15 +25,12 @@ RequireText 'UpdateClient.cs' 'sharingHost.CloseForVerifiedUpdate()'
 RequireText 'UpdateClient.cs' 'process.ArgumentList.Add("-StartInTray")'
 RequireText 'Update-DeskTouch.ps1' '[switch]$StartInTray'
 RequireText 'Update-DeskTouch.ps1' "@('--tray')"
-# Derive the expected recovery version from the current project so the
-# check remains valid for future coordinated Windows updates.
+# Derive expected recovery version from the current project rather than a
+# hard-coded old version. No network or installer execution is performed.
 $csproj = Get-Content -LiteralPath (Join-Path $root 'DeskTouchVision.csproj') -Raw
 $publishedVersion = [regex]::Match($csproj,
   '<Version>([0-9]+\.[0-9]+\.[0-9]+)-preview</Version>').Groups[1].Value
 if (-not $publishedVersion) { throw 'DeskTouch project version not found.' }
-RequireText 'RECOVER_DESKTOUCH.ps1' ('
-Write-Host 'PASS: both Windows executables share the release-event auto-updater.'
-Write-Host 'PASS: X-to-tray retains window; verified update closes it and restarts quietly in tray.'
- + "release = 'v" + $publishedVersion + "'")
+RequireText 'RECOVER_DESKTOUCH.ps1' ('$' + "release = 'v" + $publishedVersion + "'")
 Write-Host 'PASS: both Windows executables share the release-event auto-updater.'
 Write-Host 'PASS: X-to-tray retains window; verified update closes it and restarts quietly in tray.'

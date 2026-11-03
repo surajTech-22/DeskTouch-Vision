@@ -55,8 +55,26 @@ internal sealed class DisplayArrangementControl : Control
             y + (r.Top - source.Top) * scale,
             r.Width * scale, r.Height * scale);
 
-    private static RectangleF Shifted(Rectangle r, int tx, int ty, Rectangle source, float scale, float x, float y)
-        => Fit(new Rectangle(r.Left + tx, r.Top + ty, r.Width, r.Height), source, scale, x, y);
+    internal static Point ConstrainDrag(RectangleF remoteTile, Size viewport, Point delta)
+    {
+        // Dragging a connected PC beyond the window used to make the entire
+        // tile disappear until mouse release. Retain it on-screen throughout.
+        const int margin = 8;
+        int left = (int)Math.Ceiling(margin - remoteTile.Left);
+        int right = (int)Math.Floor(viewport.Width - margin - remoteTile.Right);
+        int top = (int)Math.Ceiling(margin - remoteTile.Top);
+        int bottom = (int)Math.Floor(viewport.Height - margin - remoteTile.Bottom);
+        return new Point(
+            left <= right ? Math.Clamp(delta.X, left, right) : 0,
+            top <= bottom ? Math.Clamp(delta.Y, top, bottom) : 0);
+    }
+
+    private Point ClampedDragPoint(Point attempted)
+    {
+        var delta = ConstrainDrag(_remoteBaseHit, ClientSize,
+            new Point(attempted.X - _dragOrigin.X, attempted.Y - _dragOrigin.Y));
+        return new Point(_dragOrigin.X + delta.X, _dragOrigin.Y + delta.Y);
+    }
 
     private static Rectangle Placement(Rectangle local, Rectangle remote, MonitorEdge edge)
     {
@@ -197,7 +215,12 @@ internal sealed class DisplayArrangementControl : Control
             Color.FromArgb(170, 190, 205), primary ? 2.2f : 1.2f);
         g.FillPath(fill, path);
         g.DrawPath(outline, path);
-        DrawCenter(g, number, rect, Brushes.White, Math.Clamp(rect.Height / 2.5f, 11, 28));
+        // Scale the label to BOTH dimensions and skip it for small screens.
+        // Otherwise a large numeric label looked like a collapsing tile at
+        // high display resolutions or when the window was resized.
+        if (rect.Width >= 30 && rect.Height >= 24)
+            DrawCenter(g, number, rect, Brushes.White,
+                Math.Clamp(Math.Min(rect.Height / 2.5f, rect.Width / 3f), 9, 28));
     }
 
     private static GraphicsPath Rounded(RectangleF rect, float radius)
@@ -242,7 +265,7 @@ internal sealed class DisplayArrangementControl : Control
         base.OnMouseMove(e);
         if (_draggingRemote)
         {
-            _dragCurrent = e.Location;
+            _dragCurrent = ClampedDragPoint(e.Location);
             Invalidate();
         }
         else Cursor = _remote != null && _remoteHit.Contains(e.Location)
@@ -255,7 +278,7 @@ internal sealed class DisplayArrangementControl : Control
     {
         base.OnMouseUp(e);
         if (!_draggingRemote) return;
-        _dragCurrent = e.Location;
+        _dragCurrent = ClampedDragPoint(e.Location);
         _draggingRemote = false;
         Capture = false;
         Cursor = Cursors.Default;
@@ -279,6 +302,29 @@ internal sealed class DisplayArrangementControl : Control
             RemoteEdge = next;
             RemoteEdgeChanged?.Invoke(next);
         }
+        Invalidate();
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        base.OnMouseCaptureChanged(e);
+        if (_draggingRemote && !Capture)
+        {
+            _draggingRemote = false;
+            Cursor = Cursors.Default;
+            Invalidate();
+        }
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        if (_draggingRemote)
+        {
+            _draggingRemote = false;
+            Capture = false;
+            Cursor = Cursors.Default;
+        }
+        base.OnResize(e);
         Invalidate();
     }
 }

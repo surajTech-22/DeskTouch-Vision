@@ -75,10 +75,18 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
         new LocalInputPriority(), (_, _) => Task.FromResult(true));
     receiver.Start();
     using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-    using var session = await HostSession.ConnectWithApprovalAsync(
-        "127.0.0.1", receiver.Fingerprint, message => status.Enqueue(message),
-        testTimeout.Token);
-    Check(session.RemoteMonitors.Monitors.Count >= 1,
-        "Authenticated TLS receiver must return at least one Windows display");
+    try
+    {
+        using var session = await HostSession.ConnectWithApprovalAsync(
+            "127.0.0.1", receiver.Fingerprint, message => status.Enqueue(message),
+            testTimeout.Token);
+        Check(session.RemoteMonitors.Monitors.Count >= 1,
+            "Authenticated TLS receiver must return at least one Windows display");
+    }
+    catch
+    {
+        Console.Error.WriteLine("RECEIVER STATUS: " + string.Join(" | ", status));
+        throw;
+    }
     Console.WriteLine("PASS: Windows loopback TLS pairing, explicit receiver approval and monitor exchange.");
 }

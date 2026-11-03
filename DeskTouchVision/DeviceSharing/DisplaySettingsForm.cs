@@ -23,7 +23,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _disconnect = Button("Disconnect");
     private readonly Button _trustDevice = Button("Trust device");
     private readonly Button _manageTrusted = Button("Trusted devices");
-    private readonly Button _autoConnectToggle = Button("Auto-connect: On");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
     private readonly LinkLabel _checkUpdates = new()
     {
@@ -160,7 +159,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _disconnect.Click += (_, _) => DisconnectByUser();
         _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
-        _autoConnectToggle.Click += (_, _) => ToggleAutoConnect();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
@@ -327,9 +325,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             !string.IsNullOrEmpty(_currentFingerprint) &&
             !_trusted.IsTrustedReceiver(_currentFingerprint);
         _manageTrusted.Enabled = _trusted != null;
-        _autoConnectToggle.Enabled = _trusted != null;
-        _autoConnectToggle.Text = _trusted?.AutoConnectEnabled == true
-            ? "Auto-connect: On" : "Auto-connect: Off";
         _add.Enabled = _host == null && _incomingPeer == null && !_connecting;
         _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
             !_connecting && _host == null;
@@ -666,21 +661,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         catch (Exception ex) { Status("Could not save trusted device: " + ex.Message); }
         finally { UpdateButtons(); }
-    }
-
-    private void ToggleAutoConnect()
-    {
-        if (_trusted == null) return;
-        try
-        {
-            _trusted.AutoConnectEnabled = !_trusted.AutoConnectEnabled;
-            _retryTrustedAfter = DateTime.MinValue;
-            UpdateButtons();
-            Status(_trusted.AutoConnectEnabled
-                ? "Automatic trusted-device reconnection enabled."
-                : "Automatic trusted-device reconnection paused. Manual pairing remains available.");
-        }
-        catch (Exception ex) { Status("Could not change auto-connect: " + ex.Message); }
     }
 
     private void ManageTrustedDevices()

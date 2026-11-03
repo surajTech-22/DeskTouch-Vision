@@ -36,4 +36,28 @@ public final class ProtocolSourceTest {
         assertTrue(AndroidUpdater.compareVersions("0.4.0","0.3.99")>0);
         assertTrue(AndroidUpdater.compareVersions("0.3.5","0.3.6")<0);
     }
+    @Test public void ownAndroidBeaconIsNotAnotherDevice(){
+        DesktopDiscovery.Device self=DesktopDiscovery.parse(
+            "DT1-MOBILE|My Phone|"+"F".repeat(64),"192.168.1.2");
+        DesktopDiscovery.Device other=DesktopDiscovery.parse(
+            "DT1-MOBILE|Other Phone|"+"E".repeat(64),"192.168.1.3");
+        assertFalse(DesktopDiscovery.isRemoteDevice(self,"F".repeat(64)));
+        assertTrue(DesktopDiscovery.isRemoteDevice(other,"F".repeat(64)));
+    }
+    @Test public void connectedWindowsPcGroupRetainsSeparateFingerprints(){
+        DesktopDiscovery.Device pc1=DesktopDiscovery.parse(
+            "DT1-READY|PC 1|"+"A".repeat(64),"192.168.1.11");
+        DesktopDiscovery.Device pc2=DesktopDiscovery.parse(
+            "DT1-READY|PC 2|"+"B".repeat(64),"192.168.1.12");
+        DesktopDiscovery.Device pc3=DesktopDiscovery.parse(
+            "DT1-READY|PC 3|"+"C".repeat(64),"192.168.1.13");
+        assertNotNull(pc1);assertNotNull(pc2);assertNotNull(pc3);
+        DesktopDiscovery.applyConnectedGroups(
+            java.util.Arrays.asList(pc1,pc2,pc3),
+            java.util.Collections.singletonList(
+                new String[]{"A".repeat(64),"B".repeat(64)}));
+        assertEquals(pc1.groupId,pc2.groupId);
+        assertNotEquals(pc1.groupId,pc3.groupId);
+        assertNotEquals(pc1.fingerprint,pc2.fingerprint);
+    }
 }

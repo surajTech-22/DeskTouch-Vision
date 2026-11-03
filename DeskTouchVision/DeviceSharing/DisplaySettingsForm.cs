@@ -57,6 +57,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private PhysicalInputMonitor? _nativeInput;
     private HostSession? _host;
     private ConnectedPeer? _incomingPeer;
+    private readonly Dictionary<long, ConnectedPeer> _incomingPeers = new();
+    private readonly ComboBox _peerChoice = new()
+    {
+        Name = "ConnectedDevices", Width = 235, Dock = DockStyle.Right,
+        DropDownStyle = ComboBoxStyle.DropDownList,
+        Font = new Font("Segoe UI", 9)
+    };
+    private bool _updatingPeerChoice;
+    private sealed record ConnectedDeviceChoice(long Id, string Name)
+    {
+        public override string ToString() => Name;
+    }
     private SourceCapture? _capture;
     private MonitorEdge _preferredEdge = MonitorEdge.Right;
     private bool _connecting;
@@ -98,6 +110,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _manageTrusted.Margin = new Padding(5);
         header.Controls.Add(_manageTrusted);
         header.Controls.Add(_checkUpdates);
+        _peerChoice.SelectedIndexChanged += (_, _) =>
+        {
+            if (!_updatingPeerChoice && _peerChoice.SelectedItem is ConnectedDeviceChoice choice)
+                SelectIncomingDevice(choice.Id);
+        };
+        header.Controls.Add(_peerChoice);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
@@ -359,16 +377,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             !_trusted.IsTrustedReceiver(_currentFingerprint);
         _manageTrusted.Enabled = _trusted != null;
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
-        _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
-            !_connecting && _host == null;
-        _disconnect.Enabled = _host != null || _incomingPeer != null || _connecting;
+        _copyCode.Enabled = _receiver != null && !_connecting;
+        _disconnect.Enabled = _host != null || _incomingPeers.Count > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
         if (_host != null)
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
                             $"Connected computer  ·  {_host.RemoteMonitors.Monitors.Count} display(s)";
         else if (_incomingPeer != null)
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
-                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  Two-way sharing";
+                             $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)" +
+                             $"  ·  {_incomingPeers.Count} connected device(s)";
         else
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -459,7 +477,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.Dispose();
         }
         _receiver = null;
+        _incomingPeers.Clear();
         _incomingPeer = null;
+        UpdateConnectedDevices();
         _nativeInput?.Dispose();
         _nativeInput = null;
         UpdateButtons();
@@ -474,6 +494,56 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _ => MonitorEdge.Right
     };
 
+    private void UpdateConnectedDevices()
+    {
+        if (IsDisposed) return;
+        long current = _incomingPeer?.SessionId ?? 0;
+        _updatingPeerChoice = true;
+        try
+        {
+            _peerChoice.Items.Clear();
+            foreach (var peer in _incomingPeers.Values.OrderBy(x => x.Name,
+                StringComparer.OrdinalIgnoreCase))
+                _peerChoice.Items.Add(new ConnectedDeviceChoice(peer.SessionId, peer.Name));
+            for (int i = 0; i < _peerChoice.Items.Count; i++)
+                if (_peerChoice.Items[i] is ConnectedDeviceChoice choice &&
+                    choice.Id == current) _peerChoice.SelectedIndex = i;
+            _peerChoice.Visible = _incomingPeers.Count > 0;
+        }
+        finally { _updatingPeerChoice = false; }
+        UpdateButtons();
+    }
+
+    private void SelectIncomingDevice(long id)
+    {
+        if (_receiver == null || !_incomingPeers.TryGetValue(id, out var peer)) return;
+        if (_incomingPeer?.SessionId != id)
+        {
+            if (_host == null) { _capture?.Dispose(); _capture = null; }
+            if (!_receiver.SelectPeer(id)) return;
+        }
+        _incomingPeer = peer;
+        if (_host == null)
+        {
+            try
+            {
+                _capture ??= new SourceCapture(this, _receiver, Status,
+                    _preferredEdge, preserveRawInput: true);
+                _capture.UpdateLayouts(MonitorTopology.Capture(), peer.Monitors);
+                if (!_capture.IsArmed) _capture.Arm();
+            }
+            catch (Exception ex)
+            {
+                _capture?.Dispose();
+                _capture = null;
+                Status("Cannot activate selected device: " + ex.Message);
+            }
+        }
+        UpdateConnectedDevices();
+        RefreshDisplays();
+        Status($"Selected {peer.Name}; {_incomingPeers.Count} incoming devices remain connected.");
+    }
+
     private void OnIncomingPeerConnected(ConnectedPeer peer)
     {
         PostToUi(() =>
@@ -483,56 +553,44 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 _nativeInput?.Start();
                 if (_nativeInput?.IsRunning != true)
-                    throw new InvalidOperationException("Native input safety monitor could not start.");
+                    throw new InvalidOperationException("Native physical input safety monitor unavailable.");
             }
             catch (Exception ex)
             {
-                // Never allow remote SendInput injection if the native local
-                // priority monitor cannot be established. Disconnect the peer.
-                Status("Safe input monitoring unavailable; pairing disconnected: " + ex.Message);
-                _receiver.DisconnectPeer();
+                Status("Safe input monitoring unavailable; connection rejected: " + ex.Message);
+                _receiver.DisconnectPeer(peer.SessionId);
                 return;
             }
-            _incomingPeer = peer;
-            RefreshDisplays();
-            if (_receiver != null && _capture == null)
+            _incomingPeers[peer.SessionId] = peer;
+            if (_incomingPeer == null)
+                SelectIncomingDevice(peer.SessionId);
+            else
             {
-                try
-                {
-                    // The receiver MUST also be able to become the source
-                    // without opening a second TLS socket or re-pairing.
-                    _capture = new SourceCapture(this, _receiver, Status,
-                        _preferredEdge, preserveRawInput: true);
-                    _capture.Arm();
-                    Status($"Two-way authority ready with {peer.Name}. Both PCs can initiate an edge handoff.");
-                }
-                catch (Exception ex)
-                {
-                    _capture?.Dispose();
-                    _capture = null;
-                    Status("Reverse keyboard/mouse capture unavailable: " + ex.Message);
-                }
+                UpdateConnectedDevices();
+                RefreshDisplays();
+                Status($"{peer.Name} connected; {_incomingPeers.Count} devices now online.");
             }
         });
     }
 
-    private void OnIncomingPeerDisconnected()
+    private void OnIncomingPeerDisconnected(long id)
     {
         PostToUi(() =>
         {
-            // Active reverse authority must stop immediately on network loss;
-            // never leave hooks swallowing physical keyboard/mouse input.
-            if (_host == null)
+            bool selected = _incomingPeer?.SessionId == id;
+            _incomingPeers.Remove(id);
+            if (selected)
             {
-                _capture?.Dispose();
-                _capture = null;
-                // Remove system-wide hooks again on disconnect, but keep the
-                // same priority instance for the next authenticated peer.
-                _nativeInput?.Dispose();
+                if (_host == null) { _capture?.Dispose(); _capture = null; }
+                _incomingPeer = null;
+                var next = _incomingPeers.Values.OrderBy(p => p.SessionId).FirstOrDefault();
+                if (next != null) SelectIncomingDevice(next.SessionId);
             }
-            _incomingPeer = null;
+            if (_incomingPeers.Count == 0 && _host == null)
+                _nativeInput?.Dispose();
+            UpdateConnectedDevices();
             RefreshDisplays();
-            Status("Peer disconnected. Input hooks released; discovery remains available.");
+            Status($"{_incomingPeers.Count} incoming device(s) remain connected.");
         });
     }
 
@@ -540,10 +598,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
-            _incomingPeer = peer;
-            _capture?.UpdateLayouts(MonitorTopology.Capture(), peer.Monitors);
+            _incomingPeers[peer.SessionId] = peer;
+            if (_incomingPeer?.SessionId == peer.SessionId)
+            {
+                _incomingPeer = peer;
+                if (_host == null)
+                    _capture?.UpdateLayouts(MonitorTopology.Capture(), peer.Monitors);
+            }
+            UpdateConnectedDevices();
             RefreshDisplays();
-            Status($"Two-way Windows monitor layout synchronized with {peer.Name}; pairing retained.");
         });
     }
 

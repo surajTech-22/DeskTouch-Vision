@@ -128,6 +128,7 @@ final class DesktopDiscovery {
                 verifiedLinks.add(new String[]{edge[0],edge[1]});
         applyConnectedGroups(found,verifiedLinks);
         found.sort(Comparator.comparing((Device d)->d.android)
+            .thenComparing(d->d.groupId,String.CASE_INSENSITIVE_ORDER)
             .thenComparing(d->d.name,String.CASE_INSENSITIVE_ORDER));
         return found;
     }

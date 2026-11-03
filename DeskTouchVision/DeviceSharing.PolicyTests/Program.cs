@@ -641,6 +641,86 @@ finally
     try{Directory.Delete(multipointRoot,true);}catch{}
 }
 
+// Shared environment: THREE clients join ONE TLS hub. The controller
+// selects another authenticated member by hub-issued connection ID without
+// pairing to that target. Two competing sources never control one destination.
+{
+    long clock=12000;
+    using var environment=new ReceiverServer(_=>{},
+        new LocalInputPriority(()=>Interlocked.Read(ref clock)),
+        (_,__)=>Task.FromResult(true));
+    environment.AllowForwardClaim=()=>false; // never inject into CI runner
+    environment.Start();
+    using var deadline=new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    using var phone=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    using var desktop=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    using var otherPhone=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    for(int i=0;i<80 && phone.EnvironmentMembers.Count<4;i++)
+        await Task.Delay(75,deadline.Token);
+    Check(phone.EnvironmentMembers.Count==4 &&
+        phone.EnvironmentMembers.Single(m=>m.Id==0).Platform=="Windows",
+        "One hub must advertise itself and ALL three simultaneous members");
+    var routed=phone.EnvironmentMembers
+        .Where(m=>m.Id>0).OrderBy(m=>m.Id).Skip(1).First();
+    Check(phone.SelectEnvironmentTarget(routed.Id),
+        "Android-style controller must route across the original hub connection");
+    Check(phone.SelectedEnvironmentTargetId==routed.Id,
+        "Selected input target must be an environment member, not another socket");
+    var destinationPriority=new LocalInputPriority(
+        ()=>Interlocked.Read(ref clock));
+    desktop.AttachReverseInput(destinationPriority,()=>true);
+    Interlocked.Add(ref clock,3000);
+    var granted=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var competitorBusy=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var competitorGrant=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var revoked=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    phone.AuthorityControlPacket += p=>{
+        if(p.Type=="granted"&&p.A==501)granted.TrySetResult(p.A);
+    };
+    otherPhone.AuthorityControlPacket += p=>{
+        if(p.Type=="busy"&&p.A==502)competitorBusy.TrySetResult(p.A);
+        if(p.Type=="granted"&&p.A==503)competitorGrant.TrySetResult(p.A);
+        if(p.Type=="local-active"&&p.A==503)revoked.TrySetResult(p.A);
+    };
+    Check(phone.TrySend(new Packet("claim",501)),"Controller claim must queue");
+    Check(await granted.Task.WaitAsync(deadline.Token)==501,
+        "Destination's actual reverse grant must be relayed back to source");
+    Check(destinationPriority.RemoteGranted,
+        "Destination rather than hub must hold the remote input lease");
+    Check(otherPhone.SelectEnvironmentTarget(routed.Id),
+        "Second source must view same environment member without pairing to it");
+    Check(otherPhone.TrySend(new Packet("claim",502)),
+        "Competing controller claim should reach environment hub");
+    Check(await competitorBusy.Task.WaitAsync(deadline.Token)==502,
+        "Two peers cannot own keyboard/mouse authority on the same destination");
+    Check(phone.TrySend(new Packet("release",501)),
+        "Original controller must release routed lease");
+    for(int i=0;i<60&&destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(!destinationPriority.RemoteGranted,
+        "Releasing source must free the destination's actual input authority");
+    Check(otherPhone.TrySend(new Packet("claim",503)),
+        "Second source may request control once first source releases it");
+    Check(await competitorGrant.Task.WaitAsync(deadline.Token)==503,
+        "New source must receive fresh destination grant");
+    destinationPriority.RecordPhysicalActivity();
+    Check(await revoked.Task.WaitAsync(deadline.Token)==503,
+        "Physical activity at destination must revoke the routed source lease");
+    Check(phone.SelectEnvironmentTarget(0) &&
+        phone.SelectedEnvironmentTargetId==0,
+        "Returning to environment hub cannot disconnect other connected members");
+    Check(environment.ConnectedPeerCount==3,
+        "All devices must remain in one environment while authority changes");
+    Console.WriteLine("PASS: one authenticated hub, three simultaneous members, multi-hop routed authority, exclusion and native-priority revoke.");
+}
+
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never
 // displays a window or starts the LAN receiver, and it can run on GitHub's
 // Windows test runner without touching real monitor/input settings.

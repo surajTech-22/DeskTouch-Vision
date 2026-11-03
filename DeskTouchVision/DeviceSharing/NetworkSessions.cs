@@ -12,10 +12,10 @@ namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     bool SupportsReverseInput = true, string? DeviceFingerprint = null,
-    string Platform = "Windows");
+    string Platform = "Windows", bool SupportsForwardInput = true);
 internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
-    string? Platform = null);
+    string? Platform = null, bool? ForwardInputSupported = null);
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -75,7 +75,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
     internal static bool AllowsForwardInput(ConnectedPeer peer) =>
-        peer.Platform != "Android";
+        peer.Platform != "Android" || peer.SupportsForwardInput;
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
@@ -319,7 +319,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         string platform = string.Equals(hello.Platform, "Android",
             StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true, hint, platform);
+            hello.ReverseInputSupported ?? true, hint, platform,
+            platform != "Android" || hello.ForwardInputSupported == true);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -491,7 +492,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 bool applied=false;
                 bool injectionAttempted=false;
                 if(lease>0 && _priority.CanApplyRemote &&
-                   p.Type is ("move" or "button" or "key" or "wheel"))
+                   p.Type is ("move" or "button" or "key" or "wheel" or "text"))
                 {
                     lock(session.InputLock)
                     {
@@ -505,7 +506,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             }
                         }
                     }
-                    if(injectionAttempted && !applied && p.Type=="key" &&
+                    if(injectionAttempted && !applied && (p.Type=="key" || p.Type=="text") &&
                        Interlocked.CompareExchange(ref session.KeyboardFailureReported,1,0)==0)
                     {
                         // Never log characters, scan codes, or personal input.

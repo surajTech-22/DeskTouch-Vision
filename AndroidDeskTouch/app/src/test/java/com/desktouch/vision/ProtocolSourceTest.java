@@ -84,4 +84,39 @@ public final class ProtocolSourceTest {
         assertEquals("\\",WindowsKeyText.printable(220,false));
         assertNull(WindowsKeyText.apply("x",1,1,112,false)); // F1 is not text
     }
+    @Test public void linkedPcsUseOneNetworkCardAndOneGateway() {
+        DesktopDiscovery.Device one=DesktopDiscovery.parse(
+            "DT1-READY|Desktop A|"+"A".repeat(64),"192.168.1.21");
+        DesktopDiscovery.Device two=DesktopDiscovery.parse(
+            "DT1-READY|Desktop B|"+"B".repeat(64),"192.168.1.22");
+        DesktopDiscovery.Device separate=DesktopDiscovery.parse(
+            "DT1-READY|Unlinked|"+"C".repeat(64),"192.168.1.23");
+        DesktopDiscovery.applyConnectedGroups(
+            java.util.Arrays.asList(one,two,separate),
+            java.util.Collections.singletonList(new String[]{"A".repeat(64),
+                "B".repeat(64)}));
+        java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups =
+            DesktopDiscovery.windowsGroups(java.util.Arrays.asList(one,two,separate));
+        assertEquals(2,groups.size());
+        java.util.List<DesktopDiscovery.Device> linked=groups.get(one.groupId);
+        assertEquals(2,linked.size());
+        DesktopDiscovery.Device existing=DesktopDiscovery.chooseGateway(linked,
+            java.util.Collections.singleton(two.fingerprint),
+            java.util.Collections.singleton(one.fingerprint));
+        assertEquals(two.fingerprint,existing.fingerprint); // no duplicate session
+        DesktopDiscovery.Device remembered=DesktopDiscovery.chooseGateway(linked,
+            java.util.Collections.emptySet(),
+            java.util.Collections.singleton(one.fingerprint));
+        assertEquals(one.fingerprint,remembered.fingerprint);
+        assertNotEquals(one.fingerprint,two.fingerprint); // separate TLS keys
+    }
+    @Test public void unavailableGatewayDoesNotBecomeTrusted() {
+        DesktopDiscovery.Device busy=DesktopDiscovery.parse(
+            "DT1-BUSY|Busy|"+"D".repeat(64),"192.168.1.4");
+        java.util.List<DesktopDiscovery.Device> members=
+            java.util.Collections.singletonList(busy);
+        assertFalse(DesktopDiscovery.chooseGateway(members,
+            java.util.Collections.emptySet(),
+            java.util.Collections.emptySet()).ready);
+    }
 }

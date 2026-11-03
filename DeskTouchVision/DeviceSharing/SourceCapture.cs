@@ -15,6 +15,7 @@ internal sealed class SourceCapture : IDisposable
     private readonly bool _preserveRawInput;
     private readonly AuthorityRequestTracker _claims = new();
     private int _activeClaim;
+    private int _awaitingAppliedClaim;
     private long _claimStarted;
     private readonly Win.HookProc _keyboardDelegate;
     private readonly Win.HookProc _mouseDelegate;
@@ -36,7 +37,8 @@ internal sealed class SourceCapture : IDisposable
     private bool _controlPressed, _altPressed, _shiftPressed;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
-    internal bool IsClaimPending => _claims.Pending != 0;
+    internal bool IsClaimPending =>
+        _claims.Pending != 0 || Volatile.Read(ref _awaitingAppliedClaim) > 0;
     internal bool IsArmed => Volatile.Read(ref _armed) != 0;
 
     internal SourceCapture(Control owner, IInputSession session, Action<string> status,
@@ -145,10 +147,13 @@ internal sealed class SourceCapture : IDisposable
     internal void ReturnLocal()
     {
         int pendingClaim = _claims.Pending;
+        int awaitingApplied = Interlocked.Exchange(ref _awaitingAppliedClaim, 0);
         _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
         if (pendingClaim > 0)
             _session.TrySend(new Packet("release", pendingClaim));
+        if (awaitingApplied > 0)
+            _session.TrySend(new Packet("release", awaitingApplied));
         if (Interlocked.Exchange(ref _active, 0) == 0) return;
         int priorLease = Interlocked.Exchange(ref _activeClaim, 0);
         if (priorLease > 0)
@@ -194,16 +199,12 @@ internal sealed class SourceCapture : IDisposable
 
     internal void GrantRemote(int request)
     {
-        // Network responses can arrive after cancellation, a native-input
-        // override, or a newer claim. Never promote one of those stale grants.
-        if (!_claims.Accept(request))
-        {
-            _session.TrySend(new Packet("release", request));
-            return;
-        }
-        if (Interlocked.Exchange(ref _pending, 0) != 1 ||
+        if (!_claims.Accept(request) ||
+            Interlocked.CompareExchange(ref _pending, 2, 1) != 1 ||
             !IsArmed || RemoteActive)
         {
+            // A late grant cannot move the pointer or capture keys. Even if
+            // destination has temporarily reserved a lease, release it.
             _session.TrySend(new Packet("release", request));
             return;
         }
@@ -211,22 +212,39 @@ internal sealed class SourceCapture : IDisposable
             _localMonitors.EdgeFraction(_pendingPoint, _edge));
         _remoteX = entry.X;
         _remoteY = entry.Y;
-        Win.SetCursorPos(_anchorX, _anchorY);
-        // Let touchpads without Raw Input fall back to the low-level mouse
-        // hook immediately; do not leave their first 650 ms unresponsive.
-        _lastRawMs = 0;
-        Volatile.Write(ref _activeClaim, request);
-        Interlocked.Exchange(ref _active, 1);
+        Volatile.Write(ref _awaitingAppliedClaim, request);
+        // Two-phase handoff: the receiving machine must actually APPLY the
+        // first cursor packet and acknowledge before the source parks its
+        // physical cursor and suppresses keyboard/mouse input.
         if (!_session.TrySend(new Packet("move", _remoteX, _remoteY)))
             ReturnLocal();
-        else _status($"Authority granted for handoff #{request}; remote keyboard/mouse now active until native override or return.");
+        else _status($"Destination granted request #{request}; waiting for cursor/authority application acknowledgement.");
+    }
+
+    internal void ConfirmRemoteAuthority(int request)
+    {
+        if (request <= 0 ||
+            Interlocked.CompareExchange(ref _awaitingAppliedClaim, 0, request) != request ||
+            Interlocked.CompareExchange(ref _pending, 0, 2) != 2 ||
+            !IsArmed || RemoteActive)
+        {
+            _session.TrySend(new Packet("release", request));
+            return;
+        }
+        Volatile.Write(ref _activeClaim, request);
+        // Native Windows cursor only moves AFTER remote input was accepted.
+        Win.SetCursorPos(_anchorX, _anchorY);
+        _lastRawMs = 0;
+        Interlocked.Exchange(ref _active, 1);
+        _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
     }
 
     internal void ReceiverNativePriority(int lease)
     {
         // Native input on the destination always wins. Ignore notifications
         // for earlier requests to avoid destroying a newer authority lease.
-        if (lease > 0 && lease != _activeClaim && lease != _claims.Pending)
+        if (lease > 0 && lease != _activeClaim &&
+            lease != _claims.Pending && lease != _awaitingAppliedClaim)
             return;
         _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
@@ -263,7 +281,7 @@ internal sealed class SourceCapture : IDisposable
     {
         // A disconnected or lagging target must not leave "pending" stuck
         // forever while no machine actually owns the handoff.
-        if (_claims.Pending != 0 &&
+        if (Volatile.Read(ref _pending) != 0 &&
             Environment.TickCount64 - _claimStarted > 3500)
         {
             ReturnLocal();

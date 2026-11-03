@@ -47,7 +47,8 @@ internal sealed class ReceiverServer : IDisposable
         // CRITICAL Windows fix: Schannel cannot use .NET's ephemeral RSA key
         // directly for SslStream server authentication ("platform does not
         // support ephemeral keys"). Reimport a password-protected PKCS#12
-        // into CURRENT USER persisted CNG storage, never machine-wide.
+        // into CURRENT USER Windows key storage, never machine-wide. The key
+        // is NOT kept permanently after the certificate is disposed.
         using var temporaryCertificate = req.CreateSelfSigned(
             DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(3));
         string pfxPassword = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
@@ -55,7 +56,7 @@ internal sealed class ReceiverServer : IDisposable
         try
         {
             _certificate = new X509Certificate2(pkcs12, pfxPassword,
-                X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet);
+                X509KeyStorageFlags.UserKeySet);
         }
         finally
         {

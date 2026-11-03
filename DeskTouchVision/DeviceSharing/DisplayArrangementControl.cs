@@ -11,6 +11,32 @@ namespace DeskTouch.DeviceShare;
 internal sealed class DisplayArrangementControl : Control
 {
     private MonitorTopology? _local, _remote;
+    private string _localDeviceName = Environment.MachineName;
+    private string _remoteDeviceName = "Connected device";
+    internal string LocalDeviceName
+    {
+        get => _localDeviceName;
+        set { _localDeviceName = CleanDeviceName(value, Environment.MachineName); Invalidate(); }
+    }
+    internal string RemoteDeviceName
+    {
+        get => _remoteDeviceName;
+        set { _remoteDeviceName = CleanDeviceName(value, "Connected device"); Invalidate(); }
+    }
+    internal static string CleanDeviceName(string? name, string fallback)
+    {
+        string clean = (name ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        return clean.Length == 0 ? fallback : clean.Length > 55 ? clean[..55] : clean;
+    }
+    internal static int DisplayNumber(MonitorRect monitor, int fallback)
+    {
+        // The Windows \\.\DISPLAYn monitor identifier is authoritative.
+        // Enumerating other PCs must not increment the local numbers.
+        var match = System.Text.RegularExpressions.Regex.Match(
+            monitor.Name, @"DISPLAY(\d+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success && int.TryParse(match.Groups[1].Value, out int number)
+            && number > 0 && number <= 99 ? number : fallback;
+    }
     private MonitorEdge _remoteEdge = MonitorEdge.Right;
     private RectangleF _remoteHit;
     private RectangleF _remoteBaseHit;
@@ -145,11 +171,12 @@ internal sealed class DisplayArrangementControl : Control
             offsetX + (l.Left - full.Left) * scale,
             offsetY + (l.Top - full.Top) * scale,
             l.Width * scale, l.Height * scale);
-        int id = 1;
+        int localOrdinal = 0;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
         {
             var tile = Fit(m.Bounds, full, scale, offsetX, offsetY);
-            DrawScreen(g, tile, id++.ToString(), m.Primary, true);
+            DrawScreen(g, tile, LocalDeviceName,
+                DisplayNumber(m, ++localOrdinal), m.Primary, true);
         }
 
         if (_remote is { } remote)
@@ -164,6 +191,7 @@ internal sealed class DisplayArrangementControl : Control
                 group.Y += _dragCurrent.Y - _dragOrigin.Y;
             }
             _remoteHit = group;
+            int remoteOrdinal = 0;
             foreach (var m in remote.Monitors.OrderBy(m => m.Primary ? 0 : 1))
             {
                 var rect = new Rectangle(
@@ -172,15 +200,11 @@ internal sealed class DisplayArrangementControl : Control
                 var tile = Fit(rect, full, scale, offsetX, offsetY);
                 if (_draggingRemote)
                     tile.Offset(_dragCurrent.X - _dragOrigin.X, _dragCurrent.Y - _dragOrigin.Y);
-                DrawScreen(g, tile, id++.ToString(), false, false);
+                DrawScreen(g, tile, RemoteDeviceName,
+                    DisplayNumber(m, ++remoteOrdinal), m.Primary, false);
             }
-            if (group.Width > 75)
-            {
-                using var font = new Font("Segoe UI", 9f, FontStyle.Regular);
-                DrawCenter(g, "Connected PC  •  drag to arrange", new RectangleF(
-                    group.Left, group.Bottom + 3, group.Width, 20),
-                    Brushes.Gainsboro, 9f);
-            }
+            // Each screen now carries the device name; no generic
+            // "Connected PC" title appears below the remote group.
         }
         else
         {
@@ -190,8 +214,7 @@ internal sealed class DisplayArrangementControl : Control
                 remotePos.Width * scale, remotePos.Height * scale);
             DrawPlaceholder(g, _placeholderHit);
         }
-        DrawCenter(g, "Windows native displays", new RectangleF(6, 5, Width - 12, 19),
-            Brushes.LightGray, 9f);
+        // Each native or Android display carries its own system label.
     }
 
     private static void DrawPlaceholder(Graphics g, RectangleF r)
@@ -205,7 +228,8 @@ internal sealed class DisplayArrangementControl : Control
         DrawCenter(g, "+  Add devices", r, Brushes.LightGray, 12);
     }
 
-    private static void DrawScreen(Graphics g, RectangleF rect, string number, bool primary, bool local)
+    private static void DrawScreen(Graphics g, RectangleF rect, string deviceName,
+        int displayNumber, bool primary, bool local)
     {
         if (rect.Width < 5 || rect.Height < 5) return;
         using var path = Rounded(rect, 9);
@@ -216,12 +240,28 @@ internal sealed class DisplayArrangementControl : Control
             Color.FromArgb(170, 190, 205), primary ? 2.2f : 1.2f);
         g.FillPath(fill, path);
         g.DrawPath(outline, path);
-        // Scale the label to BOTH dimensions and skip it for small screens.
-        // Otherwise a large numeric label looked like a collapsing tile at
-        // high display resolutions or when the window was resized.
-        if (rect.Width >= 30 && rect.Height >= 24)
-            DrawCenter(g, number, rect, Brushes.White,
-                Math.Clamp(Math.Min(rect.Height / 2.5f, rect.Width / 3f), 9, 28));
+        if (rect.Width < 38 || rect.Height < 28) return;
+        float labelHeight = Math.Min(27, Math.Max(13, rect.Height * .23f));
+        var title = new RectangleF(rect.Left + 4, rect.Top + 3,
+            Math.Max(1, rect.Width - 8), labelHeight);
+        using var nameFont = new Font("Segoe UI Semibold",
+            Math.Clamp(Math.Min(rect.Width / 12f, rect.Height / 8f), 7, 11),
+            FontStyle.Bold);
+        using var format = new StringFormat
+        {
+            Alignment = StringAlignment.Center,
+            LineAlignment = StringAlignment.Near,
+            Trimming = StringTrimming.EllipsisCharacter,
+            FormatFlags = StringFormatFlags.NoWrap
+        };
+        g.DrawString(deviceName, nameFont, Brushes.White, title, format);
+        var numberTile = new RectangleF(rect.Left + 4,
+            Math.Min(rect.Bottom - 17, rect.Top + labelHeight + 5),
+            Math.Max(1, rect.Width - 8),
+            Math.Min(15, Math.Max(1, rect.Height - labelHeight - 7)));
+        if (numberTile.Height >= 9)
+            DrawCenter(g, $"Display {displayNumber}", numberTile,
+                Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
     }
 
     private static GraphicsPath Rounded(RectangleF rect, float radius)

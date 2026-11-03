@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
@@ -9,7 +10,10 @@ internal sealed class PairComputerDialog : Form
 {
     private sealed record NearbyItem(NearbyComputer Peer)
     {
-        public override string ToString() => $"{Peer.Name}  •  {Peer.Address}";
+        public override string ToString() =>
+            $"{(Peer.IsAndroid ? "Android" : "Windows")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
+            (Peer.IsAndroid ? "Connect from phone" :
+             Peer.CanReceive ? "Ready" : "Busy");
     }
 
     private readonly ListBox _nearby = new() { Dock = DockStyle.Fill,
@@ -23,7 +27,9 @@ internal sealed class PairComputerDialog : Form
         ForeColor = Color.FromArgb(85, 89, 94), AutoEllipsis = true };
     private readonly Label _error = new() { Dock = DockStyle.Bottom, Height = 32,
         ForeColor = Color.FromArgb(165, 48, 48), Padding = new Padding(20, 5, 10, 5) };
-    private readonly Button _refresh = new() { Text = "Find nearby PCs", Dock = DockStyle.Right, Width = 137,
+    private readonly Button _refresh = new() { Text = "Scan devices", Dock = DockStyle.Right, Width = 116,
+        FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(240, 241, 243) };
+    private readonly Button _repair = new() { Text = "Fix LAN access", Dock = DockStyle.Right, Width = 125,
         FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(240, 241, 243) };
     private readonly CancellationTokenSource _cancel = new();
     private bool _searching;
@@ -36,7 +42,7 @@ internal sealed class PairComputerDialog : Form
 
     internal PairComputerDialog()
     {
-        Text = "Add a Windows computer";
+        Text = "Add devices";
         BackColor = Color.FromArgb(244, 244, 247);
         ForeColor = Color.FromArgb(26, 27, 30);
         ClientSize = new Size(640, 475);
@@ -47,11 +53,11 @@ internal sealed class PairComputerDialog : Form
         MaximizeBox = false;
 
         var title = new Label { Dock = DockStyle.Top, Height = 52,
-            Text = "Add a computer", Font = new Font("Segoe UI Semibold", 22),
+            Text = "Add devices", Font = new Font("Segoe UI Semibold", 22),
             Padding = new Padding(19, 9, 10, 0) };
         var intro = new Label { Dock = DockStyle.Top, Height = 60,
-            Text = "Choose a nearby DeskTouch computer. The person using that PC must approve the connection.\n" +
-                   "Both computers must be on the same trusted Wi-Fi or Ethernet network.",
+            Text = "Find all DeskTouch Windows PCs and Android phones on your local network.\n" +
+                   "Android phones initiate connections from their app; Windows PCs approve pairing.",
             Padding = new Padding(20, 3, 10, 6) };
 
         var fields = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1,
@@ -64,10 +70,11 @@ internal sealed class PairComputerDialog : Form
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         var nearbyHeader = new Panel { Dock = DockStyle.Fill };
         var listTitle = new Label { Dock = DockStyle.Fill,
-            Text = "Nearby Windows computers", Font = new Font("Segoe UI Semibold", 11),
+            Text = "Nearby devices", Font = new Font("Segoe UI Semibold", 11),
             TextAlign = ContentAlignment.MiddleLeft };
         nearbyHeader.Controls.Add(listTitle);
         nearbyHeader.Controls.Add(_refresh);
+        nearbyHeader.Controls.Add(_repair);
         fields.Controls.Add(nearbyHeader, 0, 0);
         fields.Controls.Add(_nearby, 0, 1);
         fields.Controls.Add(_discoveryStatus, 0, 2);
@@ -96,6 +103,7 @@ internal sealed class PairComputerDialog : Form
         connect.Click += (_, _) => AcceptSelection();
         _nearby.DoubleClick += (_, _) => AcceptSelection();
         _refresh.Click += async (_, _) => await RefreshAsync();
+        _repair.Click += (_, _) => RepairPrivateLanFirewall();
         Shown += async (_, _) => await RefreshAsync();
         FormClosing += (_, _) => _cancel.Cancel();
     }
@@ -123,12 +131,11 @@ internal sealed class PairComputerDialog : Form
                 if (_nearby.Items.Count > 0) _nearby.SelectedIndex = 0;
             }
             finally { _nearby.EndUpdate(); }
-            _discoveryStatus.Text = _nearby.Items.Count switch
-            {
-                0 => "No nearby computers found. Check Private-network firewall access or paste a code.",
-                1 => "1 computer found. Select it and choose Connect.",
-                _ => $"{_nearby.Items.Count} computers found. Select one to connect."
-            };
+            int mobileCount = _nearby.Items.Cast<NearbyItem>().Count(x => x.Peer.IsAndroid);
+            int windowsCount = _nearby.Items.Count - mobileCount;
+            _discoveryStatus.Text = _nearby.Items.Count == 0
+                ? "No devices found. Keep DeskTouch running on each PC/phone; check LAN firewall."
+                : $"{windowsCount} Windows PC(s), {mobileCount} Android phone(s). Busy PCs stay visible.";
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!IsDisposed) _discoveryStatus.Text = "Network scan unavailable: " + ex.Message; }
@@ -161,6 +168,16 @@ internal sealed class PairComputerDialog : Form
         }
         else if (_nearby.SelectedItem is NearbyItem selected)
         {
+            if (selected.Peer.IsAndroid)
+            {
+                _error.Text = "On that Android device, select this Windows PC to connect.";
+                return;
+            }
+            if (!selected.Peer.CanReceive)
+            {
+                _error.Text = "That PC is busy. Disconnect its active session first.";
+                return;
+            }
             Address = selected.Peer.Address;
             Fingerprint = selected.Peer.Fingerprint;
             ComputerName = selected.Peer.Name;
@@ -169,11 +186,43 @@ internal sealed class PairComputerDialog : Form
         }
         else
         {
-            _error.Text = "Select a discovered Windows computer, or paste a pairing code.";
+            _error.Text = "Select an available Windows PC, or paste a pairing code.";
             return;
         }
         DialogResult = DialogResult.OK;
         Close();
+    }
+
+    private void RepairPrivateLanFirewall()
+    {
+        var script = Path.Combine(AppContext.BaseDirectory, "ALLOW_PRIVATE_LAN.ps1");
+        if (!File.Exists(script))
+        {
+            _error.Text = "LAN repair script is missing; update the Windows app.";
+            return;
+        }
+        if (MessageBox.Show(this,
+            "Allow DeskTouch Vision to accept connections from this private local network?\n\n" +
+            "Windows will ask for administrator approval. Only TCP 37377 and UDP 37378 " +
+            "for the DeskTouch sharing app on Private networks are affected.",
+            "Repair private LAN access", MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        try
+        {
+            var info = new ProcessStartInfo("powershell.exe")
+            {
+                Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\"",
+                Verb = "runas",
+                UseShellExecute = true
+            };
+            Process.Start(info);
+            _error.Text = "Approve Windows UAC, then scan devices again.";
+        }
+        catch (Exception ex)
+        {
+            _error.Text = "LAN repair not approved: " + ex.Message;
+        }
     }
 
     protected override void Dispose(bool disposing)

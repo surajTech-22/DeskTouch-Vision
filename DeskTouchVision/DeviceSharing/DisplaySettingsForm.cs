@@ -797,24 +797,34 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private async Task AddComputerAsync()
     {
         if (_connecting || _closing.IsCancellationRequested) return;
+        // The Windows client joins ONE environment. Adding another machine
+        // must never silently drop the existing hub or keyboard lease.
+        if(_host != null || (_receiver?.ConnectedPeerCount ?? 0)>0)
+        {
+            var members=_host!=null ? _host.EnvironmentMembers
+                .Select(x=>x.Platform+" • "+x.Name).Distinct().ToArray()
+                : _receiver?.ConnectedPeers.Select(x=>x.Peer.Platform+" • "+x.Peer.Name)
+                    .ToArray() ?? Array.Empty<string>();
+            string known=members.Length>0 ? string.Join(Environment.NewLine,members) :
+                "Your current environment hub";
+            MessageBox.Show(this,
+                "You are already connected to a shared DeskTouch environment." +
+                Environment.NewLine+Environment.NewLine+
+                "Connected members:"+Environment.NewLine+known+
+                Environment.NewLine+Environment.NewLine+
+                "To add another PC or phone, open DeskTouch on that device and " +
+                "join this environment's Windows hub. Existing devices remain " +
+                "connected; no session needs to be replaced.",
+                "DeskTouch shared environment",MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
         using var dialog = new PairComputerDialog();
         _manualPairDialogOpen = true;
         DialogResult choice;
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
-        if (_host != null)
-        {
-            // Switching outgoing controller remains explicit. Inbound phones and
-            // PCs remain connected to the independent, persistent receiver.
-            var confirm = MessageBox.Show(this,
-                "Another device currently owns the remote input session.\n\n" +
-                "Disconnect that session and switch to " + dialog.ComputerName + "?",
-                "Switch DeskTouch device?", MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-            if (confirm != DialogResult.Yes) return;
-            DisconnectHost();
-        }
         _connecting = true;
         // Never tear down Windows's incoming TLS listener when this PC also
         // initiates an outgoing connection. Other mobiles and PCs may connect

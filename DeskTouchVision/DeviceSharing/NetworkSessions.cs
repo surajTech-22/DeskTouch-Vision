@@ -422,7 +422,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     }
 }
 
-internal sealed class HostSession : IDisposable
+internal sealed class HostSession : IInputSession, IDisposable
 {
     private readonly TcpClient _client;
     private readonly SslStream _ssl;
@@ -441,6 +441,80 @@ internal sealed class HostSession : IDisposable
     private Packet? _latestMove;
     private int _moveSignaled;
     private TaskCompletionSource<bool>? _pendingTrust;
+    private LocalInputPriority? _reversePriority;
+    private Func<bool>? _allowReverseClaim;
+    private readonly object _reverseInputGate = new();
+    private InputInjector? _reverseInjector;
+    private int _reverseLease;
+    internal event Action<Packet>? AuthorityControlPacket;
+    internal event Action<string>? AuthorityDiagnostic;
+    MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
+    bool IInputSession.TrySend(Packet packet) => TrySend(packet);
+
+    internal void AttachReverseInput(LocalInputPriority priority, Func<bool> allowClaim)
+    {
+        if (_reversePriority != null)
+            throw new InvalidOperationException("Reverse authority monitor already installed.");
+        _reversePriority = priority;
+        _allowReverseClaim = allowClaim;
+        _reverseInjector = new InputInjector();
+        priority.PhysicalOverride += OnReverseNativeActivity;
+    }
+
+    private void OnReverseNativeActivity()
+    {
+        int revoked = Interlocked.Exchange(ref _reverseLease, 0);
+        if (revoked <= 0) return;
+        // Native input immediately revokes permissions on the same thread;
+        // release injected held keys asynchronously outside the hook callback.
+        _ = Task.Run(() =>
+        {
+            lock (_reverseInputGate) _reverseInjector?.ReleaseAll();
+        });
+        TrySend(new Packet("reverse-local-active", revoked));
+        AuthorityDiagnostic?.Invoke("Local Windows keyboard/mouse reclaimed authority from remote computer.");
+    }
+
+    private void ReleaseReverseAuthority()
+    {
+        Interlocked.Exchange(ref _reverseLease, 0);
+        _reversePriority?.ReleaseRemote();
+        lock (_reverseInputGate) _reverseInjector?.ReleaseAll();
+    }
+
+    private void ProcessReverseInput(Packet packet)
+    {
+        if (!ReverseInputProtocol.TryDecode(packet, out var request)) return;
+        if (request.Type == "claim")
+        {
+            bool permitted = request.A > 0 &&
+                (_allowReverseClaim?.Invoke() ?? false) &&
+                (_reversePriority?.TryClaim() ?? false);
+            if (permitted)
+            {
+                Volatile.Write(ref _reverseLease, request.A);
+                permitted = _reversePriority?.CanApplyRemote == true;
+                if (!permitted) ReleaseReverseAuthority();
+            }
+            TrySend(new Packet(permitted ? "reverse-granted" : "reverse-busy", request.A));
+            return;
+        }
+        if (request.Type == "reset" ||
+            (request.Type == "release" && request.A > 0 &&
+                request.A == Volatile.Read(ref _reverseLease)))
+        {
+            ReleaseReverseAuthority();
+            return;
+        }
+        if (Volatile.Read(ref _reverseLease) <= 0 ||
+            _reversePriority?.CanApplyRemote != true) return;
+        lock (_reverseInputGate)
+        {
+            if (Volatile.Read(ref _reverseLease) > 0 &&
+                _reversePriority?.CanApplyRemote == true)
+                _reverseInjector?.Handle(request);
+        }
+    }
 
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
@@ -618,8 +692,13 @@ internal sealed class HostSession : IDisposable
                     RemotePlacementChanged?.Invoke(changedEdge);
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
-                else if (p.Type is "granted" or "busy" or "local-active")
+                else if (p.Type is "granted" or "busy" or "local-active" or "active")
+                {
+                    AuthorityControlPacket?.Invoke(p);
                     RemoteControlState?.Invoke(p.Type);
+                }
+                else if (ReverseInputProtocol.TryDecode(p, out _))
+                    ProcessReverseInput(p);
             }
         }
         catch (OperationCanceledException) { }
@@ -677,6 +756,9 @@ internal sealed class HostSession : IDisposable
         Interlocked.Exchange(ref _pendingTrust, null)?.TrySetResult(false);
         _cancel.Cancel();
         _queue.Writer.TryComplete();
+        if (_reversePriority != null)
+            _reversePriority.PhysicalOverride -= OnReverseNativeActivity;
+        ReleaseReverseAuthority();
         _ssl.Dispose();
         _client.Dispose();
         // Don't dispose the CancellationTokenSource while async workers may still be unwinding.

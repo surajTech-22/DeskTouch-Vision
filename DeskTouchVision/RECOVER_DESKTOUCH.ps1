@@ -5,10 +5,10 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$release = 'v0.2.4'
+$release = 'v0.2.7'
 $baseUrl = "https://github.com/surajTech-22/DeskTouch-Vision/releases/download/$release"
 $archiveName = 'DeskTouchVision-win-x64.zip'
-$expectedAppVersion = '0.2.4.0'
+$expectedAppVersion = '0.2.7.0'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -24,6 +24,8 @@ Set-Location -LiteralPath ([IO.Path]::GetFullPath($env:TEMP))
 $work = Join-Path $env:TEMP ('DeskTouchVision-Recovery-' + [guid]::NewGuid().ToString('N'))
 $mutex = [System.Threading.Mutex]::new($false, 'Local\DeskTouchVision.ManualRecovery')
 $acquired = $false
+$installGate = $null
+$hasInstallGate = $false
 try {
   try { $acquired = $mutex.WaitOne(0) }
   catch [System.Threading.AbandonedMutexException] { $acquired = $true }
@@ -67,6 +69,33 @@ try {
     throw "Unexpected package version $payloadVersion; expected $expectedAppVersion."
   }
 
+  # Older auto-update scripts can hold the install folder open by inheriting
+  # its working directory. Do not race one; let it finish first.
+  for ($iteration = 0; $iteration -lt 12; $iteration++) {
+    $updaters = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -match '(?i)Update-DeskTouch[.]ps1' })
+    if ($updaters.Count -eq 0) { break }
+    if ($iteration -eq 11) {
+      foreach ($owner in $updaters) {
+        Write-Record ("Old updater process is still active: PID={0} started={1}" -f $owner.ProcessId, $owner.CreationDate)
+      }
+      throw 'An older installer is still running. Recovery has NOT closed DeskTouch or overwritten any app files. Run CHECK_UPDATE_LOCK.ps1 and inspect its PIDs before retrying.'
+    }
+    Start-Sleep -Seconds 2
+  }
+
+  # Close no application until the earlier auto-installer host has
+  # finished and the installation mutex is free. This prevents concurrent
+  # manual recovery and stale background download from replacing each other.
+  $installGate = [System.Threading.Mutex]::new(
+    $false, 'Local\DeskTouchVision.Installer')
+  try { $hasInstallGate = $installGate.WaitOne(0) }
+  catch [System.Threading.AbandonedMutexException] { $hasInstallGate = $true }
+  if (-not $hasInstallGate) {
+    throw 'The DeskTouch automatic updater still owns the install lock. Recovery left the installed app unchanged. Run CHECK_UPDATE_LOCK.ps1 for read-only diagnostics.'
+  }
+  Write-Record 'Install lock acquired; existing package verified before app shutdown.'
+
   # Download and checksum validation have finished successfully. Only now
   # close running applications, so a failed download leaves DeskTouch running.
   # Stop only the exact DeskTouch executables in the canonical per-user path.
@@ -92,18 +121,6 @@ try {
     }
   }
 
-  # Older auto-update scripts can hold the install folder open by inheriting
-  # its working directory. Do not race one; let it finish first.
-  for ($iteration = 0; $iteration -lt 12; $iteration++) {
-    $updaters = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-      Where-Object { $_.CommandLine -match '(?i)Update-DeskTouch[.]ps1' })
-    if ($updaters.Count -eq 0) { break }
-    if ($iteration -eq 11) {
-      throw 'An older updater PowerShell process is still active. Close other DeskTouch update windows and retry; no processes were force-terminated.'
-    }
-    Start-Sleep -Seconds 2
-  }
-
   # Install-DeskTouch.ps1 already stages, safely closes only installed apps,
   # atomically swaps with rollback, and starts the Windows Displays launcher.
   Write-Record 'Installing from a detached TEMP directory with rollback support.'
@@ -124,6 +141,11 @@ catch {
   throw
 }
 finally {
+  # Release both mutexes before expensive TEMP folder removal.
+  if ($hasInstallGate) {
+    try { $installGate.ReleaseMutex() } catch { }
+  }
+  if ($installGate) { $installGate.Dispose() }
   if ($work -and (Test-Path -LiteralPath $work)) {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }

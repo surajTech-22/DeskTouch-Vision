@@ -24,6 +24,14 @@ public final class MainActivity extends Activity {
         session=DeskTouchRuntime.session(this);
         DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{if(status!=null)status.setText(message);}));
+        // Android 13+ requires permission to show the persistent connection
+        // notification in the shade. The foreground service itself is still
+        // subject to Android's background lifecycle rules.
+        if(Build.VERSION.SDK_INT>=33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                !=android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},37377);
+        }
         if(AutoConnectService.enabled(this)) {
             try {AutoConnectService.start(this);}
             catch(RuntimeException startupError) {

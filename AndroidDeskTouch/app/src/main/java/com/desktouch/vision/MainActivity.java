@@ -13,7 +13,7 @@ import java.util.List;
 public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList;
-    private DeskTouchSession session;
+    private MobileSessionHub session;
     private View pointerPad;
     private float prevX,prevY,downX,downY;
     private boolean dragged;
@@ -69,10 +69,14 @@ public final class MainActivity extends Activity {
         addButton(page,"Take control of Windows",()->session.claimControl());
         addButton(page,"Return control to this device",()->session.releaseControl());
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
-        addButton(page,"Disconnect",()->{
+        addButton(page,"Disconnect selected Windows",()->{
             AutoConnectService.setReconnect(this,false);
-            session.releaseControl();
             session.disconnect();
+        });
+        addButton(page,"Disconnect all devices",()->{
+            AutoConnectService.setReconnect(this,false);
+            session.disconnectAll();
+            status.setText("All devices disconnected; auto-connect paused.");
         });
         android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
         autoStart.setText("Launch on Android startup and reconnect trusted devices");
@@ -183,16 +187,25 @@ public final class MainActivity extends Activity {
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
-                    else status.setText("Select a ready Windows PC below. Busy peers and Android phones are shown for discovery.");
+                    else status.setText("Select any Windows PC to connect or switch control. "+
+                        session.connectedCount()+" currently connected.");
                     for(DesktopDiscovery.Device d:list){
                         addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
-                            (d.ready?" • Ready":" • "+(d.android?"Phone":"Busy")),()->{
+                            (session.isConnectedTo(d.fingerprint)?" • Connected":d.ready?" • Ready":
+                                " • "+(d.android?"Phone":"Busy")),()->{
                             if(d.android) {
                                 status.setText("Android phone discovered. Connect from that phone to this Windows PC.");
                                 return;
                             }
+                            if(session.isConnectedTo(d.fingerprint)){
+                                session.select(d.fingerprint);
+                                status.setText("Switched active target to "+d.name+"; "+
+                                    session.connectedCount()+" connections remain active.");
+                                return;
+                            }
                             if(!d.ready) {
-                                status.setText("Windows PC is busy. Disconnect its current sharing session and rescan.");
+                                status.setText("This PC runs an older single-client listener or has 8 sessions. "+
+                                    "Update Windows DeskTouch to the multi-device release.");
                                 return;
                             }
                             new AlertDialog.Builder(this).setTitle("Secure pairing")
@@ -203,7 +216,7 @@ public final class MainActivity extends Activity {
                                 android.graphics.Point size=new android.graphics.Point();
                                 getWindowManager().getDefaultDisplay().getRealSize(size);
                                 AutoConnectService.setReconnect(this,true);
-                                session.connect(d,size.x,size.y);
+                                session.selectAndConnect(d,size.x,size.y);
                             }).show();
                         });
                     }

@@ -66,3 +66,43 @@ Check(nonrectangular.MonitorAt(mapped) != null,
     "Mapped remote cursor must never land in unoccupied virtual-screen gaps");
 
 Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four outer edges, and nonrectangular monitor layouts.");
+
+
+// Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
+{
+    var status = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    using var receiver = new ReceiverServer(message => status.Enqueue(message),
+        new LocalInputPriority(), (_, _) => Task.FromResult(true));
+    receiver.Start();
+    using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    try
+    {
+        using var session = await HostSession.ConnectWithApprovalAsync(
+            "127.0.0.1", receiver.Fingerprint, message => status.Enqueue(message),
+            testTimeout.Token);
+        Check(session.RemoteMonitors.Monitors.Count >= 1,
+            "Authenticated TLS receiver must return at least one Windows display");
+    }
+    catch
+    {
+        Console.Error.WriteLine("RECEIVER STATUS: " + string.Join(" | ", status));
+        throw;
+    }
+    Console.WriteLine("PASS: Windows loopback TLS pairing, explicit receiver approval and monitor exchange.");
+    // The original v0.2.0 manual pairing flow must remain functional.
+    await Task.Delay(250);
+    try
+    {
+        using var manual = await HostSession.ConnectAsync(
+            "127.0.0.1", receiver.Fingerprint, receiver.Secret,
+            message => status.Enqueue(message), testTimeout.Token);
+        Check(manual.RemoteMonitors.Monitors.Count >= 1,
+            "Manual pairing code must authenticate and exchange monitors");
+    }
+    catch
+    {
+        Console.Error.WriteLine("MANUAL RECEIVER STATUS: " + string.Join(" | ", status));
+        throw;
+    }
+    Console.WriteLine("PASS: Windows loopback TLS manual pairing code and monitor exchange.");
+}

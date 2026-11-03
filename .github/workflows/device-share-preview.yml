@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -25,7 +25,8 @@ jobs:
         run: |
           foreach ($path in @('DeskTouchVision/Install-DeskTouch.ps1',
                               'DeskTouchVision/Update-DeskTouch.ps1',
-                              'DeskTouchVision/CHECK_DESKTOUCH.ps1')) {
+                              'DeskTouchVision/CHECK_DESKTOUCH.ps1',
+                              'DeskTouchVision/CHECK_CONNECTION.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(

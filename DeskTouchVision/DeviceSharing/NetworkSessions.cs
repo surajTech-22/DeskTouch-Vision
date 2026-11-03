@@ -37,9 +37,33 @@ internal sealed class ReceiverServer : IDisposable
         var req = new CertificateRequest("CN=DeskTouch-LAN", _key,
             HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
-        _certificate = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1),
-            DateTimeOffset.UtcNow.AddDays(3));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+        var serverUsage = new OidCollection();
+        serverUsage.Add(new Oid("1.3.6.1.5.5.7.3.1")); // TLS server authentication
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(serverUsage, false));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+
+        // CRITICAL Windows fix: Schannel cannot use .NET's ephemeral RSA key
+        // directly for SslStream server authentication ("platform does not
+        // support ephemeral keys"). Reimport a password-protected PKCS#12
+        // into CURRENT USER Windows key storage, never machine-wide. The key
+        // is NOT kept permanently after the certificate is disposed.
+        using var temporaryCertificate = req.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(3));
+        string pfxPassword = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        byte[] pkcs12 = temporaryCertificate.Export(X509ContentType.Pkcs12, pfxPassword);
+        try
+        {
+            _certificate = new X509Certificate2(pkcs12, pfxPassword,
+                X509KeyStorageFlags.UserKeySet);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(pkcs12);
+        }
+        if (!_certificate.HasPrivateKey)
+            throw new CryptographicException("TLS server certificate private key unavailable.");
         Fingerprint = Convert.ToHexString(SHA256.HashData(_certificate.RawData));
     }
 
@@ -253,11 +277,13 @@ internal sealed class HostSession : IDisposable
 
         var client = new TcpClient { NoDelay = true };
         SslStream? ssl = null;
+        string stage = "TCP connection";
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-            timeout.CancelAfter(TimeSpan.FromSeconds(12));
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
             await client.ConnectAsync(address, Wire.Port, timeout.Token);
+            stage = "TLS certificate verification";
             ssl = new SslStream(client.GetStream(), false, (_, cert, _, _) =>
             {
                 if (cert == null) return false;
@@ -271,6 +297,7 @@ internal sealed class HostSession : IDisposable
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 CertificateRevocationCheckMode = X509RevocationMode.NoCheck
             }, timeout.Token);
+            stage = "receiver approval";
             await Wire.WriteAsync(ssl, new Packet(
                 askReceiver ? "auth-request" : "auth",
                 Text: askReceiver ? Environment.MachineName : secret), timeout.Token);
@@ -281,16 +308,35 @@ internal sealed class HostSession : IDisposable
             if (ready.Type != "ready" || ready.C < 200 || ready.D < 100 ||
                 ready.C > 50000 || ready.D > 50000)
                 throw new AuthenticationException("The other computer did not approve the connection.");
+            stage = "monitor layout";
             var monitors = MonitorTopology.FromWire(ready.Text);
             if (monitors.Bounds != new System.Drawing.Rectangle(ready.A, ready.B, ready.C, ready.D))
                 throw new AuthenticationException("Receiver monitor geometry failed validation.");
             return new HostSession(client, ssl, monitors, onFailure);
         }
-        catch
+        catch (Exception ex)
         {
             ssl?.Dispose();
             client.Dispose();
-            throw;
+            string guidance = stage switch
+            {
+                "TCP connection" =>
+                    $"The computer was discovered, but the keyboard/mouse connection on TCP {Wire.Port} could not be opened. " +
+                    "On the receiving PC, allow DeskTouch.DeviceShare.exe through Windows Defender Firewall on PRIVATE networks only.",
+                "TLS certificate verification" =>
+                    "The secure connection failed. Both PCs must use the corrected DeskTouch build, and the receiver may need restarting to refresh its certificate.",
+                "receiver approval" =>
+                    "The receiving computer did not approve pairing, the approval timed out, or the connection was interrupted. " +
+                    "Keep DeskTouch open on that PC and approve the request.",
+                "monitor layout" =>
+                    "Secure pairing succeeded, but Windows display information could not be exchanged.",
+                _ => "Windows pairing could not complete."
+            };
+            if (ex is OperationCanceledException && cancellation.IsCancellationRequested)
+                throw;
+            if (ex is AuthenticationException && stage == "receiver approval")
+                throw new IOException(guidance, ex);
+            throw new IOException($"DeskTouch connection failed during {stage}: {guidance} ({ex.Message})", ex);
         }
     }
 

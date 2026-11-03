@@ -17,6 +17,7 @@ namespace DeskTouchVision;
 /// </summary>
 internal interface IUpdateCloseHost
 {
+    bool IsHiddenInTray { get; }
     void CloseForVerifiedUpdate();
 }
 
@@ -309,6 +310,12 @@ internal static class UpdateClient
                     "-CurrentPid", Environment.ProcessId.ToString(),
                     "-ExpectedHash", expectedHash })
                     process.ArgumentList.Add(arg);
+                // Each machine independently follows the GitHub release SSE
+                // while running in the tray. On successful auto-update,
+                // restart in that same quiet tray state instead of popping a
+                // new desktop window onto either computer.
+                if (window is IUpdateCloseHost host && host.IsHiddenInTray)
+                    process.ArgumentList.Add("-StartInTray");
                 if (IsInstallationRunning())
                 {
                     Log($"Another installer acquired the lock while v{latest.ToString(3)} was downloading; no second host launched.");

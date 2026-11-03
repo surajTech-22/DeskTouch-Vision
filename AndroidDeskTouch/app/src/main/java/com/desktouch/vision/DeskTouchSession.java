@@ -24,6 +24,18 @@ import javax.net.ssl.*;
  */
 final class DeskTouchSession implements AutoCloseable {
     interface Events { void status(String message); }
+    static final class EnvironmentTarget {
+        final int id;
+        final String name,platform,layout;
+        final boolean supportsInput;
+        EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled){
+            this.id=id;this.name=name;this.platform=platform;
+            this.layout=layout;this.supportsInput=enabled;
+        }
+        @Override public String toString(){
+            return platform+" • "+name+(supportsInput?"":" (view only)");
+        }
+    }
     private final Events events;
     private final TrustedWindows trust;
     private final Context application;
@@ -47,6 +59,10 @@ final class DeskTouchSession implements AutoCloseable {
     private final List<int[]> monitors=new ArrayList<>();
     private int cursorX,cursorY;
     private int screenX,screenY,screenWidth,screenHeight;
+    private volatile java.util.List<EnvironmentTarget> environmentTargets =
+        java.util.Collections.emptyList();
+    private volatile int environmentOwnId;
+    private volatile int selectedEnvironmentId;
     private static final SecureRandom RANDOM=new SecureRandom();
 
     DeskTouchSession(Context context,TrustedWindows trust,Events events) {
@@ -67,6 +83,86 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
     boolean hasClaim(){return claim>0||active;}
+    java.util.List<EnvironmentTarget> environmentTargets(){
+        return environmentTargets;
+    }
+    int selectedEnvironmentTarget(){return selectedEnvironmentId;}
+
+    void selectEnvironmentTarget(int id){
+        if(!running) {status("Join a shared environment first.");return;}
+        EnvironmentTarget selected=null;
+        for(EnvironmentTarget target:environmentTargets)
+            if(target.id==id){selected=target;break;}
+        if(selected==null || !selected.supportsInput || id==environmentOwnId){
+            status("That environment device is unavailable for remote control.");
+            return;
+        }
+        if(selectedEnvironmentId==id)return;
+        releaseControl(); // never carry a lease across destinations
+        try {
+            synchronized(monitors){
+                JSONArray layout=new JSONArray(selected.layout);
+                ArrayList<int[]> parsed=new ArrayList<>();
+                int minX=Integer.MAX_VALUE,minY=Integer.MAX_VALUE;
+                int maxX=Integer.MIN_VALUE,maxY=Integer.MIN_VALUE;
+                for(int i=0;i<layout.length();i++){
+                    JSONObject m=layout.getJSONObject(i);
+                    int x=m.getInt("X"),y=m.getInt("Y");
+                    int width=m.getInt("Width"),height=m.getInt("Height");
+                    if(width<1||height<1||width>32768||height>32768)
+                        throw new IOException("Invalid remote monitor dimensions");
+                    parsed.add(new int[]{x,y,width,height});
+                    minX=Math.min(minX,x);minY=Math.min(minY,y);
+                    maxX=Math.max(maxX,x+width);maxY=Math.max(maxY,y+height);
+                }
+                if(parsed.isEmpty())throw new IOException("Missing remote screens");
+                monitors.clear();monitors.addAll(parsed);
+                screenX=minX;screenY=minY;screenWidth=maxX-minX;screenHeight=maxY-minY;
+                cursorX=parsed.get(0)[0]+parsed.get(0)[2]/2;
+                cursorY=parsed.get(0)[1]+parsed.get(0)[3]/2;
+            }
+        }catch(Exception invalid){
+            status("Cannot select device: invalid screen geometry.");return;
+        }
+        selectedEnvironmentId=id;
+        send(new Packet("environment-select",id));
+        status("Selected "+selected.name+" in the same environment.");
+    }
+
+    private void acceptEnvironmentRoster(Packet packet){
+        try {
+            JSONArray roster=new JSONArray(packet.text);
+            if(roster.length()<1||roster.length()>9)return;
+            ArrayList<EnvironmentTarget> members=new ArrayList<>();
+            HashSet<Integer> ids=new HashSet<>();
+            for(int i=0;i<roster.length();i++){
+                JSONObject m=roster.getJSONObject(i);
+                int id=m.getInt("Id");
+                String name=m.getString("Name"),platform=m.getString("Platform");
+                String layout=m.getString("Layout");
+                if(id<0 || name.isEmpty() || name.length()>100 ||
+                    !(platform.equals("Windows")||platform.equals("Android")) ||
+                    !ids.add(id))return;
+                // Parsing member monitor geometry is a validation step only.
+                if(new JSONArray(layout).length()==0)return;
+                members.add(new EnvironmentTarget(id,name,platform,layout,
+                    m.optBoolean("SupportsReverseInput",false)));
+            }
+            if(!ids.contains(0))return;
+            environmentOwnId=packet.a;
+            environmentTargets=java.util.Collections.unmodifiableList(members);
+            boolean stillAvailable=selectedEnvironmentId==0;
+            for(EnvironmentTarget m:members)
+                if(m.id==selectedEnvironmentId&&m.supportsInput)
+                    stillAvailable=true;
+            if(!stillAvailable) {
+                // A departed destination cannot keep remote authority.
+                selectedEnvironmentId=-1;
+                selectEnvironmentTarget(0);
+            }
+            status("Shared DeskTouch environment: "+members.size()+" devices online.");
+        }catch(Exception invalid){status("Invalid environment membership update.");}
+    }
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
@@ -162,7 +258,14 @@ final class DeskTouchSession implements AutoCloseable {
         try {
             while(running){
                 Packet p=Packet.read(input);
-                if("granted".equals(p.type) && p.a==claim && claim>0){
+                if("environment-roster".equals(p.type)){
+                    acceptEnvironmentRoster(p);
+                } else if("environment-unavailable".equals(p.type)){
+                    status("Environment member went offline. Select another device.");
+                    if(selectedEnvironmentId==p.a){
+                        selectedEnvironmentId=-1;selectEnvironmentTarget(0);
+                    }
+                } else if("granted".equals(p.type) && p.a==claim && claim>0){
                     // The remote Windows endpoint must successfully move its cursor
                     // and acknowledge "active" before we send any keyboard/buttons.
                     send(new Packet("move",cursorX,cursorY));
@@ -188,8 +291,8 @@ final class DeskTouchSession implements AutoCloseable {
         } catch(Exception e){if(running)status("Windows disconnected: "+e.getMessage());}
         finally{closeConnection();}
     }
-    // The authenticated Windows receiver sends all reverse-* input over
-    // the SAME TLS stream. No Android->Windows input authority is granted.
+    // Windows forwards approved local or environment-relayed input through
+    // the SAME authenticated session. Native phone touch retains priority.
     private void handleWindowsControl(Packet p){
         if("reverse-claim".equals(p.type)){
             if(p.a<=0 || !DeskTouchAccessibilityService.ready(application) ||
@@ -286,14 +389,37 @@ final class DeskTouchSession implements AutoCloseable {
             clampToMonitor();
         }
     }
+    private boolean crossEnvironmentEdge(int direction){
+        if(!active)return false;
+        List<EnvironmentTarget> targets=environmentTargets;
+        ArrayList<EnvironmentTarget> available=new ArrayList<>();
+        for(EnvironmentTarget member:targets)
+            if(member.supportsInput&&member.id!=environmentOwnId)
+                available.add(member);
+        int index=-1;
+        for(int i=0;i<available.size();i++)
+            if(available.get(i).id==selectedEnvironmentId)index=i;
+        int next=index+direction;
+        if(index<0||next<0||next>=available.size())return false;
+        int before=selectedEnvironmentId;
+        selectEnvironmentTarget(available.get(next).id);
+        if(selectedEnvironmentId==before)return false;
+        synchronized(monitors){
+            cursorX=direction>0?screenX:screenX+screenWidth-1;
+            cursorY=screenY+screenHeight/2;
+            clampToMonitor();
+        }
+        claimControl(); // fresh two-phase ACK from the newly selected device
+        return true;
+    }
     void moveBy(float dx,float dy){
         if(!active)return;
         synchronized(monitors){
             int nextX=cursorX+Math.round(dx);
             if(nextX<screenX && dx<0 &&
-                DeskTouchRuntime.crossLinkedEdge(this,-1))return;
+                crossEnvironmentEdge(-1))return;
             if(nextX>=screenX+screenWidth && dx>0 &&
-                DeskTouchRuntime.crossLinkedEdge(this,1))return;
+                crossEnvironmentEdge(1))return;
             cursorX=nextX;cursorY+=Math.round(dy);
             clampToMonitor();
             send(new Packet("move",cursorX,cursorY));
@@ -348,6 +474,8 @@ final class DeskTouchSession implements AutoCloseable {
     private synchronized void closeConnection(){
         clearReverseControl(false);
         running=false;active=false;claim=0;pendingTrust=null;
+        environmentTargets=java.util.Collections.emptyList();
+        selectedEnvironmentId=0;environmentOwnId=0;
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}
     }

@@ -1,6 +1,7 @@
 package com.desktouch.vision;
 
 import android.os.Build;
+import android.content.Context;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.*;
@@ -25,6 +26,8 @@ final class DeskTouchSession implements AutoCloseable {
     interface Events { void status(String message); }
     private final Events events;
     private final TrustedWindows trust;
+    private final Context application;
+    private volatile int reverseLease,reverseApplied;
     private final ExecutorService sender=Executors.newSingleThreadExecutor();
     private final Object writeLock=new Object();
     private volatile SSLSocket socket;
@@ -42,7 +45,8 @@ final class DeskTouchSession implements AutoCloseable {
     private int screenX,screenY,screenWidth,screenHeight;
     private static final SecureRandom RANDOM=new SecureRandom();
 
-    DeskTouchSession(TrustedWindows trust,Events events) {
+    DeskTouchSession(Context context,TrustedWindows trust,Events events) {
+        this.application=context.getApplicationContext();
         this.trust=trust; this.events=events;
     }
     static boolean allowedInputType(String type) {
@@ -109,7 +113,9 @@ final class DeskTouchSession implements AutoCloseable {
                     .put("Width",width).put("Height",height).put("Primary",true));
                 JSONObject hello=new JSONObject().put("Name",Build.MANUFACTURER+" "+Build.MODEL)
                     .put("Layout",myLayout.toString())
-                    .put("ReverseInputSupported",false);
+                    .put("ReverseInputSupported",
+                        DeskTouchAccessibilityService.ready(application))
+                    .put("Platform","Android");
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
                 screenX=minX;screenY=minY;screenWidth=ready.c;screenHeight=ready.d;
@@ -162,26 +168,71 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                 } else if("trust-denied".equals(p.type)){
                     pendingTrust=null;status("Windows declined trusted-device permission");
-                } else if("reverse-claim".equals(p.type)){
-                    // Android has no ordinary-app system-wide mouse cursor injection.
-                    // Never lie about a cursor-applied acknowledgement.
-                    send(new Packet("reverse-busy",p.a));
+                } else if(p.type.startsWith("reverse-")){
+                    handleWindowsControl(p);
                 } else if("goodbye".equals(p.type)) break;
             }
         } catch(Exception e){if(running)status("Windows disconnected: "+e.getMessage());}
         finally{closeConnection();}
     }
+    // The authenticated Windows receiver sends all reverse-* input over
+    // the SAME TLS stream. No Android->Windows input authority is granted.
+    private void handleWindowsControl(Packet p){
+        if("reverse-claim".equals(p.type)){
+            if(p.a<=0 || !DeskTouchAccessibilityService.ready(application) ||
+                !DeskTouchRuntime.claimAndroidControl(this)){
+                send(new Packet("reverse-busy",p.a));
+                return;
+            }
+            reverseLease=p.a;reverseApplied=0;
+            send(new Packet("reverse-granted",p.a));
+            status("Windows is allowed to control this Android screen.");
+            return;
+        }
+        if("reverse-release".equals(p.type)||"reverse-reset".equals(p.type)){
+            if("reverse-reset".equals(p.type) || p.a==reverseLease)
+                clearReverseControl(false);
+            return;
+        }
+        if(reverseLease<=0 || !DeskTouchAccessibilityService.ready(application)){
+            clearReverseControl(false);
+            return;
+        }
+        if("reverse-move".equals(p.type)){
+            final int lease=reverseLease;
+            boolean posted=DeskTouchAccessibilityService.pointer(p.a,p.b,()->{
+                if(reverseLease==lease && reverseApplied!=lease){
+                    reverseApplied=lease;
+                    send(new Packet("reverse-active",lease));
+                }
+            });
+            if(!posted)revokeRemoteFromNative();
+        }else if("reverse-button".equals(p.type)){
+            DeskTouchAccessibilityService.mouseButton(p.a,p.b!=0);
+        }else if("reverse-wheel".equals(p.type)){
+            DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
+        }else if("reverse-key".equals(p.type)){
+            DeskTouchAccessibilityService.key(p.d,p.c!=0);
+        }
+    }
+    private void clearReverseControl(boolean notifyWindows){
+        int lease=reverseLease;reverseLease=0;reverseApplied=0;
+        DeskTouchRuntime.releaseAndroidControl(this);
+        DeskTouchAccessibilityService.endRemote();
+        if(notifyWindows && lease>0 && running)
+            send(new Packet("reverse-local-active",lease));
+    }
+    void revokeRemoteFromNative(){
+        if(reverseLease>0)clearReverseControl(true);
+    }
+
     void claimControl(){
-        if(!running){status("Connect to Windows first");return;}
-        active=false;
-        claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
-        send(new Packet("claim",claim));
-        status("Requesting Windows input authority");
+        // Explicit one-way mode. Android cannot initiate control of Windows.
+        status("One-way mode: select this phone in Windows DeskTouch Displays.");
     }
     void releaseControl(){
-        int id=claim;claim=0;active=false;
-        if(id>0)send(new Packet("release",id));
-        status("Android returned control");
+        clearReverseControl(true);
+        status("Windows control of Android released.");
     }
     void requestTrust(){
         if(!running){status("Pair with Windows first");return;}
@@ -207,25 +258,19 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
     void moveBy(float dx,float dy){
-        if(!active)return;
+        if(true)return; // one-way Windows -> Android mode; legacy API retained
         synchronized(monitors){
             cursorX+=Math.round(dx);cursorY+=Math.round(dy);clampToMonitor();
             send(new Packet("move",cursorX,cursorY));
         }
     }
     void click(int button){
-        if(!active)return;
+        if(true)return; // Android -> Windows input disabled
         send(new Packet("button",button,1));send(new Packet("button",button,0));
     }
-    void button(int button,boolean down){
-        if(active)send(new Packet("button",button,down?1:0));
-    }
-    void wheel(int amount,boolean horizontal){
-        if(active&&amount!=0)send(new Packet("wheel",amount,horizontal?1:0));
-    }
-    void key(int vk,boolean down){
-        if(active&&vk>0&&vk<=255)send(new Packet("key",0,0,down?1:0,vk));
-    }
+    void button(int button,boolean down){ /* one-way mode */ }
+    void wheel(int amount,boolean horizontal){ /* one-way mode */ }
+    void key(int vk,boolean down){ /* one-way mode */ }
     private void send(Packet p){
         sender.execute(()->{
             if(!running)return;
@@ -234,6 +279,7 @@ final class DeskTouchSession implements AutoCloseable {
         });
     }
     private synchronized void closeConnection(){
+        clearReverseControl(false);
         running=false;active=false;claim=0;pendingTrust=null;
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}

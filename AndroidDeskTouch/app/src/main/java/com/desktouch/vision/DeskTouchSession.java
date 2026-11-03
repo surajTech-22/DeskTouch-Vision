@@ -53,10 +53,10 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isActive(){return active;}
 
     private void status(String message) { events.status(message); }
-    void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
+    synchronized void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
+        if(running || connecting) {status("Already connected or connecting");return;}
+        connecting=true;
         sender.execute(()->{
-            if(running || connecting) {status("Already connected or connecting");return;}
-            connecting=true;
             try {
                 String pinned=device.fingerprint.toUpperCase(Locale.ROOT);
                 if(!pinned.matches("[A-F0-9]{64}")) throw new SecurityException("Invalid TLS fingerprint");

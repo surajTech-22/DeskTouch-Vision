@@ -361,7 +361,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var hello=await Wire.ReadAsync(ssl,helloTimeout.Token);
         if(hello.Type!="hello") throw new InvalidDataException("Missing authenticated hello.");
         var peer=ReadHello(hello.Text);
-        if(trustedSource!=null) peer=peer with { Name=trustedSource.Name };
+        // The authenticated hello carries the current computer/phone name.
+        // A saved trusted-device alias may be stale after the PC was renamed;
+        // keep the actual announced system name in the display diagram.
         var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
         if(!_sessions.TryAdd(id,session))
             throw new InvalidOperationException("Duplicate peer session ID");

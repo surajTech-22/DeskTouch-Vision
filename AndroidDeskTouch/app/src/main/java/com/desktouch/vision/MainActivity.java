@@ -54,7 +54,7 @@ public final class MainActivity extends Activity {
         status.setTextSize(15);
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
-        addButton(page,"Find Windows computers",this::scan);
+        addButton(page,"Find devices",this::scan);
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
@@ -168,16 +168,25 @@ public final class MainActivity extends Activity {
     private void scan(){
         if(scanning)return;
         scanning=true;
-        status.setText("Looking for Windows DeskTouch on local Wi-Fi...");
+        status.setText("Looking for Windows PCs and Android phones on local Wi-Fi...");
         deviceList.removeAllViews();
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
-                    if(list.isEmpty())status.setText("No Windows PCs found. Check private Wi-Fi, firewall and DeskTouch tray.");
-                    else status.setText("Select a Windows PC below and approve pairing on Windows.");
+                    if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
+                    else status.setText("Select a ready Windows PC below. Busy peers and Android phones are shown for discovery.");
                     for(DesktopDiscovery.Device d:list){
-                        addButton(deviceList,d.name+" • "+d.address,()->{
+                        addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
+                            (d.ready?" • Ready":" • "+(d.android?"Phone":"Busy")),()->{
+                            if(d.android) {
+                                status.setText("Android phone discovered. Connect from that phone to this Windows PC.");
+                                return;
+                            }
+                            if(!d.ready) {
+                                status.setText("Windows PC is busy. Disconnect its current sharing session and rescan.");
+                                return;
+                            }
                             new AlertDialog.Builder(this).setTitle("Secure pairing")
                             .setMessage("Confirm the pairing prompt on your Windows DeskTouch app. " +
                                 "The connection checks its TLS certificate fingerprint.")

@@ -1,6 +1,6 @@
 # DeskTouch Vision for Android (same product and repository)
 
-**Android preview 0.3.2** reuses the Windows DeskTouch LAN discovery (UDP 37378),
+**Android preview 0.3.6** reuses the Windows DeskTouch LAN discovery (UDP 37378),
 TLS endpoint (TCP 37377), existing approval prompt, monitor geometry, Wire
 framing and two-phase authority handoff. There is **no separate remote-desktop
 protocol, login system, or replacement keyboard/mouse settings**.
@@ -25,7 +25,7 @@ privately held signing key, supplied as a CI secret. Do **not** commit it.
 
 ## Use
 
-1. Run DeskTouch Vision v0.3.2 or newer on Windows and keep it visible or in tray.
+1. Run DeskTouch Vision v0.3.6 or newer on Windows and keep it visible or in tray.
 2. Install the APK via Android's own package installer after scanning Windows QR.
 3. Open the Android app and **Find devices** on the same private LAN.
 4. Select Windows PC and approve the pairing prompt on **Windows**.
@@ -87,3 +87,38 @@ privately held signing key, supplied as a CI secret. Do **not** commit it.
 
 These are explicit preview limits, not hidden workarounds or promises of
 unrestricted Android OS control.
+
+## v0.3.6: multiple connected devices and Android updates
+
+- **Up to 8** concurrent authenticated inbound Windows sessions; Android can
+  connect to up to 8 Windows receivers concurrently. The phone shows connected
+  Windows PCs as one network group, with each member's own TLS fingerprint.
+  Two distinct cryptographic identities are never merged into one trust token.
+- The Windows desktop keeps ONE input authority owner at a time, since two
+  simultaneous cursors/keyboards would conflict. Other devices stay online and
+  can request authority when the active lease ends.
+- The Windows server replies `pong` to Android `ping` every 1.5s. Previously,
+  ignoring heartbeats caused Android's `SocketTimeoutException` around 22 seconds.
+  Local Android mobile beacon no longer appears as a remote Android device.
+- Android **Get updates** checks the official latest GitHub release. Background
+  check is every six hours on an unmetered network. Only the official APK and
+  its SHA-256 are downloaded; APK contents and installed signing certificate
+  are checked before presenting Android's system installer.
+- **Update existing application** uses Android's own permission prompt and
+  package installer. The old debug-preview APK uses a per-workflow debug signing
+  key: different builds may have incompatible signatures. If the signer differs,
+  the app REFUSES to install rather than silently uninstalling or erasing the
+  trusted-device data. Stable release signing (configured securely in CI)
+  is needed before unattended in-place Android upgrades can work reliably.
+- No permission to silently install apps or to bypass Android's package
+  integrity / certificate rules. No Windows->Android global cursor injection.
+
+## Physical acceptance checks still required
+
+Connect Android to two Windows PCs concurrently, leave connections idle for
+over one minute to verify heartbeat, check Windows Add devices does not show
+"busy" for capacity-available receivers, scan Android to ensure it does not
+list itself, switch the selected Android keyboard target between connected PCs,
+disconnect one PC without interrupting another, and confirm the Windows native
+keyboard/mouse always overrides remote authority. Check official APK update
+with a persistent production signing certificate once configured.

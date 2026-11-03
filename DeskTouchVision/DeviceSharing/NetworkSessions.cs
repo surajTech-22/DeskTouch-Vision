@@ -378,6 +378,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock(_authorityGate) first=_selected==null;
             if(first) Select(session);
             _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
+            // The server advertises its CURRENT system name after successful
+            // pairing. Do not rely on a stale saved alias on the other PC.
+            await SendToAsync(session,new Packet("peer-name",
+                Text:Environment.MachineName),token);
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -567,6 +571,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal MonitorTopology RemoteMonitors => Volatile.Read(ref _remoteMonitors);
     internal event Action<string>? RemoteControlState;
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
+    internal event Action<string>? RemoteNameChanged;
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
     private Packet? _latestMove;
@@ -828,7 +833,10 @@ internal sealed class HostSession : IInputSession, IDisposable
             while (!_cancel.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
-                if (p.Type == "topology")
+                if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
+                    !name.Any(char.IsControl))
+                    RemoteNameChanged?.Invoke(name);
+                else if (p.Type == "topology")
                 {
                     var layout = MonitorTopology.FromWire(p.Text);
                     Volatile.Write(ref _remoteMonitors, layout);

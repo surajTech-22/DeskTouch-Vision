@@ -296,6 +296,21 @@ var uiThread = new Thread(() =>
             diagram.DrawToBitmap(rendered,
                 new System.Drawing.Rectangle(0, 0, diagram.Width, diagram.Height));
         }
+        // A real WinForms UserClosing event must hide the existing HWND,
+        // not dispose the receiver/input hooks or close the TLS pairing.
+        // We create the HWND without showing the form, so Shown/StartListening
+        // is not called and this smoke test never opens the real LAN port.
+        var nativeWindow = view.Handle;
+        Check(nativeWindow != IntPtr.Zero && view.HasTrayIcon,
+            "A tray icon must exist while the Displays window is running");
+        view.Close();
+        Check(!view.IsDisposed && !view.Visible && view.IsRunningInTray,
+            "Closing the Displays window must keep the same application running in tray");
+        // Unlike the user X, a verified updater must close the tray host so
+        // the independent installer can replace files without locks.
+        ((DeskTouchVision.IUpdateCloseHost)view).CloseForVerifiedUpdate();
+        Check(view.IsDisposed,
+            "A verified update must completely close tray host and free input hooks");
         uiCompletion.TrySetResult(true);
     }
     catch (Exception ex) { uiCompletion.TrySetException(ex); }

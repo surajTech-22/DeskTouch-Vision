@@ -79,6 +79,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "DeskTouch main application failed" }
           dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:IncludeNativeLibrariesForSelfExtract=false -o DeskTouchVision/dist/app/DeviceSharing
           if ($LASTEXITCODE -ne 0) { throw "Windows device-sharing module failed" }
+          if (!(Test-Path DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.deps.json) -or
+              !(Test-Path DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.runtimeconfig.json) -or
+              @(Get-ChildItem -Path DeskTouchVision/dist/app/DeviceSharing -Filter *.dll).Count -lt 10) {
+            throw "Standard .NET Windows sharing files not published"
+          }
           if (!(Test-Path 'DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe')) {
             throw "Windows device-sharing module missing from installable app"
           }

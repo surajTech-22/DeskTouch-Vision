@@ -1,3 +1,14 @@
+# v0.3.11 development preview — unified Windows network
+Android can show one linked Windows network card and initiate secure connections to its individual PCs in one action. Each Windows member has its own separately approved TLS certificate: a network group is **not** an authentication identity. Once approved, those Windows PCs and other mobile clients remain connected concurrently; Android's active target and Windows' input leases still select a single controlled destination at a time.
+
+To control Windows **from the phone**, connect all members, select a Windows screen in the group, choose **Take control of selected Windows screen**, and wait for the cursor-applied authority acknowledgement. Use the touchpad or the Android keyboard typing field; the on-screen keyboard commits Unicode text through an authenticated, exclusive lease. The sensitivity slider adjusts phone touchpad speed. Select another connected PC or deliberately move outward across a linked group edge to request a new handoff. The Windows machine's local keyboard/mouse takes priority.
+
+To control Android **from Windows**, enable DeskTouch's Windows-control checkbox and its Accessibility service in Android Settings. A remote Windows keyboard can type only into supported, focused non-password fields; Accessibility is not an unrestricted hardware keyboard driver. No special Android permission is required for the phone's ordinary touchpad/IME to send input to a previously approved Windows PC.
+
+This is a **development** branch; production APK updates must still be signed with the existing permanent Android certificate, and physical multi-device acceptance is required before release.
+
+---
+
 # DeskTouch Vision for Android (same product and repository)
 
 **Android release 0.3.9** reuses the Windows DeskTouch LAN discovery (UDP 37378),

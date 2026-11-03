@@ -19,8 +19,8 @@ internal sealed class ShareForm : Form
 {
     private readonly Label _status = new() { AutoSize = false, Height = 65, Dock = DockStyle.Bottom,
         Padding = new Padding(10), ForeColor = Color.White, BackColor = Color.FromArgb(31, 48, 72) };
-    private readonly TextBox _localIPs = Text(""), _fingerprint = Text(""), _secret = Text("");
-    private readonly TextBox _remoteIp = Text("192.168.1."), _remoteFingerprint = Text(""), _remoteSecret = Text("");
+    private readonly TextBox _localIPs = MakeTextBox(""), _fingerprint = MakeTextBox(""), _secret = MakeTextBox("");
+    private readonly TextBox _remoteIp = MakeTextBox("192.168.1."), _remoteFingerprint = MakeTextBox(""), _remoteSecret = MakeTextBox("");
     private readonly Button _listen = Btn("Start receiver on this PC");
     private readonly Button _stopReceive = Btn("Stop receiver");
     private readonly Button _connect = Btn("Connect to receiver");
@@ -143,7 +143,7 @@ internal sealed class ShareForm : Form
         return result;
     }
 
-    private static TextBox Text(string value) => new() { Text = value,
+    private static TextBox MakeTextBox(string value) => new() { Text = value,
         Width = 408, Height = 32, BackColor = Color.FromArgb(40, 58, 82),
         ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
     private static Button Btn(string label) => new() { Text = label, Height = 35, Width = 408,
@@ -172,9 +172,9 @@ internal sealed class ShareForm : Form
         try
         {
             var topology = MonitorTopology.Capture();
-            _localMonitorMap.Layout = topology;
-            _receiverMonitorMap.Layout = topology;
-            _remoteMonitorMap.Layout = _host?.RemoteMonitors;
+            _localMonitorMap.Topology = topology;
+            _receiverMonitorMap.Topology = topology;
+            _remoteMonitorMap.Topology = _host?.RemoteMonitors;
         }
         catch (Exception ex)
         {
@@ -295,7 +295,7 @@ internal sealed class ShareForm : Form
         _host?.Dispose();
         _host = null;
         _connect.Enabled = _receiver == null;
-        _remoteMonitorMap.Layout = null;
+        _remoteMonitorMap.Topology = null;
         _disconnect.Enabled = _arm.Enabled = _return.Enabled = false;
         Status("Disconnected. Keyboard and mouse stay local.");
     }

@@ -629,7 +629,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Pairing secret is available only by a deliberate Copy action.
             var code = $"DT1|{address}|{_receiver.Fingerprint}|{_receiver.Secret}";
             Clipboard.SetText(code);
-            Status($"Pairing code copied for {Environment.MachineName}. Paste it into Add a computer on the other PC. Keep it private.");
+            Status($"Pairing code copied for {Environment.MachineName}. Paste it into Add devices on the other PC. Keep it private.");
         }
         catch (Exception ex) { Status("Unable to copy pairing code: " + ex.Message); }
     }
@@ -643,10 +643,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
-        if (_host != null || _incomingPeer != null)
+        if (_host != null)
         {
-            // One active input owner at a time. Switching requires explicit
-            // confirmation and never claims a second simultaneous session.
+            // Switching outgoing controller remains explicit. Inbound phones and
+            // PCs remain connected to the independent, persistent receiver.
             var confirm = MessageBox.Show(this,
                 "Another device currently owns the remote input session.\n\n" +
                 "Disconnect that session and switch to " + dialog.ComputerName + "?",
@@ -654,11 +654,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
             if (confirm != DialogResult.Yes) return;
             DisconnectHost();
-            _receiver?.DisconnectPeer();
-            _incomingPeer = null;
         }
         _connecting = true;
-        StopListening(preserveDiscovery: true);
+        // Never tear down Windows's incoming TLS listener when this PC also
+        // initiates an outgoing connection. Other mobiles and PCs may connect
+        // concurrently. The same authenticated hub arbitrates input authority.
         UpdateButtons();
         Status("Connecting securely. The other computer may ask its user to approve...");
         try
@@ -666,7 +666,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             void OnFailure(string reason)
             {
                 Status(reason);
-                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(DisconnectAndListen); }
+                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(DisconnectHost); }
                 catch (InvalidOperationException) { }
             }
             var candidate = dialog.UseRemoteApproval
@@ -685,6 +685,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         catch (Exception ex)
         {
             DisconnectHost();
+            if (_incomingPeer != null) OnIncomingPeerConnected(_incomingPeer);
             Status("Connection failed: " + ex.Message);
             if (!_closing.IsCancellationRequested && !IsDisposed)
                 MessageBox.Show(this,
@@ -707,7 +708,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host = session;
         _remoteAddress = name;
         _currentFingerprint = fingerprint;
-        _nativeInput = new PhysicalInputMonitor(this);
+        // Receiver and outgoing host share a single local physical-input
+        // monitor; never create competing global hook registrations.
+        _capture?.Dispose();
+        _capture = null;
+        _nativeInput ??= new PhysicalInputMonitor(this);
         _nativeInput.Start();
         session.AttachReverseInput(_nativeInput.Priority,
             () => _capture == null ||
@@ -831,14 +836,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;
             _connecting = true;
-            StopListening(preserveDiscovery: true);
+            // Outbound auto-connect must not make Windows disappear or mark
+            // it Busy to other incoming Android/Windows devices.
             Status($"Trusted {found.Saved!.Name} discovered. Verifying persistent device identity...");
             try
             {
                 void OnFailure(string reason)
                 {
                     Status(reason);
-                    PostToUi(DisconnectAndListen);
+                    PostToUi(DisconnectHost);
                 }
                 // The token is bound to the saved pinned TLS certificate.
                 // Never use a matching name or previously seen IP as proof.
@@ -947,14 +953,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host = null;
         // Outgoing controller also hosts a native priority monitor for
         // incoming reverse claims. It belongs to this host session.
-        if (hadHost)
+        if (hadHost && _receiver?.ConnectedPeerCount == 0)
         {
             _nativeInput?.Dispose();
-            _nativeInput = null;
+            // Keep this same safety monitor object available for the receiver
+            // to arm when the next authenticated peer arrives.
+            if (_receiver == null) _nativeInput = null;
         }
         _remoteAddress = "";
         _currentFingerprint = "";
         _display.Remote = null;
+        if (_incomingPeer != null && !_closing.IsCancellationRequested)
+            OnIncomingPeerConnected(_incomingPeer);
         UpdateButtons();
     }
 

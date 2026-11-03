@@ -229,8 +229,24 @@ public final class MainActivity extends Activity {
                     available.setTextColor(Color.LTGRAY);
                     available.setPadding(0,dp(10),0,dp(4));
                     deviceList.addView(available);
+                    java.util.Map<String,Integer> groupCounts=new java.util.HashMap<>();
+                    for(DesktopDiscovery.Device member:list)
+                        if(!member.android)
+                            groupCounts.put(member.groupId,
+                                groupCounts.getOrDefault(member.groupId,0)+1);
+                    java.util.Set<String> groupHeadings=new java.util.HashSet<>();
                     for(DesktopDiscovery.Device d:list){
                         if(!d.android&&session.isConnectedTo(d.fingerprint))continue;
+                        int peersInGroup=groupCounts.getOrDefault(d.groupId,1);
+                        if(!d.android && peersInGroup>1 &&
+                           groupHeadings.add(d.groupId)){
+                            TextView network=new TextView(this);
+                            network.setText("Linked Windows network • "+peersInGroup+
+                                " computer(s) • each device securely identified");
+                            network.setTextColor(Color.rgb(165,226,206));
+                            network.setPadding(0,dp(10),0,dp(6));
+                            deviceList.addView(network);
+                        }
                         addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
                             (session.isConnectedTo(d.fingerprint)?" • Connected":d.ready?" • Ready":
                                 " • "+(d.android?"Phone":"Busy")),()->{

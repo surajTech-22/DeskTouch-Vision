@@ -423,10 +423,10 @@ public final class MainActivity extends Activity {
     }
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);
-        // An Android->Windows controller cannot remain armed after its
-        // touchpad/keyboard UI is backgrounded. Windows->Android Accessibility
-        // leases remain separately governed by real phone touch priority.
-        if(!focus)DeskTouchRuntime.releaseAll();
+        // Opening an Android soft keyboard may temporarily change window
+        // focus. It must not silently revoke the approved Windows input
+        // lease before IME text is committed. Explicit Return / Disconnect
+        // and physical Windows input still revoke that lease.
     }
     @Override protected void onDestroy(){
         DeskTouchRuntime.setListener(null);

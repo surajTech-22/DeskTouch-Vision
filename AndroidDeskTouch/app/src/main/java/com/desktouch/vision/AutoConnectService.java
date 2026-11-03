@@ -109,30 +109,25 @@ public final class AutoConnectService extends Service {
                 .getStringSet("pausedPeers",java.util.Collections.emptySet());
             if(verified.isEmpty()) return; // no silent first-time pairing
             android.util.DisplayMetrics display=getResources().getDisplayMetrics();
-            // One AUTO-RECONNECT gateway per linked network. Older versions
-            // silently reconnected every trusted PC and created separate
-            // Android TLS sessions to members of the same PC-to-PC link.
+            // A logical linked network reconnects all previously approved
+            // Windows members. Every PC retains its own pinned TLS identity;
+            // no group beacon substitutes for authentication or user consent.
             java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
                 DesktopDiscovery.windowsGroups(DesktopDiscovery.scan());
+            DeskTouchRuntime.rememberGroups(groups);
             for(java.util.List<DesktopDiscovery.Device> members:groups.values()){
-                boolean hasGateway=false;
                 for(DesktopDiscovery.Device member:members){
-                    if(DeskTouchRuntime.isConnected(member.fingerprint) ||
-                        DeskTouchRuntime.isConnecting(member.fingerprint)){
-                        hasGateway=true;break;
-                    }
+                    if(!member.ready || !verified.contains(member.fingerprint) ||
+                        paused.contains(member.fingerprint) ||
+                        DeskTouchRuntime.isConnected(member.fingerprint) ||
+                        DeskTouchRuntime.isConnecting(member.fingerprint))continue;
+                    if(DeskTouchRuntime.connectedCount()>=8)break;
+                    try {
+                        DeskTouchRuntime.forPeer(this,member.fingerprint).connect(member,
+                            Math.max(200,display.widthPixels),
+                            Math.max(100,display.heightPixels));
+                    }catch(IllegalStateException limit){break;}
                 }
-                if(hasGateway)continue;
-                java.util.Set<String> eligible=new java.util.HashSet<>(verified);
-                eligible.removeAll(paused);
-                DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
-                    members,java.util.Collections.emptySet(),eligible);
-                if(gateway==null||!gateway.ready||
-                    !eligible.contains(gateway.fingerprint))continue;
-                DeskTouchSession session=DeskTouchRuntime.forPeer(this,gateway.fingerprint);
-                if(session.isConnected()||session.isConnecting())continue;
-                session.connect(gateway,Math.max(200,display.widthPixels),
-                    Math.max(100,display.heightPixels));
             }
         }catch(Exception error){
             Log.w("DeskTouch","Trusted LAN reconnect deferred",error);

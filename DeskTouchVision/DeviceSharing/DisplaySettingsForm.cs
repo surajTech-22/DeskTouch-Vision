@@ -405,7 +405,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void StartListening()
     {
-        if (_receiver != null || _host != null || _connecting || _closing.IsCancellationRequested) return;
+        if (_receiver != null || _closing.IsCancellationRequested) return;
         try
         {
             // Discovery and trusted auto-connect do not need global keyboard
@@ -432,8 +432,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint, () =>
                     {
                         var receiver = Volatile.Read(ref _receiver);
-                        return receiver != null && receiver.CanAcceptNewPeer &&
-                            _host == null && !_connecting;
+                        return receiver != null && receiver.CanAcceptNewPeer;
                     });
                     _discovery.Start();
                 }
@@ -702,7 +701,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
-        if (_host != null || _incomingPeer != null)
+        if (_host != null)
         {
             // One active input owner at a time. Switching requires explicit
             // confirmation and never claims a second simultaneous session.
@@ -713,11 +712,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
             if (confirm != DialogResult.Yes) return;
             DisconnectHost();
-            _receiver?.DisconnectPeer();
-            _incomingPeer = null;
+            // Existing incoming sessions stay connected when changing the
+            // outgoing Windows target.
         }
         _connecting = true;
-        StopListening(preserveDiscovery: true);
+        // Continue serving incoming Android and Windows sessions even when
+        // this computer initiates an outgoing TLS connection.
         UpdateButtons();
         Status("Connecting securely. The other computer may ask its user to approve...");
         try
@@ -766,7 +766,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host = session;
         _remoteAddress = name;
         _currentFingerprint = fingerprint;
-        _nativeInput = new PhysicalInputMonitor(this);
+        _nativeInput ??= new PhysicalInputMonitor(this);
         _nativeInput.Start();
         session.AttachReverseInput(_nativeInput.Priority,
             () => _capture == null ||
@@ -1006,10 +1006,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host = null;
         // Outgoing controller also hosts a native priority monitor for
         // incoming reverse claims. It belongs to this host session.
-        if (hadHost)
+        if (hadHost && _incomingPeers.Count == 0)
         {
             _nativeInput?.Dispose();
-            _nativeInput = null;
+            // The receiver still holds this priority monitor for next incoming
+            // session, so only the hooks are stopped; keep monitor instance.
         }
         _remoteAddress = "";
         _currentFingerprint = "";
@@ -1027,7 +1028,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             RefreshDisplays();
         }
         if (!_closing.IsCancellationRequested) StartListening();
-        Status("Disconnected. Windows keyboard and mouse remain local.");
+        if (_receiver != null && _incomingPeers.Count > 0 &&
+            _incomingPeer is ConnectedPeer selected)
+            SelectIncomingDevice(selected.SessionId);
+        Status("Outgoing control released. All other connected devices remain online.");
     }
 
     private void LoadPreferredEdge()

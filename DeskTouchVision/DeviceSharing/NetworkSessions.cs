@@ -194,6 +194,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (ReferenceEquals(previous, candidate)) return true;
             _selected = candidate;
         }
+        // A target change must revoke the previous reverse input lease on
+        // the PREVIOUS authenticated TLS stream, not on the newly selected PC
+        // or phone. This prevents keyboard ownership lingering after switching.
+        if (previous != null) TrySendReverseTo(previous.Id, new Packet("reset"));
         NotifySelection(previous, candidate);
         return true;
     }
@@ -229,10 +233,38 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySendReverse(packet);
 
+    private sealed class BoundPeerInputSession : IInputSession
+    {
+        private readonly ReceiverServer _server;
+        private readonly int _peerId;
+        internal BoundPeerInputSession(ReceiverServer server, int peerId)
+        {
+            _server = server; _peerId = peerId;
+        }
+        public MonitorTopology RemoteMonitors =>
+            _server._sessions.TryGetValue(_peerId, out var peer)
+                ? peer.Peer.Monitors
+                : throw new InvalidOperationException("Selected input peer disconnected.");
+        public bool TrySend(Packet packet) =>
+            _server.TrySendReverseTo(_peerId, packet);
+    }
+
+    internal IInputSession BindSelectedInput()
+    {
+        Session selected = Volatile.Read(ref _selected) ??
+            throw new InvalidOperationException("No authenticated input target.");
+        return new BoundPeerInputSession(this, selected.Id);
+    }
+
     internal bool TrySendReverse(Packet packet)
     {
         Session? selected = Volatile.Read(ref _selected);
-        if (selected == null) return false;
+        return selected != null && TrySendReverseTo(selected.Id, packet);
+    }
+
+    private bool TrySendReverseTo(int id, Packet packet)
+    {
+        if (!_sessions.TryGetValue(id, out var selected)) return false;
         if (packet.Type == "move")
         {
             Interlocked.Exchange(ref selected.LatestReverseMove, packet);

@@ -35,6 +35,40 @@ try {
   $hashUrl = "$baseUrl/$archiveName.sha256"
   $zipUrl = "$baseUrl/$archiveName"
 
+  Write-Record "Fetching publisher release checksum for $release."
+  # In Windows PowerShell 5.1 Invoke-WebRequest.Content can be byte[]
+  # (or even a scalar byte), so it has no string Trim() method.
+  # Save the checksum to disk first, then decode it explicitly as ASCII.
+  $checksumFile = Join-Path $work ($archiveName + '.sha256')
+  Invoke-WebRequest -Uri $hashUrl -UseBasicParsing -OutFile $checksumFile
+  $checksum = (Get-Content -LiteralPath $checksumFile -Raw -Encoding ASCII).Trim()
+  $parts = @($checksum -split '\s+' | Where-Object { $_ })
+  if ($parts.Count -lt 2 -or $parts[0] -notmatch '^[0-9A-Fa-f]{64}$' -or
+      -not $checksum.Contains($archiveName)) {
+    throw 'Official release checksum file is malformed.'
+  }
+
+  Write-Record 'Downloading verified Windows install package.'
+  Invoke-WebRequest -Uri $zipUrl -UseBasicParsing -OutFile $zip
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+  if ($actual -ine $parts[0]) { throw 'Download failed SHA-256 validation; old installation was not modified.' }
+  Write-Record 'Package checksum verified.'
+
+  $unpack = Join-Path $work 'extracted'
+  Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+  $app = Join-Path $unpack 'app\DeviceSharing\DeskTouch.DeviceShare.exe'
+  $installer = Join-Path $unpack 'Install-DeskTouch.ps1'
+  if (-not (Test-Path -LiteralPath $app -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+    throw 'Release package missing Windows sharing executable or installer.'
+  }
+  $payloadVersion = (Get-Item -LiteralPath $app).VersionInfo.FileVersion
+  if ($payloadVersion -ne $expectedAppVersion) {
+    throw "Unexpected package version $payloadVersion; expected $expectedAppVersion."
+  }
+
+  # Download and checksum validation have finished successfully. Only now
+  # close running applications, so a failed download leaves DeskTouch running.
   # Stop only the exact DeskTouch executables in the canonical per-user path.
   # Graceful window close releases its keyboard/mouse hooks; NEVER force-kill.
   foreach ($name in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
@@ -68,33 +102,6 @@ try {
       throw 'An older updater PowerShell process is still active. Close other DeskTouch update windows and retry; no processes were force-terminated.'
     }
     Start-Sleep -Seconds 2
-  }
-
-  Write-Record "Fetching publisher release checksum for $release."
-  $checksum = (Invoke-WebRequest -Uri $hashUrl -UseBasicParsing).Content.Trim()
-  $parts = @($checksum -split '\s+' | Where-Object { $_ })
-  if ($parts.Count -lt 2 -or $parts[0] -notmatch '^[0-9A-Fa-f]{64}$' -or
-      -not $checksum.Contains($archiveName)) {
-    throw 'Official release checksum file is malformed.'
-  }
-
-  Write-Record 'Downloading verified Windows install package.'
-  Invoke-WebRequest -Uri $zipUrl -UseBasicParsing -OutFile $zip
-  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
-  if ($actual -ine $parts[0]) { throw 'Download failed SHA-256 validation; old installation was not modified.' }
-  Write-Record 'Package checksum verified.'
-
-  $unpack = Join-Path $work 'extracted'
-  Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
-  $app = Join-Path $unpack 'app\DeviceSharing\DeskTouch.DeviceShare.exe'
-  $installer = Join-Path $unpack 'Install-DeskTouch.ps1'
-  if (-not (Test-Path -LiteralPath $app -PathType Leaf) -or
-      -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-    throw 'Release package missing Windows sharing executable or installer.'
-  }
-  $payloadVersion = (Get-Item -LiteralPath $app).VersionInfo.FileVersion
-  if ($payloadVersion -ne $expectedAppVersion) {
-    throw "Unexpected package version $payloadVersion; expected $expectedAppVersion."
   }
 
   # Install-DeskTouch.ps1 already stages, safely closes only installed apps,

@@ -35,8 +35,22 @@ final class DeskTouchRuntime {
         if(!fingerprint.matches("[A-Fa-f0-9]{64}"))
             throw new IllegalArgumentException("Invalid cryptographic device identity");
         String id=fingerprint.toUpperCase(Locale.ROOT);
-        if(!sessions.containsKey(id) && sessions.size()>=9)
-            throw new IllegalStateException("Maximum eight connected devices reached");
+        if(!sessions.containsKey(id) && sessions.size()>=9) {
+            // Recycle an old disconnected session rather than permanently
+            // exhausting the device list after ordinary network changes.
+            for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()) {
+                if(entry.getKey().equals("__unselected__"))continue;
+                DeskTouchSession old=entry.getValue();
+                if(!old.isConnected()&&!old.isConnecting() &&
+                   !entry.getKey().equals(selectedFingerprint)) {
+                    sessions.remove(entry.getKey(),old);
+                    old.close();
+                    break;
+                }
+            }
+            if(sessions.size()>=9)
+                throw new IllegalStateException("Maximum eight devices connected");
+        }
         return sessions.computeIfAbsent(id,k->newSession(context,k));
     }
 
@@ -50,6 +64,7 @@ final class DeskTouchRuntime {
         return next;
     }
 
+    static String selectedIdentity(){return selectedFingerprint;}
     static synchronized boolean isConnected(String fingerprint){
         DeskTouchSession s=sessions.get(fingerprint.toUpperCase(Locale.ROOT));
         return s!=null&&s.isConnected();
@@ -64,7 +79,7 @@ final class DeskTouchRuntime {
         return count;
     }
     static void releaseAll() {
-        for(DeskTouchSession s:sessions.values())s.releaseControl();
+        for(DeskTouchSession s:sessions.values())if(s.hasClaim())s.releaseControl();
     }
     static void setListener(Consumer<String> observer){
         listener=observer;

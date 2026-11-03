@@ -1,6 +1,6 @@
 # DeskTouch Vision for Android (same product and repository)
 
-**Android preview 0.3.1** reuses the Windows DeskTouch LAN discovery (UDP 37378),
+**Android preview 0.3.2** reuses the Windows DeskTouch LAN discovery (UDP 37378),
 TLS endpoint (TCP 37377), existing approval prompt, monitor geometry, Wire
 framing and two-phase authority handoff. There is **no separate remote-desktop
 protocol, login system, or replacement keyboard/mouse settings**.
@@ -25,9 +25,9 @@ privately held signing key, supplied as a CI secret. Do **not** commit it.
 
 ## Use
 
-1. Run DeskTouch Vision v0.3.1 or newer on Windows and keep it visible or in tray.
+1. Run DeskTouch Vision v0.3.2 or newer on Windows and keep it visible or in tray.
 2. Install the APK via Android's own package installer after scanning Windows QR.
-3. Open the Android app and **Find Windows computers** on the same private LAN.
+3. Open the Android app and **Find devices** on the same private LAN.
 4. Select Windows PC and approve the pairing prompt on **Windows**.
 5. Tap **Take control of Windows** when the physical Windows keyboard/mouse is idle.
    Only after a matching `granted` and cursor-applied `active` ACK will Android
@@ -41,6 +41,25 @@ privately held signing key, supplied as a CI secret. Do **not** commit it.
 8. Use **Android keyboard settings** / **Android connected device settings**
    to open Android's built-in system settings. The app does not implement
    duplicate keyboard/mouse configuration.
+9. **Startup and reconnect** are enabled by default after the first launch.
+   The foreground connection notification persists when the app is backgrounded.
+   After Windows has approved a trusted device token, the Android background
+   service scans the local LAN every 10 seconds and securely reconnects to that
+   exact TLS identity (no saved IP). Reconnection does **not** steal input
+   authority; take control deliberately after bringing the app to the front.
+   The startup checkbox can disable boot launch; the Disconnect button pauses
+   trusted reconnection until manually re-enabled.
+10. **Two or more PCs** on the LAN appear in Add devices even if one is busy.
+   Android phones also advertise their presence. Windows receiver sessions are
+   currently limited to one active remote-control peer at a time; switching
+   to a different PC requires explicit disconnect/confirmation. Presence does
+   not imply two simultaneous input-control connections.
+11. On Windows, **Launch in tray when Windows starts** is enabled for the
+   current Windows user; the tray menu can disable it. To fix a refused TCP
+   connection, open Windows Add devices → Fix LAN access (UAC consent required).
+   This adds only application-scoped TCP 37377/UDP 37378 inbound rules on
+   Private, LocalSubnet networks; it never opens a Public network rule.
+
 
 ## Known limitations / fail-safe behavior
 
@@ -51,8 +70,11 @@ privately held signing key, supplied as a CI secret. Do **not** commit it.
   movement ACK or 1:1 mouse event behavior.
 - Pointer capture and physical keyboard forwarding are available **while the
   Android activity has focus**. Leaving the app returns Windows control.
-  Android background service and automatic trusted reconnection are not yet
-  available, notwithstanding stored trust tokens.
+  An Android connectedDevice foreground service now continues LAN
+  discovery and trusted-device reconnection while backgrounded, where the OS
+  allows. It starts after boot without opening the Android UI. Some OEM power
+  managers can defer or stop this service; app/notification permissions may
+  need adjustment through Android's own Settings.
 - No screen streaming, file transfer or Android screen takeover is implemented.
 - Network discovery may be blocked by router isolation; same-routed-LAN
   connectivity and Windows firewall TCP/UDP rules are required.

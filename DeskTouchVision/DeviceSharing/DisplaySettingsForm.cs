@@ -18,7 +18,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly DisplayArrangementControl _display = new();
     private readonly Label _status = new();
     private readonly Label _summary = new();
-    private readonly Button _add = Button("Add a computer", true);
+    private readonly Button _add = Button("Add devices", true);
     private readonly Button _copyCode = Button("Copy pairing code");
     private readonly Button _disconnect = Button("Disconnect");
     private readonly Button _trustDevice = Button("Trust device");
@@ -47,6 +47,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private string _currentFingerprint = "";
     private NotifyIcon? _trayIcon;
     private ContextMenuStrip? _trayMenu;
+    private ToolStripMenuItem? _startupMenu;
     private bool _exitRequested;
     private bool _trayTipShown;
     private readonly bool _startInTray;
@@ -86,7 +87,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Text = "Displays", Font = new Font("Segoe UI Semibold", 29),
             ForeColor = Color.WhiteSmoke };
         var subtitle = new Label { Dock = DockStyle.Fill,
-            Text = "Arrange your computers like Windows monitors. Your existing Windows display layout remains unchanged.",
+            Text = "Arrange connected devices while keeping your Windows display layout unchanged.",
             ForeColor = Color.FromArgb(188, 190, 198), AutoEllipsis = true };
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
@@ -174,6 +175,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             RefreshDisplays();
             StartListening();
+            try
+            {
+                WindowsStartup.EnsureDefault();
+                if (_startupMenu != null) _startupMenu.Checked = WindowsStartup.Enabled;
+            }
+            catch (Exception ex) { Status("Windows sign-in startup could not be enabled: " + ex.Message); }
             UpdateClient.StartEventUpdates(this);
             _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 8500 };
             _trustedScanTimer.Tick += async (_, _) => await ScanTrustedAsync();
@@ -214,6 +221,23 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             view.ShowDialog(this);
         });
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
+        _startupMenu = new ToolStripMenuItem("Launch in tray when Windows starts")
+        {
+            Checked = WindowsStartup.Enabled, CheckOnClick = false
+        };
+        _startupMenu.Click += (_, _) =>
+        {
+            try
+            {
+                WindowsStartup.SetEnabled(!WindowsStartup.Enabled);
+                _startupMenu.Checked = WindowsStartup.Enabled;
+                Status(_startupMenu.Checked
+                    ? "Windows sign-in startup enabled. DeskTouch will launch in the tray."
+                    : "Windows sign-in startup disabled by user.");
+            }
+            catch (Exception ex) { Status("Could not change Windows Startup Apps: " + ex.Message); }
+        };
+        _trayMenu.Items.Add(_startupMenu);
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 
@@ -289,7 +313,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         Text = name, Width = name switch {
             "Windows display settings" => 178, "Copy pairing code" => 155,
-            "Add a computer" => 150, _ => 100 },
+            "Add devices" => 145, "Get Android app" => 150, _ => 100 },
         FlatStyle = FlatStyle.Flat,
         FlatAppearance = { BorderColor = Color.FromArgb(85, 89, 100), BorderSize = 1 },
         ForeColor = Color.White,
@@ -334,7 +358,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             !string.IsNullOrEmpty(_currentFingerprint) &&
             !_trusted.IsTrustedReceiver(_currentFingerprint);
         _manageTrusted.Enabled = _trusted != null;
-        _add.Enabled = _host == null && _incomingPeer == null && !_connecting;
+        _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
         _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
             !_connecting && _host == null;
         _disconnect.Enabled = _host != null || _incomingPeer != null || _connecting;
@@ -380,15 +404,25 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.Start();
             try
             {
-                _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint);
-                _discovery.Start();
-                Status("Ready. Nearby PCs can find this computer. Select Add a computer to connect.");
+                // Preserve UDP discovery even when the PC becomes an outgoing
+                // controller. Busy PCs remain visible instead of disappearing.
+                if (_discovery == null)
+                {
+                    _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint, () =>
+                    {
+                        var receiver = Volatile.Read(ref _receiver);
+                        return receiver != null && receiver.CanAcceptNewPeer &&
+                            _host == null && !_connecting;
+                    });
+                    _discovery.Start();
+                }
+                Status("Ready. Nearby Windows PCs and Android devices can find this computer.");
             }
             catch (Exception ex)
             {
                 _discovery?.Dispose();
                 _discovery = null;
-                Status("Ready to pair by code. LAN device discovery unavailable: " + ex.Message);
+                Status("Ready to pair by code. LAN discovery unavailable: " + ex.Message);
             }
         }
         catch (Exception ex)
@@ -398,7 +432,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
     }
 
-    private void StopListening()
+    private void StopListening(bool preserveDiscovery = false)
     {
         // Receiving PC also owns a SourceCapture when paired. Always unhook
         // before disposing its LocalInputPriority and raw input registration.
@@ -407,8 +441,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture?.Dispose();
             _capture = null;
         }
-        _discovery?.Dispose();
-        _discovery = null;
+        if (!preserveDiscovery)
+        {
+            _discovery?.Dispose();
+            _discovery = null;
+        }
         if (_receiver != null)
         {
             _receiver.PeerConnected -= OnIncomingPeerConnected;
@@ -574,17 +611,29 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private async Task AddComputerAsync()
     {
-        if (_host != null || _incomingPeer != null || _connecting || _closing.IsCancellationRequested) return;
+        if (_connecting || _closing.IsCancellationRequested) return;
         using var dialog = new PairComputerDialog();
         _manualPairDialogOpen = true;
         DialogResult choice;
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
-        if (choice != DialogResult.OK) return;
-        if (_host != null || _incomingPeer != null || _connecting ||
-            _closing.IsCancellationRequested) return;
+        if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
+        if (_host != null || _incomingPeer != null)
+        {
+            // One active input owner at a time. Switching requires explicit
+            // confirmation and never claims a second simultaneous session.
+            var confirm = MessageBox.Show(this,
+                "Another device currently owns the remote input session.\n\n" +
+                "Disconnect that session and switch to " + dialog.ComputerName + "?",
+                "Switch DeskTouch device?", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes) return;
+            DisconnectHost();
+            _receiver?.DisconnectPeer();
+            _incomingPeer = null;
+        }
         _connecting = true;
-        StopListening();
+        StopListening(preserveDiscovery: true);
         UpdateButtons();
         Status("Connecting securely. The other computer may ask its user to approve...");
         try
@@ -757,7 +806,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;
             _connecting = true;
-            StopListening();
+            StopListening(preserveDiscovery: true);
             Status($"Trusted {found.Saved!.Name} discovered. Verifying persistent device identity...");
             try
             {

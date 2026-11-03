@@ -8,6 +8,9 @@ import android.util.Base64;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.SecureRandom;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.Locale;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -58,6 +61,13 @@ final class TrustedWindows {
         aes.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,iv));
         aes.updateAAD(fingerprint.getBytes(StandardCharsets.US_ASCII));
         return new String(aes.doFinal(combined,12,combined.length-12),StandardCharsets.US_ASCII);
+    }
+    synchronized Set<String> fingerprints() {
+        Set<String> identities=new HashSet<>();
+        for(String stored:prefs.getAll().keySet())
+            if(stored.matches("[A-Fa-f0-9]{64}"))
+                identities.add(stored.toUpperCase(Locale.ROOT));
+        return identities;
     }
     synchronized void forget(String fingerprint) {
         prefs.edit().remove(fingerprint).apply();

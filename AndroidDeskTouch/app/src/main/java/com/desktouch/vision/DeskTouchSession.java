@@ -31,6 +31,7 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile DataInputStream input;
     private volatile DataOutputStream output;
     private volatile boolean running;
+    private volatile boolean connecting;
     private volatile boolean active;
     private volatile int claim;
     private volatile String fingerprint;
@@ -48,12 +49,14 @@ final class DeskTouchSession implements AutoCloseable {
         return "move".equals(type)||"button".equals(type)||"key".equals(type)||"wheel".equals(type);
     }
     boolean isConnected(){return running;}
+    boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
         sender.execute(()->{
-            if(running) {status("Disconnect first");return;}
+            if(running || connecting) {status("Already connected or connecting");return;}
+            connecting=true;
             try {
                 String pinned=device.fingerprint.toUpperCase(Locale.ROOT);
                 if(!pinned.matches("[A-F0-9]{64}")) throw new SecurityException("Invalid TLS fingerprint");
@@ -126,7 +129,7 @@ final class DeskTouchSession implements AutoCloseable {
             } catch(Exception e) {
                 status("Connection failed: "+e.getMessage());
                 closeConnection();
-            }
+            } finally {connecting=false;}
         });
     }
     private static byte[] hex(String value) {
@@ -232,6 +235,10 @@ final class DeskTouchSession implements AutoCloseable {
         running=false;active=false;claim=0;pendingTrust=null;
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}
+    }
+    void disconnect(){
+        closeConnection();
+        status("Disconnected. Trusted auto-reconnect paused until enabled.");
     }
     @Override public void close(){
         closeConnection();

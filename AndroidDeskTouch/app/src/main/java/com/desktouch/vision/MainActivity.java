@@ -21,8 +21,23 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
-        session=new DeskTouchSession(new TrustedWindows(this),message->
+        session=DeskTouchRuntime.session(this);
+        DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{if(status!=null)status.setText(message);}));
+        // Android 13+ requires permission to show the persistent connection
+        // notification in the shade. The foreground service itself is still
+        // subject to Android's background lifecycle rules.
+        if(Build.VERSION.SDK_INT>=33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                !=android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},37377);
+        }
+        if(AutoConnectService.enabled(this)) {
+            try {AutoConnectService.start(this);}
+            catch(RuntimeException startupError) {
+                android.util.Log.w("DeskTouch","Background startup not available",startupError);
+            }
+        }
         LinearLayout page=new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         page.setPadding(dp(16),dp(16),dp(16),dp(12));
@@ -47,16 +62,30 @@ public final class MainActivity extends Activity {
         status.setTextSize(15);
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
-        addButton(page,"Find Windows computers",this::scan);
+        addButton(page,"Find devices",this::scan);
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
         addButton(page,"Take control of Windows",()->session.claimControl());
         addButton(page,"Return control to this device",()->session.releaseControl());
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
-        addButton(page,"Disconnect",()->{session.releaseControl();session.close();session=
-            new DeskTouchSession(new TrustedWindows(this),message->
-                runOnUiThread(()->status.setText(message)));});
+        addButton(page,"Disconnect",()->{
+            AutoConnectService.setReconnect(this,false);
+            session.releaseControl();
+            session.disconnect();
+        });
+        android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
+        autoStart.setText("Launch on Android startup and reconnect trusted devices");
+        autoStart.setTextColor(Color.WHITE);
+        autoStart.setChecked(AutoConnectService.enabled(this));
+        autoStart.setOnCheckedChangeListener((button,checked)->{
+            AutoConnectService.setEnabled(this,checked);
+            AutoConnectService.setReconnect(this,checked);
+            status.setText(checked
+                ? "Android startup enabled; trusted PCs reconnect automatically when reachable."
+                : "Android startup and background reconnect disabled.");
+        });
+        page.addView(autoStart);
         TextView padLabel=new TextView(this);
         padLabel.setText("Touchpad / external mouse area");
         padLabel.setTextColor(Color.WHITE);
@@ -135,6 +164,7 @@ public final class MainActivity extends Activity {
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
+
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){
@@ -146,16 +176,25 @@ public final class MainActivity extends Activity {
     private void scan(){
         if(scanning)return;
         scanning=true;
-        status.setText("Looking for Windows DeskTouch on local Wi-Fi...");
+        status.setText("Looking for Windows PCs and Android phones on local Wi-Fi...");
         deviceList.removeAllViews();
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
-                    if(list.isEmpty())status.setText("No Windows PCs found. Check private Wi-Fi, firewall and DeskTouch tray.");
-                    else status.setText("Select a Windows PC below and approve pairing on Windows.");
+                    if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
+                    else status.setText("Select a ready Windows PC below. Busy peers and Android phones are shown for discovery.");
                     for(DesktopDiscovery.Device d:list){
-                        addButton(deviceList,d.name+" • "+d.address,()->{
+                        addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
+                            (d.ready?" • Ready":" • "+(d.android?"Phone":"Busy")),()->{
+                            if(d.android) {
+                                status.setText("Android phone discovered. Connect from that phone to this Windows PC.");
+                                return;
+                            }
+                            if(!d.ready) {
+                                status.setText("Windows PC is busy. Disconnect its current sharing session and rescan.");
+                                return;
+                            }
                             new AlertDialog.Builder(this).setTitle("Secure pairing")
                             .setMessage("Confirm the pairing prompt on your Windows DeskTouch app. " +
                                 "The connection checks its TLS certificate fingerprint.")
@@ -163,6 +202,7 @@ public final class MainActivity extends Activity {
                             .setPositiveButton("Connect",(dialog,which)->{
                                 android.graphics.Point size=new android.graphics.Point();
                                 getWindowManager().getDefaultDisplay().getRealSize(size);
+                                AutoConnectService.setReconnect(this,true);
                                 session.connect(d,size.x,size.y);
                             }).show();
                         });
@@ -211,7 +251,8 @@ public final class MainActivity extends Activity {
         if(!focus&&session!=null)session.releaseControl();
     }
     @Override protected void onDestroy(){
-        if(session!=null)session.close();
+        DeskTouchRuntime.setListener(null);
+        if(session!=null)session.releaseControl();
         super.onDestroy();
     }
 }

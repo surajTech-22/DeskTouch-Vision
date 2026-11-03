@@ -202,7 +202,7 @@ internal sealed class DisplayArrangementControl : Control
         using var path = Rounded(r, 10);
         g.FillPath(bg, path);
         g.DrawPath(pen, path);
-        DrawCenter(g, "+  Add a computer", r, Brushes.LightGray, 12);
+        DrawCenter(g, "+  Add devices", r, Brushes.LightGray, 12);
     }
 
     private static void DrawScreen(Graphics g, RectangleF rect, string number, bool primary, bool local)

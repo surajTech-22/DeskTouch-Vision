@@ -65,6 +65,7 @@ public final class ProtocolSourceTest {
         assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-claim"));
         assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-move"));
         assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-key"));
+        assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-text"));
         assertTrue(DeskTouchSession.allowedWindowsControlType("reverse-release"));
         assertFalse(DeskTouchSession.allowedWindowsControlType("auth-trusted"));
         assertFalse(DeskTouchSession.allowedWindowsControlType("reverse-auth-request"));
@@ -110,6 +111,31 @@ public final class ProtocolSourceTest {
             java.util.Collections.singleton(one.fingerprint));
         assertEquals(one.fingerprint,remembered.fingerprint);
         assertNotEquals(one.fingerprint,two.fingerprint); // separate TLS keys
+    }
+    @Test public void environmentDiscoveryPrefersActualHubNotJoinedMember() {
+        DesktopDiscovery.Device hub=DesktopDiscovery.parse(
+            "DT1-READY|DESKTOP-HUB|"+"A".repeat(64),"192.168.1.10");
+        DesktopDiscovery.Device member=DesktopDiscovery.parse(
+            "DT1-READY|DESKTOP-MEMBER|"+"B".repeat(64),"192.168.1.20");
+        hub.isHub=true;
+        java.util.List<DesktopDiscovery.Device> linked=java.util.Arrays.asList(hub,member);
+        DesktopDiscovery.applyConnectedGroups(linked,
+            java.util.Collections.singletonList(
+                new String[]{hub.fingerprint,member.fingerprint}));
+        assertEquals(hub.groupId,member.groupId);
+        DesktopDiscovery.Device selected=DesktopDiscovery.chooseGateway(
+            linked,java.util.Collections.emptySet(),
+            java.util.Collections.singleton(member.fingerprint));
+        assertEquals(hub.fingerprint,selected.fingerprint);
+        assertNotEquals(member.fingerprint,selected.fingerprint);
+    }
+    @Test public void environmentMemberHasRoutedDisplayWithoutNewConnection() {
+        DeskTouchSession.EnvironmentTarget member=
+            new DeskTouchSession.EnvironmentTarget(
+                3,"DESKTOP-SECOND","Windows","[]",true);
+        assertEquals(3,member.id);
+        assertTrue(member.supportsInput);
+        assertEquals("Windows • DESKTOP-SECOND",member.toString());
     }
     @Test public void unavailableGatewayDoesNotBecomeTrusted() {
         DesktopDiscovery.Device busy=DesktopDiscovery.parse(

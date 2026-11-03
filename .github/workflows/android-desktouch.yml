@@ -34,11 +34,41 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Unit tests and installable Android debug APK
+      - name: Prepare persistent release signing if repository secrets are configured
+        env:
+          DESKTOUCH_KEYSTORE_B64: ${{ secrets.DESKTOUCH_ANDROID_KEYSTORE_BASE64 }}
+          DESKTOUCH_KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
+          DESKTOUCH_STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
+          DESKTOUCH_KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
+        shell: bash
         run: |
+          set -euo pipefail
+          if [[ -n "$DESKTOUCH_KEYSTORE_B64" && -n "$DESKTOUCH_KEY_ALIAS" &&
+                -n "$DESKTOUCH_STORE_PASSWORD" && -n "$DESKTOUCH_KEY_PASSWORD" ]]; then
+            echo "$DESKTOUCH_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/desktouch-release.jks"
+            chmod 600 "$RUNNER_TEMP/desktouch-release.jks"
+            echo "DESKTOUCH_SIGN_STORE_FILE=$RUNNER_TEMP/desktouch-release.jks" >> "$GITHUB_ENV"
+            echo "DESKTOUCH_STABLE_SIGNING=true" >> "$GITHUB_ENV"
+          else
+            echo "DESKTOUCH_STABLE_SIGNING=false" >> "$GITHUB_ENV"
+            echo "::warning::Android APK uses ephemeral debug signing. It cannot reliably update an older preview in-place. Configure the signing secrets for stable upgrades."
+          fi
+      - name: Unit tests and installable Android APK
+        env:
+          DESKTOUCH_SIGN_STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
+          DESKTOUCH_SIGN_KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
+          DESKTOUCH_SIGN_KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
           gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+          if [ "$DESKTOUCH_STABLE_SIGNING" = "true" ]; then
+            gradle --no-daemon --stacktrace :app:assembleRelease
+            test -s app/build/outputs/apk/release/app-release.apk
+            cp app/build/outputs/apk/release/app-release.apk DeskTouchVision-android-preview.apk
+          else
+            test -s app/build/outputs/apk/debug/app-debug.apk
+            cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+          fi
           sha256sum DeskTouchVision-android-preview.apk > DeskTouchVision-android-preview.apk.sha256
       - name: Archive Android APK
         uses: actions/upload-artifact@v4

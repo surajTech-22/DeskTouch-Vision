@@ -30,4 +30,10 @@ public final class ProtocolSourceTest {
         assertFalse(android.ready);
         assertNull(DesktopDiscovery.parse("DT1-READY|Fake|BAD","192.168.1.9"));
     }
+    @Test public void releaseUpdaterComparesSemanticVersions() {
+        assertTrue(AndroidUpdater.compareVersions("0.3.6","0.3.5")>0);
+        assertEquals(0,AndroidUpdater.compareVersions("0.3.6","0.3.6"));
+        assertTrue(AndroidUpdater.compareVersions("0.4.0","0.3.99")>0);
+        assertTrue(AndroidUpdater.compareVersions("0.3.5","0.3.6")<0);
+    }
 }

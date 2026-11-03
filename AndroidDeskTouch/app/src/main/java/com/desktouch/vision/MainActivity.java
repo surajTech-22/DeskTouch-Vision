@@ -13,6 +13,7 @@ import java.util.List;
 public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList;
+    private TextView connectionSummary;
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY;
@@ -63,16 +64,26 @@ public final class MainActivity extends Activity {
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
         addButton(page,"Find devices",this::scan);
+        connectionSummary=new TextView(this);
+        connectionSummary.setTextColor(Color.rgb(171,216,188));
+        connectionSummary.setPadding(0,dp(5),0,dp(9));
+        connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
+        page.addView(connectionSummary);
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
-        addButton(page,"Take control of Windows",()->session.claimControl());
+        addButton(page,"Take control of selected Windows device",()->{
+            DeskTouchRuntime.releaseAll(); // one physical keyboard/mouse controller.
+            session.claimControl();
+        });
         addButton(page,"Return control to this device",()->session.releaseControl());
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
-        addButton(page,"Disconnect",()->{
-            AutoConnectService.setReconnect(this,false);
+        addButton(page,"Disconnect selected device",()->{
+            AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
             session.releaseControl();
             session.disconnect();
+            status.setText("Selected device disconnected. Other peers stay connected; "+
+                "auto reconnect paused only for this device.");
         });
         android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
         autoStart.setText("Launch on Android startup and reconnect trusted devices");
@@ -86,6 +97,11 @@ public final class MainActivity extends Activity {
                 : "Android startup and background reconnect disabled.");
         });
         page.addView(autoStart);
+        addButton(page,"Get updates",()->AndroidUpdater.checkForUpdates(this,true));
+        addButton(page,"Update existing application",()->AndroidUpdater.installAvailableUpdate(this));
+        // Only checks official GitHub metadata; never downloads or silently
+        // installs an executable without explicit user action.
+        AndroidUpdater.checkForUpdates(this,false);
         TextView padLabel=new TextView(this);
         padLabel.setText("Touchpad / external mouse area");
         padLabel.setTextColor(Color.WHITE);
@@ -182,17 +198,27 @@ public final class MainActivity extends Activity {
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
+                    connectionSummary.setText("Connected devices: "+
+                        DeskTouchRuntime.connectedCount()+" / 8");
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
                     else status.setText("Select a ready Windows PC below. Busy peers and Android phones are shown for discovery.");
                     for(DesktopDiscovery.Device d:list){
+                        boolean connected=DeskTouchRuntime.isConnected(d.fingerprint);
                         addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
-                            (d.ready?" • Ready":" • "+(d.android?"Phone":"Busy")),()->{
+                            (connected?" • Connected (select)":
+                             d.ready?" • Ready":" • "+(d.android?"Phone":"At capacity")),()->{
                             if(d.android) {
                                 status.setText("Android phone discovered. Connect from that phone to this Windows PC.");
                                 return;
                             }
+                            if(DeskTouchRuntime.isConnected(d.fingerprint)) {
+                                session=DeskTouchRuntime.select(this,d.fingerprint);
+                                status.setText("Selected "+d.name+" for mouse and keyboard control. "+
+                                    DeskTouchRuntime.connectedCount()+" devices connected.");
+                                return;
+                            }
                             if(!d.ready) {
-                                status.setText("Windows PC is busy. Disconnect its current sharing session and rescan.");
+                                status.setText("That Windows PC has reached its connection capacity. Rescan later.");
                                 return;
                             }
                             new AlertDialog.Builder(this).setTitle("Secure pairing")
@@ -203,7 +229,11 @@ public final class MainActivity extends Activity {
                                 android.graphics.Point size=new android.graphics.Point();
                                 getWindowManager().getDefaultDisplay().getRealSize(size);
                                 AutoConnectService.setReconnect(this,true);
+                                AutoConnectService.resumePeer(this,d.fingerprint);
+                                session=DeskTouchRuntime.select(this,d.fingerprint);
                                 session.connect(d,size.x,size.y);
+                                connectionSummary.setText("Connecting to "+d.name+" • "+
+                                    DeskTouchRuntime.connectedCount()+" connected devices");
                             }).show();
                         });
                     }
@@ -248,11 +278,11 @@ public final class MainActivity extends Activity {
     }
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);
-        if(!focus&&session!=null)session.releaseControl();
+        if(!focus)DeskTouchRuntime.releaseAll();
     }
     @Override protected void onDestroy(){
         DeskTouchRuntime.setListener(null);
-        if(session!=null)session.releaseControl();
+        DeskTouchRuntime.releaseAll();
         super.onDestroy();
     }
 }

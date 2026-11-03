@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo;
 import android.os.*;
 import android.util.Log;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.*;
 
 /**
@@ -33,6 +34,22 @@ public final class AutoConnectService extends Service {
         return context.getSharedPreferences(PREFS, MODE_PRIVATE)
             .getBoolean(RECONNECT,true);
     }
+    static void pausePeer(Context context,String fingerprint) {
+        if(fingerprint==null || !fingerprint.matches("[A-Fa-f0-9]{64}"))return;
+        android.content.SharedPreferences prefs=context.getSharedPreferences(PREFS,MODE_PRIVATE);
+        Set<String> paused=new HashSet<>(prefs.getStringSet("pausedPeers",
+            java.util.Collections.emptySet()));
+        paused.add(fingerprint.toUpperCase(java.util.Locale.ROOT));
+        prefs.edit().putStringSet("pausedPeers",paused).apply();
+    }
+    static void resumePeer(Context context,String fingerprint) {
+        if(fingerprint==null || !fingerprint.matches("[A-Fa-f0-9]{64}"))return;
+        android.content.SharedPreferences prefs=context.getSharedPreferences(PREFS,MODE_PRIVATE);
+        Set<String> paused=new HashSet<>(prefs.getStringSet("pausedPeers",
+            java.util.Collections.emptySet()));
+        paused.remove(fingerprint.toUpperCase(java.util.Locale.ROOT));
+        prefs.edit().putStringSet("pausedPeers",paused).apply();
+    }
     static void setReconnect(Context context,boolean value) {
         context.getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putBoolean(RECONNECT,value).apply();
@@ -53,7 +70,6 @@ public final class AutoConnectService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         trust=new TrustedWindows(this);
-        DeskTouchRuntime.session(this);
         NotificationManager manager=getSystemService(NotificationManager.class);
         NotificationChannel channel=new NotificationChannel(CHANNEL,
             "DeskTouch device sharing", NotificationManager.IMPORTANCE_LOW);
@@ -78,22 +94,31 @@ public final class AutoConnectService extends Service {
         }
         scheduler=Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleWithFixedDelay(this::autoConnect,0,10,TimeUnit.SECONDS);
+        // Updates are downloaded only from official GitHub and SHA-256 checked.
+        // Android's own installer must still be approved by the user.
+        scheduler.scheduleWithFixedDelay(
+            ()->AndroidUpdater.checkBackground(getApplicationContext()),
+            30,2*60*60,TimeUnit.SECONDS);
     }
     private void autoConnect() {
         if(scanning || !reconnectEnabled(this) || !enabled(this)) return;
-        DeskTouchSession session=DeskTouchRuntime.session(this);
-        if(session.isConnected() || session.isConnecting())return;
         scanning=true;
         try {
             Set<String> verified=trust.fingerprints();
+            Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
+                .getStringSet("pausedPeers",java.util.Collections.emptySet());
             if(verified.isEmpty()) return; // no silent first-time pairing
+            android.util.DisplayMetrics display=getResources().getDisplayMetrics();
+            // Connect EVERY approved device, not just the first discovered PC.
+            // Each connection has its own socket, token and two-phase authority.
             for(DesktopDiscovery.Device device:DesktopDiscovery.scan()) {
-                if(!device.ready||device.android||!verified.contains(device.fingerprint))continue;
-                if(session.isConnected()||session.isConnecting())break;
-                android.util.DisplayMetrics display=getResources().getDisplayMetrics();
+                if(!device.ready || device.android ||
+                    !verified.contains(device.fingerprint)||
+                    paused.contains(device.fingerprint))continue;
+                DeskTouchSession session=DeskTouchRuntime.forPeer(this,device.fingerprint);
+                if(session.isConnected()||session.isConnecting())continue;
                 session.connect(device,Math.max(200,display.widthPixels),
                     Math.max(100,display.heightPixels));
-                break;
             }
         }catch(Exception error){
             Log.w("DeskTouch","Trusted LAN reconnect deferred",error);

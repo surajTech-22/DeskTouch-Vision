@@ -51,6 +51,7 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isConnected(){return running;}
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
+    boolean hasClaim(){return claim>0||active;}
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
@@ -107,7 +108,8 @@ final class DeskTouchSession implements AutoCloseable {
                 myLayout.put(new JSONObject().put("Name","Android screen").put("X",0).put("Y",0)
                     .put("Width",width).put("Height",height).put("Primary",true));
                 JSONObject hello=new JSONObject().put("Name",Build.MANUFACTURER+" "+Build.MODEL)
-                    .put("Layout",myLayout.toString());
+                    .put("Layout",myLayout.toString())
+                    .put("ReverseInputSupported",false);
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
                 screenX=minX;screenY=minY;screenWidth=ready.c;screenHeight=ready.d;

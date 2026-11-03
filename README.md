@@ -2,7 +2,17 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.5 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.6 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.6 — reliable screen-edge mouse handoff and stable Displays layout
+
+- Raw mouse movement is **now checked while pairing is armed**, not only after remote control has begun. This fixes missed handoffs when Windows clamps the cursor at the final screen pixel and further outward movement does not generate useful ordinary `WM_MOUSEMOVE` events. Uses the built-in Windows Raw Input API, with a low-level mouse-message fallback for precision touchpads that lack usable raw motion.
+- The handoff requires **deliberate outward movement** within a 14-physical-pixel boundary zone. Merely resting at an edge, moving inward, or crossing an internal Windows extended-monitor seam will not switch PCs. Supports all four outer boundaries and negative-coordinate mixed Windows display layouts.
+- Raw-input touchpad fallback now activates immediately after a handoff. Failed UI dispatch no longer leaves a stuck pending edge-switch flag. A new `connection.log` entry records whether a handoff was triggered by raw mouse input or touchpad-compatible mouse-hook movement (without recording typed keys or cursor coordinates).
+- The Windows Displays panel is unchanged in design. Connected screen tiles cannot be dragged completely off-screen, labels scale down for smaller tiles, and an interrupted drag or window resize cancels the drag safely. Connection action buttons do not wrap into invisible rows at high DPI.
+- Windows CI tests deliberate outward movement at all four edges, clamped pointer, native seams, inward and idle movements, negative coordinates, drag bounds, and **off-screen WinForms bitmap rendering** at minimum and standard window sizes, plus native-input priority and encrypted pairing.
+
+**Install v0.2.6 on both Windows PCs** and test crossing the actual outside edge of your Windows desktop. On a two-monitor PC, crossing an internal Windows monitor boundary should stay local. The Windows CI runner cannot guarantee physical mouse/touchpad driver behavior on the user's devices; real two-PC validation remains required. For missed handoffs, review `%LOCALAPPDATA%\\DeskTouchVision\\logs\\connection.log` on the controlling computer.
 
 ## v0.2.5 — stable paired Windows computers and mirrored monitor arrangements
 

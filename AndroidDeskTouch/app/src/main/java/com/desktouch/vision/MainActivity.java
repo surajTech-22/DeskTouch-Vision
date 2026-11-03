@@ -151,57 +151,76 @@ public final class MainActivity extends Activity {
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
                     else status.setText("DeskTouch found "+list.size()+" nearby device(s). "+
                         "Interconnected PCs are grouped; choose a member to connect.");
-                    java.util.Map<String,Integer> groupSizes=new java.util.HashMap<>();
+                    // One visible connection card per linked Windows network.
+                    // Direct TLS identities remain separate underneath; a group
+                    // must never be substituted for a certificate fingerprint.
+                    java.util.LinkedHashMap<String,List<DesktopDiscovery.Device>> groups=
+                        DesktopDiscovery.windowsGroups(list);
+                    java.util.Set<String> connectedFingerprints=new java.util.HashSet<>();
                     for(DesktopDiscovery.Device device:list)
-                        if(!device.android)
-                            groupSizes.put(device.groupId,
-                                groupSizes.getOrDefault(device.groupId,0)+1);
-                    java.util.Set<String> shownGroups=new java.util.HashSet<>();
-                    for(DesktopDiscovery.Device d:list){
-                        if(!d.android && groupSizes.getOrDefault(d.groupId,1)>1 &&
-                            shownGroups.add(d.groupId)){
-                            TextView group=new TextView(this);
-                            group.setText("Linked DeskTouch network • "+
-                                groupSizes.get(d.groupId)+" Windows PCs");
-                            group.setTextColor(Color.rgb(158,221,205));
-                            group.setTextSize(17);
-                            group.setPadding(0,dp(10),0,dp(6));
-                            deviceList.addView(group);
-                        }
-                        boolean connected=DeskTouchRuntime.isConnected(d.fingerprint);
-                        addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
-                            (connected?" • Connected (select)":
-                             d.ready?" • Ready":" • "+(d.android?"Phone":"At capacity")),()->{
-                            if(d.android) {
-                                status.setText("Android phone discovered. Connect from that phone to this Windows PC.");
+                        if(!device.android&&DeskTouchRuntime.isConnected(device.fingerprint))
+                            connectedFingerprints.add(device.fingerprint);
+                    java.util.Set<String> approved=new java.util.HashSet<>();
+                    try {approved.addAll(new TrustedWindows(this).fingerprints());}
+                    catch(Exception ignored){}
+                    long activeGroups=groups.values().stream().filter(members->
+                        members.stream().anyMatch(m->connectedFingerprints.contains(m.fingerprint)))
+                        .count();
+                    connectionSummary.setText("Connected Windows networks: "+
+                        activeGroups+" / "+groups.size());
+                    for(List<DesktopDiscovery.Device> members:groups.values()){
+                        DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
+                            members,connectedFingerprints,approved);
+                        if(gateway==null)continue;
+                        boolean connected=members.stream().anyMatch(
+                            m->connectedFingerprints.contains(m.fingerprint));
+                        String names=String.join(" + ",members.stream()
+                            .map(m->m.name).toArray(String[]::new));
+                        String label=(members.size()>1?"Linked Windows network":"Windows PC")
+                            +" • "+names
+                            +(connected?" • Connected via "+gateway.name:
+                              gateway.ready?" • Connect":" • At capacity");
+                        addButton(deviceList,label,()->{
+                            if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
+                                session=DeskTouchRuntime.select(this,gateway.fingerprint);
+                                status.setText("Connected to "+names+" through "+gateway.name+
+                                    ". Network members keep their own TLS identities. "+
+                                    "This connection does not automatically relay Android "+
+                                    "keyboard input through another PC.");
                                 return;
                             }
-                            if(DeskTouchRuntime.isConnected(d.fingerprint)) {
-                                session=DeskTouchRuntime.select(this,d.fingerprint);
-                                status.setText("Connected to "+d.name+". Select this Android phone in that PC's Displays window. "+
-                                    DeskTouchRuntime.connectedCount()+" devices connected.");
+                            if(!gateway.ready){
+                                status.setText("No available Windows gateway. Rescan after the "+
+                                    "connected PCs start DeskTouch or release a session.");
                                 return;
                             }
-                            if(!d.ready) {
-                                status.setText("That Windows PC has reached its connection capacity. Rescan later.");
-                                return;
-                            }
-                            new AlertDialog.Builder(this).setTitle("Secure pairing")
-                            .setMessage("Confirm the pairing prompt on your Windows DeskTouch app. " +
-                                "The connection checks its TLS certificate fingerprint.")
-                            .setNegativeButton("Cancel",null)
-                            .setPositiveButton("Connect",(dialog,which)->{
-                                android.graphics.Point size=new android.graphics.Point();
-                                getWindowManager().getDefaultDisplay().getRealSize(size);
-                                AutoConnectService.setReconnect(this,true);
-                                AutoConnectService.resumePeer(this,d.fingerprint);
-                                session=DeskTouchRuntime.select(this,d.fingerprint);
-                                session.connect(d,size.x,size.y);
-                                connectionSummary.setText("Connecting to "+d.name+" • "+
-                                    DeskTouchRuntime.connectedCount()+" connected devices");
-                            }).show();
+                            new AlertDialog.Builder(this).setTitle(
+                                members.size()>1?"Connect to linked Windows network":"Secure pairing")
+                                .setMessage("DeskTouch will pair with "+gateway.name+
+                                    " as this network's gateway. Approve the pairing on "+
+                                    "that Windows PC. Other linked PCs remain separately "+
+                                    "authenticated; selecting a group does not install "+
+                                    "a transparent keyboard relay.")
+                                .setNegativeButton("Cancel",null)
+                                .setPositiveButton("Connect",(dialog,which)->{
+                                    android.graphics.Point size=new android.graphics.Point();
+                                    getWindowManager().getDefaultDisplay().getRealSize(size);
+                                    AutoConnectService.setReconnect(this,true);
+                                    AutoConnectService.resumePeer(this,gateway.fingerprint);
+                                    session=DeskTouchRuntime.select(this,gateway.fingerprint);
+                                    session.connect(gateway,size.x,size.y);
+                                    status.setText("Connecting to "+names+" via "+
+                                        gateway.name+"; authorize on that Windows PC.");
+                                }).show();
                         });
                     }
+                    // Android peers remain individually identifiable: only
+                    // interconnected Windows PCs share a network grouping.
+                    for(DesktopDiscovery.Device d:list)
+                        if(d.android)
+                            addButton(deviceList,"Android • "+d.name+
+                                " • discoverable only",()->status.setText(
+                                "Select Windows control from that Android device."));
                 });
             }catch(Exception e){runOnUiThread(()->status.setText("LAN scan failed: "+e.getMessage()));}
             finally{scanning=false;}

@@ -66,3 +66,19 @@ Check(nonrectangular.MonitorAt(mapped) != null,
     "Mapped remote cursor must never land in unoccupied virtual-screen gaps");
 
 Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four outer edges, and nonrectangular monitor layouts.");
+
+
+// Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
+{
+    var status = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    using var receiver = new ReceiverServer(message => status.Enqueue(message),
+        new LocalInputPriority(), (_, _) => Task.FromResult(true));
+    receiver.Start();
+    using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    using var session = await HostSession.ConnectWithApprovalAsync(
+        "127.0.0.1", receiver.Fingerprint, message => status.Enqueue(message),
+        testTimeout.Token);
+    Check(session.RemoteMonitors.Monitors.Count >= 1,
+        "Authenticated TLS receiver must return at least one Windows display");
+    Console.WriteLine("PASS: Windows loopback TLS pairing, explicit receiver approval and monitor exchange.");
+}

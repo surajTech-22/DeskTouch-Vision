@@ -11,7 +11,11 @@ namespace DeskTouch.DeviceShare;
 internal sealed class SourceCapture : IDisposable
 {
     private readonly Control _owner;
-    private readonly HostSession _session;
+    private readonly IInputSession _session;
+    private readonly bool _preserveRawInput;
+    private readonly AuthorityRequestTracker _claims = new();
+    private int _activeClaim;
+    private long _claimStarted;
     private readonly Win.HookProc _keyboardDelegate;
     private readonly Win.HookProc _mouseDelegate;
     private readonly Action<string> _status;
@@ -32,12 +36,14 @@ internal sealed class SourceCapture : IDisposable
     private bool _controlPressed, _altPressed, _shiftPressed;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
+    internal bool IsClaimPending => _claims.Pending != 0;
     internal bool IsArmed => Volatile.Read(ref _armed) != 0;
 
-    internal SourceCapture(Control owner, HostSession session, Action<string> status,
-        MonitorEdge exitEdge = MonitorEdge.Right)
+    internal SourceCapture(Control owner, IInputSession session, Action<string> status,
+        MonitorEdge exitEdge = MonitorEdge.Right, bool preserveRawInput = false)
     {
         _owner = owner;
+        _preserveRawInput = preserveRawInput;
         _edge = exitEdge;
         _session = session;
         _status = status;
@@ -125,7 +131,10 @@ internal sealed class SourceCapture : IDisposable
         Interlocked.Exchange(ref _armed, 0);
         if (_keyHook != IntPtr.Zero) { Win.UnhookWindowsHookEx(_keyHook); _keyHook = IntPtr.Zero; }
         if (_mouseHook != IntPtr.Zero) { Win.UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
-        if (_owner.IsHandleCreated)
+        // A PhysicalInputMonitor on the same HWND must continue observing
+        // physical input when this capture session ends. Removing the mouse
+        // registration would silently disable its native priority protection.
+        if (!_preserveRawInput && _owner.IsHandleCreated)
         {
             var remove = new[] { new Win.RAWINPUTDEVICE { UsagePage = 1,
                 Usage = 2, Flags = Win.RIDEV_REMOVE, Target = IntPtr.Zero } };
@@ -135,9 +144,15 @@ internal sealed class SourceCapture : IDisposable
 
     internal void ReturnLocal()
     {
+        int pendingClaim = _claims.Pending;
+        _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
+        if (pendingClaim > 0)
+            _session.TrySend(new Packet("release", pendingClaim));
         if (Interlocked.Exchange(ref _active, 0) == 0) return;
-        _session.TrySend(new Packet("release"));
+        int priorLease = Interlocked.Exchange(ref _activeClaim, 0);
+        if (priorLease > 0)
+            _session.TrySend(new Packet("release", priorLease));
         _cooldownUntil = Environment.TickCount64 + 1000;
         // Return to the real Windows screen the cursor left, not an empty
         // rectangle or another physical monitor.
@@ -164,22 +179,32 @@ internal sealed class SourceCapture : IDisposable
             Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return;
         _slowEdge.Reset();
         _pendingPoint = sourcePoint;
-        // Do not capture/suppress any source keyboard or mouse event until the
-        // receiver explicitly confirms its native devices have been idle.
-        if (!_session.TrySend(new Packet("claim")))
+        int request = _claims.Begin();
+        _claimStarted = Environment.TickCount64;
+        // Never hide or park local pointer until the authenticated target
+        // acknowledges THIS exact request. A stale grant cannot switch owners.
+        if (!_session.TrySend(new Packet("claim", request)))
         {
+            _claims.Cancel();
             Interlocked.Exchange(ref _pending, 0);
-            _status("Receiver unavailable; local input remains active.");
+            _status("Receiver unavailable; local authority remains active.");
         }
         else _status("Requesting remote control; local keyboard/mouse still work.");
     }
 
-    internal void GrantRemote()
+    internal void GrantRemote(int request)
     {
+        // Network responses can arrive after cancellation, a native-input
+        // override, or a newer claim. Never promote one of those stale grants.
+        if (!_claims.Accept(request))
+        {
+            _session.TrySend(new Packet("release", request));
+            return;
+        }
         if (Interlocked.Exchange(ref _pending, 0) != 1 ||
             !IsArmed || RemoteActive)
         {
-            _session.TrySend(new Packet("release"));
+            _session.TrySend(new Packet("release", request));
             return;
         }
         var entry = _remoteMonitors.EntryPoint(Opposite(_edge),
@@ -190,24 +215,30 @@ internal sealed class SourceCapture : IDisposable
         // Let touchpads without Raw Input fall back to the low-level mouse
         // hook immediately; do not leave their first 650 ms unresponsive.
         _lastRawMs = 0;
+        Volatile.Write(ref _activeClaim, request);
         Interlocked.Exchange(ref _active, 1);
         if (!_session.TrySend(new Packet("move", _remoteX, _remoteY)))
             ReturnLocal();
-        else _status("Remote control active. Receiver's physical keyboard/mouse will take priority immediately.");
+        else _status($"Authority granted for handoff #{request}; remote keyboard/mouse now active until native override or return.");
     }
 
-    internal void ReceiverNativePriority()
+    internal void ReceiverNativePriority(int lease)
     {
-        // Unconditional return: even a queued grant must not override the
-        // person physically using the receiver computer.
+        // Native input on the destination always wins. Ignore notifications
+        // for earlier requests to avoid destroying a newer authority lease.
+        if (lease > 0 && lease != _activeClaim && lease != _claims.Pending)
+            return;
+        _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
         ReturnLocal();
         _cooldownUntil = Environment.TickCount64 + 1500;
         _status("Receiver physical keyboard/mouse detected. Automatically restored LOCAL control.");
     }
 
-    internal void ReceiverBusy()
+    internal void ReceiverBusy(int request)
     {
+        if (request != _claims.Pending) return;
+        _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
         ReturnLocal();
         _cooldownUntil = Environment.TickCount64 + 1500;
@@ -230,6 +261,15 @@ internal sealed class SourceCapture : IDisposable
 
     private void SlowEdgeTick(object? sender, EventArgs args)
     {
+        // A disconnected or lagging target must not leave "pending" stuck
+        // forever while no machine actually owns the handoff.
+        if (_claims.Pending != 0 &&
+            Environment.TickCount64 - _claimStarted > 3500)
+        {
+            ReturnLocal();
+            _cooldownUntil = Environment.TickCount64 + 1200;
+            _status("Handoff acknowledgement timed out; local authority retained.");
+        }
         if (!IsArmed || RemoteActive || Volatile.Read(ref _pending) != 0 ||
             Environment.TickCount64 < _cooldownUntil) return;
         var cursor = Cursor.Position;

@@ -287,9 +287,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         Volatile.Write(ref _reverseQueue, reverseQueue);
         using var sessionCancel = CancellationTokenSource.CreateLinkedTokenSource(token);
         _ = Task.Run(() => ReverseSendLoopAsync(reverseQueue, sessionCancel.Token));
-        PeerConnected?.Invoke(incoming!);
         try
         {
+            // Include UI notification in the protected session lifetime.
+            // Even a failing subscriber must release the TLS socket, reverse
+            // input queue and all synthetic held keys in the finally block.
+            PeerConnected?.Invoke(incoming!);
             while (!token.IsCancellationRequested)
             {
                 // If Wi-Fi disappears without closing TCP, release any

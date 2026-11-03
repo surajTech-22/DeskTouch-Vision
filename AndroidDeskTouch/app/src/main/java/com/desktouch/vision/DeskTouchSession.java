@@ -77,7 +77,7 @@ final class DeskTouchSession implements AutoCloseable {
         return "reverse-claim".equals(type)||"reverse-release".equals(type)||
             "reverse-reset".equals(type)||"reverse-move".equals(type)||
             "reverse-button".equals(type)||"reverse-key".equals(type)||
-            "reverse-wheel".equals(type);
+            "reverse-wheel".equals(type)||"reverse-text".equals(type);
     }
     boolean isConnected(){return running;}
     boolean isConnecting(){return connecting;}
@@ -329,6 +329,9 @@ final class DeskTouchSession implements AutoCloseable {
             DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
         }else if("reverse-key".equals(p.type)){
             DeskTouchAccessibilityService.key(p.d,p.c!=0);
+        }else if("reverse-text".equals(p.type) && p.text!=null &&
+            p.text.length()>0 && p.text.length()<=512){
+            DeskTouchAccessibilityService.text(p.text);
         }
     }
     private void clearReverseControl(boolean notifyWindows){

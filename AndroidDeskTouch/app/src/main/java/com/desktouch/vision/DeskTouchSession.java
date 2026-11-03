@@ -257,17 +257,8 @@ final class DeskTouchSession implements AutoCloseable {
             cursorX=bx;cursorY=by;
         }
     }
-    void moveBy(float dx,float dy){
-        if(true)return; // one-way Windows -> Android mode; legacy API retained
-        synchronized(monitors){
-            cursorX+=Math.round(dx);cursorY+=Math.round(dy);clampToMonitor();
-            send(new Packet("move",cursorX,cursorY));
-        }
-    }
-    void click(int button){
-        if(true)return; // Android -> Windows input disabled
-        send(new Packet("button",button,1));send(new Packet("button",button,0));
-    }
+    void moveBy(float dx,float dy){ /* one-way Windows -> Android */ }
+    void click(int button){ /* one-way Windows -> Android */ }
     void button(int button,boolean down){ /* one-way mode */ }
     void wheel(int amount,boolean horizontal){ /* one-way mode */ }
     void key(int vk,boolean down){ /* one-way mode */ }

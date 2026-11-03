@@ -23,7 +23,7 @@ internal static class Program
         "DeskTouchVision.WindowsDisplays.ShowFromTray.2026");
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         using var singleInstance = new Mutex(true,
             @"Local\DeskTouchVision.WindowsDisplays", out bool firstInstance);
@@ -37,6 +37,7 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new DisplaySettingsForm());
+        Application.Run(new DisplaySettingsForm(
+            args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase))));
     }
 }

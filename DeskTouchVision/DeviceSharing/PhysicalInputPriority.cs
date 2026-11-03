@@ -119,11 +119,12 @@ internal sealed class PhysicalInputMonitor : IDisposable
         {
             var mouse = Marshal.PtrToStructure<Win.MSLLHOOKSTRUCT>(lParam);
             int msg = unchecked((int)wParam.ToInt64());
-            // Avoid SetCursorPos remote-pointer feedback loops by using the
-            // Raw Input device messages for mouse movement. Hooks cover clicks.
+            // Real touchpad motion may arrive as non-injected mouse moves
+            // without Raw Input. Remote pointer movement now uses SendInput,
+            // which sets LLMHF_INJECTED and is safely ignored here.
             if ((mouse.flags & 1) == 0 &&
-                msg is Win.WM_LBUTTONDOWN or Win.WM_RBUTTONDOWN or
-                       Win.WM_MBUTTONDOWN or Win.WM_MOUSEWHEEL or Win.WM_MOUSEHWHEEL)
+                (msg is Win.WM_MOUSEMOVE or Win.WM_LBUTTONDOWN or Win.WM_RBUTTONDOWN or
+                       Win.WM_MBUTTONDOWN or Win.WM_MOUSEWHEEL or Win.WM_MOUSEHWHEEL))
                 Priority.RecordPhysicalActivity();
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);

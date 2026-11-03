@@ -359,7 +359,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             !_trusted.IsTrustedReceiver(_currentFingerprint);
         _manageTrusted.Enabled = _trusted != null;
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
-        _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
+        _copyCode.Enabled = _receiver?.CanAcceptNewPeer == true &&
             !_connecting && _host == null;
         _disconnect.Enabled = _host != null || _incomingPeer != null || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
@@ -414,8 +414,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint, () =>
                     {
                         var receiver = Volatile.Read(ref _receiver);
-                        return receiver != null && receiver.CanAcceptNewPeer &&
-                            _host == null && !_connecting;
+                        return receiver != null && receiver.CanAcceptNewPeer;
                     });
                     _discovery.Start();
                 }
@@ -824,7 +823,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private async Task ScanTrustedAsync()
     {
         if (_scanningTrusted || _connecting || _manualPairDialogOpen || _host != null ||
-            _incomingPeer != null || _closing.IsCancellationRequested ||
+            _closing.IsCancellationRequested ||
             _trusted?.AutoConnectEnabled != true || _trusted.Outgoing.Count == 0 ||
             DateTime.UtcNow < _retryTrustedAfter || _receiver == null)
             return;
@@ -837,7 +836,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             var found = peers.Select(p => new { Peer = p,
                 Saved = _trusted.FindAutoConnect(p.Fingerprint) })
                 .FirstOrDefault(x => x.Saved != null);
-            if (found == null || _host != null || _incomingPeer != null ||
+            if (found == null || _host != null ||
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;
             _connecting = true;

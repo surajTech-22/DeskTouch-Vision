@@ -17,12 +17,19 @@ internal sealed class ReceiverServer : IDisposable
     private readonly RSA _key;
     private Task? _serverTask;
     private int _active;
+    private readonly LocalInputPriority _priority;
+    private readonly object _inputGate = new();
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private InputInjector? _currentInjector;
+    private SslStream? _currentStream;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
-    internal ReceiverServer(Action<string> status)
+    internal ReceiverServer(Action<string> status, LocalInputPriority priority)
     {
         _status = status;
+        _priority = priority;
+        _priority.PhysicalOverride += OnPhysicalOverride;
         _key = RSA.Create(2048);
         var req = new CertificateRequest("CN=DeskTouch-LAN", _key,
             HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
@@ -65,6 +72,28 @@ internal sealed class ReceiverServer : IDisposable
         return CryptographicOperations.FixedTimeEquals(a, b);
     }
 
+    private async Task SendControlAsync(Packet message, CancellationToken token)
+    {
+        var ssl = Volatile.Read(ref _currentStream);
+        if (ssl == null) return;
+        await _writeGate.WaitAsync(token);
+        try { await Wire.WriteAsync(ssl, message, token); }
+        finally { _writeGate.Release(); }
+    }
+
+    private void OnPhysicalOverride()
+    {
+        // Native activity immediately blocks new remote inputs before any
+        // asynchronous notification. Never await network I/O in an input hook.
+        lock (_inputGate) _currentInjector?.ReleaseAll();
+        _status("Local physical keyboard/mouse has priority; remote input paused.");
+        _ = Task.Run(async () =>
+        {
+            try { await SendControlAsync(new Packet("local-active"), _cancel.Token); }
+            catch (Exception) { } // Source connection may already have ended.
+        });
+    }
+
     private async Task ServeAsync(TcpClient client, CancellationToken token)
     {
         using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen: false);
@@ -89,29 +118,59 @@ internal sealed class ReceiverServer : IDisposable
         var screen = topology.Bounds;
         await Wire.WriteAsync(ssl, new Packet("ready", screen.Left, screen.Top,
             screen.Width, screen.Height, topology.ToWire()), token);
-        _status("Authenticated Windows peer connected.");
+        _status("Authenticated Windows peer connected; waiting for requested control.");
         var injector = new InputInjector();
+        Volatile.Write(ref _currentInjector, injector);
+        Volatile.Write(ref _currentStream, ssl);
         try
         {
             while (!token.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(ssl, token);
                 if (p.Type == "goodbye") break;
-                if (p.Type == "reset") { injector.ReleaseAll(); continue; }
-                injector.Handle(p);
+
+                if (p.Type == "claim")
+                {
+                    bool granted = _priority.TryClaim();
+                    // Respond explicitly; the source must not capture the
+                    // keyboard until an authenticated grant is received.
+                    await SendControlAsync(new Packet(granted ? "granted" : "busy"), token);
+                    continue;
+                }
+                if (p.Type == "reset" || p.Type == "release")
+                {
+                    _priority.ReleaseRemote();
+                    lock (_inputGate) injector.ReleaseAll();
+                    continue;
+                }
+                if (p.Type == "ping") continue;
+                lock (_inputGate)
+                {
+                    // Every input is gated by LOCAL native priority. A newly
+                    // pressed local keyboard wins even during a live session.
+                    if (_priority.CanApplyRemote) injector.Handle(p);
+                }
             }
         }
         catch (EndOfStreamException) { }
         catch (IOException) { }
         finally
         {
-            injector.ReleaseAll();
-            _status("Peer disconnected. All held keys/buttons released.");
+            _priority.ReleaseRemote();
+            Volatile.Write(ref _currentStream, null);
+            lock (_inputGate)
+            {
+                injector.ReleaseAll();
+                Volatile.Write(ref _currentInjector, null);
+            }
+            _status("Peer disconnected. Native keyboard/mouse always available.");
         }
     }
 
     public void Dispose()
     {
+        _priority.PhysicalOverride -= OnPhysicalOverride;
+        _priority.ReleaseRemote();
         _cancel.Cancel();
         _listener.Stop();
         _certificate.Dispose();
@@ -132,6 +191,7 @@ internal sealed class HostSession : IDisposable
     private int _closed;
     internal System.Drawing.Rectangle Screen => RemoteMonitors.Bounds;
     internal MonitorTopology RemoteMonitors { get; }
+    internal event Action<string>? RemoteControlState;
 
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
@@ -139,6 +199,7 @@ internal sealed class HostSession : IDisposable
         _client = client; _ssl = ssl; RemoteMonitors = monitors; _onFailure = onFailure;
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
+        _ = Task.Run(ReceiveLoopAsync);
     }
 
     internal static async Task<HostSession> ConnectAsync(
@@ -199,6 +260,25 @@ internal sealed class HostSession : IDisposable
         if (_queue.Writer.TryWrite(p)) return true;
         _onFailure("Input queue overloaded: local controls restored for safety.");
         return false;
+    }
+
+    private async Task ReceiveLoopAsync()
+    {
+        try
+        {
+            while (!_cancel.IsCancellationRequested)
+            {
+                var p = await Wire.ReadAsync(_ssl, _cancel.Token);
+                if (p.Type is "granted" or "busy" or "local-active")
+                    RemoteControlState?.Invoke(p.Type);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            if (Volatile.Read(ref _closed) == 0)
+                _onFailure("Connection closed while monitoring local input priority: " + ex.Message);
+        }
     }
 
     private async Task HeartbeatAsync()

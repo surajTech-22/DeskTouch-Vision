@@ -684,6 +684,8 @@ finally
     Interlocked.Add(ref clock,3000);
     var granted=new TaskCompletionSource<int>(
         TaskCreationOptions.RunContinuationsAsynchronously);
+    var appliedRouted=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     var competitorBusy=new TaskCompletionSource<int>(
         TaskCreationOptions.RunContinuationsAsynchronously);
     var competitorGrant=new TaskCompletionSource<int>(
@@ -692,6 +694,7 @@ finally
         TaskCreationOptions.RunContinuationsAsynchronously);
     mobileSource.AuthorityControlPacket += p=>{
         if(p.Type=="granted"&&p.A==501)granted.TrySetResult(p.A);
+        if(p.Type=="active"&&p.A==501)appliedRouted.TrySetResult(p.A);
     };
     otherPhone.AuthorityControlPacket += p=>{
         if(p.Type=="busy"&&p.A==502)competitorBusy.TrySetResult(p.A);
@@ -703,6 +706,16 @@ finally
         "Destination's actual reverse grant must be relayed back to source");
     Check(destinationPriority.RemoteGranted,
         "Destination rather than hub must hold the remote input lease");
+    Check(!appliedRouted.Task.IsCompleted,
+        "Remote grant alone MUST NOT activate keyboard before cursor application");
+    var sourceCursor=System.Windows.Forms.Cursor.Position;
+    var appliedStarted=System.Diagnostics.Stopwatch.StartNew();
+    Check(mobileSource.TrySend(new Packet("move",sourceCursor.X,sourceCursor.Y)),
+        "Remote cursor movement must follow routed grant");
+    Check(await appliedRouted.Task.WaitAsync(deadline.Token)==501,
+        "Second Windows PC must apply routed first cursor and return real active ACK");
+    appliedStarted.Stop();
+    Console.WriteLine($"MEASURED: routed claim-to-ACK after grant {appliedStarted.ElapsedMilliseconds} ms (CI loopback only).");
     Check(otherPhone.SelectEnvironmentTarget(routed.Id),
         "Second source must view same environment member without pairing to it");
     Check(otherPhone.TrySend(new Packet("claim",502)),
@@ -751,6 +764,48 @@ finally
     Check(environment.ConnectedPeerCount==3,
         "Authority reset must not terminate any concurrent environment connection");
     Console.WriteLine("PASS: one hub, three members, routed keyboard authority, competing claims, native priority and old-target release.");
+}
+
+// Stress: a hub must keep up to eight approved simultaneous TLS participants
+// in ONE roster, refuse an extra connection, and admit a replacement after a
+// member disconnects without severing any other peer.
+{
+    using var capacityHub = new ReceiverServer(_=>{},new LocalInputPriority(),
+        (_,__)=>Task.FromResult(true));
+    capacityHub.AllowForwardClaim=()=>false;
+    capacityHub.Start();
+    using var capTimeout=new CancellationTokenSource(TimeSpan.FromSeconds(35));
+    var endpoints = new List<HostSession>();
+    try
+    {
+        for(int i=0;i<8;i++)
+            endpoints.Add(await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+                capacityHub.Fingerprint,_=>{},capTimeout.Token));
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=8;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==8 && !capacityHub.CanAcceptNewPeer,
+            "Hub must permit eight independently authenticated members and enforce capacity");
+        for(int retry=0;retry<120 && endpoints[0].EnvironmentMembers.Count!=9;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(endpoints[0].EnvironmentMembers.Count==9,
+            "Full hub roster must contain eight live peers plus the hub itself");
+        endpoints[7].Dispose();
+        endpoints.RemoveAt(7);
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=7;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==7 && capacityHub.CanAcceptNewPeer,
+            "Disconnecting one member must restore one available hub slot");
+        endpoints.Add(await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+            capacityHub.Fingerprint,_=>{},capTimeout.Token));
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=8;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==8,
+            "Replacement member must join without disrupting the seven connected peers");
+        Check(endpoints.Take(7).All(peer=>peer.EnvironmentMembers.Count>=8),
+            "Existing participants must continue receiving environment membership updates");
+        Console.WriteLine("PASS: hub saturation at eight authenticated peers, disconnect, slot reuse and roster continuity.");
+    }
+    finally {foreach(var endpoint in endpoints)endpoint.Dispose();}
 }
 
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never

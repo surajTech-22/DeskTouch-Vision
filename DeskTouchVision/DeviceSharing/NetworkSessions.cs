@@ -70,6 +70,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
+    internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
+        _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
+    internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+    internal bool SelectConnectedPeer(int id)
+    {
+        if (!_sessions.TryGetValue(id, out var session)) return false;
+        // Selection is ONLY routing over the already authenticated TLS stream.
+        // It cannot grant authority and it never initiates another connection.
+        return Select(session);
+    }
     // Only labels for LAN display grouping; individual peer trust remains
     // pinned to its own approved TLS certificate/fingerprint.
     internal IReadOnlyList<string> ConnectedDeviceFingerprints =>

@@ -89,6 +89,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ForeColor = Color.FromArgb(188, 190, 198), AutoEllipsis = true };
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
+        _manageTrusted.Name = "TrustedDevicesButton";
         _manageTrusted.Text = "Trusted devices";
         _manageTrusted.Width = 128;
         _manageTrusted.Dock = DockStyle.Right;

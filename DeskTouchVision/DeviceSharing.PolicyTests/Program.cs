@@ -541,7 +541,34 @@ try
         "Third device must connect while the second stays online");
     Check(!multiPriority.RemoteGranted,
         "Connected peers must not steal local keyboard/mouse control");
-    Console.WriteLine("PASS: two concurrent authenticated devices, independent disconnect, third-peer join, and no input lease without consent.");
+    // An explicit claim may use the mouse/keyboard only when there is no
+    // different active lease owner. No move/key is injected in this test.
+    multiServer.AllowForwardClaim=()=>true;
+    await Task.Delay(LocalInputPriority.IdleBeforeRemoteMilliseconds+150,timeout.Token);
+    var firstGrant=new TaskCompletionSource<string>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var secondBusy=new TaskCompletionSource<string>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var secondGrant=new TaskCompletionSource<string>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    peer2.AuthorityControlPacket += p => {
+        if(p.A==1001 && p.Type=="granted")firstGrant.TrySetResult(p.Type);
+    };
+    peer3.AuthorityControlPacket += p => {
+        if(p.A==2001 && p.Type=="busy")secondBusy.TrySetResult(p.Type);
+        if(p.A==2002 && p.Type=="granted")secondGrant.TrySetResult(p.Type);
+    };
+    Check(peer2.TrySend(new Packet("claim",1001)),"First lease request must queue");
+    await firstGrant.Task.WaitAsync(TimeSpan.FromSeconds(8));
+    Check(peer3.TrySend(new Packet("claim",2001)),"Second lease request must queue");
+    await secondBusy.Task.WaitAsync(TimeSpan.FromSeconds(8));
+    Check(peer2.TrySend(new Packet("release",1001)),"First owner must release");
+    await Task.Delay(150,timeout.Token);
+    Check(peer3.TrySend(new Packet("claim",2002)),
+        "Second device must request a new lease after release");
+    await secondGrant.Task.WaitAsync(TimeSpan.FromSeconds(8));
+    peer3.TrySend(new Packet("release",2002));
+    Console.WriteLine("PASS: simultaneous TLS devices with one exclusive input authority lease and safe peer-to-peer transfer.");
 }
 finally
 {

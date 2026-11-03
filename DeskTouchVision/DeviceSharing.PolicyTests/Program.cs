@@ -634,8 +634,8 @@ try
     IInputSession bound = multiServer.BindSelectedInput();
     Check(multiServer.SelectConnectedPeer(alternate.Id),
         "Second authenticated Windows peer should be selectable without disconnect");
-    Check(bound.TrySend(new Packet("release",3003)),
-        "Old capture must still address its original connected input peer");
+    Check(!bound.TrySend(new Packet("release",3003)),
+        "Unowned stale release must not reset another environment member's authority");
     peer2.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);
@@ -727,7 +727,30 @@ finally
         "Returning to environment hub cannot disconnect other connected members");
     Check(environment.ConnectedPeerCount==3,
         "All devices must remain in one environment while authority changes");
-    Console.WriteLine("PASS: one authenticated hub, three simultaneous members, multi-hop routed authority, exclusion and native-priority revoke.");
+    // Hub-local control is also exclusive. A target switch must deliver the
+    // previous target's approved reset on the PREVIOUS peer session, not drop
+    // it because another peer is now selected.
+    Interlocked.Add(ref clock,3000);
+    Check(environment.SelectConnectedPeer(routed.Id),
+        "Hub should be able to select the routed desktop as a local target");
+    IInputSession hubCapture=environment.BindSelectedInput();
+    Check(hubCapture.TrySend(new Packet("claim",700)),
+        "Hub-local claim must queue on original authenticated target");
+    for(int i=0;i<50&&!destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(destinationPriority.RemoteGranted,
+        "Hub-local claim must acquire only that member's destination lease");
+    var anotherId=environment.ConnectedPeers
+        .Where(p=>p.Id!=routed.Id).OrderBy(p=>p.Id).First().Id;
+    Check(environment.SelectConnectedPeer(anotherId),
+        "Selecting a different member must not sever any environment connection");
+    for(int i=0;i<50&&destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(!destinationPriority.RemoteGranted,
+        "Original peer's reset must arrive even after hub's target changes");
+    Check(environment.ConnectedPeerCount==3,
+        "Authority reset must not terminate any concurrent environment connection");
+    Console.WriteLine("PASS: one hub, three members, routed keyboard authority, competing claims, native priority and old-target release.");
 }
 
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never

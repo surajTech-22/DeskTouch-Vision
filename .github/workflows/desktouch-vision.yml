@@ -77,8 +77,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o DeskTouchVision/dist/app
           if ($LASTEXITCODE -ne 0) { throw "DeskTouch main application failed" }
-          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o DeskTouchVision/dist/app/DeviceSharing
+          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:IncludeNativeLibrariesForSelfExtract=false -o DeskTouchVision/dist/app/DeviceSharing
           if ($LASTEXITCODE -ne 0) { throw "Windows device-sharing module failed" }
+          if (!(Test-Path DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.deps.json) -or
+              !(Test-Path DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.runtimeconfig.json) -or
+              @(Get-ChildItem -Path DeskTouchVision/dist/app/DeviceSharing -Filter *.dll).Count -lt 10) {
+            throw "Standard .NET Windows sharing files not published"
+          }
           if (!(Test-Path 'DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe')) {
             throw "Windows device-sharing module missing from installable app"
           }
@@ -86,18 +91,26 @@ jobs:
           # which itself is SHA-256 verified before install/update.
           $app = 'DeskTouchVision/dist/app'
           $required = @('DeskTouchVision.exe','DeviceSharing/DeskTouch.DeviceShare.exe',
+            'DeviceSharing/DeskTouch.DeviceShare.deps.json','DeviceSharing/DeskTouch.DeviceShare.runtimeconfig.json',
             'Update-DeskTouch.ps1','VERIFY_DESKTOUCH_PAYLOAD.ps1','CHECK_SECURITY_STATUS.ps1')
-          $entries = foreach ($relative in $required) {
+          foreach ($relative in $required) {
             $item = Join-Path $app ($relative -replace '/', '\')
             if (!(Test-Path -LiteralPath $item -PathType Leaf)) {
               throw "Published payload missing required file: $relative"
             }
-            [pscustomobject]@{
-              path = $relative
-              sha256 = (Get-FileHash -LiteralPath $item -Algorithm SHA256).Hash.ToLowerInvariant()
-              bytes = (Get-Item -LiteralPath $item).Length
-            }
           }
+          # Standard .NET publish ships executable plus runtime DLLs. Verify
+          # every file, not only the EXE, so partial AV extraction fails closed.
+          $entries = @(Get-ChildItem -LiteralPath $app -Recurse -File |
+            Where-Object { $_.Name -ne 'payload-integrity.json' } |
+            Sort-Object FullName | ForEach-Object {
+              $relative = $_.FullName.Substring(([IO.Path]::GetFullPath($app)).Length).TrimStart('\') -replace '\\','/'
+              [pscustomobject]@{
+                path = $relative
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                bytes = $_.Length
+              }
+            })
           [IO.File]::WriteAllText((Join-Path $app 'payload-integrity.json'),
             ([pscustomobject]@{schema=1;files=@($entries)} |
               ConvertTo-Json -Depth 5), [Text.Encoding]::UTF8)
@@ -151,7 +164,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.3.3: Windows Displays missing-file repair safeguards: shipping release ZIP includes an app-level SHA-256 integrity manifest, verified before installation, after staging, and after committing an update. Incomplete or quarantined executables fail closed with rollback; the app displays an actionable error with real line breaks. CHECK_SECURITY_STATUS.ps1 safely reports missing files, Authenticode state and DeskTouch-specific Defender history to Downloads without disabling antivirus. Existing Windows multi-device discovery, tray startup and trusted Android reconnection preserved. Android preview APK compatibility retained. Antivirus false positives must be reviewed by the vendor; this release does not disable security protections."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.3.4: Standard self-contained .NET Windows sharing packaging (individual EXE and runtime DLLs instead of self-extracting single-file bundle). All published Windows files are SHA-256 verified after download, extraction and installation, with safe rollback if quarantined or incomplete. Defender diagnostics and multi-device LAN discovery/trusted reconnection remain unchanged. Antivirus may still flag binaries; report exact threat name to the vendor for false-positive review. No antivirus bypass, exclusions or code-signing claim. Android APK is still a preview and requires real-device testing."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

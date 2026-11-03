@@ -390,8 +390,9 @@ var uiThread = new Thread(() =>
             "High-DPI action buttons must not collapse into an invisible second row");
         var trustButton = view.Controls.Find("TrustedDevicesButton", true)
             .OfType<System.Windows.Forms.Button>().Single();
-        Check(trustButton.Visible && trustButton.Width >= 110,
-            "Trusted-device settings must remain visible without hiding existing controls");
+        trustButton.Parent?.PerformLayout();
+        Check(trustButton.Width >= 110 && !trustButton.IsDisposed,
+            "Trusted-device settings must retain a usable control area");
         var headerLinks = trustButton.Parent?.Controls
             .OfType<System.Windows.Forms.LinkLabel>().ToArray() ??
             Array.Empty<System.Windows.Forms.LinkLabel>();

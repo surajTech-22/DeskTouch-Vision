@@ -53,7 +53,7 @@ public final class MainActivity extends Activity {
         heading.setTextColor(Color.WHITE);
         page.addView(heading);
         TextView hint=new TextView(this);
-        hint.setText("Windows + Android • same secure DeskTouch connection");
+        hint.setText("One-way mode: control this Android screen from connected Windows PCs");
         hint.setTextColor(Color.LTGRAY);
         hint.setPadding(0,dp(4),0,dp(12));
         page.addView(hint);
@@ -72,11 +72,26 @@ public final class MainActivity extends Activity {
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
-        addButton(page,"Take control of selected Windows device",()->{
-            DeskTouchRuntime.releaseAll(); // one physical keyboard/mouse controller.
-            session.claimControl();
+        android.widget.CheckBox allowWindows=new android.widget.CheckBox(this);
+        allowWindows.setText("Allow approved Windows PCs to control this Android screen");
+        allowWindows.setTextColor(Color.WHITE);
+        allowWindows.setChecked(DeskTouchAccessibilityService.allowed(this));
+        allowWindows.setOnCheckedChangeListener((v,enabled)->{
+            DeskTouchAccessibilityService.setAllowed(this,enabled);
+            if(enabled && !DeskTouchAccessibilityService.ready(this)){
+                status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings, then reconnect.");
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            }else status.setText(enabled
+                ? "Windows control enabled. Reconnect this phone so Windows detects the new capability."
+                : "Windows control disabled. Android touch has priority.");
         });
-        addButton(page,"Return control to this device",()->session.releaseControl());
+        page.addView(allowWindows);
+        addButton(page,"Open Android Accessibility settings",()->
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+        addButton(page,"Stop Windows control on this phone",()->{
+            DeskTouchRuntime.remoteNativeTouch();
+            status.setText("Windows input authority returned to Android.");
+        });
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
         addButton(page,"Disconnect selected device",()->{
             AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
@@ -102,81 +117,14 @@ public final class MainActivity extends Activity {
         // Only checks official GitHub metadata; never downloads or silently
         // installs an executable without explicit user action.
         AndroidUpdater.checkForUpdates(this,false);
-        TextView padLabel=new TextView(this);
-        padLabel.setText("Touchpad / external mouse area");
-        padLabel.setTextColor(Color.WHITE);
-        padLabel.setTextSize(16);
-        padLabel.setPadding(0,dp(12),0,dp(8));
-        page.addView(padLabel);
-        pointerPad=new View(this){
-            final Paint paint=new Paint(3);
-            @Override protected void onDraw(Canvas c){
-                super.onDraw(c);
-                paint.setColor(Color.rgb(49,56,69));
-                c.drawRoundRect(0,0,getWidth(),getHeight(),dp(12),dp(12),paint);
-                paint.setColor(Color.rgb(190,198,214));
-                paint.setTextAlign(Paint.Align.CENTER);
-                paint.setTextSize(dp(14));
-                c.drawText("Move to navigate • tap to click",getWidth()/2f,getHeight()/2f,paint);
-                c.drawText("Hardware mouse: enable pointer capture below",getWidth()/2f,getHeight()/2f+dp(22),paint);
-            }
-            @Override public boolean onCapturedPointerEvent(android.view.MotionEvent e){
-                if(e.getActionMasked()==MotionEvent.ACTION_MOVE){
-                    session.moveBy(e.getX(),e.getY());
-                    return true;
-                }
-                if(e.getActionMasked()==MotionEvent.ACTION_SCROLL){
-                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_VSCROLL)*120),false);
-                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_HSCROLL)*120),true);
-                    return true;
-                }
-                if(e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS||
-                   e.getActionMasked()==MotionEvent.ACTION_BUTTON_RELEASE){
-                    boolean down=e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS;
-                    int button=e.getActionButton()==MotionEvent.BUTTON_SECONDARY?2:
-                        e.getActionButton()==MotionEvent.BUTTON_TERTIARY?3:1;
-                    session.button(button,down);
-                    return true;
-                }
-                return super.onCapturedPointerEvent(e);
-            }
-        };
-        pointerPad.setFocusable(true);
-        pointerPad.setFocusableInTouchMode(true);
-        pointerPad.setMinimumHeight(dp(170));
-        page.addView(pointerPad,new LinearLayout.LayoutParams(-1,dp(190)));
-        pointerPad.setOnTouchListener((v,event)->{
-            switch(event.getActionMasked()){
-                case MotionEvent.ACTION_DOWN:
-                    prevX=downX=event.getX();prevY=downY=event.getY();dragged=false;
-                    v.requestFocus();
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    float dx=event.getX()-prevX,dy=event.getY()-prevY;
-                    if(Math.abs(event.getX()-downX)+Math.abs(event.getY()-downY)>dp(9))dragged=true;
-                    session.moveBy(dx*1.3f,dy*1.3f);
-                    prevX=event.getX();prevY=event.getY();
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    if(!dragged)session.click(1);
-                    v.performClick();
-                    return true;
-                default:return true;
-            }
-        });
-        addButton(page,"Capture connected physical mouse",()->{
-            pointerPad.requestFocus();
-            pointerPad.requestPointerCapture(); // Android's built-in physical mouse handling.
-            status.setText("Mouse capture requested; Back or losing focus releases capture.");
-        });
-        addButton(page,"Android keyboard settings",()->
-            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
-        addButton(page,"Android connected device / Bluetooth settings",()->
-            startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
         TextView note=new TextView(this);
-        note.setText("Uses Android's own keyboard and mouse settings. DeskTouch does not change " +
-            "system input devices or silently enable accessibility. Two-way global Android " +
-            "cursor injection is not available to an ordinary app.");
+        note.setText("1. Enable Windows control and approve the Android Accessibility service. " +
+            "2. Reconnect this phone to the Windows DeskTouch app. " +
+            "3. In Windows Displays select this Android phone and position its screen. " +
+            "4. Move the Windows cursor to that outside edge. Windows mouse taps and " +
+            "typing in ordinary editable fields then control Android. " +
+            "Android touch always cancels remote control. Password fields remain protected. " +
+            "This is not an Android virtual display or full hardware keyboard driver.");
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
@@ -192,7 +140,7 @@ public final class MainActivity extends Activity {
     private void scan(){
         if(scanning)return;
         scanning=true;
-        status.setText("Looking for Windows PCs and Android phones on local Wi-Fi...");
+        status.setText("Finding trusted Windows PCs; Windows will control this phone, not vice versa...");
         deviceList.removeAllViews();
         new Thread(()->{
             try{
@@ -230,7 +178,7 @@ public final class MainActivity extends Activity {
                             }
                             if(DeskTouchRuntime.isConnected(d.fingerprint)) {
                                 session=DeskTouchRuntime.select(this,d.fingerprint);
-                                status.setText("Selected "+d.name+" for mouse and keyboard control. "+
+                                status.setText("Connected to "+d.name+". Select this Android phone in that PC's Displays window. "+
                                     DeskTouchRuntime.connectedCount()+" devices connected.");
                                 return;
                             }
@@ -259,47 +207,15 @@ public final class MainActivity extends Activity {
             finally{scanning=false;}
         },"DeskTouch LAN discovery").start();
     }
-    @Override public boolean dispatchKeyEvent(KeyEvent e){
-        if(session!=null&&session.isActive()&&e.getDevice()!=null&&
-           (e.getSource()&InputDevice.SOURCE_KEYBOARD)==InputDevice.SOURCE_KEYBOARD){
-            int vk=toWindowsKey(e.getKeyCode());
-            if(vk!=0 && (e.getAction()==KeyEvent.ACTION_DOWN||e.getAction()==KeyEvent.ACTION_UP)){
-                if(e.getRepeatCount()==0)session.key(vk,e.getAction()==KeyEvent.ACTION_DOWN);
-                return true;
-            }
-        }
-        return super.dispatchKeyEvent(e);
-    }
-    private static int toWindowsKey(int c){
-        if(c>=KeyEvent.KEYCODE_A&&c<=KeyEvent.KEYCODE_Z)return 0x41+c-KeyEvent.KEYCODE_A;
-        if(c>=KeyEvent.KEYCODE_0&&c<=KeyEvent.KEYCODE_9)return 0x30+c-KeyEvent.KEYCODE_0;
-        if(c>=KeyEvent.KEYCODE_F1&&c<=KeyEvent.KEYCODE_F12)return 0x70+c-KeyEvent.KEYCODE_F1;
-        switch(c){
-            case KeyEvent.KEYCODE_ENTER:return 0x0D;
-            case KeyEvent.KEYCODE_DEL:return 0x08;
-            case KeyEvent.KEYCODE_TAB:return 0x09;
-            case KeyEvent.KEYCODE_ESCAPE:return 0x1B;
-            case KeyEvent.KEYCODE_SPACE:return 0x20;
-            case KeyEvent.KEYCODE_DPAD_LEFT:return 0x25;
-            case KeyEvent.KEYCODE_DPAD_UP:return 0x26;
-            case KeyEvent.KEYCODE_DPAD_RIGHT:return 0x27;
-            case KeyEvent.KEYCODE_DPAD_DOWN:return 0x28;
-            case KeyEvent.KEYCODE_SHIFT_LEFT:return 0xA0;
-            case KeyEvent.KEYCODE_SHIFT_RIGHT:return 0xA1;
-            case KeyEvent.KEYCODE_CTRL_LEFT:return 0xA2;
-            case KeyEvent.KEYCODE_CTRL_RIGHT:return 0xA3;
-            case KeyEvent.KEYCODE_ALT_LEFT:return 0xA4;
-            case KeyEvent.KEYCODE_ALT_RIGHT:return 0xA5;
-            default:return 0;
-        }
-    }
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);
-        if(!focus)DeskTouchRuntime.releaseAll();
+        // Do not revoke the remote input lease simply because the Android
+        // user opened an app to be controlled. Physical touch revokes it.
     }
     @Override protected void onDestroy(){
         DeskTouchRuntime.setListener(null);
-        DeskTouchRuntime.releaseAll();
+        // The foreground reconnect service owns the authenticated TLS sessions.
+        // Closing this setup screen must not disconnect the selected phone.
         super.onDestroy();
     }
 }

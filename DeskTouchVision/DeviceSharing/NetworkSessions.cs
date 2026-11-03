@@ -9,11 +9,11 @@ using System.Text.Json;
 
 namespace DeskTouch.DeviceShare;
 
-internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors);
+internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors, long SessionId = 0);
 
 internal sealed record PeerHello(string Name, string Layout);
 
-internal sealed class ReceiverServer : IInputSession, IDisposable
+internal sealed class PeerReceiverSession : IInputSession, IDisposable
 {
     private readonly Action<string> _status;
     private readonly CancellationTokenSource _cancel = new();
@@ -39,18 +39,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
-    internal event Action? PeerDisconnected;
+    internal event Action<long>? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
     internal string Fingerprint { get; }
-    internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+    internal string Secret { get; }
+    private readonly long _sessionId;
+    private readonly SharedPeerAuthority _authority;
 
-    internal ReceiverServer(Action<string> status, LocalInputPriority priority,
+    internal PeerReceiverSession(Action<string> status, LocalInputPriority priority,
         Func<string, CancellationToken, Task<bool>>? requestApproval = null,
         TrustedDeviceStore? trusted = null,
         Func<string, CancellationToken, Task<bool>>? requestTrustApproval = null,
-        string? identityPath = null)
+        string? identityPath = null,
+        long sessionId = 0, SharedPeerAuthority? authority = null, string? sharedSecret = null)
     {
+        _sessionId = sessionId;
+        _authority = authority ?? new SharedPeerAuthority(priority);
+        Secret = sharedSecret ?? Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
         _status = status;
         _priority = priority;
         _requestApproval = requestApproval;
@@ -101,6 +107,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
+    internal Task ServeClientAsync(TcpClient client, CancellationToken token) =>
+        ServeAsync(client, token);
+
     private static bool ConstantTimeSecret(string? got, string expected)
     {
         if (got == null || got.Length != expected.Length) return false;
@@ -129,6 +138,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock (_inputGate) _currentInjector?.ReleaseAll();
         });
         int revokedLease = Interlocked.Exchange(ref _forwardLease, 0);
+        _authority.Release(_sessionId);
         Interlocked.Exchange(ref _forwardAppliedLease, 0);
         _status("Local physical keyboard/mouse has priority; forward authority revoked.");
         _ = Task.Run(async () =>
@@ -287,8 +297,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             // trusted sessions, use the name stored when trust was approved.
             if (trustedSource != null)
                 peer = peer with { Name = trustedSource.Name };
-            incoming = peer;
-            Volatile.Write(ref _connectedRemoteMonitors, peer.Monitors);
+            incoming = peer with { SessionId = _sessionId };
+            Volatile.Write(ref _connectedRemoteMonitors, incoming.Monitors);
             Volatile.Write(ref _currentClient, client);
         }
         _status("Authenticated Windows peers connected; both computers may request input authority.");
@@ -372,7 +382,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // The receiver may itself be controlling the source PC.
                     // Never issue forward and reverse authority at once.
                     bool allowed = p.A > 0 && (AllowForwardClaim?.Invoke() ?? true);
-                    bool granted = allowed && _priority.TryClaim();
+                    bool granted = allowed && _authority.TryClaim(_sessionId);
                     if (granted)
                     {
                         Volatile.Write(ref _forwardLease, p.A);
@@ -386,7 +396,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     Interlocked.Exchange(ref _forwardLease, 0);
                     Interlocked.Exchange(ref _forwardAppliedLease, 0);
-                    _priority.ReleaseRemote();
+                    _authority.Release(_sessionId);
                     lock (_inputGate) injector.ReleaseAll();
                     continue;
                 }
@@ -395,7 +405,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 bool cursorApplied = false;
                 lock (_inputGate)
                 {
-                    if (lease > 0 && _priority.CanApplyRemote &&
+                    if (lease > 0 && _authority.IsOwner(_sessionId) && _priority.CanApplyRemote &&
                         p.Type is ("move" or "button" or "key" or "wheel"))
                     {
                         // ACK only after SendInput actually succeeded.
@@ -405,7 +415,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         cursorApplied = appliedToWindows && p.Type == "move";
                     }
                 }
-                if (cursorApplied && _priority.CanApplyRemote &&
+                if (cursorApplied && _authority.IsOwner(_sessionId) && _priority.CanApplyRemote &&
                     Volatile.Read(ref _forwardLease) == lease &&
                     Interlocked.CompareExchange(ref _forwardAppliedLease, lease, 0) == 0)
                     await SendControlAsync(new Packet("active", lease), token);
@@ -434,7 +444,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             Interlocked.Exchange(ref _reverseMoveSignaled, 0);
             Interlocked.Exchange(ref _forwardLease, 0);
             Interlocked.Exchange(ref _forwardAppliedLease, 0);
-            _priority.ReleaseRemote();
+            _authority.Release(_sessionId);
             Volatile.Write(ref _currentStream, null);
             lock (_inputGate)
             {
@@ -442,7 +452,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Volatile.Write(ref _currentInjector, null);
             }
             Volatile.Write(ref _currentClient, null);
-            PeerDisconnected?.Invoke();
+            PeerDisconnected?.Invoke(_sessionId);
             _status("Peer connection ended. Native keyboard/mouse always available.");
         }
     }
@@ -450,7 +460,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     public void Dispose()
     {
         _priority.PhysicalOverride -= OnPhysicalOverride;
-        _priority.ReleaseRemote();
+        _authority.Release(_sessionId);
         _cancel.Cancel();
         _listener.Stop();
         DisconnectPeer();

@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -26,13 +26,21 @@ jobs:
           foreach ($path in @('DeskTouchVision/Install-DeskTouch.ps1',
                               'DeskTouchVision/Update-DeskTouch.ps1',
                               'DeskTouchVision/CHECK_DESKTOUCH.ps1',
-                              'DeskTouchVision/CHECK_CONNECTION.ps1')) {
+                              'DeskTouchVision/CHECK_CONNECTION.ps1',
+                              'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
+                              'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1')) {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
               (Resolve-Path $path), [ref]$tokens, [ref]$errors)
             if ($errors.Count -gt 0) { throw "Invalid PowerShell in $path : $($errors -join '; ')" }
           }
+      - name: Verify detached Windows updater can rename app directory
+        shell: pwsh
+        run: |
+          # A PowerShell script throws on failure; LASTEXITCODE is not
+          # defined by a successfully invoked .ps1 and may be stale.
+          & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
       - name: Verify native-input priority state machine
         shell: pwsh
         run: |

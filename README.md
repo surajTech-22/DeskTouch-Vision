@@ -2,7 +2,27 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.3 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.4 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.4 — fix installation-folder lock and stop repeat download loops
+
+**Confirmed on the user’s machine, 2026-11-03:** v0.2.2 repeatedly downloaded and verified the v0.2.3 release but the independent PowerShell updater failed with `Cannot move item because ...\\Programs\\DeskTouchVision is in use`; it then restarted v0.2.2, which downloaded the same release again. This is **not** a connection/discovery or checksum problem.
+
+**Root cause:** the update PowerShell process could inherit a working directory *within* `DeskTouchVision\\DeviceSharing`, preventing Windows from renaming the parent installation directory while the updater itself was running. The v0.2.4 launcher now copies the updater into a unique temporary folder and explicitly sets its working directory **outside** the installation. The installer also resets its current directory to TEMP, serializes install attempts with a Windows named mutex, and retries transient folder locks rather than terminating unrelated processes.
+
+**One-time recovery for older installations:** Versions 0.2.2 and 0.2.3 cannot inherit v0.2.4’s corrected updater until they install successfully. Run the standalone `RECOVER_DESKTOUCH.ps1` on the affected Windows PC from **Downloads**, not from the installed application folder. It downloads the official v0.2.4 ZIP and matching SHA-256 checksum, validates the archive, closes only the installed DeskTouch windows gracefully, waits for old updater hosts to exit, invokes the atomic installer from TEMP and checks the final sharing executable reports **0.2.4.0**. The script never force-kills native input processes, changes Windows keyboard/mouse drivers, or alters display settings.
+
+PowerShell 5.1 commands to get and execute the recovery script:
+
+```powershell
+$script = "$env:USERPROFILE\\Downloads\\RECOVER_DESKTOUCH.ps1"
+Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/surajTech-22/DeskTouch-Vision/main/DeskTouchVision/RECOVER_DESKTOUCH.ps1" -OutFile $script
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script
+```
+
+The output is recorded under `%LOCALAPPDATA%\\DeskTouchVision\\logs\\recovery.log`; automatic updater logs are `update-check.log` and `update.log`. No keyboard content, pairing secrets or screen data are collected. If the repair encounters another active updater or a persistent lock, it stops without force-terminating another process, and the installed application is preserved.
+
+The standalone release installer ZIP and manual `INSTALL_DESKTOUCH.cmd` remain valid alternatives. Hardware validation of two-PC input sharing and the first post-repair unattended version upgrade is still pending.
 
 ## v0.2.3 — Windows connection fix
 

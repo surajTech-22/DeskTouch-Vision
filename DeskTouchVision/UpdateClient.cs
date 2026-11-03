@@ -237,19 +237,38 @@ internal static class UpdateClient
                 if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("Downloaded DeskTouch archive failed SHA-256 verification.");
 
-                // The independent host waits for all *installed* DeskTouch
-                // executables to exit gracefully before replacing either.
+                // CRITICAL v0.2.4: PowerShell inherits the child's current
+                // working directory. When that directory is INSIDE the app
+                // being updated, Windows prevents Move-Item from renaming it.
+                // Copy the updater to TEMP and explicitly start it outside
+                // the installed directory; neither its script nor its CWD
+                // may retain a lock on DeskTouchVision/DeviceSharing.
+                string detachedUpdater = Path.Combine(downloadFolder,
+                    "Update-DeskTouch.ps1");
+                File.Copy(updater, detachedUpdater, overwrite: false);
+                string safeWorkingDirectory = Path.GetFullPath(downloadFolder);
+                if (safeWorkingDirectory.StartsWith(
+                    Path.GetFullPath(expectedRoot).TrimEnd(Path.DirectorySeparatorChar)
+                    + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException(
+                        "Updater working directory is inside the app folder.");
+
                 var process = new ProcessStartInfo("powershell.exe")
-                { UseShellExecute = false, CreateNoWindow = true };
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = safeWorkingDirectory
+                };
                 foreach (var arg in new[] {
                     "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                    "-File", updater, "-Package", archivePath, "-Target", expectedRoot,
+                    "-File", detachedUpdater, "-Package", archivePath,
+                    "-Target", expectedRoot,
                     "-CurrentPid", Environment.ProcessId.ToString(),
                     "-ExpectedHash", expectedHash })
                     process.ArgumentList.Add(arg);
                 if (Process.Start(process) == null)
                     throw new InvalidOperationException("Unable to start the independent update installer.");
-                Log("Checksum verified; separate installer launched. Closing old DeskTouch window.");
+                Log("Checksum verified; detached TEMP updater launched outside installed directory. Closing old DeskTouch window.");
                 SetStatus(window, "installing update");
                 Post(window, window.Close);
                 return CheckResult.InstallationStarted;

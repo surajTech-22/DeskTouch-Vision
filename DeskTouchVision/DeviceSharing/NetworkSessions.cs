@@ -37,9 +37,32 @@ internal sealed class ReceiverServer : IDisposable
         var req = new CertificateRequest("CN=DeskTouch-LAN", _key,
             HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
-        _certificate = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1),
-            DateTimeOffset.UtcNow.AddDays(3));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+        var serverUsage = new OidCollection();
+        serverUsage.Add(new Oid("1.3.6.1.5.5.7.3.1")); // TLS server authentication
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(serverUsage, false));
+        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+
+        // CRITICAL Windows fix: Schannel cannot use .NET's ephemeral RSA key
+        // directly for SslStream server authentication ("platform does not
+        // support ephemeral keys"). Reimport a password-protected PKCS#12
+        // into CURRENT USER persisted CNG storage, never machine-wide.
+        using var temporaryCertificate = req.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(3));
+        string pfxPassword = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        byte[] pkcs12 = temporaryCertificate.Export(X509ContentType.Pkcs12, pfxPassword);
+        try
+        {
+            _certificate = new X509Certificate2(pkcs12, pfxPassword,
+                X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.PersistKeySet);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(pkcs12);
+        }
+        if (!_certificate.HasPrivateKey)
+            throw new CryptographicException("TLS server certificate private key unavailable.");
         Fingerprint = Convert.ToHexString(SHA256.HashData(_certificate.RawData));
     }
 

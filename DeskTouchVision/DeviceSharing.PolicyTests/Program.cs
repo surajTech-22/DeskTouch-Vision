@@ -257,7 +257,12 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
     receiver.PeerConnected += peer => connected.TrySetResult(peer);
     receiver.PeerPlacementChanged += edge => remoteArrangement.TrySetResult(edge);
     receiver.PeerTopologyChanged += peer => remoteRefresh.TrySetResult(peer);
-    receiver.PeerDisconnected += peerId => ended.TrySetResult(peerId > 0);
+    long firstConnectedPeerId = 0;
+    receiver.PeerDisconnected += peerId =>
+    {
+        if (peerId == Interlocked.Read(ref firstConnectedPeerId))
+            ended.TrySetResult(true);
+    };
     receiver.Start();
     using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
     try
@@ -268,9 +273,36 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
         Check(session.RemoteMonitors.Monitors.Count >= 1,
             "Authenticated TLS receiver must return at least one Windows display");
         var peer = await connected.Task.WaitAsync(testTimeout.Token);
+        Interlocked.Exchange(ref firstConnectedPeerId, peer.SessionId);
         Check(peer.Name == Environment.MachineName &&
             peer.Monitors.Monitors.Count >= 1,
             "The receiving PC must show the authenticated source monitor layout");
+        // The second authenticated peer must remain connected at the SAME
+        // time as the first. Disconnecting it may never close or revoke the
+        // original TLS session or remove its display topology.
+        using (var second = await HostSession.ConnectWithApprovalAsync(
+            "127.0.0.1", receiver.Fingerprint, message => status.Enqueue(message),
+            testTimeout.Token))
+        {
+            for (int i = 0; i < 40 && receiver.ConnectedCount < 2; i++)
+                await Task.Delay(50, testTimeout.Token);
+            Check(receiver.ConnectedCount == 2,
+                "Two simultaneous authenticated Windows clients must be accepted");
+            Check(receiver.CanAcceptNewPeer,
+                "Connected receiver must still accept an Android third device");
+            var secondId = receiver.ConnectedPeers.Single(p =>
+                p.SessionId != peer.SessionId).SessionId;
+            receiver.DisconnectPeer(secondId);
+            for (int i = 0; i < 40 && receiver.ConnectedCount > 1; i++)
+                await Task.Delay(50, testTimeout.Token);
+            Check(receiver.ConnectedCount == 1 &&
+                  receiver.ConnectedPeers.Single().SessionId == peer.SessionId,
+                "Disconnecting one client must retain the first peer identity");
+            Check(session.TrySend(new Packet("ping")),
+                "Original device remains connected after second peer disconnect");
+        }
+        Console.WriteLine("PASS: two simultaneous TLS clients; independent disconnect; third slot ready.");
+
         session.PublishSourcePlacement(MonitorEdge.Right);
         Check(await remoteArrangement.Task.WaitAsync(testTimeout.Token) == MonitorEdge.Right,
             "Receiver should mirror source PC monitor placement");

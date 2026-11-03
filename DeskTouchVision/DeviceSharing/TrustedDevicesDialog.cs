@@ -22,6 +22,13 @@ internal sealed class TrustedDevicesDialog : Form
         BackColor = Color.FromArgb(44, 46, 53),
         ForeColor = Color.WhiteSmoke
     };
+    private readonly CheckBox _globalAutoConnect = new()
+    {
+        Dock = DockStyle.Top, Height = 43,
+        Text = "Automatically reconnect when a trusted computer is discovered",
+        Padding = new Padding(15, 0, 10, 0),
+        ForeColor = Color.WhiteSmoke
+    };
     private readonly Button _toggle = new()
     {
         Text = "Toggle auto-connect",
@@ -68,8 +75,21 @@ internal sealed class TrustedDevicesDialog : Form
         buttons.Controls.Add(_toggle);
         Controls.Add(_devices);
         Controls.Add(buttons);
+        Controls.Add(_globalAutoConnect);
         Controls.Add(heading);
 
+        _globalAutoConnect.Checked = _trusted.AutoConnectEnabled;
+        _globalAutoConnect.CheckedChanged += (_, _) =>
+        {
+            try { _trusted.AutoConnectEnabled = _globalAutoConnect.Checked; }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message,
+                    "Unable to save auto-connect setting", MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                _globalAutoConnect.Checked = _trusted.AutoConnectEnabled;
+            }
+        };
         _devices.SelectedIndexChanged += (_, _) => UpdateSelection();
         _toggle.Click += (_, _) => ToggleSelected();
         _forget.Click += (_, _) => ForgetSelected();

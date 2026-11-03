@@ -663,7 +663,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (_receiver?.ConnectedPeerCount == 0 && _host == null)
                 _nativeInput?.Dispose();
             _incomingPeer = null;
-            if (_host != null)
+            // The server raises a selection-change "disconnect" callback
+            // before "connect". If another incoming peer has already been
+            // selected, preserve that target rather than switching back to
+            // the outgoing PC and losing the newly selected Android display.
+            bool anotherInboundSelected = _receiver?.SelectedPeerId > 0;
+            if (_host != null && !anotherInboundSelected && _captureUsesInbound)
             {
                 _captureUsesInbound = false;
                 SelectConnectedTarget(0);

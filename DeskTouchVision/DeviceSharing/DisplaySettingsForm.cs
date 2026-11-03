@@ -418,11 +418,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try
         {
             int selected = _captureUsesInbound || _host == null
-                ? _receiver?.SelectedPeerId ?? 0 : 0;
+                ? _receiver?.SelectedPeerId ?? 0 :
+                  -_host.SelectedEnvironmentTargetId;
             _targetChoice.Items.Clear();
             if (_host != null)
+            {
                 _targetChoice.Items.Add(new TargetOption(0,
-                    "Windows  •  " + _remoteAddress));
+                    "Environment hub  •  " + (_host.EnvironmentMembers
+                        .FirstOrDefault(m => m.Id==0)?.Name ?? _remoteAddress)));
+                foreach(var member in _host.EnvironmentMembers)
+                {
+                    if(member.Id==0 || !member.SupportsReverseInput) continue;
+                    _targetChoice.Items.Add(new TargetOption(-member.Id,
+                        "In same environment  •  " + member.Platform + "  •  " + member.Name));
+                }
+            }
             if (_receiver != null)
                 foreach (var (id, peer) in _receiver.ConnectedPeers)
                     _targetChoice.Items.Add(new TargetOption(id,
@@ -439,10 +449,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void SelectConnectedTarget(int id)
     {
-        // Switching which screen to control NEVER creates another TCP
-        // connection or merges two PC/phone certificate identities.
-        if (id == 0 && _host != null)
+        // One authenticated environment session routes to all members.
+        // No disconnection/re-pairing occurs when selecting another screen.
+        if (id <= 0 && _host != null)
         {
+            _capture?.ReturnLocal();
+            int routedId = id < 0 ? -id : 0;
+            if (!_host.SelectEnvironmentTarget(routedId))
+            {
+                Status("Environment target unavailable or not authorized.");
+                RefreshDisplays();
+                return;
+            }
             if (_captureUsesInbound)
             {
                 _capture?.Dispose();
@@ -464,6 +482,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     Status("Windows target cannot be armed: " + ex.Message);
                 }
             }
+            _capture?.UpdateLayouts(MonitorTopology.Capture(),_host.RemoteMonitors);
             RefreshDisplays();
             return;
         }
@@ -866,6 +885,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
+        session.EnvironmentRosterChanged += HandleEnvironmentRoster;
         if (session.RemoteSystemName is { Length: > 0 } actual)
             _remoteAddress = DisplayArrangementControl.CleanDeviceName(actual,
                 _remoteAddress);
@@ -1052,6 +1072,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
     }
 
+    private void HandleEnvironmentRoster() => PostToUi(() =>
+    {
+        if(_host == null) return;
+        // The authenticated hub provides current members. One connection
+        // stays alive while target keyboard/mouse authority changes.
+        UpdateTargetChoice();
+        RefreshDisplays();
+        Status($"Shared environment: {_host.EnvironmentMembers.Count} available devices.");
+    });
+
     private void HandleRemoteName(string actualName)
     {
         PostToUi(() =>
@@ -1107,6 +1137,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.InputDeliveryWarning -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;
+            _host.EnvironmentRosterChanged -= HandleEnvironmentRoster;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
         _capture?.Dispose();

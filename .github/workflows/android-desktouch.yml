@@ -16,7 +16,10 @@ permissions:
 
 jobs:
   android:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 35
     defaults:
@@ -34,57 +37,100 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Prepare persistent release signing if repository secrets are configured
-        env:
-          DESKTOUCH_KEYSTORE_B64: ${{ secrets.DESKTOUCH_ANDROID_KEYSTORE_BASE64 }}
-          DESKTOUCH_KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
-          DESKTOUCH_STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
-          DESKTOUCH_KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
-        shell: bash
+
+      - name: Android unit tests and development-only debug build
         run: |
           set -euo pipefail
-          if [[ -n "$DESKTOUCH_KEYSTORE_B64" && -n "$DESKTOUCH_KEY_ALIAS" &&
-                -n "$DESKTOUCH_STORE_PASSWORD" && -n "$DESKTOUCH_KEY_PASSWORD" ]]; then
-            echo "$DESKTOUCH_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/desktouch-release.jks"
-            chmod 600 "$RUNNER_TEMP/desktouch-release.jks"
-            echo "DESKTOUCH_SIGN_STORE_FILE=$RUNNER_TEMP/desktouch-release.jks" >> "$GITHUB_ENV"
-            echo "DESKTOUCH_STABLE_SIGNING=true" >> "$GITHUB_ENV"
-          else
-            echo "DESKTOUCH_STABLE_SIGNING=false" >> "$GITHUB_ENV"
-            echo "::warning::Android APK uses ephemeral debug signing. It cannot reliably update an older preview in-place. Configure the signing secrets for stable upgrades."
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Verify existing permanent signing identity for official builds
+        if: >-
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.head_branch == 'main') ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.ref == 'refs/heads/main')
+        env:
+          KEYSTORE_B64: ${{ secrets.DESKTOUCH_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Release artifacts MUST use the approved, permanent certificate.
+          # If a secret is missing, FAIL; never quietly publish a debug APK.
+          if [[ -z "$KEYSTORE_B64" || -z "$STORE_PASSWORD" ||
+                -z "$KEY_ALIAS" || -z "$KEY_PASSWORD" ]]; then
+            echo "::error::Permanent Android signing secrets are not configured. Refusing an ephemeral debug-signed release."
+            exit 1
           fi
-      - name: Unit tests and installable Android APK
+          umask 077
+          signing_file="$RUNNER_TEMP/desktouch-android-release.p12"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$signing_file"
+          if [[ ! -s "$signing_file" ]]; then
+            echo "::error::Android private signing keystore is empty"
+            exit 1
+          fi
+          actual_fingerprint="$(keytool -exportcert -storetype PKCS12             -keystore "$signing_file" -storepass "$STORE_PASSWORD"             -alias "$KEY_ALIAS" 2>/dev/null | sha256sum | cut -d ' ' -f1)"
+          expected_fingerprint="56b2e0078f8d7b07ab21c6e63f1258622fdea081bac83698d02f11bd4e66c9c6"
+          if [[ "$actual_fingerprint" != "$expected_fingerprint" ]]; then
+            echo "::error::Android certificate does not match the permanent DeskTouch Vision signing identity."
+            exit 1
+          fi
+          # The keystore is never uploaded as an artifact or committed to Git.
+          echo "DESKTOUCH_SIGN_STORE_FILE=$signing_file" >> "$GITHUB_ENV"
+          echo "Permanent DeskTouch Android signing certificate verified."
+
+      - name: Assemble production APK with permanent certificate
+        if: >-
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.head_branch == 'main') ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.ref == 'refs/heads/main')
         env:
           DESKTOUCH_SIGN_STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
           DESKTOUCH_SIGN_KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
           DESKTOUCH_SIGN_KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
-          if [ "$DESKTOUCH_STABLE_SIGNING" = "true" ]; then
-            gradle --no-daemon --stacktrace :app:assembleRelease
-            test -s app/build/outputs/apk/release/app-release.apk
-            cp app/build/outputs/apk/release/app-release.apk DeskTouchVision-android-preview.apk
-          else
-            test -s app/build/outputs/apk/debug/app-debug.apk
-            cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
-          fi
+          gradle --no-daemon --stacktrace :app:assembleRelease
+          test -s app/build/outputs/apk/release/app-release.apk
+          cp app/build/outputs/apk/release/app-release.apk DeskTouchVision-android-preview.apk
+
+      - name: Stage unsigned-to-production debug test artifact for development branches only
+        if: >-
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.ref != 'refs/heads/main')
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+          echo "Development test only. The debug APK is NOT a production update."
+
+      - name: Hash and upload APK build artifact
+        run: |
+          test -s DeskTouchVision-android-preview.apk
           sha256sum DeskTouchVision-android-preview.apk > DeskTouchVision-android-preview.apk.sha256
-      - name: Archive Android APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: DeskTouchVision-Android-Preview
+          name: DeskTouchVision-Android-Artifact
           path: |
             AndroidDeskTouch/DeskTouchVision-android-preview.apk
             AndroidDeskTouch/DeskTouchVision-android-preview.apk.sha256
           if-no-files-found: error
-      - name: Attach Android preview to verified Windows release
-        if: github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main'
+
+      - name: Attach ONLY permanent-key-signed Android APK to matching official release
+        if: >-
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.head_branch == 'main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(grep 'versionName' app/build.gradle | head -1 | sed -E "s/.*'([^']+)'.*/\\1/")
+          set -euo pipefail
+          version="$(grep 'versionName' app/build.gradle | head -1 | sed -E "s/.*'([^']+)'.*/\1/")"
           tag="v${version}"
-          # Windows completed successfully before this workflow_run starts.
           gh release view "$tag" --repo "${{ github.repository }}"
           gh release upload "$tag" DeskTouchVision-android-preview.apk DeskTouchVision-android-preview.apk.sha256 --clobber --repo "${{ github.repository }}"
+
+      - name: Remove temporary signing keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/desktouch-android-release.p12"

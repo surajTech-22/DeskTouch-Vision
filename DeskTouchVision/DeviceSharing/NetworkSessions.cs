@@ -73,6 +73,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
+    internal static bool AllowsForwardInput(ConnectedPeer peer) =>
+        peer.Platform != "Android";
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
@@ -433,7 +435,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         // One-way Android mode: never accept Android->Windows
                         // keyboard/mouse claims. Android remains paired for
                         // Windows->Android control via reverse-* packets.
-                        if(p.A>0 && session.Peer.Platform!="Android" &&
+                        if(p.A>0 && AllowsForwardInput(session.Peer) &&
                            (_owner==null || ReferenceEquals(_owner,session)) &&
                            (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
                         {

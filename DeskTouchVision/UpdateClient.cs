@@ -21,14 +21,14 @@ internal static class UpdateClient
     private const string Topic = "desktouch-vision-surajtech22-qrp9f4x2";
     private const string ArchiveName = "DeskTouchVision-win-x64.zip";
     private const string ChecksumName = "DeskTouchVision-win-x64.zip.sha256";
-    private static readonly Version CurrentVersion = new(0, 1, 0);
+    private static readonly Version CurrentVersion = new(0, 2, 0);
     private static readonly HttpClient Http = MakeHttp();
     private static int _updateStarted;
 
     private static HttpClient MakeHttp()
     {
         var c = new HttpClient { Timeout = TimeSpan.FromMinutes(4) };
-        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskTouchVision", "0.1.0"));
+        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskTouchVision", "0.2.0"));
         return c;
     }
 

@@ -18,10 +18,12 @@ public final class MainActivity extends Activity {
     private float prevX,prevY,downX,downY;
     private boolean dragged;
     private volatile boolean scanning;
+    private AndroidUpdateClient updater;
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
         session=DeskTouchRuntime.session(this);
+        updater=new AndroidUpdateClient(this);
         DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{if(status!=null)status.setText(message);}));
         // Android 13+ requires permission to show the persistent connection
@@ -63,6 +65,11 @@ public final class MainActivity extends Activity {
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
         addButton(page,"Find devices",this::scan);
+        addButton(page,"Get updates",()->new Thread(()->
+            updater.check(false,message->runOnUiThread(()->status.setText(message))),
+            "DeskTouch manual update check").start());
+        addButton(page,"Update existing application",()->
+            updater.installExisting(this,message->status.setText(message)));
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
@@ -168,7 +175,20 @@ public final class MainActivity extends Activity {
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
-
+        if(getIntent()!=null&&getIntent().getBooleanExtra(AndroidUpdateClient.EXTRA_INSTALL,false))
+            status.post(()->new AlertDialog.Builder(this)
+                .setTitle("DeskTouch update ready")
+                .setMessage("A verified APK is available. Android will confirm whether it can "+
+                    "update the existing installed application without removing app data.")
+                .setNegativeButton("Later",null)
+                .setPositiveButton("Update",(dialog,which)->
+                    updater.installExisting(this,message->status.setText(message))).show());
+    }
+    @Override protected void onNewIntent(Intent intent){
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if(intent!=null&&intent.getBooleanExtra(AndroidUpdateClient.EXTRA_INSTALL,false))
+            updater.installExisting(this,message->status.setText(message));
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){

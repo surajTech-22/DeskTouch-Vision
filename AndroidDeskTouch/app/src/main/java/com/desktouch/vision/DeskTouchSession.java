@@ -107,7 +107,8 @@ final class DeskTouchSession implements AutoCloseable {
                 myLayout.put(new JSONObject().put("Name","Android screen").put("X",0).put("Y",0)
                     .put("Width",width).put("Height",height).put("Primary",true));
                 JSONObject hello=new JSONObject().put("Name",Build.MANUFACTURER+" "+Build.MODEL)
-                    .put("Layout",myLayout.toString());
+                    .put("Layout",myLayout.toString())
+                    .put("ReverseInputSupported",false);
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
                 screenX=minX;screenY=minY;screenWidth=ready.c;screenHeight=ready.d;

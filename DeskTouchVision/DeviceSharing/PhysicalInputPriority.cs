@@ -11,13 +11,20 @@ namespace DeskTouch.DeviceShare;
 internal sealed class LocalInputPriority
 {
     internal const int IdleBeforeRemoteMilliseconds = 2000;
-    private long _lastPhysical = Environment.TickCount64;
+    private readonly Func<long> _clock;
+    private long _lastPhysical;
     private int _remoteGranted;
     internal event Action? PhysicalOverride;
 
+    internal LocalInputPriority(Func<long>? monotonicClock = null)
+    {
+        _clock = monotonicClock ?? (() => Environment.TickCount64);
+        _lastPhysical = _clock();
+    }
+
     internal bool RemoteGranted => Volatile.Read(ref _remoteGranted) == 1;
     internal long MillisecondsSinceNative =>
-        Math.Max(0, Environment.TickCount64 - Interlocked.Read(ref _lastPhysical));
+        Math.Max(0, _clock() - Interlocked.Read(ref _lastPhysical));
 
     internal bool TryClaim()
     {
@@ -35,7 +42,7 @@ internal sealed class LocalInputPriority
 
     internal void RecordPhysicalActivity()
     {
-        Interlocked.Exchange(ref _lastPhysical, Environment.TickCount64);
+        Interlocked.Exchange(ref _lastPhysical, _clock());
         if (Interlocked.Exchange(ref _remoteGranted, 0) == 1)
             PhysicalOverride?.Invoke();
     }

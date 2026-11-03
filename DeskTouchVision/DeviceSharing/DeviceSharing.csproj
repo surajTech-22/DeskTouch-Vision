@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <AssemblyName>DeskTouch.DeviceShare</AssemblyName>
-    <Version>0.2.4-preview</Version>
+    <Version>0.2.5-preview</Version>
   </PropertyGroup>
   <ItemGroup>
     <!-- Reuse the SAME official GitHub release updater in the visible UI. -->

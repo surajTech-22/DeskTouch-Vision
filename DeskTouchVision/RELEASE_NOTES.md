@@ -1,22 +1,20 @@
-# DeskTouch Vision v0.3.10
+# DeskTouch Vision v0.3.11 — development preview (not released)
 
-## Android network grouping
-- Interconnected Windows computers appear as **one linked Windows network card**, showing member names. The previous UI showed a group heading and then misleading separate Connect buttons for each member.
-- A connected or previously trusted Windows PC is chosen as the gateway. The phone does not need a new connection just to show or select the group.
-- Trusted-device auto-reconnect connects to **at most one gateway per discovered linked group**, instead of silently opening separate phone connections to each linked PC.
-- Existing per-device TLS fingerprints remain separate. A group label is **not an authenticated proxy or keyboard relay**. Truly controlling a different Windows PC from the phone via the gateway is not part of this release.
+## Linked Windows group and mobile connection
+- A linked network appears as **one group card** in Android, rather than separate Connect buttons.
+- **Connect all** initiates individually authenticated TLS pairing to every available Windows PC in that group. First-time approval is still required on **each** Windows PC. Subsequent trusted reconnects retain every approved member, subject to the 8-peer receiver limit. No IP is stored as a trusted identity.
+- All PCs and multiple Android phones may remain connected simultaneously. Only **one input source may control each destination** at a time; keystrokes are never broadcast to every PC.
+- Mobile offers an active Windows-screen selector. Swiping past the left/right edge of an active PC screen can switch to an already connected adjacent group member with a new input claim and applied-cursor acknowledgement.
+- This is **one logical network** in the UI backed by independently authenticated direct TLS connections, not a transparent Windows-to-Windows gateway relay. Android-to-Android remote control is not implemented.
 
-## Keyboard input checks
-- Windows retries valid virtual-key `SendInput` injection if scan-code injection fails, without logging keystrokes.
-- When a receiving Windows PC rejects a keyboard injection, DeskTouch reports the delivery failure to the sending PC, with guidance to check application focus and elevation.
-- Independent native Windows keyboard/mouse authority and the original PC-to-PC encrypted session remain intact; no duplicate session is required simply to view the linked network.
+## Keyboard and mouse
+- Android to Windows input is restored behind an explicit **Take control** button and the existing physical-input-priority two-phase lease. The Android touchpad, physical USB/Bluetooth keyboard/mouse, and on-screen keyboard typing field can send input to the selected Windows PC.
+- Committed Android IME text is sent as a bounded, authenticated Unicode text packet. Windows injects it only for the currently granted input lease. No text contents are retained in diagnostic logs. Text entry requires an ordinary editable program with focus; elevated Windows apps may reject input from a lower-privileged process.
+- Mouse movement coalesces to the newest position instead of queuing stale moves; Android's TLS socket disables Nagle packet delays. Mobile touchpad sensitivity is adjustable.
+- Windows reverse-input capture is **bound to the original peer session**. On selected-target changes, the prior reverse lease is reset on that original connection, preventing stale key/release packets from targeting the new screen.
+- Windows → Android typing remains an opt-in Android Accessibility feature limited to accessible non-password editable fields. It does not provide an unrestricted Android system keyboard driver.
 
-## Android permissions
-- To enable **Windows → Android** control, explicitly enable DeskTouch's **Windows control** toggle and Android's `DeskTouch Windows control` Accessibility service. Android 13+ may require allowing restricted settings for sideloaded apps.
-- Notifications are optional for status alerts. Background/connected-device service needs normal Android foreground-service permissions and may be subject to OEM battery controls. Root, device admin, contacts, SMS, and full storage permissions are not required.
-
-## Important boundary
-- **The Windows-to-Android one-way mode remains unchanged.** The phone does not send global keyboard/mouse control to Windows PCs.
-- Two PCs connected through DeskTouch do **not** automatically form an input-routing proxy. Mouse crossing the two PCs on a Windows-to-Windows link does not prove that Android keyboard traffic can reach either PC through the other. Cross-PC keyboard relay from one Android gateway requires a separate authorized multi-hop routing design and is not claimed complete.
-- Private signing key/certificate remains the pinned v0.3.8 permanent Android identity; future APK updates remain in-place.
-- CI tests cover linked-group selection, single-gateway routing decisions, input policy and packaging; physical Windows/Android acceptance is still required.
+## Test and release boundary
+- Android APK unit/build checks and Windows .NET input, discovery, priority and packaging CI run on the development branch.
+- CI cannot reproduce two actual PCs' display edges, Android IME behavior, Bluetooth peripherals or Windows elevated-app focus. Real three-device acceptance is required before calling v0.3.11 a verified release.
+- The private Android signing identity from v0.3.8 remains unchanged; never replace or commit the signing keystore.

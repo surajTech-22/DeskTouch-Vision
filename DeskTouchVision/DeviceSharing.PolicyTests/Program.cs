@@ -274,6 +274,12 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
             "Authenticated TLS receiver must return at least one Windows display");
         var peer = await connected.Task.WaitAsync(testTimeout.Token);
         Interlocked.Exchange(ref firstConnectedPeerId, peer.SessionId);
+        var pong = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        session.HeartbeatAcknowledged += () => pong.TrySetResult(true);
+        Check(session.TrySend(new Packet("ping")),
+            "Android-compatible heartbeat ping must be accepted.");
+        Check(await pong.Task.WaitAsync(testTimeout.Token),
+            "Windows must send pong to prevent Android read timeout.");
         Check(peer.Name == Environment.MachineName &&
             peer.Monitors.Monitors.Count >= 1,
             "The receiving PC must show the authenticated source monitor layout");

@@ -285,9 +285,18 @@ public final class MainActivity extends Activity {
         for(DeskTouchSession.EnvironmentTarget device:targets){
             String label=(device.id==active.selectedEnvironmentTarget()?"● ":"")
                 +device.platform+" • "+device.name;
+            if(device.id==active.ownEnvironmentId() || !device.supportsInput){
+                TextView item=new TextView(this);
+                item.setText(label+(device.id==active.ownEnvironmentId()
+                    ?" • this phone":" • input permission required"));
+                item.setTextColor(Color.LTGRAY);
+                item.setPadding(0,dp(9),0,dp(9));
+                environmentList.addView(item);
+                continue;
+            }
             addButton(environmentList,label,()->{
                 active.selectEnvironmentTarget(device.id);
-                if(device.supportsInput)active.claimControl();
+                active.claimControl();
             });
         }
     }

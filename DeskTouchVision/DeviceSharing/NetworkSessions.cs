@@ -85,9 +85,10 @@ internal sealed class ReceiverServer : IDisposable
             return;
         }
 
-        var screen = System.Windows.Forms.SystemInformation.VirtualScreen;
+        var topology = MonitorTopology.Capture();
+        var screen = topology.Bounds;
         await Wire.WriteAsync(ssl, new Packet("ready", screen.Left, screen.Top,
-            screen.Width, screen.Height), token);
+            screen.Width, screen.Height, topology.ToWire()), token);
         _status("Authenticated Windows peer connected.");
         var injector = new InputInjector();
         try
@@ -125,16 +126,17 @@ internal sealed class HostSession : IDisposable
     private readonly SslStream _ssl;
     private readonly Channel<Packet> _queue = Channel.CreateBounded<Packet>(
         new BoundedChannelOptions(2048) { SingleReader = true, SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite });
+            FullMode = BoundedChannelFullMode.Wait });
     private readonly CancellationTokenSource _cancel = new();
     private readonly Action<string> _onFailure;
     private int _closed;
-    internal System.Drawing.Rectangle Screen { get; }
+    internal System.Drawing.Rectangle Screen => RemoteMonitors.Bounds;
+    internal MonitorTopology RemoteMonitors { get; }
 
     private HostSession(TcpClient client, SslStream ssl,
-        System.Drawing.Rectangle screen, Action<string> onFailure)
+        MonitorTopology monitors, Action<string> onFailure)
     {
-        _client = client; _ssl = ssl; Screen = screen; _onFailure = onFailure;
+        _client = client; _ssl = ssl; RemoteMonitors = monitors; _onFailure = onFailure;
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
     }
@@ -178,8 +180,10 @@ internal sealed class HostSession : IDisposable
             if (ready.Type != "ready" || ready.C < 200 || ready.D < 100 ||
                 ready.C > 50000 || ready.D > 50000)
                 throw new AuthenticationException("Receiver did not accept pairing.");
-            return new HostSession(client, ssl,
-                new System.Drawing.Rectangle(ready.A, ready.B, ready.C, ready.D), onFailure);
+            var monitors = MonitorTopology.FromWire(ready.Text);
+            if (monitors.Bounds != new System.Drawing.Rectangle(ready.A, ready.B, ready.C, ready.D))
+                throw new AuthenticationException("Receiver monitor geometry failed validation.");
+            return new HostSession(client, ssl, monitors, onFailure);
         }
         catch
         {

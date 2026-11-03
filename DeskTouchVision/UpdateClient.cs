@@ -64,8 +64,8 @@ internal static class UpdateClient
             if (!window.IsDisposed && window.IsHandleCreated)
                 window.BeginInvoke(() => { if (!window.IsDisposed) action(); });
         }
-        catch (InvalidOperationException) { }
         catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
     }
 
     private static void SetStatus(Form window, string status)

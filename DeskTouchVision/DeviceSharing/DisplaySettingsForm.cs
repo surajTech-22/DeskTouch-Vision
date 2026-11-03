@@ -865,6 +865,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
+        if (session.RemoteSystemName is { Length: > 0 } actual)
+            _remoteAddress = DisplayArrangementControl.CleanDeviceName(actual,
+                _remoteAddress);
         session.RemotePlacementChanged += HandleRemotePlacement;
         RefreshDisplays();
         _capture.Arm();

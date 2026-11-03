@@ -55,6 +55,15 @@ var threeDevices = NearbyComputerDiscovery.DistinctDevices(new [] {
 });
 Check(threeDevices.Count == 3 && threeDevices.Count(p => !p.IsAndroid) == 2,
     "Two distinct Windows PCs and Android must all be visible without duplicates");
+var discoveredHub = new NearbyComputer("HUB", "192.168.1.25",
+    new string('D',64),IsAndroid:false,CanReceive:true,IsHub:true);
+var discoveredLeaf = new NearbyComputer("LEAF", "192.168.1.26",
+    new string('E',64),IsAndroid:false,CanReceive:true,IsHub:false);
+var sortedEnvironment=NearbyComputerDiscovery.DistinctDevices(
+    new[]{discoveredLeaf,discoveredHub});
+Check(sortedEnvironment[0].IsHub &&
+    sortedEnvironment[0].Name=="HUB",
+    "Windows discovery must prioritize one environment hub over member endpoints");
 Check(NearbyComputerDiscovery.ParseReply("DT1-READY|Fake|BAD",
     local1) == null, "Invalid discovery identity must never be accepted");
 Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.exe")
@@ -626,7 +635,7 @@ try
     Check(multiServer.SelectConnectedPeer(alternate.Id),
         "Second authenticated Windows peer should be selectable without disconnect");
     Check(bound.TrySend(new Packet("release",3003)),
-        "Old capture must still address its original connected input peer");
+        "Unowned stale release is a safe no-op and cannot reset another environment member");
     peer2.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);
@@ -639,6 +648,164 @@ try
 finally
 {
     try{Directory.Delete(multipointRoot,true);}catch{}
+}
+
+// Shared environment: THREE clients join ONE TLS hub. The controller
+// selects another authenticated member by hub-issued connection ID without
+// pairing to that target. Two competing sources never control one destination.
+{
+    long clock=12000;
+    using var environment=new ReceiverServer(_=>{},
+        new LocalInputPriority(()=>Interlocked.Read(ref clock)),
+        (_,__)=>Task.FromResult(true));
+    environment.AllowForwardClaim=()=>false; // never inject into CI runner
+    environment.Start();
+    using var deadline=new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    using var mobileSource=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    using var desktop=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    using var otherPhone=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        environment.Fingerprint,_=>{},deadline.Token);
+    for(int i=0;i<80 && mobileSource.EnvironmentMembers.Count<4;i++)
+        await Task.Delay(75,deadline.Token);
+    Check(mobileSource.EnvironmentMembers.Count==4 &&
+        mobileSource.EnvironmentMembers.Single(m=>m.Id==0).Platform=="Windows",
+        "One hub must advertise itself and ALL three simultaneous members");
+    var routed=mobileSource.EnvironmentMembers
+        .Where(m=>m.Id>0).OrderBy(m=>m.Id).Skip(1).First();
+    Check(mobileSource.SelectEnvironmentTarget(routed.Id),
+        "Android-style controller must route across the original hub connection");
+    Check(mobileSource.SelectedEnvironmentTargetId==routed.Id,
+        "Selected input target must be an environment member, not another socket");
+    var destinationPriority=new LocalInputPriority(
+        ()=>Interlocked.Read(ref clock));
+    desktop.AttachReverseInput(destinationPriority,()=>true);
+    Interlocked.Add(ref clock,3000);
+    var granted=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var appliedRouted=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var competitorBusy=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var competitorGrant=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var revoked=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    mobileSource.AuthorityControlPacket += p=>{
+        if(p.Type=="granted"&&p.A==501)granted.TrySetResult(p.A);
+        if(p.Type=="active"&&p.A==501)appliedRouted.TrySetResult(p.A);
+    };
+    otherPhone.AuthorityControlPacket += p=>{
+        if(p.Type=="busy"&&p.A==502)competitorBusy.TrySetResult(p.A);
+        if(p.Type=="granted"&&p.A==503)competitorGrant.TrySetResult(p.A);
+        if(p.Type=="local-active"&&p.A==503)revoked.TrySetResult(p.A);
+    };
+    Check(mobileSource.TrySend(new Packet("claim",501)),"Controller claim must queue");
+    Check(await granted.Task.WaitAsync(deadline.Token)==501,
+        "Destination's actual reverse grant must be relayed back to source");
+    Check(destinationPriority.RemoteGranted,
+        "Destination rather than hub must hold the remote input lease");
+    Check(!appliedRouted.Task.IsCompleted,
+        "Remote grant alone MUST NOT activate keyboard before cursor application");
+    var sourceCursor=System.Windows.Forms.Cursor.Position;
+    var appliedStarted=System.Diagnostics.Stopwatch.StartNew();
+    Check(mobileSource.TrySend(new Packet("move",sourceCursor.X,sourceCursor.Y)),
+        "Remote cursor movement must follow routed grant");
+    Check(await appliedRouted.Task.WaitAsync(deadline.Token)==501,
+        "Second Windows PC must apply routed first cursor and return real active ACK");
+    appliedStarted.Stop();
+    Console.WriteLine($"MEASURED: routed claim-to-ACK after grant {appliedStarted.ElapsedMilliseconds} ms (CI loopback only).");
+    Check(otherPhone.SelectEnvironmentTarget(routed.Id),
+        "Second source must view same environment member without pairing to it");
+    Check(otherPhone.TrySend(new Packet("claim",502)),
+        "Competing controller claim should reach environment hub");
+    Check(await competitorBusy.Task.WaitAsync(deadline.Token)==502,
+        "Two peers cannot own keyboard/mouse authority on the same destination");
+    Check(mobileSource.TrySend(new Packet("release",501)),
+        "Original controller must release routed lease");
+    for(int i=0;i<60&&destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(!destinationPriority.RemoteGranted,
+        "Releasing source must free the destination's actual input authority");
+    Check(otherPhone.TrySend(new Packet("claim",503)),
+        "Second source may request control once first source releases it");
+    Check(await competitorGrant.Task.WaitAsync(deadline.Token)==503,
+        "New source must receive fresh destination grant");
+    destinationPriority.RecordPhysicalActivity();
+    Check(await revoked.Task.WaitAsync(deadline.Token)==503,
+        "Physical activity at destination must revoke the routed source lease");
+    Check(mobileSource.SelectEnvironmentTarget(0) &&
+        mobileSource.SelectedEnvironmentTargetId==0,
+        "Returning to environment hub cannot disconnect other connected members");
+    Check(environment.ConnectedPeerCount==3,
+        "All devices must remain in one environment while authority changes");
+    // Hub-local control is also exclusive. A target switch must deliver the
+    // previous target's approved reset on the PREVIOUS peer session, not drop
+    // it because another peer is now selected.
+    Interlocked.Add(ref clock,3000);
+    Check(environment.SelectConnectedPeer(routed.Id),
+        "Hub should be able to select the routed desktop as a local target");
+    IInputSession hubCapture=environment.BindSelectedInput();
+    Check(hubCapture.TrySend(new Packet("claim",700)),
+        "Hub-local claim must queue on original authenticated target");
+    for(int i=0;i<50&&!destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(destinationPriority.RemoteGranted,
+        "Hub-local claim must acquire only that member's destination lease");
+    var anotherId=environment.ConnectedPeers
+        .Where(p=>p.Id!=routed.Id).OrderBy(p=>p.Id).First().Id;
+    Check(environment.SelectConnectedPeer(anotherId),
+        "Selecting a different member must not sever any environment connection");
+    for(int i=0;i<50&&destinationPriority.RemoteGranted;i++)
+        await Task.Delay(50,deadline.Token);
+    Check(!destinationPriority.RemoteGranted,
+        "Original peer's reset must arrive even after hub's target changes");
+    Check(environment.ConnectedPeerCount==3,
+        "Authority reset must not terminate any concurrent environment connection");
+    Console.WriteLine("PASS: one hub, three members, routed keyboard authority, competing claims, native priority and old-target release.");
+}
+
+// Stress: a hub must keep up to eight approved simultaneous TLS participants
+// in ONE roster, refuse an extra connection, and admit a replacement after a
+// member disconnects without severing any other peer.
+{
+    using var capacityHub = new ReceiverServer(_=>{},new LocalInputPriority(),
+        (_,__)=>Task.FromResult(true));
+    capacityHub.AllowForwardClaim=()=>false;
+    capacityHub.Start();
+    using var capTimeout=new CancellationTokenSource(TimeSpan.FromSeconds(35));
+    var endpoints = new List<HostSession>();
+    try
+    {
+        for(int i=0;i<8;i++)
+            endpoints.Add(await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+                capacityHub.Fingerprint,_=>{},capTimeout.Token));
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=8;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==8 && !capacityHub.CanAcceptNewPeer,
+            "Hub must permit eight independently authenticated members and enforce capacity");
+        for(int retry=0;retry<120 && endpoints[0].EnvironmentMembers.Count!=9;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(endpoints[0].EnvironmentMembers.Count==9,
+            "Full hub roster must contain eight live peers plus the hub itself");
+        endpoints[7].Dispose();
+        endpoints.RemoveAt(7);
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=7;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==7 && capacityHub.CanAcceptNewPeer,
+            "Disconnecting one member must restore one available hub slot");
+        endpoints.Add(await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+            capacityHub.Fingerprint,_=>{},capTimeout.Token));
+        for(int retry=0;retry<120&&capacityHub.ConnectedPeerCount!=8;retry++)
+            await Task.Delay(40,capTimeout.Token);
+        Check(capacityHub.ConnectedPeerCount==8,
+            "Replacement member must join without disrupting the seven connected peers");
+        Check(endpoints.Take(7).All(peer=>peer.EnvironmentMembers.Count>=8),
+            "Existing participants must continue receiving environment membership updates");
+        Console.WriteLine("PASS: hub saturation at eight authenticated peers, disconnect, slot reuse and roster continuity.");
+    }
+    finally {foreach(var endpoint in endpoints)endpoint.Dispose();}
 }
 
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never

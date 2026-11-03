@@ -10,6 +10,7 @@ final class DesktopDiscovery {
         final String name,address,fingerprint;
         final boolean ready,android;
         String groupId;
+        boolean isHub;
         Device(String n,String a,String f,boolean ready,boolean android) {
             name=n;address=a;fingerprint=f;this.ready=ready;this.android=android;
             groupId=f;
@@ -75,10 +76,13 @@ final class DesktopDiscovery {
     }
     static Device chooseGateway(List<Device> group,Set<String> connected,
             Set<String> trusted){
-        // Prefer an EXISTING connection. No second TLS handshake is required
-        // to display or select the already connected group.
+        // A peer with its own outgoing session is a member, not the hub.
+        // Rejoining a member as another gateway would split the environment.
+        for(Device d:group)if(d.isHub&&connected.contains(d.fingerprint))return d;
+        for(Device d:group)if(d.isHub&&d.ready&&trusted.contains(d.fingerprint))return d;
+        for(Device d:group)if(d.isHub&&d.ready)return d;
+        // Older Windows releases do not announce roles; retain safe fallback.
         for(Device d:group)if(connected.contains(d.fingerprint))return d;
-        // If reconnecting, prefer a previously approved certificate.
         for(Device d:group)if(d.ready&&trusted.contains(d.fingerprint))return d;
         for(Device d:group)if(d.ready)return d;
         return group.isEmpty()?null:group.get(0);
@@ -89,6 +93,7 @@ final class DesktopDiscovery {
         Map<String,Device> devices=new LinkedHashMap<>();
         Map<String,String> sourceIpByFingerprint=new HashMap<>();
         List<String[]> pendingLinks=new ArrayList<>();
+        List<String[]> hubHints=new ArrayList<>();
         // The local phone's beacon is for Windows, not a remote Android peer.
         String ownAndroidIdentity=null;
         try {ownAndroidIdentity=MobileDiscoveryResponder.mobileFingerprint();}
@@ -127,6 +132,13 @@ final class DesktopDiscovery {
                 String message=new String(result.getData(),0,result.getLength(),
                     StandardCharsets.US_ASCII);
                 String ip=result.getAddress().getHostAddress();
+                if(message.startsWith("DT1-HUB|")){
+                    String id=message.substring("DT1-HUB|".length());
+                    if(id.matches("[A-Fa-f0-9]{64}"))
+                        hubHints.add(new String[]{
+                            id.toUpperCase(Locale.ROOT),ip});
+                    continue;
+                }
                 if(message.startsWith("DT1-LINK|")){
                     String[] link=message.split("\\|",-1);
                     if(link.length==3&&link[1].matches("[A-Fa-f0-9]{64}")&&
@@ -152,6 +164,13 @@ final class DesktopDiscovery {
             if(edge.length==3 && edge[2].equals(sourceIpByFingerprint.get(edge[0])))
                 verifiedLinks.add(new String[]{edge[0],edge[1]});
         applyConnectedGroups(found,verifiedLinks);
+        // A plain UDP claim cannot grant trust. Only associate the hub role
+        // with a device which also announced its fingerprint from this IP.
+        for(Device device:found)if(!device.android)
+            for(String[] hint:hubHints)
+                if(hint[0].equals(device.fingerprint)&&
+                    hint[1].equals(sourceIpByFingerprint.get(device.fingerprint)))
+                    device.isHub=true;
         found.sort(Comparator.comparing((Device d)->d.android)
             .thenComparing(d->d.groupId,String.CASE_INSENSITIVE_ORDER)
             .thenComparing(d->d.name,String.CASE_INSENSITIVE_ORDER));

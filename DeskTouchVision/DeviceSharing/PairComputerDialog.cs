@@ -11,9 +11,9 @@ internal sealed class PairComputerDialog : Form
     private sealed record NearbyItem(NearbyComputer Peer)
     {
         public override string ToString() =>
-            $"{(Peer.IsAndroid ? "Android" : "Windows")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
-            (Peer.IsAndroid ? "Connect from phone" :
-             Peer.CanReceive ? "Ready" : "Busy");
+            $"{(Peer.IsAndroid ? "Android" : Peer.IsHub ? "Environment hub" : "Windows member")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
+            (Peer.IsAndroid ? "Join from phone" :
+             Peer.CanReceive ? "Accepting members" : "At capacity");
     }
 
     private readonly ListBox _nearby = new() { Dock = DockStyle.Fill,
@@ -56,8 +56,8 @@ internal sealed class PairComputerDialog : Form
             Text = "Add devices", Font = new Font("Segoe UI Semibold", 22),
             Padding = new Padding(19, 9, 10, 0) };
         var intro = new Label { Dock = DockStyle.Top, Height = 60,
-            Text = "Find all DeskTouch Windows PCs and Android phones on your local network.\n" +
-                   "Android phones initiate connections from their app; Windows PCs approve pairing.",
+            Text = "Join one DeskTouch environment hub; its existing PCs and phones appear automatically.\n" +
+                   "Each member connects once to the hub, never separately to every device.",
             Padding = new Padding(20, 3, 10, 6) };
 
         var fields = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1,
@@ -175,7 +175,13 @@ internal sealed class PairComputerDialog : Form
             }
             if (!selected.Peer.CanReceive)
             {
-                _error.Text = "That PC is busy. Disconnect its active session first.";
+                _error.Text = "That Windows endpoint is at capacity. The existing environment stays connected.";
+                return;
+            }
+            if(!selected.Peer.IsHub && _nearby.Items.Cast<NearbyItem>()
+                .Any(item=>item.Peer.IsHub && item.Peer.CanReceive))
+            {
+                _error.Text = "Join the available environment hub, not an already joined member PC.";
                 return;
             }
             Address = selected.Peer.Address;

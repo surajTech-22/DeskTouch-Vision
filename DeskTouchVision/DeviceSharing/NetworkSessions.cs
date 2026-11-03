@@ -17,6 +17,11 @@ internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
     string? Platform = null, bool? ForwardInputSupported = null);
 
+// Issued exclusively by the authenticated hub over an existing TLS session.
+// Id is a connection-scoped route identifier, not a device identity or trust proof.
+internal sealed record EnvironmentMember(int Id, string Name, string Platform,
+    string Layout, bool SupportsReverseInput);
+
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
 /// through the same existing TLS protocol. Only one peer holds the input lease.
@@ -44,6 +49,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int Lease;
         internal int AppliedLease;
         internal int KeyboardFailureReported;
+        internal int EnvironmentTargetId; // 0 is the local Windows hub
+    }
+
+    private sealed class RelayLease
+    {
+        internal required Session Source;
+        internal required Session Target;
+        internal required int Claim;
+        internal bool Granted;
     }
 
     private readonly Action<string> _status;
@@ -57,6 +71,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
     private readonly object _authorityGate = new();
+    // A single environment can have many authenticated peers but only one
+    // controller per destination. Every routed input is pinned to BOTH TLS
+    // sessions, not a name, IP address or broadcast group hint.
+    private readonly Dictionary<int, RelayLease> _relayBySource = new();
+    private readonly Dictionary<int, RelayLease> _relayByTarget = new();
+    // The hub itself is also a controller. Its selected reverse-input claim
+    // must arbitrate against routed peers targeting the same device.
+    private readonly Dictionary<int,int> _hubClaims = new();
     private Task? _serverTask;
     private int _nextClientId;
     private int _pendingAndActive;
@@ -79,6 +101,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+
+    internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
+        bool differentPeers, int claim) =>
+        claim > 0 && differentPeers && AllowsForwardInput(source) &&
+        target.SupportsReverseInput;
     internal bool SelectConnectedPeer(int id)
     {
         if (!_sessions.TryGetValue(id, out var session)) return false;
@@ -177,6 +204,57 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         finally { session.Write.Release(); }
     }
 
+    private RelayLease? RemoveRelayFromSource(int sourceId)
+    {
+        lock (_authorityGate)
+        {
+            if (!_relayBySource.Remove(sourceId, out var relay)) return null;
+            _relayByTarget.Remove(relay.Target.Id);
+            return relay;
+        }
+    }
+
+    private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
+        CancellationToken token)
+    {
+        if (_sessions.ContainsKey(relay.Target.Id))
+        {
+            try { await SendToAsync(relay.Target,
+                new Packet("reverse-reset", relay.Claim), token); }
+            catch (Exception) { }
+        }
+        if (notifySource && _sessions.ContainsKey(relay.Source.Id))
+        {
+            try { await SendToAsync(relay.Source,
+                new Packet("local-active", relay.Claim), token); }
+            catch (Exception) { }
+        }
+    }
+
+    private async Task PublishEnvironmentAsync(CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+        // Roster is an authenticated statement from this hub. Individual
+        // session IDs are ephemeral and may never authorize a new pairing.
+        var members = new List<EnvironmentMember> {
+            new(0, Environment.MachineName, "Windows",
+                MonitorTopology.Capture().ToWire(), true)
+        };
+        foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
+            members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
+                peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput));
+        string payload = JsonSerializer.Serialize(members);
+        if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
+        {
+            _status("Environment roster too large; refusing to advertise incomplete routes.");
+            return;
+        }
+        foreach (var recipient in _sessions.Values)
+            try { await SendToAsync(recipient,
+                new Packet("environment-roster", recipient.Id, Text: payload), token); }
+            catch (Exception) { /* peer may have disconnected */ }
+    }
+
     private void NotifySelection(Session? previous, Session? next)
     {
         if (ReferenceEquals(previous, next)) return;
@@ -265,6 +343,28 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private bool TrySendReverseTo(int id, Packet packet)
     {
         if (!_sessions.TryGetValue(id, out var selected)) return false;
+        lock (_authorityGate)
+        {
+            if (packet.Type=="claim")
+            {
+                if (packet.A<=0 || _relayByTarget.ContainsKey(id) ||
+                    _hubClaims.ContainsKey(id))
+                    return false;
+                _hubClaims[id]=packet.A;
+            }
+            else if(packet.Type is "reset" or "release")
+            {
+                if(_hubClaims.TryGetValue(id,out int claim) &&
+                    (packet.Type=="reset" || claim==packet.A))
+                    _hubClaims.Remove(id);
+                else
+                    // An already-revoked RELEASE is an idempotent success,
+                    // but must NEVER send a reset to another routed owner.
+                    return packet.Type=="release";
+            }
+            else if (!_hubClaims.ContainsKey(id))
+                return false;
+        }
         if (packet.Type == "move")
         {
             Interlocked.Exchange(ref selected.LatestReverseMove, packet);
@@ -288,9 +388,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             await foreach (var p in session.ReverseQueue.Reader.ReadAllAsync(token))
             {
-                // Never allow an old peer's queued reverse input to be sent
-                // to the new peer after selection changes.
-                if (!ReferenceEquals(Volatile.Read(ref _selected), session)) continue;
+                // Old target movements/buttons must never leak after a
+                // selection change. Its pending RELEASE/RESET must still be
+                // delivered on the ORIGINAL authenticated TLS stream.
+                bool stillSelected=ReferenceEquals(Volatile.Read(ref _selected),session);
+                if(!stillSelected)
+                {
+                    Interlocked.Exchange(ref session.LatestReverseMove,null);
+                    Interlocked.Exchange(ref session.ReverseMoveSignaled,0);
+                    if(p.Type is "release" or "reset")
+                        await SendToAsync(session,
+                            ReverseInputProtocol.Encode(p),token);
+                    continue;
+                }
                 if (p.Type == "move-flush")
                 {
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
@@ -416,6 +526,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
+            await PublishEnvironmentAsync(token);
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -447,6 +558,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type=="topology")
                 {
                     session.Peer=session.Peer with {Monitors=MonitorTopology.FromWire(p.Text)};
+                    await PublishEnvironmentAsync(token);
                     if(ReferenceEquals(Volatile.Read(ref _selected),session))
                         PeerTopologyChanged?.Invoke(session.Peer);
                     continue;
@@ -461,8 +573,99 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
-                    if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                    RelayLease? relay;
+                    lock (_authorityGate)
+                    {
+                        _relayByTarget.TryGetValue(session.Id, out relay);
+                        if (relay != null && relay.Claim != p.A) relay=null;
+                        if (relay != null && p.Type=="reverse-granted")
+                            relay.Granted=true;
+                    }
+                    if (relay != null)
+                    {
+                        // Deliver the destination's real grant/applied ACK to
+                        // the original authenticated controller, not the hub UI.
+                        if (p.Type is "reverse-busy" or "reverse-local-active")
+                            RemoveRelayFromSource(relay.Source.Id);
+                        string response=p.Type["reverse-".Length..];
+                        if (p.Type!="reverse-active" || relay.Granted)
+                            try { await SendToAsync(relay.Source,
+                                new Packet(response,p.A),token); }
+                            catch (Exception) { }
+                    }
+                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                    {
+                        if(p.Type is "reverse-busy" or "reverse-local-active")
+                            lock(_authorityGate) _hubClaims.Remove(session.Id);
                         ReverseControlMessage?.Invoke(p);
+                    }
+                    continue;
+                }
+                if(p.Type=="environment-select")
+                {
+                    // The hub owns routing decisions. Clients may request
+                    // only connection IDs issued on this authenticated link.
+                    Session? target=p.A==0 ? null :
+                        _sessions.TryGetValue(p.A,out var targetPeer)?targetPeer:null;
+                    bool valid=p.A==0 ||
+                        (target!=null && !ReferenceEquals(target,session) &&
+                         target.Peer.SupportsReverseInput);
+                    if(!valid)
+                    {
+                        await SendToAsync(session,new Packet("environment-unavailable",p.A),token);
+                        continue;
+                    }
+                    var previous=RemoveRelayFromSource(session.Id);
+                    if(previous!=null)
+                        await RevokeRelayAsync(previous,false,token);
+                    bool localOwner=false;
+                    lock(_authorityGate)
+                    {
+                        if(ReferenceEquals(_owner,session))
+                        {
+                            _owner=null;session.Lease=0;session.AppliedLease=0;
+                            _priority.ReleaseRemote();localOwner=true;
+                        }
+                        session.EnvironmentTargetId=p.A;
+                    }
+                    if(localOwner)lock(session.InputLock)session.Injector.ReleaseAll();
+                    await SendToAsync(session,new Packet("environment-selected",p.A),token);
+                    continue;
+                }
+                if(p.Type=="claim" && session.EnvironmentTargetId!=0)
+                {
+                    RelayLease? relay=null;
+                    lock(_authorityGate)
+                    {
+                        if(_sessions.TryGetValue(session.EnvironmentTargetId,
+                                out var destination) &&
+                           CanRoute(session.Peer,destination.Peer,
+                                !ReferenceEquals(session,destination),p.A) &&
+                           !_relayBySource.ContainsKey(session.Id) &&
+                           !_relayByTarget.ContainsKey(destination.Id) &&
+                           !_hubClaims.ContainsKey(destination.Id) &&
+                           !_relayByTarget.ContainsKey(session.Id) &&
+                           !_relayBySource.ContainsKey(destination.Id) &&
+                           !ReferenceEquals(_owner,session))
+                        {
+                            relay=new RelayLease { Source=session,
+                                Target=destination,Claim=p.A };
+                            _relayBySource.Add(session.Id,relay);
+                            _relayByTarget.Add(destination.Id,relay);
+                        }
+                    }
+                    if(relay==null)
+                        await SendToAsync(session,new Packet("busy",p.A),token);
+                    else
+                    {
+                        try { await SendToAsync(relay.Target,
+                            new Packet("reverse-claim",p.A),token); }
+                        catch(Exception)
+                        {
+                            RemoveRelayFromSource(session.Id);
+                            await SendToAsync(session,new Packet("busy",p.A),token);
+                        }
+                    }
                     continue;
                 }
                 if(p.Type=="claim")
@@ -497,6 +700,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="reset" || p.Type=="release")
                 {
+                    RelayLease? activeRelay=null;
+                    lock(_authorityGate)
+                        if(_relayBySource.TryGetValue(session.Id,out var candidate) &&
+                            (p.Type=="reset" || p.A==candidate.Claim))
+                            activeRelay=candidate;
+                    if(activeRelay!=null)
+                    {
+                        var removed=RemoveRelayFromSource(session.Id);
+                        if(removed!=null)await RevokeRelayAsync(removed,false,token);
+                        continue;
+                    }
                     bool wasOwner=false;
                     lock(_authorityGate)
                     {
@@ -518,6 +732,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     await SendToAsync(session,new Packet("pong"),token);
                     continue;
                 }
+                RelayLease? forward=null;
+                lock(_authorityGate)
+                    _relayBySource.TryGetValue(session.Id,out forward);
+                if(forward!=null)
+                {
+                    if(forward.Granted &&
+                        p.Type is ("move" or "button" or "key" or "wheel" or "text"))
+                    {
+                        try { await SendToAsync(forward.Target,
+                            ReverseInputProtocol.Encode(p),token); }
+                        catch(Exception)
+                        {
+                            var removed=RemoveRelayFromSource(session.Id);
+                            if(removed!=null)
+                                await RevokeRelayAsync(removed,true,token);
+                        }
+                    }
+                    continue;
+                }
+                if(session.EnvironmentTargetId!=0)
+                    continue; // Never accidentally inject an unrouted packet locally.
                 int lease;
                 lock(_authorityGate)
                     lease=ReferenceEquals(_owner,session)?session.Lease:0;
@@ -561,6 +796,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            lock(_authorityGate) _hubClaims.Remove(id);
+            var disconnectedRoutes=new List<RelayLease>();
+            lock(_authorityGate)
+            {
+                if(_relayBySource.TryGetValue(id,out var from))
+                    disconnectedRoutes.Add(from);
+                if(_relayByTarget.TryGetValue(id,out var to) &&
+                    !disconnectedRoutes.Contains(to))
+                    disconnectedRoutes.Add(to);
+                foreach(var route in disconnectedRoutes)
+                {
+                    _relayBySource.Remove(route.Source.Id);
+                    _relayByTarget.Remove(route.Target.Id);
+                }
+            }
+            foreach(var route in disconnectedRoutes)
+                await RevokeRelayAsync(route,route.Target.Id==id,token);
+            await PublishEnvironmentAsync(token);
             PeerListChanged?.Invoke();
             Session? previous=null, next=null;
             bool released=false;
@@ -618,6 +871,16 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
     internal event Action<string>? RemoteNameChanged;
     private string? _remoteSystemName;
+    private string? _environmentHubName;
+    private readonly MonitorTopology _environmentHubMonitors;
+    private EnvironmentMember[] _environmentMembers = [];
+    private int _environmentOwnId;
+    private int _environmentTargetId;
+    internal IReadOnlyList<EnvironmentMember> EnvironmentMembers =>
+        Volatile.Read(ref _environmentMembers);
+    internal int SelectedEnvironmentTargetId => Volatile.Read(ref _environmentTargetId);
+    internal int OwnEnvironmentMemberId => Volatile.Read(ref _environmentOwnId);
+    internal event Action? EnvironmentRosterChanged;
     internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
@@ -636,6 +899,30 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<string>? InputDeliveryWarning;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
+
+    internal bool SelectEnvironmentTarget(int id)
+    {
+        if (Volatile.Read(ref _closed)!=0 || id<0) return false;
+        var members=Volatile.Read(ref _environmentMembers);
+        EnvironmentMember? chosen=members.FirstOrDefault(m=>m.Id==id);
+        if (id!=0 && (chosen==null || id==_environmentOwnId ||
+            !chosen.SupportsReverseInput)) return false;
+        // The hub's real monitor information is retained separately from the
+        // chosen member's display geometry. Changing targets never opens TCP.
+        MonitorTopology topology=id==0 ? _environmentHubMonitors :
+            MonitorTopology.FromWire(chosen!.Layout);
+        string name=id==0 ? _environmentHubName??"Environment hub" : chosen!.Name;
+        if (id!=SelectedEnvironmentTargetId)
+        {
+            if (!TrySend(new Packet("environment-select",id))) return false;
+            Volatile.Write(ref _environmentTargetId,id);
+        }
+        Volatile.Write(ref _remoteMonitors,topology);
+        Volatile.Write(ref _remoteSystemName,name);
+        RemoteTopologyChanged?.Invoke(topology);
+        RemoteNameChanged?.Invoke(name);
+        return true;
+    }
 
     internal void AttachReverseInput(LocalInputPriority priority, Func<bool> allowClaim)
     {
@@ -716,7 +1003,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
     {
-        _client = client; _ssl = ssl; _remoteMonitors = monitors; _onFailure = onFailure;
+        _client = client; _ssl = ssl; _remoteMonitors = monitors;
+        _environmentHubMonitors = monitors; _onFailure = onFailure;
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
@@ -881,19 +1169,51 @@ internal sealed class HostSession : IInputSession, IDisposable
             while (!_cancel.IsCancellationRequested)
             {
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
-                if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
+                if (p.Type == "environment-roster" &&
+                    p.Text is { Length: > 1 and <= 7800 } roster)
+                {
+                    var members = JsonSerializer.Deserialize<EnvironmentMember[]>(roster)
+                        ?? Array.Empty<EnvironmentMember>();
+                    if (members.Length is < 1 or > 9 ||
+                        !members.Any(m=>m.Id==0 && m.Platform=="Windows") ||
+                        members.Select(m=>m.Id).Distinct().Count()!=members.Length ||
+                        members.Any(m=>m.Id<0 || m.Name.Length is < 1 or > 100 ||
+                            m.Name.Any(char.IsControl) ||
+                            m.Platform is not ("Windows" or "Android")))
+                        throw new InvalidDataException("Invalid authenticated environment roster.");
+                    Volatile.Write(ref _environmentMembers,members);
+                    Volatile.Write(ref _environmentOwnId,p.A);
+                    int current=SelectedEnvironmentTargetId;
+                    if (current!=0 && !members.Any(m=>m.Id==current &&
+                        m.SupportsReverseInput))
+                        SelectEnvironmentTarget(0);
+                    EnvironmentRosterChanged?.Invoke();
+                }
+                else if (p.Type == "environment-unavailable")
+                {
+                    if (p.A==SelectedEnvironmentTargetId)
+                        SelectEnvironmentTarget(0);
+                    InputDeliveryWarning?.Invoke(
+                        "Selected environment member is unavailable; returned to the hub.");
+                }
+                else if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
                     !name.Any(char.IsControl))
                 {
-                    // Cache even if the UI subscribes after the TLS reader
-                    // receives this first metadata frame.
-                    Volatile.Write(ref _remoteSystemName,name);
-                    RemoteNameChanged?.Invoke(name);
+                    _environmentHubName=name;
+                    if (SelectedEnvironmentTargetId==0)
+                    {
+                        Volatile.Write(ref _remoteSystemName,name);
+                        RemoteNameChanged?.Invoke(name);
+                    }
                 }
                 else if (p.Type == "topology")
                 {
                     var layout = MonitorTopology.FromWire(p.Text);
-                    Volatile.Write(ref _remoteMonitors, layout);
-                    RemoteTopologyChanged?.Invoke(layout);
+                    if (SelectedEnvironmentTargetId==0)
+                    {
+                        Volatile.Write(ref _remoteMonitors, layout);
+                        RemoteTopologyChanged?.Invoke(layout);
+                    }
                 }
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))

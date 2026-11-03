@@ -418,11 +418,22 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try
         {
             int selected = _captureUsesInbound || _host == null
-                ? _receiver?.SelectedPeerId ?? 0 : 0;
+                ? _receiver?.SelectedPeerId ?? 0 :
+                  -_host.SelectedEnvironmentTargetId;
             _targetChoice.Items.Clear();
             if (_host != null)
+            {
                 _targetChoice.Items.Add(new TargetOption(0,
-                    "Windows  •  " + _remoteAddress));
+                    "Environment hub  •  " + (_host.EnvironmentMembers
+                        .FirstOrDefault(m => m.Id==0)?.Name ?? _remoteAddress)));
+                foreach(var member in _host.EnvironmentMembers)
+                {
+                    if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId ||
+                        !member.SupportsReverseInput) continue;
+                    _targetChoice.Items.Add(new TargetOption(-member.Id,
+                        "In same environment  •  " + member.Platform + "  •  " + member.Name));
+                }
+            }
             if (_receiver != null)
                 foreach (var (id, peer) in _receiver.ConnectedPeers)
                     _targetChoice.Items.Add(new TargetOption(id,
@@ -439,10 +450,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void SelectConnectedTarget(int id)
     {
-        // Switching which screen to control NEVER creates another TCP
-        // connection or merges two PC/phone certificate identities.
-        if (id == 0 && _host != null)
+        // One authenticated environment session routes to all members.
+        // No disconnection/re-pairing occurs when selecting another screen.
+        if (id <= 0 && _host != null)
         {
+            _capture?.ReturnLocal();
+            int routedId = id < 0 ? -id : 0;
+            if (!_host.SelectEnvironmentTarget(routedId))
+            {
+                Status("Environment target unavailable or not authorized.");
+                RefreshDisplays();
+                return;
+            }
             if (_captureUsesInbound)
             {
                 _capture?.Dispose();
@@ -464,6 +483,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     Status("Windows target cannot be armed: " + ex.Message);
                 }
             }
+            _capture?.UpdateLayouts(MonitorTopology.Capture(),_host.RemoteMonitors);
             RefreshDisplays();
             return;
         }
@@ -548,7 +568,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             if (_host != null && _currentFingerprint.Length == 64)
                                 neighbours.Add(_currentFingerprint);
                             return neighbours;
-                        });
+                        }, () => _host == null);
                     _discovery.Start();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
@@ -778,24 +798,34 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private async Task AddComputerAsync()
     {
         if (_connecting || _closing.IsCancellationRequested) return;
+        // The Windows client joins ONE environment. Adding another machine
+        // must never silently drop the existing hub or keyboard lease.
+        if(_host != null || (_receiver?.ConnectedPeerCount ?? 0)>0)
+        {
+            var members=_host!=null ? _host.EnvironmentMembers
+                .Select(x=>x.Platform+" • "+x.Name).Distinct().ToArray()
+                : _receiver?.ConnectedPeers.Select(x=>x.Peer.Platform+" • "+x.Peer.Name)
+                    .ToArray() ?? Array.Empty<string>();
+            string known=members.Length>0 ? string.Join(Environment.NewLine,members) :
+                "Your current environment hub";
+            MessageBox.Show(this,
+                "You are already connected to a shared DeskTouch environment." +
+                Environment.NewLine+Environment.NewLine+
+                "Connected members:"+Environment.NewLine+known+
+                Environment.NewLine+Environment.NewLine+
+                "To add another PC or phone, open DeskTouch on that device and " +
+                "join this environment's Windows hub. Existing devices remain " +
+                "connected; no session needs to be replaced.",
+                "DeskTouch shared environment",MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
         using var dialog = new PairComputerDialog();
         _manualPairDialogOpen = true;
         DialogResult choice;
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
-        if (_host != null)
-        {
-            // Switching outgoing controller remains explicit. Inbound phones and
-            // PCs remain connected to the independent, persistent receiver.
-            var confirm = MessageBox.Show(this,
-                "Another device currently owns the remote input session.\n\n" +
-                "Disconnect that session and switch to " + dialog.ComputerName + "?",
-                "Switch DeskTouch device?", MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
-            if (confirm != DialogResult.Yes) return;
-            DisconnectHost();
-        }
         _connecting = true;
         // Never tear down Windows's incoming TLS listener when this PC also
         // initiates an outgoing connection. Other mobiles and PCs may connect
@@ -866,6 +896,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
+        session.EnvironmentRosterChanged += HandleEnvironmentRoster;
         if (session.RemoteSystemName is { Length: > 0 } actual)
             _remoteAddress = DisplayArrangementControl.CleanDeviceName(actual,
                 _remoteAddress);
@@ -976,9 +1007,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Discovery finds CURRENT network addresses; the saved file has
             // NO IP address, only the receiver's persistent TLS fingerprint.
             var peers = await NearbyComputerDiscovery.FindAsync(_closing.Token);
-            var found = peers.Select(p => new { Peer = p,
-                Saved = _trusted.FindAutoConnect(p.Fingerprint) })
-                .FirstOrDefault(x => x.Saved != null);
+            var remembered = peers.Select(p => new { Peer = p,
+                Saved = _trusted.FindAutoConnect(p.Fingerprint) }).ToArray();
+            // Reconnect to the existing environment hub; never silently
+            // start a second, isolated PC-to-PC session with a leaf when a
+            // real hub is discoverable but has not yet been approved.
+            bool hubAvailable = peers.Any(p => p.IsHub && p.CanReceive);
+            var found = remembered.FirstOrDefault(x =>
+                x.Saved != null && x.Peer.IsHub);
+            if(found == null && !hubAvailable)
+                found = remembered.FirstOrDefault(x => x.Saved != null);
             if (found == null || _host != null ||
                 _connecting || !_trusted.AutoConnectEnabled)
                 return;
@@ -1052,6 +1090,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
     }
 
+    private void HandleEnvironmentRoster() => PostToUi(() =>
+    {
+        if(_host == null) return;
+        // The authenticated hub provides current members. One connection
+        // stays alive while target keyboard/mouse authority changes.
+        UpdateTargetChoice();
+        RefreshDisplays();
+        Status($"Shared environment: {_host.EnvironmentMembers.Count} available devices.");
+    });
+
     private void HandleRemoteName(string actualName)
     {
         PostToUi(() =>
@@ -1107,6 +1155,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.InputDeliveryWarning -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;
+            _host.EnvironmentRosterChanged -= HandleEnvironmentRoster;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
         _capture?.Dispose();

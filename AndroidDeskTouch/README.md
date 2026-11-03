@@ -1,17 +1,20 @@
-# v0.3.11 development preview — unified Windows network
-Android can show one linked Windows network card and initiate secure connections to its individual PCs in one action. Each Windows member has its own separately approved TLS certificate: a network group is **not** an authentication identity. Once approved, those Windows PCs and other mobile clients remain connected concurrently; Android's active target and Windows' input leases still select a single controlled destination at a time.
+# v0.3.12 development preview — one shared DeskTouch environment
 
-To control Windows **from the phone**, connect all members, select a Windows screen in the group, choose **Take control of selected Windows screen**, and wait for the cursor-applied authority acknowledgement. Use the touchpad or the Android keyboard typing field; the on-screen keyboard commits Unicode text through an authenticated, exclusive lease. The sensitivity slider adjusts phone touchpad speed. Select another connected PC or deliberately move outward across a linked group edge to request a new handoff. The Windows machine's local keyboard/mouse takes priority.
+**One environment, multiple connected devices.** Select **Join environment** on Android. The phone connects to one Windows hub using its pinned TLS certificate; other PCs and phones join the **same** hub separately. Once connected, the hub sends an authenticated list of all its members. Select any supported member from this list; the hub routes control there without requiring another pairing or separate Android connection.
 
-To control Android **from Windows**, enable DeskTouch's Windows-control checkbox and its Accessibility service in Android Settings. A remote Windows keyboard can type only into supported, focused non-password fields; Accessibility is not an unrestricted hardware keyboard driver. No special Android permission is required for the phone's ordinary touchpad/IME to send input to a previously approved Windows PC.
+To add another Windows PC, open DeskTouch on that PC and join the current hub; to add another mobile, choose that same hub in the mobile app. Each device must be approved by the hub. One destination accepts one remote input controller at a time, while all other devices stay connected and can continue operating independently. Hardware input on the destination takes priority.
 
-This is a **development** branch; production APK updates must still be signed with the existing permanent Android certificate, and physical multi-device acceptance is required before release.
+Android's on-screen typing field / physical keyboard can control selected Windows programs when a remote lease is active. Windows can control Android using its opt-in Accessibility service; normal password-field protections remain. Hub role discovery avoids mistakenly joining a connected Windows leaf.
+
+The current hub accepts **up to 8 simultaneous incoming devices**. Devices must share a reachable private LAN; no external server or IP-address based trust is used. This is a single hub-based environment, not a transparent cross-network mesh. Real multi-device and permission testing is required before official release; use only the existing permanent Android signing identity.
 
 ---
 
+
+
 # DeskTouch Vision for Android (same product and repository)
 
-**Android release 0.3.9** reuses the Windows DeskTouch LAN discovery (UDP 37378),
+**Earlier Android release 0.3.9** reuses the Windows DeskTouch LAN discovery (UDP 37378),
 TLS endpoint (TCP 37377), existing approval prompt, monitor geometry, Wire
 framing and two-phase authority handoff. There is **no separate remote-desktop
 protocol, login system, or replacement keyboard/mouse settings**.

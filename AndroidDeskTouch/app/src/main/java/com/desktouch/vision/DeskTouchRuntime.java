@@ -6,9 +6,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
 /**
- * The same DeskTouch app keeps several authenticated Windows TLS sessions.
- * Hardware input always targets only the user-selected peer. A connection is
- * NOT equivalent to permission to control that machine.
+ * Android maintains one authenticated connection to its selected Windows
+ * environment hub. That hub routes input to its approved online members.
+ * Each destination still requires an exclusive input authority lease.
  */
 final class DeskTouchRuntime {
     private static final Map<String,DeskTouchSession> sessions=new ConcurrentHashMap<>();
@@ -16,9 +16,6 @@ final class DeskTouchRuntime {
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
     private static DeskTouchSession androidController;
-    // A group is a single UI connection, with independently authenticated
-    // TLS sessions to its members. Never mistake a LAN group hint for trust.
-    private static final Map<String,List<String>> linkedGroups=new HashMap<>();
     private DeskTouchRuntime(){}
 
     private static DeskTouchSession newSession(Context context,String id) {
@@ -31,7 +28,18 @@ final class DeskTouchRuntime {
     }
 
     static synchronized DeskTouchSession session(Context context) {
-        if(selectedFingerprint==null)selectedFingerprint="__unselected__";
+        // A reconnect service can establish the hub before the UI opens.
+        if(selectedFingerprint==null ||
+           (!sessions.containsKey(selectedFingerprint) &&
+            !sessions.isEmpty())){
+            selectedFingerprint=null;
+            for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
+                if(entry.getValue().isConnected()){
+                    selectedFingerprint=entry.getKey();break;
+                }
+            }
+            if(selectedFingerprint==null)selectedFingerprint="__unselected__";
+        }
         return sessions.computeIfAbsent(selectedFingerprint,
             id->newSession(context,id));
     }
@@ -69,34 +77,6 @@ final class DeskTouchRuntime {
         return next;
     }
 
-    static synchronized void rememberGroups(
-            Map<String,List<DesktopDiscovery.Device>> groups){
-        linkedGroups.clear();
-        for(List<DesktopDiscovery.Device> members:groups.values()){
-            List<String> identities=new ArrayList<>();
-            for(DesktopDiscovery.Device member:members)
-                identities.add(member.fingerprint.toUpperCase(Locale.ROOT));
-            for(String id:identities)
-                linkedGroups.put(id,Collections.unmodifiableList(identities));
-        }
-    }
-    static synchronized boolean crossLinkedEdge(DeskTouchSession source, int direction){
-        if(selectedFingerprint==null || sessions.get(selectedFingerprint)!=source)
-            return false;
-        List<String> group=linkedGroups.get(selectedFingerprint);
-        if(group==null || group.size()<2)return false;
-        int current=group.indexOf(selectedFingerprint);
-        int destination=current+direction;
-        if(destination<0||destination>=group.size())return false;
-        String id=group.get(destination);
-        DeskTouchSession target=sessions.get(id);
-        if(target==null||!target.isConnected())return false;
-        source.releaseControl();
-        selectedFingerprint=id;
-        target.prepareGroupEntry(direction);
-        target.claimControl();
-        return true;
-    }
     static String selectedIdentity(){return selectedFingerprint;}
     static synchronized boolean isConnected(String fingerprint){
         DeskTouchSession s=sessions.get(fingerprint.toUpperCase(Locale.ROOT));
@@ -133,7 +113,7 @@ final class DeskTouchRuntime {
     }
     static synchronized void clear(){
         for(DeskTouchSession s:sessions.values())s.close();
-        sessions.clear();linkedGroups.clear();
+        sessions.clear();
         selectedFingerprint=null;androidController=null;listener=null;
     }
 }

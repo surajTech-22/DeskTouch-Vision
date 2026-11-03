@@ -9,7 +9,7 @@ namespace DeskTouch.DeviceShare;
 /// <summary>Discovery-only information. The advertised fingerprint is never
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
-    bool IsAndroid = false, bool CanReceive = true);
+    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
@@ -27,17 +27,20 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
     private readonly Func<IEnumerable<string>> _connectedFingerprints;
+    private readonly Func<bool> _isEnvironmentHub;
     private UdpClient? _listener;
     private Task? _loop;
 
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
-        Func<IEnumerable<string>>? connectedFingerprints = null)
+        Func<IEnumerable<string>>? connectedFingerprints = null,
+        Func<bool>? isEnvironmentHub = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A stable TLS fingerprint is required.");
         _fingerprint = fingerprint;
         _canAcceptConnections = canAcceptConnections ?? (() => true);
         _connectedFingerprints = connectedFingerprints ?? (() => Array.Empty<string>());
+        _isEnvironmentHub = isEnvironmentHub ?? (() => true);
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -77,6 +80,14 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 var prefix = accepting ? ReadyPrefix : BusyPrefix;
                 byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
                 await _listener.SendAsync(reply,msg.RemoteEndPoint,_stop.Token);
+                // A member with an outgoing hub connection is a LEAF, even if
+                // it keeps its own incoming listener. Android should prefer a
+                // real environment hub instead of creating a split network.
+                if (_isEnvironmentHub())
+                {
+                    byte[] hubHint=Encoding.ASCII.GetBytes("DT1-HUB|"+_fingerprint);
+                    await _listener.SendAsync(hubHint,msg.RemoteEndPoint,_stop.Token);
+                }
                 // Optional second datagram announces connected PC membership.
                 // The original READY/BUSY packet is untouched for older apps.
                 // These hints are VISUAL only and never authorize pairing.
@@ -121,8 +132,10 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal static IReadOnlyList<NearbyComputer> DistinctDevices(IEnumerable<NearbyComputer> peers) =>
         peers.GroupBy(p => (p.IsAndroid, p.Fingerprint), 
                 EqualityComparer<(bool, string)>.Default)
-            .Select(g => g.OrderByDescending(p => p.CanReceive).First())
+            .Select(g => g.OrderByDescending(p => p.CanReceive)
+                .ThenByDescending(p=>p.IsHub).First())
             .OrderBy(p => p.IsAndroid)
+            .ThenByDescending(p=>p.IsHub)
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(p => p.Address, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -130,6 +143,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal static async Task<IReadOnlyList<NearbyComputer>> FindAsync(CancellationToken cancel)
     {
         var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
+        var advertisedHubs = new ConcurrentDictionary<string,string>(
+            StringComparer.OrdinalIgnoreCase);
         using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         var destinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -178,8 +193,15 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             try
             {
                 var packet = await udp.ReceiveAsync(slice.Token);
-                var peer = ParseReply(Encoding.ASCII.GetString(packet.Buffer),
-                    packet.RemoteEndPoint.Address);
+                string response = Encoding.ASCII.GetString(packet.Buffer);
+                if(response.StartsWith("DT1-HUB|",StringComparison.Ordinal))
+                {
+                    string id=response["DT1-HUB|".Length..];
+                    if(id.Length==64 && id.All(Uri.IsHexDigit))
+                        advertisedHubs[id]=packet.RemoteEndPoint.Address.ToString();
+                    continue;
+                }
+                var peer = ParseReply(response, packet.RemoteEndPoint.Address);
                 if (peer is not null)
                     found[(peer.IsAndroid ? "android:" : "windows:") + peer.Fingerprint] = peer;
             }
@@ -187,7 +209,10 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException) { break; }
         }
-        return DistinctDevices(found.Values);
+        return DistinctDevices(found.Values.Select(p =>
+            p with { IsHub = !p.IsAndroid &&
+                advertisedHubs.TryGetValue(p.Fingerprint,out var claimedAddress) &&
+                string.Equals(claimedAddress,p.Address,StringComparison.OrdinalIgnoreCase) }));
     }
 
     public void Dispose()

@@ -381,8 +381,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if (lease > 0 && _priority.CanApplyRemote &&
                         p.Type is ("move" or "button" or "key" or "wheel"))
                     {
-                        injector.Handle(p);
-                        cursorApplied = p.Type == "move";
+                        // ACK only after SendInput actually succeeded.
+                        // If Windows refused injection, the source must time
+                        // out and retain its local mouse/key authority.
+                        bool appliedToWindows = injector.Handle(p);
+                        cursorApplied = appliedToWindows && p.Type == "move";
                     }
                 }
                 if (cursorApplied && _priority.CanApplyRemote &&
@@ -535,8 +538,8 @@ internal sealed class HostSession : IInputSession, IDisposable
         {
             if (active > 0 && _reversePriority?.CanApplyRemote == true)
             {
-                _reverseInjector?.Handle(request);
-                cursorApplied = request.Type == "move";
+                bool injected = _reverseInjector?.Handle(request) == true;
+                cursorApplied = injected && request.Type == "move";
             }
         }
         if (cursorApplied && _reversePriority?.CanApplyRemote == true &&

@@ -207,9 +207,30 @@ public final class MainActivity extends Activity {
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
                     if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
-                    else status.setText("Select any Windows PC to connect or switch control. "+
-                        session.connectedCount()+" currently connected.");
+                    else status.setText("DeskTouch network: "+session.connectedCount()+
+                        " connected PC(s). Select a member to control, or connect another.");
+                    if(session.connectedCount()>0){
+                        TextView group=new TextView(this);
+                        group.setText("Connected DeskTouch network • "+
+                            session.connectedCount()+" computer(s)");
+                        group.setTextColor(Color.rgb(165,226,206));
+                        group.setTextSize(18);
+                        group.setPadding(0,dp(12),0,dp(8));
+                        deviceList.addView(group);
+                        // Connected PCs form ONE network group visually; their
+                        // different TLS fingerprints remain distinct for security.
+                        for(DesktopDiscovery.Device member:list)
+                            if(!member.android && session.isConnectedTo(member.fingerprint))
+                                addButton(deviceList,"↳ "+member.name+" • Switch control",()->
+                                    session.select(member.fingerprint));
+                    }
+                    TextView available=new TextView(this);
+                    available.setText("Other devices on local network");
+                    available.setTextColor(Color.LTGRAY);
+                    available.setPadding(0,dp(10),0,dp(4));
+                    deviceList.addView(available);
                     for(DesktopDiscovery.Device d:list){
+                        if(!d.android&&session.isConnectedTo(d.fingerprint))continue;
                         addButton(deviceList,(d.android?"Android":"Windows")+" • "+d.name+" • "+d.address+
                             (session.isConnectedTo(d.fingerprint)?" • Connected":d.ready?" • Ready":
                                 " • "+(d.android?"Phone":"Busy")),()->{

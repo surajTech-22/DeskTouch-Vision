@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -41,6 +41,11 @@ jobs:
           # A PowerShell script throws on failure; LASTEXITCODE is not
           # defined by a successfully invoked .ps1 and may be stale.
           & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
+      - name: Verify recovery checksum in actual Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_RECOVERY_CHECKSUM.ps1'
+          if ($LASTEXITCODE -ne 0) { throw 'Recovery checksum test failed under Windows PowerShell 5.1.' }
       - name: Verify native-input priority state machine
         shell: pwsh
         run: |

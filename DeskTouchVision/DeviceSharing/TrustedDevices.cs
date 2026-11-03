@@ -18,6 +18,7 @@ internal sealed class TrustedDeviceStore
     {
         public List<TrustedOutgoing> Outgoing { get; set; } = new();
         public List<TrustedIncoming> Incoming { get; set; } = new();
+        public bool AutoConnectEnabled { get; set; } = true;
     }
 
     private readonly object _lock = new();
@@ -72,6 +73,19 @@ internal sealed class TrustedDeviceStore
             File.Move(temp, _path, overwrite: true);
         }
         finally { if (File.Exists(temp)) File.Delete(temp); }
+    }
+
+    internal bool AutoConnectEnabled
+    {
+        get { lock (_lock) return _data.AutoConnectEnabled; }
+        set
+        {
+            lock (_lock)
+            {
+                _data.AutoConnectEnabled = value;
+                Save();
+            }
+        }
     }
 
     internal IReadOnlyList<TrustedOutgoing> Outgoing

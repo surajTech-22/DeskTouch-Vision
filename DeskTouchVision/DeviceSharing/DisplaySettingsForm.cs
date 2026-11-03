@@ -47,6 +47,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private string _currentFingerprint = "";
     private NotifyIcon? _trayIcon;
     private ContextMenuStrip? _trayMenu;
+    private ToolStripMenuItem? _startupMenu;
     private bool _exitRequested;
     private bool _trayTipShown;
     private readonly bool _startInTray;
@@ -174,6 +175,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             RefreshDisplays();
             StartListening();
+            try
+            {
+                WindowsStartup.EnsureDefault();
+                if (_startupMenu != null) _startupMenu.Checked = WindowsStartup.Enabled;
+            }
+            catch (Exception ex) { Status("Windows sign-in startup could not be enabled: " + ex.Message); }
             UpdateClient.StartEventUpdates(this);
             _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 8500 };
             _trustedScanTimer.Tick += async (_, _) => await ScanTrustedAsync();
@@ -214,6 +221,23 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             view.ShowDialog(this);
         });
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
+        _startupMenu = new ToolStripMenuItem("Launch in tray when Windows starts")
+        {
+            Checked = WindowsStartup.Enabled, CheckOnClick = false
+        };
+        _startupMenu.Click += (_, _) =>
+        {
+            try
+            {
+                WindowsStartup.SetEnabled(!WindowsStartup.Enabled);
+                _startupMenu.Checked = WindowsStartup.Enabled;
+                Status(_startupMenu.Checked
+                    ? "Windows sign-in startup enabled. DeskTouch will launch in the tray."
+                    : "Windows sign-in startup disabled by user.");
+            }
+            catch (Exception ex) { Status("Could not change Windows Startup Apps: " + ex.Message); }
+        };
+        _trayMenu.Items.Add(_startupMenu);
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 

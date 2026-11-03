@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -10,32 +11,54 @@ using System.Text.Json;
 namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors);
-
 internal sealed record PeerHello(string Name, string Layout);
 
+/// <summary>
+/// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
+/// through the same existing TLS protocol. Only one peer holds the input lease.
+/// The currently selected peer is the target for Windows-to-peer reverse input;
+/// switching to another peer is explicit when that peer requests authority.
+/// </summary>
 internal sealed class ReceiverServer : IInputSession, IDisposable
 {
+    private const int MaxPeers = 8;
+    private sealed class Session
+    {
+        internal required int Id;
+        internal required TcpClient Client;
+        internal required SslStream Stream;
+        internal required ConnectedPeer Peer;
+        internal readonly SemaphoreSlim Write = new(1, 1);
+        internal readonly InputInjector Injector = new();
+        internal readonly object InputLock = new();
+        internal readonly Channel<Packet> ReverseQueue = Channel.CreateBounded<Packet>(
+            new BoundedChannelOptions(2048) {
+                SingleReader = true, SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait });
+        internal Packet? LatestReverseMove;
+        internal int ReverseMoveSignaled;
+        internal int Lease;
+        internal int AppliedLease;
+    }
+
     private readonly Action<string> _status;
     private readonly CancellationTokenSource _cancel = new();
     private readonly TcpListener _listener = new(IPAddress.Any, Wire.Port);
     private readonly X509Certificate2 _certificate;
     private readonly TrustedDeviceStore? _trusted;
-    private Task? _serverTask;
-    private int _active;
     private readonly LocalInputPriority _priority;
-    private readonly Func<string, CancellationToken, Task<bool>>? _requestApproval;
-    private readonly Func<string, CancellationToken, Task<bool>>? _requestTrustApproval;
-    private readonly object _inputGate = new();
-    private readonly SemaphoreSlim _writeGate = new(1, 1);
-    private InputInjector? _currentInjector;
-    private SslStream? _currentStream;
-    private TcpClient? _currentClient;
-    private MonitorTopology? _connectedRemoteMonitors;
-    private Channel<Packet>? _reverseQueue;
-    private Packet? _latestReverseMove;
-    private int _reverseMoveSignaled;
-    private int _forwardLease;
-    private int _forwardAppliedLease;
+    private readonly Func<string,CancellationToken,Task<bool>>? _requestApproval;
+    private readonly Func<string,CancellationToken,Task<bool>>? _requestTrustApproval;
+    private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
+    private readonly ConcurrentDictionary<int,Session> _sessions = new();
+    private readonly object _authorityGate = new();
+    private Task? _serverTask;
+    private int _nextClientId;
+    private int _pendingAndActive;
+    private Session? _selected;
+    private Session? _owner;
+    private bool _disposed;
+
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
@@ -44,34 +67,28 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<MonitorEdge>? PeerPlacementChanged;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
+    internal int ConnectedPeerCount => _sessions.Count;
 
     internal ReceiverServer(Action<string> status, LocalInputPriority priority,
-        Func<string, CancellationToken, Task<bool>>? requestApproval = null,
+        Func<string,CancellationToken,Task<bool>>? requestApproval = null,
         TrustedDeviceStore? trusted = null,
-        Func<string, CancellationToken, Task<bool>>? requestTrustApproval = null,
+        Func<string,CancellationToken,Task<bool>>? requestTrustApproval = null,
         string? identityPath = null)
     {
-        _status = status;
-        _priority = priority;
-        _requestApproval = requestApproval;
-        _trusted = trusted;
+        _status = status; _priority = priority;
+        _requestApproval = requestApproval; _trusted = trusted;
         _requestTrustApproval = requestTrustApproval;
         _priority.PhysicalOverride += OnPhysicalOverride;
-        // Stable TLS identity is required for pinning across restart/updates.
-        // It lives in a DPAPI-encrypted file scoped to the Windows user.
         _certificate = PersistentReceiverIdentity.LoadOrCreate(identityPath);
         Fingerprint = Convert.ToHexString(SHA256.HashData(_certificate.RawData));
     }
 
-    // Discovery must not advertise a Windows PC whose TCP server is gone,
-    // already paired, or transitioning to an outgoing controller session.
-    // Being visible over UDP is never proof that port 37377 can be accepted.
     internal bool CanAcceptNewPeer
     {
         get
         {
-            if (_cancel.IsCancellationRequested || Volatile.Read(ref _active) != 0)
-                return false;
+            if (_cancel.IsCancellationRequested ||
+                Volatile.Read(ref _pendingAndActive) >= MaxPeers) return false;
             try { return _listener.Server.IsBound; }
             catch (ObjectDisposedException) { return false; }
         }
@@ -79,7 +96,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal void Start()
     {
-        _listener.Start(1);
+        _listener.Start(MaxPeers);
         _serverTask = Task.Run(LoopAsync);
     }
 
@@ -89,373 +106,405 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             try
             {
-                using TcpClient client = await _listener.AcceptTcpClientAsync(_cancel.Token);
+                var client = await _listener.AcceptTcpClientAsync(_cancel.Token);
+                if (Interlocked.Increment(ref _pendingAndActive) > MaxPeers)
+                {
+                    Interlocked.Decrement(ref _pendingAndActive);
+                    client.Dispose();
+                    continue;
+                }
+                var id = Interlocked.Increment(ref _nextClientId);
+                _clients[id] = client;
                 client.NoDelay = true;
-                if (Interlocked.Exchange(ref _active, 1) == 1) continue;
-                try { await ServeAsync(client, _cancel.Token); }
-                finally { Volatile.Write(ref _active, 0); }
+                // Do not block accept on another client's TLS, pairing prompt,
+                // heartbeat, or long-lived authenticated input session.
+                _ = Task.Run(async () =>
+                {
+                    try { await ServeAsync(id, client, _cancel.Token); }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex) { _status("Peer session ended: " + ex.Message); }
+                    finally
+                    {
+                        _clients.TryRemove(id, out _);
+                        client.Dispose();
+                        Interlocked.Decrement(ref _pendingAndActive);
+                    }
+                });
             }
-            catch (OperationCanceledException) { break; }
-            catch (ObjectDisposedException) { break; }
-            catch (Exception ex) { _status("Receiver connection closed: " + ex.Message); }
+            catch (OperationCanceledException) { return; }
+            catch (ObjectDisposedException) { return; }
+            catch (Exception ex) { _status("LAN accept error: " + ex.Message); }
         }
     }
 
     private static bool ConstantTimeSecret(string? got, string expected)
     {
         if (got == null || got.Length != expected.Length) return false;
-        byte[] a = System.Text.Encoding.ASCII.GetBytes(got);
-        byte[] b = System.Text.Encoding.ASCII.GetBytes(expected);
-        return CryptographicOperations.FixedTimeEquals(a, b);
+        return CryptographicOperations.FixedTimeEquals(
+            System.Text.Encoding.ASCII.GetBytes(got),
+            System.Text.Encoding.ASCII.GetBytes(expected));
     }
 
-    private async Task SendControlAsync(Packet message, CancellationToken token)
+    private static async Task SendToAsync(Session session, Packet packet,
+        CancellationToken token)
     {
-        var ssl = Volatile.Read(ref _currentStream);
-        if (ssl == null) return;
-        await _writeGate.WaitAsync(token);
-        try { await Wire.WriteAsync(ssl, message, token); }
-        finally { _writeGate.Release(); }
+        await session.Write.WaitAsync(token);
+        try { await Wire.WriteAsync(session.Stream, packet, token); }
+        finally { session.Write.Release(); }
+    }
+
+    private void NotifySelection(Session? previous, Session? next)
+    {
+        if (ReferenceEquals(previous, next)) return;
+        if (previous != null) PeerDisconnected?.Invoke();
+        if (next != null) PeerConnected?.Invoke(next.Peer);
+    }
+
+    private bool Select(Session candidate)
+    {
+        Session? previous;
+        lock (_authorityGate)
+        {
+            if (!_sessions.ContainsKey(candidate.Id)) return false;
+            previous = _selected;
+            if (ReferenceEquals(previous, candidate)) return true;
+            _selected = candidate;
+        }
+        NotifySelection(previous, candidate);
+        return true;
     }
 
     private void OnPhysicalOverride()
     {
-        // Native activity immediately blocks new remote inputs before any
-        // asynchronous notification. Never await network I/O in an input hook.
-        // A physical event always revokes the grant synchronously. Release
-        // injected keys away from the low-level keyboard/mouse callback thread.
+        Session? owner;
+        int revoked;
+        lock (_authorityGate)
+        {
+            owner = _owner;
+            _owner = null;
+            revoked = owner == null ? 0 : Interlocked.Exchange(ref owner.Lease, 0);
+            if (owner != null) Interlocked.Exchange(ref owner.AppliedLease, 0);
+        }
+        if (owner == null) return;
         _ = Task.Run(() =>
         {
-            lock (_inputGate) _currentInjector?.ReleaseAll();
+            lock (owner.InputLock) owner.Injector.ReleaseAll();
         });
-        int revokedLease = Interlocked.Exchange(ref _forwardLease, 0);
-        Interlocked.Exchange(ref _forwardAppliedLease, 0);
-        _status("Local physical keyboard/mouse has priority; forward authority revoked.");
         _ = Task.Run(async () =>
         {
-            try { await SendControlAsync(new Packet("local-active", revokedLease), _cancel.Token); }
-            catch (Exception) { } // Source connection may already have ended.
+            try { await SendToAsync(owner, new Packet("local-active", revoked), _cancel.Token); }
+            catch (Exception) { }
         });
+        _status("Physical keyboard/mouse reclaimed control from remote device.");
     }
 
-    internal void DisconnectPeer() => Volatile.Read(ref _currentClient)?.Close();
-
+    internal void DisconnectPeer() => Volatile.Read(ref _selected)?.Client.Close();
     internal MonitorTopology RemoteMonitors =>
-        Volatile.Read(ref _connectedRemoteMonitors) ??
-        throw new InvalidOperationException("No authenticated peer monitor layout yet.");
-
+        Volatile.Read(ref _selected)?.Peer.Monitors ??
+        throw new InvalidOperationException("No authenticated peer layout.");
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySendReverse(packet);
 
     internal bool TrySendReverse(Packet packet)
     {
-        if (Volatile.Read(ref _currentStream) == null) return false;
-        var queue = Volatile.Read(ref _reverseQueue);
-        if (queue == null) return false;
-        // Do not put a packet per pixel into the network; keep the newest
-        // coordinate, like HostSession's forward-direction send loop.
+        Session? selected = Volatile.Read(ref _selected);
+        if (selected == null) return false;
         if (packet.Type == "move")
         {
-            Interlocked.Exchange(ref _latestReverseMove, packet);
-            if (Interlocked.CompareExchange(ref _reverseMoveSignaled, 1, 0) == 0 &&
-                !queue.Writer.TryWrite(new Packet("move-flush")))
+            Interlocked.Exchange(ref selected.LatestReverseMove, packet);
+            if (Interlocked.CompareExchange(ref selected.ReverseMoveSignaled, 1, 0) == 0 &&
+                !selected.ReverseQueue.Writer.TryWrite(new Packet("move-flush")))
             {
-                Interlocked.Exchange(ref _reverseMoveSignaled, 0);
+                Interlocked.Exchange(ref selected.ReverseMoveSignaled, 0);
                 return false;
             }
             return true;
         }
-        if (queue.Writer.TryWrite(packet)) return true;
-        _status("Reverse input control queue stalled; reconnecting to restore local authority.");
-        DisconnectPeer();
+        if (selected.ReverseQueue.Writer.TryWrite(packet)) return true;
+        _status("Peer input queue stalled. Disconnecting that peer safely.");
+        selected.Client.Close();
         return false;
     }
 
-    private async Task ReverseSendLoopAsync(Channel<Packet> queue, CancellationToken token)
+    private async Task ReverseSendLoopAsync(Session session, CancellationToken token)
     {
         try
         {
-            await foreach (var queued in queue.Reader.ReadAllAsync(token))
+            await foreach (var p in session.ReverseQueue.Reader.ReadAllAsync(token))
             {
-                if (queued.Type == "move-flush")
+                // Never allow an old peer's queued reverse input to be sent
+                // to the new peer after selection changes.
+                if (!ReferenceEquals(Volatile.Read(ref _selected), session)) continue;
+                if (p.Type == "move-flush")
                 {
-                    Interlocked.Exchange(ref _reverseMoveSignaled, 0);
-                    var move = Interlocked.Exchange(ref _latestReverseMove, null);
+                    Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
+                    var move = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (move != null)
-                        await SendControlAsync(ReverseInputProtocol.Encode(move), token);
+                        await SendToAsync(session, ReverseInputProtocol.Encode(move), token);
                     continue;
                 }
-                var last = Interlocked.Exchange(ref _latestReverseMove, null);
-                if (last != null)
-                    await SendControlAsync(ReverseInputProtocol.Encode(last), token);
-                await SendControlAsync(ReverseInputProtocol.Encode(queued), token);
+                var prior = Interlocked.Exchange(ref session.LatestReverseMove, null);
+                if (prior != null)
+                    await SendToAsync(session, ReverseInputProtocol.Encode(prior), token);
+                await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _status("Reverse input transport stopped: " + ex.Message);
-            DisconnectPeer(); // cannot leave the remote host holding keys
+            _status("Reverse control stream ended: " + ex.Message);
+            session.Client.Close();
         }
     }
 
     internal void PublishPlacement(MonitorEdge side)
     {
-        if (Volatile.Read(ref _currentStream) == null) return;
-        _ = Task.Run(async () =>
-        {
-            try { await SendControlAsync(new Packet("placement", Text: side.ToString()), _cancel.Token); }
+        Session? peer = Volatile.Read(ref _selected);
+        if (peer == null) return;
+        _ = Task.Run(async () => {
+            try { await SendToAsync(peer,new Packet("placement", Text: side.ToString()),_cancel.Token); }
             catch (Exception) { }
         });
     }
 
     internal void PublishLocalTopology(MonitorTopology monitors)
     {
-        if (Volatile.Read(ref _currentStream) == null) return;
-        _ = Task.Run(async () =>
+        foreach (var peer in _sessions.Values)
         {
-            try { await SendControlAsync(new Packet("topology", Text: monitors.ToWire()), _cancel.Token); }
-            catch (Exception) { /* session cleanup handles half-open transport */ }
-        });
+            _ = Task.Run(async () => {
+                try { await SendToAsync(peer,
+                    new Packet("topology", Text: monitors.ToWire()),_cancel.Token); }
+                catch (Exception) { }
+            });
+        }
     }
 
-    private static ConnectedPeer ReadHello(string? helloJson)
+    private static ConnectedPeer ReadHello(string? value)
     {
-        if (string.IsNullOrWhiteSpace(helloJson) || helloJson.Length > 6000)
-            throw new InvalidDataException("Peer did not describe its monitor layout.");
-        var hello = JsonSerializer.Deserialize<PeerHello>(helloJson)
+        if (string.IsNullOrWhiteSpace(value) || value.Length > 6000)
+            throw new InvalidDataException("Missing peer monitor layout.");
+        var hello = JsonSerializer.Deserialize<PeerHello>(value)
             ?? throw new InvalidDataException("Unrecognized peer hello.");
         string name = hello.Name.Trim();
         if (name.Length is < 1 or > 60 || name.Any(char.IsControl))
-            throw new InvalidDataException("Invalid peer computer name.");
+            throw new InvalidDataException("Invalid peer name.");
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout));
     }
 
-    private async Task ServeAsync(TcpClient client, CancellationToken token)
+    private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
     {
-        using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen: false);
+        using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen:false);
         using var handshakeLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
         handshakeLimit.CancelAfter(TimeSpan.FromSeconds(12));
         await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
         {
-            ServerCertificate = _certificate,
-            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-            ClientCertificateRequired = false,
-            CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-        }, handshakeLimit.Token);
-        var request = await Wire.ReadAsync(ssl, handshakeLimit.Token);
-        var trustedSource = request.Type == "auth-trusted"
-            ? _trusted?.AuthenticateIncoming(request.Text) : null;
-        bool approved = trustedSource != null ||
-            (request.Type == "auth" && ConstantTimeSecret(request.Text, Secret));
-        if (!approved && request.Type == "auth-request" && _requestApproval != null)
+            ServerCertificate=_certificate,
+            EnabledSslProtocols=SslProtocols.Tls12 | SslProtocols.Tls13,
+            ClientCertificateRequired=false,
+            CertificateRevocationCheckMode=X509RevocationMode.NoCheck
+        },handshakeLimit.Token);
+        var request=await Wire.ReadAsync(ssl,handshakeLimit.Token);
+        var trustedSource=request.Type=="auth-trusted" ?
+            _trusted?.AuthenticateIncoming(request.Text) : null;
+        bool approved=trustedSource!=null ||
+            (request.Type=="auth" && ConstantTimeSecret(request.Text,Secret));
+        if (!approved && request.Type=="auth-request" && _requestApproval!=null)
         {
-            // Discovery advertises only a public certificate fingerprint.
-            // Any first connection must be explicitly approved on this PC.
             using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
             approvalLimit.CancelAfter(TimeSpan.FromSeconds(40));
-            string peerIp = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString()
-                ?? "Unknown address";
-            string claimedName = (request.Text ?? "Unknown PC").Trim();
-            if (claimedName.Length > 60) claimedName = claimedName[..60];
-            try { approved = await _requestApproval(
-                $"{claimedName} ({peerIp})", approvalLimit.Token); }
-            catch (OperationCanceledException) { approved = false; }
+            string ip=(client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "?";
+            string name=(request.Text ?? "Unknown device").Trim();
+            if (name.Length>60)name=name[..60];
+            try { approved=await _requestApproval(name+" ("+ip+")",approvalLimit.Token); }
+            catch (OperationCanceledException) { approved=false; }
         }
-        if (!approved)
+        if(!approved)
         {
-            _status("Unapproved pairing attempt rejected. No remote input granted.");
-            await Wire.WriteAsync(ssl, new Packet("denied"), token);
+            await Wire.WriteAsync(ssl,new Packet("denied"),token);
             return;
         }
+        var topology=MonitorTopology.Capture();
+        var bounds=topology.Bounds;
+        await Wire.WriteAsync(ssl,new Packet("ready",bounds.Left,bounds.Top,
+            bounds.Width,bounds.Height,topology.ToWire()),token);
 
-        var topology = MonitorTopology.Capture();
-        var screen = topology.Bounds;
-        await Wire.WriteAsync(ssl, new Packet("ready", screen.Left, screen.Top,
-            screen.Width, screen.Height, topology.ToWire()), token);
-        // BOTH PCs receive their peer's monitor layout. The original sender
-        // alone had a remote display group; the receiver never got a hello.
-        ConnectedPeer? incoming = null;
-        using (var helloTimeout = CancellationTokenSource.CreateLinkedTokenSource(token))
-        {
-            helloTimeout.CancelAfter(TimeSpan.FromSeconds(10));
-            var helloPacket = await Wire.ReadAsync(ssl, helloTimeout.Token);
-            if (helloPacket.Type != "hello")
-                throw new InvalidDataException("Missing authenticated peer hello.");
-            var peer = ReadHello(helloPacket.Text);
-            // Treat advertised names as labels, not identities. For automatic
-            // trusted sessions, use the name stored when trust was approved.
-            if (trustedSource != null)
-                peer = peer with { Name = trustedSource.Name };
-            incoming = peer;
-            Volatile.Write(ref _connectedRemoteMonitors, peer.Monitors);
-            Volatile.Write(ref _currentClient, client);
-        }
-        _status("Authenticated Windows peers connected; both computers may request input authority.");
-        var injector = new InputInjector();
-        var reverseQueue = Channel.CreateBounded<Packet>(
-            new BoundedChannelOptions(2048) { SingleReader = true,
-                SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
-        Volatile.Write(ref _currentInjector, injector);
-        Volatile.Write(ref _currentStream, ssl);
-        Volatile.Write(ref _reverseQueue, reverseQueue);
-        using var sessionCancel = CancellationTokenSource.CreateLinkedTokenSource(token);
-        _ = Task.Run(() => ReverseSendLoopAsync(reverseQueue, sessionCancel.Token));
+        using var helloTimeout=CancellationTokenSource.CreateLinkedTokenSource(token);
+        helloTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var hello=await Wire.ReadAsync(ssl,helloTimeout.Token);
+        if(hello.Type!="hello") throw new InvalidDataException("Missing authenticated hello.");
+        var peer=ReadHello(hello.Text);
+        if(trustedSource!=null) peer=peer with { Name=trustedSource.Name };
+        var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
+        if(!_sessions.TryAdd(id,session))
+            throw new InvalidOperationException("Duplicate peer session ID");
+        using var linked=CancellationTokenSource.CreateLinkedTokenSource(token);
+        var sendTask=Task.Run(()=>ReverseSendLoopAsync(session,linked.Token));
         try
         {
-            // Include UI notification in the protected session lifetime.
-            // Even a failing subscriber must release the TLS socket, reverse
-            // input queue and all synthetic held keys in the finally block.
-            PeerConnected?.Invoke(incoming!);
-            while (!token.IsCancellationRequested)
+            bool first;
+            lock(_authorityGate) first=_selected==null;
+            if(first) Select(session);
+            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
+            while(!token.IsCancellationRequested)
             {
-                // If Wi-Fi disappears without closing TCP, release any
-                // remotely held keys/buttons rather than retaining control.
-                // The source sends keepalive every 1.5 seconds.
-                using var receiveDeadline = CancellationTokenSource.CreateLinkedTokenSource(token);
-                // A six-second watchdog caused unnecessary disconnects on
-                // congested Windows/Wi-Fi systems despite a live pairing.
-                // The sender pings every 1.5 s. 18 s permits brief stalls but
-                // still releases remote held keys after an actual link failure.
-                receiveDeadline.CancelAfter(TimeSpan.FromSeconds(18));
-                var p = await Wire.ReadAsync(ssl, receiveDeadline.Token);
-                if (p.Type == "goodbye") break;
-                if (p.Type == "trust-request")
+                using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
+                deadline.CancelAfter(TimeSpan.FromSeconds(18));
+                var p=await Wire.ReadAsync(ssl,deadline.Token);
+                if(p.Type=="goodbye") break;
+                if(p.Type=="trust-request")
                 {
-                    bool allowed = false;
-                    if (_trusted != null && _requestTrustApproval != null &&
-                        p.Text is { Length: 64 } proposal &&
-                        proposal.All(Uri.IsHexDigit))
+                    bool allowed=false;
+                    if(_trusted!=null && _requestTrustApproval!=null &&
+                       p.Text is {Length:64} proposal && proposal.All(Uri.IsHexDigit))
                     {
-                        using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
-                        approvalLimit.CancelAfter(TimeSpan.FromSeconds(50));
+                        using var trustLimit=CancellationTokenSource.CreateLinkedTokenSource(token);
+                        trustLimit.CancelAfter(TimeSpan.FromSeconds(50));
                         try
                         {
-                            allowed = await _requestTrustApproval(incoming!.Name,
-                                approvalLimit.Token);
-                            if (allowed) _trusted.AllowIncoming(incoming!.Name, proposal);
+                            allowed=await _requestTrustApproval(peer.Name,trustLimit.Token);
+                            if(allowed)_trusted.AllowIncoming(peer.Name,proposal);
                         }
-                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        catch(Exception ex) when (ex is not OperationCanceledException)
                         {
-                            _status("Cannot save device trust: " + ex.Message);
-                            allowed = false;
+                            _status("Cannot save device trust: "+ex.Message);
                         }
-                        catch (OperationCanceledException) { allowed = false; }
+                        catch(OperationCanceledException){allowed=false;}
                     }
-                    await SendControlAsync(new Packet(
-                        allowed ? "trust-granted" : "trust-denied"), token);
+                    await SendToAsync(session,new Packet(allowed?"trust-granted":"trust-denied"),token);
                     continue;
                 }
-                if (p.Type == "topology")
+                if(p.Type=="topology")
                 {
-                    var peerLayout = MonitorTopology.FromWire(p.Text);
-                    incoming = incoming! with { Monitors = peerLayout };
-                    Volatile.Write(ref _connectedRemoteMonitors, peerLayout);
-                    PeerTopologyChanged?.Invoke(incoming);
+                    session.Peer=session.Peer with {Monitors=MonitorTopology.FromWire(p.Text)};
+                    if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                        PeerTopologyChanged?.Invoke(session.Peer);
                     continue;
                 }
-                if (p.Type == "placement" &&
-                    Enum.TryParse<MonitorEdge>(p.Text, true, out var sourceEdge))
+                if(p.Type=="placement")
                 {
-                    PeerPlacementChanged?.Invoke(sourceEdge);
+                    if(ReferenceEquals(Volatile.Read(ref _selected),session) &&
+                       Enum.TryParse<MonitorEdge>(p.Text,true,out var edge))
+                        PeerPlacementChanged?.Invoke(edge);
                     continue;
                 }
-
-                if (p.Type is "reverse-granted" or "reverse-busy" or
+                if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
-                    ReverseControlMessage?.Invoke(p);
+                    if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                        ReverseControlMessage?.Invoke(p);
                     continue;
                 }
-                if (p.Type == "claim")
+                if(p.Type=="claim")
                 {
-                    // The receiver may itself be controlling the source PC.
-                    // Never issue forward and reverse authority at once.
-                    bool allowed = p.A > 0 && (AllowForwardClaim?.Invoke() ?? true);
-                    bool granted = allowed && _priority.TryClaim();
-                    if (granted)
+                    bool granted=false;
+                    lock(_authorityGate)
                     {
-                        Volatile.Write(ref _forwardLease, p.A);
-                        Volatile.Write(ref _forwardAppliedLease, 0);
+                        if(p.A>0 && (_owner==null || ReferenceEquals(_owner,session)) &&
+                           (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
+                        {
+                            _owner=session;
+                            session.Lease=p.A;
+                            session.AppliedLease=0;
+                            granted=true;
+                        }
                     }
-                    await SendControlAsync(new Packet(granted ? "granted" : "busy", p.A), token);
-                    continue;
-                }
-                if (p.Type == "reset" ||
-                    (p.Type == "release" && p.A > 0 && p.A == Volatile.Read(ref _forwardLease)))
-                {
-                    Interlocked.Exchange(ref _forwardLease, 0);
-                    Interlocked.Exchange(ref _forwardAppliedLease, 0);
-                    _priority.ReleaseRemote();
-                    lock (_inputGate) injector.ReleaseAll();
-                    continue;
-                }
-                if (p.Type == "ping") continue;
-                int lease = Volatile.Read(ref _forwardLease);
-                bool cursorApplied = false;
-                lock (_inputGate)
-                {
-                    if (lease > 0 && _priority.CanApplyRemote &&
-                        p.Type is ("move" or "button" or "key" or "wheel"))
+                    if(granted && !Select(session))
                     {
-                        // ACK only after SendInput actually succeeded.
-                        // If Windows refused injection, the source must time
-                        // out and retain its local mouse/key authority.
-                        bool appliedToWindows = injector.Handle(p);
-                        cursorApplied = appliedToWindows && p.Type == "move";
+                        lock(_authorityGate)
+                        {
+                            if(ReferenceEquals(_owner,session))
+                            { _owner=null;session.Lease=0;_priority.ReleaseRemote(); }
+                        }
+                        granted=false;
                     }
+                    await SendToAsync(session,new Packet(granted?"granted":"busy",p.A),token);
+                    continue;
                 }
-                if (cursorApplied && _priority.CanApplyRemote &&
-                    Volatile.Read(ref _forwardLease) == lease &&
-                    Interlocked.CompareExchange(ref _forwardAppliedLease, lease, 0) == 0)
-                    await SendControlAsync(new Packet("active", lease), token);
+                if(p.Type=="reset" || p.Type=="release")
+                {
+                    bool wasOwner=false;
+                    lock(_authorityGate)
+                    {
+                        if(ReferenceEquals(_owner,session) &&
+                           (p.Type=="reset" || (p.A>0 && p.A==session.Lease)))
+                        {
+                            _owner=null;session.Lease=0;session.AppliedLease=0;
+                            _priority.ReleaseRemote();wasOwner=true;
+                        }
+                    }
+                    if(wasOwner) lock(session.InputLock)session.Injector.ReleaseAll();
+                    continue;
+                }
+                if(p.Type=="ping")continue;
+                int lease;
+                lock(_authorityGate)
+                    lease=ReferenceEquals(_owner,session)?session.Lease:0;
+                bool applied=false;
+                if(lease>0 && _priority.CanApplyRemote &&
+                   p.Type is ("move" or "button" or "key" or "wheel"))
+                {
+                    lock(session.InputLock)
+                    {
+                        lock(_authorityGate)
+                        {
+                            if(ReferenceEquals(_owner,session) && lease==session.Lease &&
+                               _priority.CanApplyRemote)
+                                applied=session.Injector.Handle(p);
+                        }
+                    }
+                    if(applied && p.Type=="move" && _priority.CanApplyRemote &&
+                       Interlocked.CompareExchange(ref session.AppliedLease,lease,0)==0)
+                        await SendToAsync(session,new Packet("active",lease),token);
+                }
             }
         }
-        catch (EndOfStreamException)
-        {
-            _status("Remote peer closed the TCP connection.");
-        }
-        catch (IOException ex)
-        {
-            _status("Remote peer network stream ended: " + ex.Message);
-        }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        {
-            _status("No peer heartbeat for 18 seconds; releasing any held input for safety.");
-        }
-        catch (OperationCanceledException) { } // shutdown
+        catch(EndOfStreamException) { _status("Peer closed connection: "+peer.Name); }
+        catch(IOException ex) { _status("Peer network ended: "+ex.Message); }
+        catch(OperationCanceledException) when (!token.IsCancellationRequested)
+            { _status("Peer heartbeat expired; releasing input: "+peer.Name); }
+        catch(OperationCanceledException) { }
         finally
         {
-            sessionCancel.Cancel();
-            reverseQueue.Writer.TryComplete();
-            Volatile.Write(ref _reverseQueue, null);
-            Volatile.Write(ref _connectedRemoteMonitors, null);
-            Interlocked.Exchange(ref _latestReverseMove, null);
-            Interlocked.Exchange(ref _reverseMoveSignaled, 0);
-            Interlocked.Exchange(ref _forwardLease, 0);
-            Interlocked.Exchange(ref _forwardAppliedLease, 0);
-            _priority.ReleaseRemote();
-            Volatile.Write(ref _currentStream, null);
-            lock (_inputGate)
+            linked.Cancel();
+            session.ReverseQueue.Writer.TryComplete();
+            _sessions.TryRemove(id,out _);
+            Session? previous=null, next=null;
+            bool released=false;
+            lock(_authorityGate)
             {
-                injector.ReleaseAll();
-                Volatile.Write(ref _currentInjector, null);
+                if(ReferenceEquals(_owner,session))
+                {
+                    _owner=null;session.Lease=0;session.AppliedLease=0;
+                    _priority.ReleaseRemote();released=true;
+                }
+                if(ReferenceEquals(_selected,session))
+                {
+                    previous=session;
+                    next=_sessions.Values.OrderBy(s=>s.Id).FirstOrDefault();
+                    _selected=next;
+                }
             }
-            Volatile.Write(ref _currentClient, null);
-            PeerDisconnected?.Invoke();
-            _status("Peer connection ended. Native keyboard/mouse always available.");
+            lock(session.InputLock)session.Injector.ReleaseAll();
+            if(previous!=null)NotifySelection(previous,next);
+            if(released)_status("Input authority released on peer disconnect.");
+            _status("Disconnected: "+peer.Name+" ("+ConnectedPeerCount+" devices remain).");
+            try { await sendTask; } catch(Exception) { }
+            session.Write.Dispose();
         }
     }
 
     public void Dispose()
     {
+        if(_disposed)return;
+        _disposed=true;
         _priority.PhysicalOverride -= OnPhysicalOverride;
-        _priority.ReleaseRemote();
         _cancel.Cancel();
         _listener.Stop();
-        DisconnectPeer();
+        foreach(var client in _clients.Values) client.Close();
+        _priority.ReleaseRemote();
         _certificate.Dispose();
-        _cancel.Dispose();
+        // Cancellation source is intentionally retained until all accepted
+        // session tasks unwind; they may still observe its token.
     }
 }
 

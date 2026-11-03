@@ -255,15 +255,24 @@ internal static class PersistentReceiverIdentity
                 byte[] protectedIdentity = ProtectedData.Protect(plain, null,
                     DataProtectionScope.CurrentUser);
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                // Atomic create, not overwriting a concurrent process identity.
-                try { using var stream = new FileStream(path, FileMode.CreateNew,
-                    FileAccess.Write, FileShare.None); stream.Write(protectedIdentity); }
-                catch (IOException) when (File.Exists(path))
+                // Write to a unique temporary file, then atomically rename.
+                // A crash while writing must never leave a truncated permanent
+                // device ID; never silently generate a replacement identity.
+                string pending = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
                 {
-                    // Another receiver initialized identity first.
-                    return LoadOrCreate(path);
+                    File.WriteAllBytes(pending, protectedIdentity);
+                    try { File.Move(pending, path, overwrite: false); }
+                    catch (IOException) when (File.Exists(path))
+                    {
+                        // A concurrent receiver has already created identity.
+                        // Reuse that exact device ID, never the losing key.
+                        return LoadOrCreate(path);
+                    }
+                    return new X509Certificate2(exported, password,
+                        X509KeyStorageFlags.UserKeySet);
                 }
-                return new X509Certificate2(exported, password, X509KeyStorageFlags.UserKeySet);
+                finally { if (File.Exists(pending)) File.Delete(pending); }
             }
             finally { CryptographicOperations.ZeroMemory(plain); }
         }

@@ -9,9 +9,9 @@ using System.Text.Json;
 
 namespace DeskTouch.DeviceShare;
 
-internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors, long SessionId = 0);
+internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors, long SessionId = 0, string? DeviceFingerprint = null);
 
-internal sealed record PeerHello(string Name, string Layout);
+internal sealed record PeerHello(string Name, string Layout, string? Fingerprint = null);
 
 internal sealed class PeerReceiverSession : IInputSession, IDisposable
 {
@@ -238,7 +238,12 @@ internal sealed class PeerReceiverSession : IInputSession, IDisposable
         string name = hello.Name.Trim();
         if (name.Length is < 1 or > 60 || name.Any(char.IsControl))
             throw new InvalidDataException("Invalid peer computer name.");
-        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout));
+        // The claimed fingerprint is a display-group hint only; never treat
+        // it as TLS authentication or use it to grant keyboard/mouse control.
+        string? hint = hello.Fingerprint is { Length: 64 } fp &&
+            fp.All(Uri.IsHexDigit) ? fp.ToUpperInvariant() : null;
+        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
+            DeviceFingerprint: hint);
     }
 
     private async Task ServeAsync(TcpClient client, CancellationToken token)
@@ -684,8 +689,11 @@ internal sealed class HostSession : IInputSession, IDisposable
             // identical two-computer arrangement without initiating a second
             // TCP connection (which would race the existing receiver).
             var mine = MonitorTopology.Capture();
+            using var localIdentity = PersistentReceiverIdentity.LoadOrCreate();
+            string sourceId = Convert.ToHexString(
+                SHA256.HashData(localIdentity.RawData));
             var hello = JsonSerializer.Serialize(
-                new PeerHello(Environment.MachineName, mine.ToWire()));
+                new PeerHello(Environment.MachineName, mine.ToWire(), sourceId));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             return new HostSession(client, ssl, monitors, onFailure);

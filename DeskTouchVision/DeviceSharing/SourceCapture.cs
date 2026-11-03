@@ -15,13 +15,15 @@ internal sealed class SourceCapture : IDisposable
     private readonly Win.HookProc _keyboardDelegate;
     private readonly Win.HookProc _mouseDelegate;
     private readonly Action<string> _status;
-    private readonly System.Drawing.Rectangle _local, _remote;
+    private readonly MonitorTopology _localMonitors, _remoteMonitors;
+    private readonly System.Drawing.Rectangle _local;
     private IntPtr _keyHook, _mouseHook;
     private int _armed, _active, _switchPending;
     private int _remoteX, _remoteY;
     private readonly int _anchorX, _anchorY;
     private long _cooldownUntil;
     private long _lastRawMs;
+    private bool _controlPressed, _altPressed, _shiftPressed;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
     internal bool IsArmed => Volatile.Read(ref _armed) != 0;
@@ -31,10 +33,13 @@ internal sealed class SourceCapture : IDisposable
         _owner = owner;
         _session = session;
         _status = status;
-        _local = SystemInformation.VirtualScreen;
-        _remote = session.Screen;
-        _anchorX = _local.Left + _local.Width / 2;
-        _anchorY = _local.Top + _local.Height / 2;
+        _localMonitors = MonitorTopology.Capture();
+        _remoteMonitors = session.RemoteMonitors;
+        _local = _localMonitors.Bounds;
+        var home = _localMonitors.Monitors.FirstOrDefault(m => m.Primary)
+            ?? _localMonitors.Monitors[0];
+        _anchorX = home.X + home.Width / 2;
+        _anchorY = home.Y + home.Height / 2;
         _keyboardDelegate = KeyboardHook;
         _mouseDelegate = MouseHook;
     }
@@ -80,17 +85,21 @@ internal sealed class SourceCapture : IDisposable
         _session.TrySend(new Packet("reset"));
         _cooldownUntil = Environment.TickCount64 + 1000;
         // Put local cursor inside display, rather than immediately on switching boundary.
-        Win.SetCursorPos(_local.Right - Math.Min(100, _local.Width / 4),
-            Math.Clamp(_anchorY, _local.Top, _local.Bottom - 1));
+        var localReturn = _localMonitors.ClampToRealMonitor(
+            new System.Drawing.Point(_local.Right - Math.Min(100, _local.Width / 4),
+                _anchorY));
+        Win.SetCursorPos(localReturn.X, localReturn.Y);
         _status("Control returned to this Windows computer.");
     }
 
     private void EnterRemote(int localY)
     {
         if (!IsArmed || RemoteActive) return;
-        _remoteX = _remote.Left + Math.Min(45, _remote.Width / 5);
-        double fractionalY = (double)(localY - _local.Top) / Math.Max(1, _local.Height);
-        _remoteY = _remote.Top + Math.Clamp((int)(fractionalY * _remote.Height), 0, _remote.Height - 1);
+        var entry = _remoteMonitors.EntryPoint(MonitorEdge.Left,
+            _localMonitors.EdgeFraction(new System.Drawing.Point(_local.Right - 1, localY),
+                MonitorEdge.Right));
+        _remoteX = entry.X;
+        _remoteY = entry.Y;
         Win.SetCursorPos(_anchorX, _anchorY);
         _lastRawMs = Environment.TickCount64;
         Interlocked.Exchange(ref _active, 1);
@@ -146,7 +155,8 @@ internal sealed class SourceCapture : IDisposable
         }
         else if (IsArmed && msg == Win.WM_MOUSEMOVE &&
             Environment.TickCount64 >= _cooldownUntil &&
-            mouse.pt.X >= _local.Right - 2 &&
+            _localMonitors.IsExternalEdge(
+                new System.Drawing.Point(mouse.pt.X, mouse.pt.Y), MonitorEdge.Right) &&
             Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
         {
             int y = mouse.pt.Y;
@@ -165,10 +175,13 @@ internal sealed class SourceCapture : IDisposable
         var key = Marshal.PtrToStructure<Win.KBDLLHOOKSTRUCT>(lParam);
         if ((key.flags & 0x10) != 0) return Win.CallNextHookEx(_keyHook, code, wParam, lParam);
         bool down = msg is Win.WM_KEYDOWN or Win.WM_SYSKEYDOWN;
+        // Track physical modifiers locally because remote mode suppresses the
+        // usual Windows key-state transitions; GetAsyncKeyState is not reliable.
+        if (key.vkCode is 0x11 or 0xA2 or 0xA3) _controlPressed = down;
+        if (key.vkCode is 0x12 or 0xA4 or 0xA5) _altPressed = down;
+        if (key.vkCode is 0x10 or 0xA0 or 0xA1) _shiftPressed = down;
         if (RemoteActive && down && key.vkCode == 0x7B &&
-            (Win.GetAsyncKeyState(0x11) & 0x8000) != 0 &&
-            (Win.GetAsyncKeyState(0x12) & 0x8000) != 0 &&
-            (Win.GetAsyncKeyState(0x10) & 0x8000) != 0)
+            _controlPressed && _altPressed && _shiftPressed)
         {
             Post(ReturnLocal);
             return (IntPtr)1;
@@ -207,14 +220,23 @@ internal sealed class SourceCapture : IDisposable
     {
         if (!RemoteActive || (dx == 0 && dy == 0)) return;
         int nextX = _remoteX + dx;
-        if (nextX <= _remote.Left)
+        int nextY = _remoteY + dy;
+        var monitor = _remoteMonitors.MonitorAt(new System.Drawing.Point(_remoteX, _remoteY));
+        if (dx < 0 && monitor != null &&
+            nextX < monitor.X &&
+            _remoteMonitors.IsExternalEdge(
+                new System.Drawing.Point(monitor.X, _remoteY), MonitorEdge.Left, 1))
         {
             if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
                 Post(() => { Interlocked.Exchange(ref _switchPending, 0); ReturnLocal(); });
             return;
         }
-        _remoteX = Math.Clamp(nextX, _remote.Left, _remote.Right - 1);
-        _remoteY = Math.Clamp(_remoteY + dy, _remote.Top, _remote.Bottom - 1);
+        // The OS can have real monitors with gaps / negative screen coordinates.
+        // Never inject the pointer into an unoccupied part of the virtual bounding box.
+        var mapped = _remoteMonitors.ClampToRealMonitor(
+            new System.Drawing.Point(nextX, nextY));
+        _remoteX = mapped.X;
+        _remoteY = mapped.Y;
         _session.TrySend(new Packet("move", _remoteX, _remoteY));
     }
 

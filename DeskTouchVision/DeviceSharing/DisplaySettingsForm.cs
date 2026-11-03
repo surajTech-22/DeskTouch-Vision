@@ -40,7 +40,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private bool _exitRequested;
     private bool _trayTipShown;
     private readonly bool _startInTray;
-    private bool _isHiddenInTray;
+    private volatile bool _isHiddenInTray;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
     private PhysicalInputMonitor? _nativeInput;
@@ -169,7 +169,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trayMenu = new ContextMenuStrip();
         _trayMenu.Items.Add("Show Displays", null, (_, _) => ShowFromTray());
         _trayMenu.Items.Add("Check for updates", null, async (_, _) =>
-            await UpdateClient.CheckManuallyAsync(this));
+        {
+            ShowFromTray();
+            await UpdateClient.CheckManuallyAsync(this);
+        });
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectAndListen());
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
@@ -209,7 +212,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trayIcon.BalloonTipTitle = "DeskTouch keeps sharing in the tray";
             _trayIcon.BalloonTipText =
                 "The computers stay paired. Double-click the tray icon to show Displays.";
-            _trayIcon.ShowBalloonTip(2500);
+            try { _trayIcon.ShowBalloonTip(2500); }
+            catch (InvalidOperationException) { /* Tray remains active. */ }
         }
     }
 
@@ -442,7 +446,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 var safePeer = peer.Replace("\r", " ").Replace("\n", " ");
                 // A receiving computer should visibly request local approval
                 // even if its Displays window was minimized in the background.
-                if (WindowState == FormWindowState.Minimized)
+                if (!Visible) ShowFromTray();
+                else if (WindowState == FormWindowState.Minimized)
                     WindowState = FormWindowState.Normal;
                 Activate();
                 var result = MessageBox.Show(this,

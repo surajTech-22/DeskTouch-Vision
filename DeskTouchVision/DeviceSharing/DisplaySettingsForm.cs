@@ -194,7 +194,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
         _isHiddenInTray = false;
-        ShowInTaskbar = true;
+        // Do not toggle ShowInTaskbar: WinForms may recreate the HWND, which
+        // would invalidate Raw Input registrations and break mouse handoff.
         if (!Visible) Show();
         WindowState = FormWindowState.Normal;
         Activate();
@@ -204,10 +205,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void HideToTray(bool showBalloon = true)
     {
         _isHiddenInTray = true;
-        // Hiding a WinForms form must NOT destroy its HWND. The existing
-        // HWND processes WM_INPUT and owns the physical keyboard/mouse hooks.
-        // The same UI message loop also hosts independent SSE auto-updates.
-        ShowInTaskbar = false;
+        // Hide() naturally removes an invisible Form from the taskbar
+        // WITHOUT changing ShowInTaskbar (which can recreate the HWND).
+        // The same handle must keep receiving raw mouse input even in tray.
+        // The UI message loop continues to receive GitHub release SSE events.
         Hide();
         if (showBalloon && !_trayTipShown && _trayIcon != null)
         {

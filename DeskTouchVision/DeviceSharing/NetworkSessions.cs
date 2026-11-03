@@ -572,6 +572,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<string>? RemoteControlState;
     internal event Action<MonitorTopology>? RemoteTopologyChanged;
     internal event Action<string>? RemoteNameChanged;
+    private string? _remoteSystemName;
+    internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
     private Packet? _latestMove;
@@ -835,7 +837,12 @@ internal sealed class HostSession : IInputSession, IDisposable
                 var p = await Wire.ReadAsync(_ssl, _cancel.Token);
                 if (p.Type == "peer-name" && p.Text is { Length: > 0 and <= 60 } name &&
                     !name.Any(char.IsControl))
+                {
+                    // Cache even if the UI subscribes after the TLS reader
+                    // receives this first metadata frame.
+                    Volatile.Write(ref _remoteSystemName,name);
                     RemoteNameChanged?.Invoke(name);
+                }
                 else if (p.Type == "topology")
                 {
                     var layout = MonitorTopology.FromWire(p.Text);

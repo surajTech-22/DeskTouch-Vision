@@ -42,6 +42,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly string? _trustLoadError;
     private System.Windows.Forms.Timer? _trustedScanTimer;
     private bool _scanningTrusted;
+    private bool _manualPairDialogOpen;
     private DateTime _retryTrustedAfter = DateTime.MinValue;
     private string _currentFingerprint = "";
     private NotifyIcon? _trayIcon;
@@ -534,7 +535,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (_host != null || _incomingPeer != null || _connecting || _closing.IsCancellationRequested) return;
         using var dialog = new PairComputerDialog();
-        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        _manualPairDialogOpen = true;
+        DialogResult choice;
+        try { choice = dialog.ShowDialog(this); }
+        finally { _manualPairDialogOpen = false; }
+        if (choice != DialogResult.OK) return;
+        if (_host != null || _incomingPeer != null || _connecting ||
+            _closing.IsCancellationRequested) return;
         _connecting = true;
         StopListening();
         UpdateButtons();
@@ -699,7 +706,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private async Task ScanTrustedAsync()
     {
-        if (_scanningTrusted || _connecting || _host != null ||
+        if (_scanningTrusted || _connecting || _manualPairDialogOpen || _host != null ||
             _incomingPeer != null || _closing.IsCancellationRequested ||
             _trusted?.AutoConnectEnabled != true || _trusted.Outgoing.Count == 0 ||
             DateTime.UtcNow < _retryTrustedAfter || _receiver == null)

@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032, fix/windows-install-quarantine-integrity-v033]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032, fix/windows-install-quarantine-integrity-v033, fix/standard-dotnet-packaging-v034]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -75,7 +75,7 @@ jobs:
       - name: Compile standalone Windows device sharing
         shell: pwsh
         run: |
-          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out/DeviceSharing
+          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:IncludeNativeLibrariesForSelfExtract=false -o out/DeviceSharing
           if ($LASTEXITCODE -ne 0) { throw "Device share compile failed" }
       - name: Compile existing DeskTouch Vision shell
         shell: pwsh

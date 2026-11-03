@@ -201,3 +201,50 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
     }
     Console.WriteLine("PASS: Windows loopback TLS manual pairing code and monitor exchange.");
 }
+
+
+// Windows Forms layout smoke test runs on a dedicated STA thread. It never
+// displays a window or starts the LAN receiver, and it can run on GitHub's
+// Windows test runner without touching real monitor/input settings.
+var uiCompletion = new TaskCompletionSource<bool>(
+    TaskCreationOptions.RunContinuationsAsynchronously);
+var uiThread = new Thread(() =>
+{
+    try
+    {
+        using var view = new DisplaySettingsForm();
+        view.CreateControl();
+        var actionRow = view.Controls.Find("ConnectionActions", true)
+            .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
+        Check(!actionRow.WrapContents && actionRow.AutoScroll,
+            "High-DPI action buttons must not collapse into an invisible second row");
+        var diagram = view.Controls.Find("DisplayDiagram", true)
+            .OfType<DisplayArrangementControl>().Single();
+        diagram.Local = extended;
+        diagram.Remote = nonrectangular;
+        foreach (var windowSize in new[] {
+            new System.Drawing.Size(780, 600),
+            new System.Drawing.Size(1000, 690) })
+        {
+            view.ClientSize = windowSize;
+            view.PerformLayout();
+            foreach (System.Windows.Forms.Control outer in view.Controls)
+                outer.PerformLayout();
+            diagram.Parent?.PerformLayout();
+            diagram.PerformLayout();
+            Check(diagram.Width > 250 && diagram.Height > 80,
+                "Native display diagram must retain meaningful dimensions");
+            using var rendered = new System.Drawing.Bitmap(
+                diagram.Width, diagram.Height);
+            diagram.DrawToBitmap(rendered,
+                new System.Drawing.Rectangle(0, 0, diagram.Width, diagram.Height));
+        }
+        uiCompletion.TrySetResult(true);
+    }
+    catch (Exception ex) { uiCompletion.TrySetException(ex); }
+});
+uiThread.SetApartmentState(ApartmentState.STA);
+uiThread.Start();
+await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
+uiThread.Join();
+Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");

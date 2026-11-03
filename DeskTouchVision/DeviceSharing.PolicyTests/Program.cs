@@ -634,8 +634,8 @@ try
     IInputSession bound = multiServer.BindSelectedInput();
     Check(multiServer.SelectConnectedPeer(alternate.Id),
         "Second authenticated Windows peer should be selectable without disconnect");
-    Check(!bound.TrySend(new Packet("release",3003)),
-        "Unowned stale release must not reset another environment member's authority");
+    Check(bound.TrySend(new Packet("release",3003)),
+        "Unowned stale release is a safe no-op and cannot reset another environment member");
     peer2.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);

@@ -20,7 +20,7 @@ internal sealed class DisplayArrangementControl : Control
     private Point _dragOrigin;
     private Point _dragCurrent;
 
-    internal event Action? AddDevicesRequested;
+    internal event Action? AddComputerRequested;
     internal event Action<MonitorEdge>? RemoteEdgeChanged;
 
     internal MonitorTopology? Local

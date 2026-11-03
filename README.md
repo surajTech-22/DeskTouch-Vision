@@ -2,7 +2,19 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.9 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.3.0 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.3.0 — real two-way keyboard/mouse authority, confirmed on both Windows endpoints
+
+**Root cause:** v0.2.9 connected two computers and mirrored monitor tiles on both, but only the PC that opened the TLS connection could send keyboard/mouse input. The receiving PC never installed a reverse `SourceCapture`, and its `WM_INPUT` handler discarded mouse packets before that reverse capture could see them. Display/cursor visibility is **not** authority to use the other computer's keyboard/mouse.
+
+**Fix:** Both computers now run the same physical screen-edge capture state machine, and both can request to send keyboard/mouse events over the **existing authenticated TLS pairing**. The receiver sends reverse input packets through a bounded, mouse-coalescing transport; the original source validates reverse claims using its own native physical-input priority and injects only authorized input. The original source keeps its normal forward control path. No second TCP socket, new pairing prompt, or virtual Windows monitor is introduced.
+
+**Two-phase authority transfer:** On either PC, reaching its selected outside screen edge sends a uniquely numbered *claim*. The remote PC must grant that exact claim while physically idle and then **successfully apply the first cursor packet** using Windows SendInput before returning the final `active` acknowledgement. Until both confirmations arrive, the originating PC **keeps its local keyboard/mouse active**. Handoff cancellation, local physical input, a stale reply, failed SendInput, lost transport, or an unconfirmed request after 3.5 seconds roll back safely to local authority. This prevents a visual cursor shift being mistaken for successfully transferred mouse/keyboard ownership.
+
+The physical keyboard/mouse on **either computer** always takes priority. Receiver and source release held injected keys and buttons on override and disconnection. Both screen directions support mouse, keyboard, clicks, wheel and deliberate return over the outer Windows monitor edge. Internal native Windows extended monitor seams are not remote handoff boundaries. The WinForms X-to-tray behavior and trusted device identity/automatic reconnect remain unchanged.
+
+**Install v0.3.0 on BOTH PCs.** Earlier versions cannot interpret the two-way lease and reverse input messages. The Windows CI regression tests exercise `PC1 → PC2` then `PC2 → PC1` on **the same encrypted socket**, rejection of unapproved and stale claims, cursor-applied authority acknowledgement, native-input revocation, TCP connection continuity, trusted pairing, high-frequency mouse bursts, tray lifecycle, and both Windows app builds. CI is not a substitute for testing the two physical Windows machines' keyboards, mouse drivers and LAN.
 
 ## v0.2.9 — trusted computers by permanent cryptographic identity, never remembered IP
 

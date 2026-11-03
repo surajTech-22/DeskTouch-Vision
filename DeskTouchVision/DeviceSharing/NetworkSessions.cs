@@ -357,6 +357,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(_hubClaims.TryGetValue(id,out int claim) &&
                     (packet.Type=="reset" || claim==packet.A))
                     _hubClaims.Remove(id);
+                else
+                    return false; // Never reset another member's routed authority.
             }
             else if (!_hubClaims.ContainsKey(id))
                 return false;
@@ -384,9 +386,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             await foreach (var p in session.ReverseQueue.Reader.ReadAllAsync(token))
             {
-                // Never allow an old peer's queued reverse input to be sent
-                // to the new peer after selection changes.
-                if (!ReferenceEquals(Volatile.Read(ref _selected), session)) continue;
+                // Old target movements/buttons must never leak after a
+                // selection change. Its pending RELEASE/RESET must still be
+                // delivered on the ORIGINAL authenticated TLS stream.
+                bool stillSelected=ReferenceEquals(Volatile.Read(ref _selected),session);
+                if(!stillSelected)
+                {
+                    Interlocked.Exchange(ref session.LatestReverseMove,null);
+                    Interlocked.Exchange(ref session.ReverseMoveSignaled,0);
+                    if(p.Type is "release" or "reset")
+                        await SendToAsync(session,
+                            ReverseInputProtocol.Encode(p),token);
+                    continue;
+                }
                 if (p.Type == "move-flush")
                 {
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);

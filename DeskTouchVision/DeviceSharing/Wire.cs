@@ -9,7 +9,7 @@ internal sealed record Packet(string Type, int A = 0, int B = 0, int C = 0,
 internal static class Wire
 {
     internal const int Port = 37377;
-    private const int MaxFrame = 1024;
+    private const int MaxFrame = 8192;
     internal static async Task WriteAsync(Stream stream, Packet data, CancellationToken token)
     {
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(data);

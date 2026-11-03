@@ -176,6 +176,18 @@ internal sealed class DisplaySettingsForm : Form
             return;
         }
         _status.Text = message;
+        try
+        {
+            string logs = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DeskTouchVision", "logs");
+            Directory.CreateDirectory(logs);
+            // Status strings intentionally contain no pairing secrets, keys or
+            // raw keyboard events. Keep connection-stage errors diagnosable.
+            File.AppendAllText(Path.Combine(logs, "connection.log"),
+                DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
+        }
+        catch { /* Never block Windows input for diagnostic logging. */ }
         UpdateButtons();
     }
 
@@ -262,6 +274,11 @@ internal sealed class DisplaySettingsForm : Form
                     return;
                 }
                 var safePeer = peer.Replace("\r", " ").Replace("\n", " ");
+                // A receiving computer should visibly request local approval
+                // even if its Displays window was minimized in the background.
+                if (WindowState == FormWindowState.Minimized)
+                    WindowState = FormWindowState.Normal;
+                Activate();
                 var result = MessageBox.Show(this,
                     $"Allow {safePeer} to share its keyboard and mouse with this computer?\n\n" +
                     "Your own keyboard, mouse and touchpad always have priority. " +
@@ -336,6 +353,13 @@ internal sealed class DisplaySettingsForm : Form
         {
             DisconnectHost();
             Status("Connection failed: " + ex.Message);
+            if (!_closing.IsCancellationRequested && !IsDisposed)
+                MessageBox.Show(this,
+                    ex.Message +
+                    "\n\nIf discovery works but TCP port 37377 is blocked, allow DeskTouch.DeviceShare.exe in Windows Firewall on PRIVATE networks on the receiving PC. " +
+                    "For a port test, run CHECK_CONNECTION.ps1 from the downloaded installer.",
+                    "Unable to connect Windows computers",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         finally
         {

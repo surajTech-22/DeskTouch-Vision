@@ -245,8 +245,8 @@ internal sealed class ReceiverServer : IDisposable
                 if (p.Type == "goodbye") break;
                 if (p.Type == "topology")
                 {
-                    var topology = MonitorTopology.FromWire(p.Text);
-                    incoming = incoming! with { Monitors = topology };
+                    var peerLayout = MonitorTopology.FromWire(p.Text);
+                    incoming = incoming! with { Monitors = peerLayout };
                     PeerTopologyChanged?.Invoke(incoming);
                     continue;
                 }

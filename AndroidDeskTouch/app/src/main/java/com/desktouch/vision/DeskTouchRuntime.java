@@ -5,14 +5,14 @@ import java.util.function.Consumer;
 
 /** One process-wide DeskTouch connection shared by foreground service and UI. */
 final class DeskTouchRuntime {
-    private static DeskTouchSession session;
+    private static MobileSessionHub session;
     private static volatile Consumer<String> listener;
     private static volatile String lastStatus = "DeskTouch ready to find trusted devices.";
 
     private DeskTouchRuntime() {}
-    static synchronized DeskTouchSession session(Context context) {
+    static synchronized MobileSessionHub session(Context context) {
         if (session == null) {
-            session = new DeskTouchSession(new TrustedWindows(context.getApplicationContext()), message -> {
+            session = new MobileSessionHub(new TrustedWindows(context.getApplicationContext()), message -> {
                 lastStatus = message;
                 Consumer<String> current = listener;
                 if (current != null) current.accept(message);

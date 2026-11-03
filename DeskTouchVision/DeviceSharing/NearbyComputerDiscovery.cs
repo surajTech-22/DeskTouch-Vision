@@ -9,7 +9,7 @@ namespace DeskTouch.DeviceShare;
 /// <summary>Discovery-only information. The advertised fingerprint is never
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
-    bool IsAndroid = false, bool CanReceive = true);
+    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
@@ -132,8 +132,10 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal static IReadOnlyList<NearbyComputer> DistinctDevices(IEnumerable<NearbyComputer> peers) =>
         peers.GroupBy(p => (p.IsAndroid, p.Fingerprint), 
                 EqualityComparer<(bool, string)>.Default)
-            .Select(g => g.OrderByDescending(p => p.CanReceive).First())
+            .Select(g => g.OrderByDescending(p => p.CanReceive)
+                .ThenByDescending(p=>p.IsHub).First())
             .OrderBy(p => p.IsAndroid)
+            .ThenByDescending(p=>p.IsHub)
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(p => p.Address, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -141,6 +143,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal static async Task<IReadOnlyList<NearbyComputer>> FindAsync(CancellationToken cancel)
     {
         var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
+        var advertisedHubs = new ConcurrentDictionary<string,string>(
+            StringComparer.OrdinalIgnoreCase);
         using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         var destinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -189,8 +193,15 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             try
             {
                 var packet = await udp.ReceiveAsync(slice.Token);
-                var peer = ParseReply(Encoding.ASCII.GetString(packet.Buffer),
-                    packet.RemoteEndPoint.Address);
+                string response = Encoding.ASCII.GetString(packet.Buffer);
+                if(response.StartsWith("DT1-HUB|",StringComparison.Ordinal))
+                {
+                    string id=response["DT1-HUB|".Length..];
+                    if(id.Length==64 && id.All(Uri.IsHexDigit))
+                        advertisedHubs[id]=packet.RemoteEndPoint.Address.ToString();
+                    continue;
+                }
+                var peer = ParseReply(response, packet.RemoteEndPoint.Address);
                 if (peer is not null)
                     found[(peer.IsAndroid ? "android:" : "windows:") + peer.Fingerprint] = peer;
             }
@@ -198,7 +209,10 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             catch (OperationCanceledException) { break; }
             catch (SocketException) { break; }
         }
-        return DistinctDevices(found.Values);
+        return DistinctDevices(found.Values.Select(p =>
+            p with { IsHub = !p.IsAndroid &&
+                advertisedHubs.TryGetValue(p.Fingerprint,out var claimedAddress) &&
+                string.Equals(claimedAddress,p.Address,StringComparison.OrdinalIgnoreCase) }));
     }
 
     public void Dispose()

@@ -306,6 +306,8 @@ var uiThread = new Thread(() =>
         view.Close();
         Check(!view.IsDisposed && !view.Visible && view.IsRunningInTray,
             "Closing the Displays window must keep the same application running in tray");
+        Check(view.Handle == nativeWindow,
+            "Hiding to tray must never recreate the HWND or break raw mouse input registration");
         // Unlike the user X, a verified updater must close the tray host so
         // the independent installer can replace files without locks.
         ((DeskTouchVision.IUpdateCloseHost)view).CloseForVerifiedUpdate();

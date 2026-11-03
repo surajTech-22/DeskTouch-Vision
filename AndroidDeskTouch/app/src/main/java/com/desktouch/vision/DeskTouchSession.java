@@ -87,6 +87,7 @@ final class DeskTouchSession implements AutoCloseable {
         return environmentTargets;
     }
     int selectedEnvironmentTarget(){return selectedEnvironmentId;}
+    int ownEnvironmentId(){return environmentOwnId;}
 
     void selectEnvironmentTarget(int id){
         if(!running) {status("Join a shared environment first.");return;}

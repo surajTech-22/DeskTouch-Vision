@@ -358,7 +358,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     (packet.Type=="reset" || claim==packet.A))
                     _hubClaims.Remove(id);
                 else
-                    return false; // Never reset another member's routed authority.
+                    // An already-revoked RELEASE is an idempotent success,
+                    // but must NEVER send a reset to another routed owner.
+                    return packet.Type=="release";
             }
             else if (!_hubClaims.ContainsKey(id))
                 return false;

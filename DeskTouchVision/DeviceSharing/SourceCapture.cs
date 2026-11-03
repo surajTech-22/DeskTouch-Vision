@@ -18,7 +18,8 @@ internal sealed class SourceCapture : IDisposable
     private readonly MonitorTopology _localMonitors, _remoteMonitors;
     private readonly System.Drawing.Rectangle _local;
     private IntPtr _keyHook, _mouseHook;
-    private int _armed, _active, _switchPending;
+    private int _armed, _active, _switchPending, _pending;
+    private int _pendingY;
     private int _remoteX, _remoteY;
     private readonly int _anchorX, _anchorY;
     private long _cooldownUntil;
@@ -68,6 +69,7 @@ internal sealed class SourceCapture : IDisposable
     internal void Disarm()
     {
         ReturnLocal();
+        Interlocked.Exchange(ref _pending, 0);
         Interlocked.Exchange(ref _armed, 0);
         if (_keyHook != IntPtr.Zero) { Win.UnhookWindowsHookEx(_keyHook); _keyHook = IntPtr.Zero; }
         if (_mouseHook != IntPtr.Zero) { Win.UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
@@ -81,8 +83,9 @@ internal sealed class SourceCapture : IDisposable
 
     internal void ReturnLocal()
     {
+        Interlocked.Exchange(ref _pending, 0);
         if (Interlocked.Exchange(ref _active, 0) == 0) return;
-        _session.TrySend(new Packet("reset"));
+        _session.TrySend(new Packet("release"));
         _cooldownUntil = Environment.TickCount64 + 1000;
         // Put local cursor inside display, rather than immediately on switching boundary.
         var localReturn = _localMonitors.ClampToRealMonitor(
@@ -94,7 +97,28 @@ internal sealed class SourceCapture : IDisposable
 
     private void EnterRemote(int localY)
     {
-        if (!IsArmed || RemoteActive) return;
+        if (!IsArmed || RemoteActive ||
+            Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return;
+        _pendingY = localY;
+        // Do not capture/suppress any source keyboard or mouse event until the
+        // receiver explicitly confirms its native devices have been idle.
+        if (!_session.TrySend(new Packet("claim")))
+        {
+            Interlocked.Exchange(ref _pending, 0);
+            _status("Receiver unavailable; local input remains active.");
+        }
+        else _status("Requesting remote control; local keyboard/mouse still work.");
+    }
+
+    internal void GrantRemote()
+    {
+        if (Interlocked.Exchange(ref _pending, 0) != 1 ||
+            !IsArmed || RemoteActive)
+        {
+            _session.TrySend(new Packet("release"));
+            return;
+        }
+        int localY = _pendingY;
         var entry = _remoteMonitors.EntryPoint(MonitorEdge.Left,
             _localMonitors.EdgeFraction(new System.Drawing.Point(_local.Right - 1, localY),
                 MonitorEdge.Right));
@@ -105,7 +129,25 @@ internal sealed class SourceCapture : IDisposable
         Interlocked.Exchange(ref _active, 1);
         if (!_session.TrySend(new Packet("move", _remoteX, _remoteY)))
             ReturnLocal();
-        else _status("Controlling remote Windows. Return via LEFT screen edge, or Ctrl+Alt+Shift+F12.");
+        else _status("Remote control active. Receiver's physical keyboard/mouse will take priority immediately.");
+    }
+
+    internal void ReceiverNativePriority()
+    {
+        // Unconditional return: even a queued grant must not override the
+        // person physically using the receiver computer.
+        Interlocked.Exchange(ref _pending, 0);
+        ReturnLocal();
+        _cooldownUntil = Environment.TickCount64 + 1500;
+        _status("Receiver physical keyboard/mouse detected. Automatically restored LOCAL control.");
+    }
+
+    internal void ReceiverBusy()
+    {
+        Interlocked.Exchange(ref _pending, 0);
+        ReturnLocal();
+        _cooldownUntil = Environment.TickCount64 + 1500;
+        _status("Remote PC is currently being used locally. Native input has priority.");
     }
 
     private void Post(Action action)

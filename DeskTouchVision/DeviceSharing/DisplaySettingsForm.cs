@@ -24,6 +24,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _trustDevice = Button("Trust device");
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
+    private readonly Button _androidDownload = Button("Get Android app");
     private readonly LinkLabel _checkUpdates = new()
     {
         Text = "Check for updates",
@@ -105,7 +106,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings })
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -161,6 +162,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
+        _androidDownload.Click += (_, _) => { using var view = new AndroidDownloadDialog(); view.ShowDialog(this); };
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
@@ -204,6 +206,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             ShowFromTray();
             ManageTrustedDevices();
+        });
+        _trayMenu.Items.Add("Get Android app", null, (_, _) =>
+        {
+            ShowFromTray();
+            using var view = new AndroidDownloadDialog();
+            view.ShowDialog(this);
         });
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
         _trayMenu.Items.Add(new ToolStripSeparator());

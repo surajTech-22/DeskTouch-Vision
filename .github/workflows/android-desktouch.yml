@@ -1,0 +1,60 @@
+name: DeskTouch Vision - Android APK and input protocol tests
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'AndroidDeskTouch/**'
+      - '.github/workflows/android-desktouch.yml'
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['DeskTouch Vision - Build, Install, Release']
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: AndroidDeskTouch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Unit tests and installable Android debug APK
+        run: |
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+          sha256sum DeskTouchVision-android-preview.apk > DeskTouchVision-android-preview.apk.sha256
+      - name: Archive Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouchVision-Android-Preview
+          path: |
+            AndroidDeskTouch/DeskTouchVision-android-preview.apk
+            AndroidDeskTouch/DeskTouchVision-android-preview.apk.sha256
+          if-no-files-found: error
+      - name: Attach Android preview to verified Windows release
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep 'versionName' app/build.gradle | head -1 | sed -E "s/.*'([^']+)'.*/\\1/")
+          tag="v${version}"
+          # Windows completed successfully before this workflow_run starts.
+          gh release view "$tag" --repo "${{ github.repository }}"
+          gh release upload "$tag" DeskTouchVision-android-preview.apk DeskTouchVision-android-preview.apk.sha256 --clobber --repo "${{ github.repository }}"

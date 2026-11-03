@@ -252,6 +252,15 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
         Check(peer.Name == Environment.MachineName &&
             peer.Monitors.Monitors.Count >= 1,
             "The receiving PC must show the authenticated source monitor layout");
+        var heartbeatAck=new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        session.HeartbeatAcknowledged += () => heartbeatAck.TrySetResult(true);
+        Check(session.TrySend(new Packet("ping")),
+            "Authenticated Android-style ping must be accepted.");
+        Check(await heartbeatAck.Task.WaitAsync(testTimeout.Token),
+            "Receiver must answer pong before Android's 22-second read timeout.");
+        Console.WriteLine("PASS: Windows sends authenticated heartbeat pong to Android.");
+
         session.PublishSourcePlacement(MonitorEdge.Right);
         Check(await remoteArrangement.Task.WaitAsync(testTimeout.Token) == MonitorEdge.Right,
             "Receiver should mirror source PC monitor placement");

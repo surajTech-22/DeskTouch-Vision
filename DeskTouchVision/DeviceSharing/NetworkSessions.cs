@@ -11,9 +11,9 @@ using System.Text.Json;
 namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
-    bool SupportsReverseInput = true);
+    bool SupportsReverseInput = true, string? DeviceFingerprint = null);
 internal sealed record PeerHello(string Name, string Layout,
-    bool? ReverseInputSupported = null);
+    bool? ReverseInputSupported = null, string? Fingerprint = null);
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -70,6 +70,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
+    // Only labels for LAN display grouping; individual peer trust remains
+    // pinned to its own approved TLS certificate/fingerprint.
+    internal IReadOnlyList<string> ConnectedDeviceFingerprints =>
+        _sessions.Values.Select(s=>s.Peer.DeviceFingerprint)
+            .Where(id=>!string.IsNullOrWhiteSpace(id)).Cast<string>()
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
 
     internal ReceiverServer(Action<string> status, LocalInputPriority priority,
         Func<string,CancellationToken,Task<bool>>? requestApproval = null,
@@ -290,8 +296,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         string name = hello.Name.Trim();
         if (name.Length is < 1 or > 60 || name.Any(char.IsControl))
             throw new InvalidDataException("Invalid peer name.");
+        // A claimed fingerprint is a network-display hint only; NEVER use
+        // it to authenticate the source or grant remote keyboard authority.
+        string? hint = hello.Fingerprint is { Length:64 } id &&
+            id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true);
+            hello.ReverseInputSupported ?? true, hint);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -438,7 +448,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if(wasOwner) lock(session.InputLock)session.Injector.ReleaseAll();
                     continue;
                 }
-                if(p.Type=="ping")continue;
+                if(p.Type=="ping")
+                {
+                    // The Android client expects a server response within 22s.
+                    // Older Windows releases ignored all mobile heartbeats,
+                    // causing a healthy connection to time out after 22s.
+                    await SendToAsync(session,new Packet("pong"),token);
+                    continue;
+                }
                 int lease;
                 lock(_authorityGate)
                     lease=ReferenceEquals(_owner,session)?session.Lease:0;
@@ -538,6 +555,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private int _reverseAppliedLease;
     internal event Action<Packet>? AuthorityControlPacket;
     internal event Action<string>? AuthorityDiagnostic;
+    internal event Action? HeartbeatAcknowledged;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -718,8 +736,11 @@ internal sealed class HostSession : IInputSession, IDisposable
             // identical two-computer arrangement without initiating a second
             // TCP connection (which would race the existing receiver).
             var mine = MonitorTopology.Capture();
+            using var identity = PersistentReceiverIdentity.LoadOrCreate();
+            string sourceId = Convert.ToHexString(
+                SHA256.HashData(identity.RawData));
             var hello = JsonSerializer.Serialize(
-                new PeerHello(Environment.MachineName, mine.ToWire()));
+                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             return new HostSession(client, ssl, monitors, onFailure);
@@ -791,6 +812,8 @@ internal sealed class HostSession : IInputSession, IDisposable
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
                     RemotePlacementChanged?.Invoke(changedEdge);
+                else if (p.Type == "pong")
+                    HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
                 else if (p.Type is "granted" or "busy" or "local-active" or "active")

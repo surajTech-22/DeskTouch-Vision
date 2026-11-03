@@ -43,6 +43,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ReverseMoveSignaled;
         internal int Lease;
         internal int AppliedLease;
+        internal int KeyboardFailureReported;
     }
 
     private readonly Action<string> _status;
@@ -500,6 +501,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                                 applied=session.Injector.Handle(p);
                         }
                     }
+                    if(!applied && p.Type=="key" &&
+                       Interlocked.CompareExchange(ref session.KeyboardFailureReported,1,0)==0)
+                    {
+                        // Never log characters, scan codes, or personal input.
+                        await SendToAsync(session,new Packet("keyboard-unavailable"),token);
+                        _status("Remote PC keyboard injection rejected; verify focus and elevation.");
+                    }
                     if(applied && p.Type=="move" && _priority.CanApplyRemote &&
                        Interlocked.CompareExchange(ref session.AppliedLease,lease,0)==0)
                         await SendToAsync(session,new Packet("active",lease),token);
@@ -588,6 +596,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<Packet>? AuthorityControlPacket;
     internal event Action<string>? AuthorityDiagnostic;
     internal event Action? HeartbeatAcknowledged;
+    internal event Action<string>? InputDeliveryWarning;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -856,6 +865,10 @@ internal sealed class HostSession : IInputSession, IDisposable
                     HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
+                else if (p.Type == "keyboard-unavailable")
+                    InputDeliveryWarning?.Invoke("The receiving Windows PC rejected keyboard " +
+                        "input. Click a normal text field on that PC and check whether " +
+                        "the target program is running as Administrator.");
                 else if (p.Type is "granted" or "busy" or "local-active" or "active")
                 {
                     AuthorityControlPacket?.Invoke(p);

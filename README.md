@@ -2,7 +2,22 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.4 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.5 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.5 — stable paired Windows computers and mirrored monitor arrangements
+
+This release addresses the situation where the **controlling computer shows the connected PC, but the receiving computer does not**, along with unnecessary connection loss while using native displays.
+
+- Both computers now exchange their **actual Windows extended-monitor layout and computer name after authenticated TLS pairing**. The receiver's *Displays* UI shows its peer, not merely the `Ready to pair` label.
+- Move the connected screen group on either computer; the matching **left/right/top/bottom placement is mirrored to the other side**. Only the computer that initiated sharing forwards keyboard/mouse events in this two-PC preview; showing the peer on both computers does not imply full bidirectional input routing yet.
+- Windows `WM_DISPLAYCHANGE` events **no longer destroy TLS pairing**. A spurious notification is ignored; a genuine monitor layout change updates the peer without dropping the connection. Active remote input is returned to the local PC safely if the coordinates change.
+- While paired, the receiver keeps the connection alive when its own physical keyboard, touchpad or mouse is used; local physical input **revokes remote input only**, never the peer relationship.
+- Mouse movement packets are **coalesced** to the latest coordinates instead of filling the send queue and triggering overload disconnections. Heartbeats run every 1.5 seconds and receiver's silence watchdog is increased to 18 seconds. Actual disconnection reasons are written to `%LOCALAPPDATA%\\DeskTouchVision\\logs\\connection.log`.
+- An actual network failure still releases remotely held keys/buttons and may require re-pairing. The application does not bypass Windows Firewall or silently grant a new remote-control connection.
+
+**Install this release on BOTH computers** before testing. An older receiver does not understand the new two-way monitor-layout messages.
+
+The Windows CI integration test now verifies **receiver-side peer visibility**, topology changes in both directions, placement synchronization, high-frequency mouse events without overload, secure TLS/manual-code pairing, and native input priority. These are automated protocol tests on one Windows runner, not proof of reliability over the user's two physical computers.
 
 ## v0.2.4 — fix installation-folder lock and stop repeat download loops
 

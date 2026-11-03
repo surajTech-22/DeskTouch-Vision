@@ -33,6 +33,7 @@ jobs:
                               'DeskTouchVision/CHECK_CONNECTION.ps1',
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
+                              'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
                               'DeskTouchVision/TEST_INSTALL_MUTEX.ps1',
                               'DeskTouchVision/CHECK_UPDATE_LOCK.ps1')) {
             $tokens = $null
@@ -52,6 +53,11 @@ jobs:
           # A PowerShell script throws on failure; LASTEXITCODE is not
           # defined by a successfully invoked .ps1 and may be stale.
           & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
+      - name: Verify both Windows tray and auto-update paths (PowerShell 5.1)
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_TRAY_UPDATES.ps1'
+          if ($LASTEXITCODE -ne 0) { throw "DeskTouch tray auto-update integration regression failed" }
       - name: Check local hardware priority regression tests
         shell: pwsh
         run: |
@@ -113,7 +119,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.7: fixes repeated updater downloads and installations skipped as duplicate. Release update mutex directly after commit/rollback, BEFORE slow backup and extraction deletion; wait up to 90 seconds for competing installer, report owner PID and restore old app on error. Client checks active installer mutex before downloading/launching. Includes read-only CHECK_UPDATE_LOCK.ps1 diagnostics. Windows PowerShell 5.1 concurrent-installer regression tests pass. One manual repair install may be required for v0.2.5/v0.2.6 clients with a blocked old updater. Real-PC update testing still required."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.8: fixes slow mouse/touchpad movement failing to cross the real external Windows monitor edge. The Close/X button now hides DeskTouch in the Windows tray WITHOUT dropping pairing. Tray Show, Disconnect, Check Updates and explicit Exit actions, and second desktop shortcut reopens the same tray process. Both computers independently receive release-event auto-updates while tray-running; a verified update shuts down the tray app safely and restarts hidden if previously hidden. Includes all prior TLS, native input, installer-lock and safe recovery fixes. Install v0.2.8 on BOTH PCs; actual two-PC hardware checks remain required."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

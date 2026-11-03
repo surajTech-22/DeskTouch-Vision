@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory=$true)][string]$Package,
   [Parameter(Mandatory=$true)][string]$Target,
   [Parameter(Mandatory=$true)][int]$CurrentPid,
-  [Parameter(Mandatory=$true)][string]$ExpectedHash
+  [Parameter(Mandatory=$true)][string]$ExpectedHash,
+  [switch]$StartInTray
 )
 $ErrorActionPreference = 'Stop'
 # Set current directory OUTSIDE the application before touching install files.
@@ -129,7 +130,12 @@ try {
   if (-not (Test-Path (Join-Path $targetFull 'DeskTouchVision.exe'))) {
     throw 'Updated application not found after install'
   }
-  Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe')
+  $restartArgs = if ($StartInTray) { @('--tray') } else { @() }
+  if ($restartArgs.Count -gt 0) {
+    Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ArgumentList $restartArgs
+  } else {
+    Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe')
+  }
   $activated = $true
   Log "INSTALL COMMITTED PID=$PID. Settings preserved; releasing mutex before cleanup."
 }
@@ -153,7 +159,11 @@ catch {
           [StringComparison]::OrdinalIgnoreCase) })
       if ($running.Count -eq 0) {
         Log 'Restarting previous DeskTouch installation after failed update.'
-        Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ErrorAction Stop
+        if ($StartInTray) {
+          Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ArgumentList '--tray' -ErrorAction Stop
+        } else {
+          Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ErrorAction Stop
+        }
       }
     } catch { Log "Restart after failure unavailable: $($_.Exception.Message)" }
   }

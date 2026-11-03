@@ -37,11 +37,14 @@ internal static class Program
         }
         try
         {
-            Process.Start(new ProcessStartInfo(share)
+            var launch = new ProcessStartInfo(share)
             {
                 UseShellExecute = true,
                 WorkingDirectory = Path.GetDirectoryName(share)!
-            });
+            };
+            if (args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase)))
+                launch.ArgumentList.Add("--tray");
+            Process.Start(launch);
         }
         catch (Exception ex)
         {

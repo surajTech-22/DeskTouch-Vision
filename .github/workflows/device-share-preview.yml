@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'
@@ -29,6 +29,7 @@ jobs:
                               'DeskTouchVision/CHECK_CONNECTION.ps1',
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
+                              'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
                               'DeskTouchVision/TEST_INSTALL_MUTEX.ps1',
                               'DeskTouchVision/CHECK_UPDATE_LOCK.ps1')) {
             $tokens = $null
@@ -53,6 +54,11 @@ jobs:
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_RECOVERY_CHECKSUM.ps1'
           if ($LASTEXITCODE -ne 0) { throw 'Recovery checksum test failed under Windows PowerShell 5.1.' }
+      - name: Verify both Windows tray and auto-update paths (PowerShell 5.1)
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'DeskTouchVision/TEST_TRAY_UPDATES.ps1'
+          if ($LASTEXITCODE -ne 0) { throw "DeskTouch tray auto-update integration regression failed" }
       - name: Verify native-input priority state machine
         shell: pwsh
         run: |

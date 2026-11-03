@@ -27,6 +27,8 @@ internal sealed class SourceCapture : IDisposable
     private long _lastRawMs;
     private System.Drawing.Point _lastPhysicalPointer;
     private bool _hasLastPhysicalPointer;
+    private readonly SlowEdgeApproach _slowEdge = new();
+    private System.Windows.Forms.Timer? _slowEdgeTimer;
     private bool _controlPressed, _altPressed, _shiftPressed;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
@@ -55,6 +57,7 @@ internal sealed class SourceCapture : IDisposable
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
         _hasLastPhysicalPointer = false;
+        _slowEdge.Reset();
         _edge = side;
     }
 
@@ -69,6 +72,7 @@ internal sealed class SourceCapture : IDisposable
         _remoteMonitors = remote;
         _local = local.Bounds;
         _hasLastPhysicalPointer = false;
+        _slowEdge.Reset();
         var home = local.Monitors.FirstOrDefault(m => m.Primary) ?? local.Monitors[0];
         _anchorX = home.X + home.Width / 2;
         _anchorY = home.Y + home.Height / 2;
@@ -101,13 +105,21 @@ internal sealed class SourceCapture : IDisposable
             Disarm();
             throw new InvalidOperationException("Windows global low-level hooks unavailable.");
         }
-        _hasLastPhysicalPointer = false;
+        _hasLastPhysicalPointer = true;
+        _lastPhysicalPointer = Cursor.Position;
+        _slowEdge.Reset();
+        _slowEdgeTimer ??= new System.Windows.Forms.Timer { Interval = 55 };
+        _slowEdgeTimer.Tick -= SlowEdgeTick;
+        _slowEdgeTimer.Tick += SlowEdgeTick;
+        _slowEdgeTimer.Start();
         Interlocked.Exchange(ref _armed, 1);
         _status($"Ready. Move to the {_edge.ToString().ToLowerInvariant()} outside edge to control the connected PC.");
     }
 
     internal void Disarm()
     {
+        _slowEdgeTimer?.Stop();
+        _slowEdge.Reset();
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
         Interlocked.Exchange(ref _armed, 0);
@@ -142,6 +154,7 @@ internal sealed class SourceCapture : IDisposable
         var localReturn = _localMonitors.ClampToRealMonitor(interior);
         Win.SetCursorPos(localReturn.X, localReturn.Y);
         _hasLastPhysicalPointer = false;
+        _slowEdge.Reset();
         _status("Control returned to this Windows computer.");
     }
 
@@ -149,6 +162,7 @@ internal sealed class SourceCapture : IDisposable
     {
         if (!IsArmed || RemoteActive ||
             Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return;
+        _slowEdge.Reset();
         _pendingPoint = sourcePoint;
         // Do not capture/suppress any source keyboard or mouse event until the
         // receiver explicitly confirms its native devices have been idle.
@@ -212,6 +226,23 @@ internal sealed class SourceCapture : IDisposable
         }
         catch (InvalidOperationException) { }
         return false;
+    }
+
+    private void SlowEdgeTick(object? sender, EventArgs args)
+    {
+        if (!IsArmed || RemoteActive || Volatile.Read(ref _pending) != 0 ||
+            Environment.TickCount64 < _cooldownUntil) return;
+        var cursor = Cursor.Position;
+        if (_slowEdge.Ready(_localMonitors, cursor, _edge,
+            Environment.TickCount64))
+            RequestAtOuterEdge(cursor, "slow edge approach");
+    }
+
+    private void ObserveEdgeMotion(System.Drawing.Point cursor, int dx, int dy)
+    {
+        if (IsArmed && !RemoteActive)
+            _slowEdge.Observe(_localMonitors, cursor, _edge,
+                dx, dy, Environment.TickCount64);
     }
 
     private void RequestAtOuterEdge(System.Drawing.Point cursor, string source)
@@ -281,8 +312,9 @@ internal sealed class SourceCapture : IDisposable
             int dy = _hasLastPhysicalPointer ? cursor.Y - _lastPhysicalPointer.Y : 0;
             _lastPhysicalPointer = cursor;
             _hasLastPhysicalPointer = true;
-            // Fallback for laptop touchpads which provide ordinary mouse
-            // messages but no usable Raw Input relative motion.
+            // Touchpad fallback: even a single slow outward pixel movement
+            // must count toward a deliberate outer-edge approach.
+            ObserveEdgeMotion(cursor, dx, dy);
             if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor, _edge, dx, dy))
                 RequestAtOuterEdge(cursor, "mouse-hook movement");
         }
@@ -345,6 +377,7 @@ internal sealed class SourceCapture : IDisposable
                 // pixel. WM_INPUT still reports the mouse pushing outward.
                 // This is the missing-edge case that the old LL hook missed.
                 var cursor = Cursor.Position;
+                ObserveEdgeMotion(cursor, input.Mouse.LastX, input.Mouse.LastY);
                 if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
                     _edge, input.Mouse.LastX, input.Mouse.LastY))
                     RequestAtOuterEdge(cursor, "raw-mouse movement");
@@ -399,5 +432,14 @@ internal sealed class SourceCapture : IDisposable
         _session.TrySend(new Packet("move", _remoteX, _remoteY));
     }
 
-    public void Dispose() => Disarm();
+    public void Dispose()
+    {
+        Disarm();
+        if (_slowEdgeTimer != null)
+        {
+            _slowEdgeTimer.Tick -= SlowEdgeTick;
+            _slowEdgeTimer.Dispose();
+            _slowEdgeTimer = null;
+        }
+    }
 }

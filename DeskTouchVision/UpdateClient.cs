@@ -10,6 +10,18 @@ using System.Windows.Forms;
 namespace DeskTouchVision;
 
 /// <summary>
+/// A window can stay alive in the tray during ordinary user Close, but an
+/// independently verified installer must ask it to release the existing TLS
+/// peer and input hooks before files are replaced. Both Windows applications
+/// use the same update engine and the same independent installed package.
+/// </summary>
+internal interface IUpdateCloseHost
+{
+    bool IsHiddenInTray { get; }
+    void CloseForVerifiedUpdate();
+}
+
+/// <summary>
 /// Independent release-event updater for both the DeskTouch launcher and the
 /// Windows Displays application. Avoids false "up to date" when a background
 /// download is already running, logs failures, and verifies release archives.
@@ -298,6 +310,12 @@ internal static class UpdateClient
                     "-CurrentPid", Environment.ProcessId.ToString(),
                     "-ExpectedHash", expectedHash })
                     process.ArgumentList.Add(arg);
+                // Each machine independently follows the GitHub release SSE
+                // while running in the tray. On successful auto-update,
+                // restart in that same quiet tray state instead of popping a
+                // new desktop window onto either computer.
+                if (window is IUpdateCloseHost host && host.IsHiddenInTray)
+                    process.ArgumentList.Add("-StartInTray");
                 if (IsInstallationRunning())
                 {
                     Log($"Another installer acquired the lock while v{latest.ToString(3)} was downloading; no second host launched.");
@@ -308,7 +326,12 @@ internal static class UpdateClient
                     throw new InvalidOperationException("Unable to start the independent update installer.");
                 Log("Checksum verified; detached TEMP updater launched outside installed directory. Closing old DeskTouch window.");
                 SetStatus(window, "installing update");
-                Post(window, window.Close);
+                Post(window, () =>
+                {
+                    if (window is IUpdateCloseHost sharingHost)
+                        sharingHost.CloseForVerifiedUpdate();
+                    else window.Close();
+                });
                 return CheckResult.InstallationStarted;
             }
             catch

@@ -51,6 +51,7 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isConnected(){return running;}
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
+    boolean hasClaim(){return claim>0||active;}
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {

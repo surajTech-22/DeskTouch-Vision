@@ -502,6 +502,52 @@ finally
     try { Directory.Delete(trustRoot, recursive: true); } catch { }
 }
 
+// Live multi-peer LAN transport regression: two simultaneous authenticated
+// TLS clients must remain connected, and disconnecting one must not sever the
+// other. No hooks or synthetic input are installed by this test.
+var multipointRoot=Path.Combine(Path.GetTempPath(),
+    "DeskTouch-MultiPeer-"+Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(multipointRoot);
+try
+{
+    var multiPriority=new LocalInputPriority();
+    using var multiServer=new ReceiverServer(
+        _=>{},multiPriority,(_,__)=>Task.FromResult(true),
+        identityPath:Path.Combine(multipointRoot,"identity.bin"));
+    multiServer.AllowForwardClaim=()=>false; // no Windows SendInput in CI.
+    multiServer.Start();
+    Check(multiServer.CanAcceptNewPeer,"Fresh hub must accept a peer");
+    using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(18));
+    using var peer1=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        multiServer.Fingerprint,_=>{},timeout.Token);
+    using var peer2=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        multiServer.Fingerprint,_=>{},timeout.Token);
+    for(int t=0;t<30 && multiServer.ConnectedPeerCount<2;t++)
+        await Task.Delay(100,timeout.Token);
+    Check(multiServer.ConnectedPeerCount==2,
+        "Windows receiver must keep TWO authenticated TLS peers at once");
+    Check(multiServer.CanAcceptNewPeer,
+        "Windows must remain discoverable/ready with two connected devices");
+    peer1.Dispose();
+    for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
+        await Task.Delay(100,timeout.Token);
+    Check(multiServer.ConnectedPeerCount==1,
+        "Disconnecting one peer must preserve the other");
+    using var peer3=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+        multiServer.Fingerprint,_=>{},timeout.Token);
+    for(int t=0;t<30 && multiServer.ConnectedPeerCount<2;t++)
+        await Task.Delay(100,timeout.Token);
+    Check(multiServer.ConnectedPeerCount==2,
+        "Third device must connect while the second stays online");
+    Check(!multiPriority.RemoteGranted,
+        "Connected peers must not steal local keyboard/mouse control");
+    Console.WriteLine("PASS: two concurrent authenticated devices, independent disconnect, third-peer join, and no input lease without consent.");
+}
+finally
+{
+    try{Directory.Delete(multipointRoot,true);}catch{}
+}
+
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never
 // displays a window or starts the LAN receiver, and it can run on GitHub's
 // Windows test runner without touching real monitor/input settings.

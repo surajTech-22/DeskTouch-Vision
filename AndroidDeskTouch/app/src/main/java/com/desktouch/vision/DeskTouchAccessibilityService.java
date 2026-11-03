@@ -190,6 +190,39 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             },ui);
         if(!started)remoteGesture=false;
     }
+    static void text(String incoming){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null||!ready(service)||
+            incoming==null||incoming.length()==0||incoming.length()>512)return;
+        service.ui.post(()->{
+            AccessibilityNodeInfo root=service.getRootInActiveWindow();
+            if(root==null)return;
+            AccessibilityNodeInfo field=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if(field==null||!field.isEditable()||field.isPassword())return;
+            CharSequence original=field.getText();
+            String content=original==null?"":original.toString();
+            int start=field.getTextSelectionStart();
+            int end=field.getTextSelectionEnd();
+            if(start<0)start=content.length();
+            if(end<0)end=start;
+            start=Math.max(0,Math.min(content.length(),start));
+            end=Math.max(start,Math.min(content.length(),end));
+            String value=content.substring(0,start)+incoming+content.substring(end);
+            Bundle args=new Bundle();
+            args.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,value);
+            if(field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,args)){
+                Bundle selection=new Bundle();
+                int caret=start+incoming.length();
+                selection.putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,caret);
+                selection.putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,caret);
+                field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,selection);
+            }
+        });
+    }
+
     static void key(int vk,boolean pressed){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return;

@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032, fix/windows-install-quarantine-integrity-v033, fix/standard-dotnet-packaging-v034, fix/defer-global-input-hooks-035, feature/multipeer-android-update-v036, fix/heartbeats-device-mesh-v037, feature/windows-controls-android-v039, fix/connected-windows-group-keyboard-v0310]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0, feature/android-desktouch-qr-v031, fix/android-tcp-rejected-v032, fix/windows-install-quarantine-integrity-v033, fix/standard-dotnet-packaging-v034, fix/defer-global-input-hooks-035, feature/multipeer-android-update-v036, fix/heartbeats-device-mesh-v037, feature/windows-controls-android-v039, fix/connected-windows-group-keyboard-v0310, fix/unified-group-input-v0311]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'

@@ -16,6 +16,18 @@ namespace DeskTouch.DeviceShare;
 internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 {
     private readonly DisplayArrangementControl _display = new();
+    private readonly ComboBox _targetChoice = new()
+    {
+        Name = "ConnectedDeviceTarget", Dock = DockStyle.Right,
+        Width = 256, DropDownStyle = ComboBoxStyle.DropDownList,
+        Font = new Font("Segoe UI", 9)
+    };
+    private bool _updatingTargetChoice;
+    private bool _captureUsesInbound;
+    private sealed record TargetOption(int Id, string Name)
+    {
+        public override string ToString() => Name;
+    }
     private readonly Label _status = new();
     private readonly Label _summary = new();
     private readonly Button _add = Button("Add devices", true);
@@ -98,6 +110,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _manageTrusted.Margin = new Padding(5);
         header.Controls.Add(_manageTrusted);
         header.Controls.Add(_checkUpdates);
+        _targetChoice.SelectedIndexChanged += (_, _) =>
+        {
+            if (!_updatingTargetChoice && _targetChoice.SelectedItem is TargetOption target)
+                SelectConnectedTarget(target.Id);
+        };
+        header.Controls.Add(_targetChoice);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
@@ -361,14 +379,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
         _copyCode.Enabled = _receiver?.CanAcceptNewPeer == true &&
             !_connecting && _host == null;
-        _disconnect.Enabled = _host != null || _incomingPeer != null || _connecting;
+        _disconnect.Enabled = _host != null ||
+            _receiver?.ConnectedPeerCount > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
         if (_host != null)
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
                             $"Connected computer  ·  {_host.RemoteMonitors.Monitors.Count} display(s)";
         else if (_incomingPeer != null)
-            _summary.Text = $"This computer  ·  {localScreens} Windows display(s)     +     " +
-                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  Two-way sharing";
+            _summary.Text = $"This computer  ·  {localScreens} display(s)     +     " +
+                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  " +
+                            $"{_receiver?.ConnectedPeerCount ?? 0} devices online";
         else
             _summary.Text = $"This computer  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -378,11 +398,118 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         try
         {
+            _display.LocalDeviceName = Environment.MachineName;
             _display.Local = MonitorTopology.Capture();
-            _display.Remote = _host?.RemoteMonitors ?? _incomingPeer?.Monitors;
+            bool inbound = (_captureUsesInbound || _host == null) &&
+                _incomingPeer != null;
+            _display.Remote = inbound ? _incomingPeer!.Monitors :
+                _host?.RemoteMonitors ?? _incomingPeer?.Monitors;
+            _display.RemoteDeviceName = inbound ? _incomingPeer!.Name :
+                _host != null ? _remoteAddress : _incomingPeer?.Name ?? "Connected device";
+            UpdateTargetChoice();
             UpdateButtons();
         }
         catch (Exception ex) { Status("Windows display detection failed: " + ex.Message); }
+    }
+
+    private void UpdateTargetChoice()
+    {
+        _updatingTargetChoice = true;
+        try
+        {
+            int selected = _captureUsesInbound || _host == null
+                ? _receiver?.SelectedPeerId ?? 0 : 0;
+            _targetChoice.Items.Clear();
+            if (_host != null)
+                _targetChoice.Items.Add(new TargetOption(0,
+                    "Windows  •  " + _remoteAddress));
+            if (_receiver != null)
+                foreach (var (id, peer) in _receiver.ConnectedPeers)
+                    _targetChoice.Items.Add(new TargetOption(id,
+                        peer.Platform + "  •  " + peer.Name));
+            for (int i = 0; i < _targetChoice.Items.Count; i++)
+                if (_targetChoice.Items[i] is TargetOption item && item.Id == selected)
+                    _targetChoice.SelectedIndex = i;
+            if (_targetChoice.SelectedIndex == -1 && _targetChoice.Items.Count > 0)
+                _targetChoice.SelectedIndex = 0;
+            _targetChoice.Visible = _targetChoice.Items.Count > 0;
+        }
+        finally { _updatingTargetChoice = false; }
+    }
+
+    private void SelectConnectedTarget(int id)
+    {
+        // Switching which screen to control NEVER creates another TCP
+        // connection or merges two PC/phone certificate identities.
+        if (id == 0 && _host != null)
+        {
+            if (_captureUsesInbound)
+            {
+                _capture?.Dispose();
+                _capture = null;
+            }
+            _captureUsesInbound = false;
+            if (_capture == null)
+            {
+                try
+                {
+                    _capture = new SourceCapture(this, _host, Status,
+                        _preferredEdge, preserveRawInput: true);
+                    _capture.Arm();
+                }
+                catch (Exception ex)
+                {
+                    _capture?.Dispose();
+                    _capture = null;
+                    Status("Windows target cannot be armed: " + ex.Message);
+                }
+            }
+            RefreshDisplays();
+            return;
+        }
+        if (_receiver == null) return;
+        var target = _receiver.ConnectedPeers
+            .FirstOrDefault(p => p.Id == id);
+        if (target.Id != id || target.Peer == null) return;
+        if (!target.Peer.SupportsReverseInput)
+        {
+            Status("Enable DeskTouch Accessibility control on " +
+                target.Peer.Name + " and reconnect it to allow Windows control.");
+            RefreshDisplays();
+            return;
+        }
+        if (_host != null && !_captureUsesInbound)
+        {
+            _capture?.Dispose();
+            _capture = null;
+        }
+        _captureUsesInbound = true;
+        if (!_receiver.SelectConnectedPeer(id)) return;
+        // PeerConnected fires on selection. If the same peer was already
+        // selected, ensure the capture starts without opening a new socket.
+        ArmSelectedInbound();
+        RefreshDisplays();
+    }
+
+    private void ArmSelectedInbound()
+    {
+        if (_receiver == null || _incomingPeer?.SupportsReverseInput != true ||
+            !_captureUsesInbound && _host != null) return;
+        if (_capture != null) return;
+        try
+        {
+            _capture = new SourceCapture(this, _receiver, Status,
+                _preferredEdge, preserveRawInput: true);
+            _capture.Arm();
+            Status("Windows controls " + _incomingPeer.Name +
+                " across the existing authenticated connection.");
+        }
+        catch (Exception ex)
+        {
+            _capture?.Dispose();
+            _capture = null;
+            Status("Input capture unavailable: " + ex.Message);
+        }
     }
 
     private void StartListening()

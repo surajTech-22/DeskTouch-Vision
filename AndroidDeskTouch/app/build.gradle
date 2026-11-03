@@ -14,8 +14,34 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    // Long-lived release signing must be configured via GitHub Actions
+    // encrypted secrets; NEVER embed a signing key in the source repository.
+    signingConfigs {
+        stableRelease {
+            def keystore = System.getenv('DESKTOUCH_ANDROID_KEYSTORE_PATH')
+            def storePassword = System.getenv('DESKTOUCH_ANDROID_STORE_PASSWORD')
+            def aliasName = System.getenv('DESKTOUCH_ANDROID_KEY_ALIAS')
+            def privatePassword = System.getenv('DESKTOUCH_ANDROID_KEY_PASSWORD')
+            if (keystore && storePassword && aliasName && privatePassword) {
+                storeFile file(keystore)
+                storePassword storePassword
+                keyAlias aliasName
+                keyPassword privatePassword
+            }
+        }
+    }
     buildFeatures { buildConfig true }
-    buildTypes { release { minifyEnabled false } }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (System.getenv('DESKTOUCH_ANDROID_KEYSTORE_PATH') &&
+                System.getenv('DESKTOUCH_ANDROID_STORE_PASSWORD') &&
+                System.getenv('DESKTOUCH_ANDROID_KEY_ALIAS') &&
+                System.getenv('DESKTOUCH_ANDROID_KEY_PASSWORD')) {
+                signingConfig signingConfigs.stableRelease
+            }
+        }
+    }
     testOptions { unitTests.returnDefaultValues = true }
 }
 dependencies { implementation 'androidx.core:core:1.15.0'; testImplementation 'junit:junit:4.13.2'; testImplementation 'org.json:json:20240303' }

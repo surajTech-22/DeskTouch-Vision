@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Windows.Forms;
+using DeskTouchVision;
 
 namespace DeskTouch.DeviceShare;
 
@@ -21,6 +22,17 @@ internal sealed class DisplaySettingsForm : Form
     private readonly Button _copyCode = Button("Copy pairing code");
     private readonly Button _disconnect = Button("Disconnect");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
+    private readonly LinkLabel _checkUpdates = new()
+    {
+        Text = "Check for updates",
+        Dock = DockStyle.Right,
+        Width = 132,
+        Height = 34,
+        TextAlign = ContentAlignment.MiddleCenter,
+        LinkColor = Color.FromArgb(159, 201, 255),
+        ActiveLinkColor = Color.White,
+        VisitedLinkColor = Color.FromArgb(159, 201, 255)
+    };
 
     private readonly CancellationTokenSource _closing = new();
     private ReceiverServer? _receiver;
@@ -57,6 +69,7 @@ internal sealed class DisplaySettingsForm : Form
             ForeColor = Color.FromArgb(188, 190, 198), AutoEllipsis = true };
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
+        header.Controls.Add(_checkUpdates);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 183,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
@@ -116,6 +129,8 @@ internal sealed class DisplaySettingsForm : Form
         _copyCode.Click += (_, _) => CopyPairingCode();
         _disconnect.Click += (_, _) => DisconnectAndListen();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
+        _checkUpdates.LinkClicked += async (_, _) =>
+            await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
 
@@ -125,6 +140,7 @@ internal sealed class DisplaySettingsForm : Form
         {
             RefreshDisplays();
             StartListening();
+            UpdateClient.StartEventUpdates(this);
         };
         FormClosing += (_, _) =>
         {

@@ -864,6 +864,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             preserveRawInput: true);
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
+        session.RemoteNameChanged += HandleRemoteName;
         session.RemotePlacementChanged += HandleRemotePlacement;
         RefreshDisplays();
         _capture.Arm();
@@ -1047,6 +1048,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
     }
 
+    private void HandleRemoteName(string actualName)
+    {
+        PostToUi(() =>
+        {
+            _remoteAddress = DisplayArrangementControl.CleanDeviceName(actualName,
+                _remoteAddress);
+            RefreshDisplays();
+        });
+    }
+
     private void HandleRemoteTopology(MonitorTopology topology)
     {
         PostToUi(() =>
@@ -1090,6 +1101,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.AuthorityControlPacket -= HandleRemoteState;
             _host.AuthorityDiagnostic -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
+            _host.RemoteNameChanged -= HandleRemoteName;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
         _capture?.Dispose();

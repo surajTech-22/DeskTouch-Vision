@@ -52,6 +52,12 @@ final class DeskTouchSession implements AutoCloseable {
     static boolean allowedInputType(String type) {
         return "move".equals(type)||"button".equals(type)||"key".equals(type)||"wheel".equals(type);
     }
+    static boolean allowedWindowsControlType(String type) {
+        return "reverse-claim".equals(type)||"reverse-release".equals(type)||
+            "reverse-reset".equals(type)||"reverse-move".equals(type)||
+            "reverse-button".equals(type)||"reverse-key".equals(type)||
+            "reverse-wheel".equals(type);
+    }
     boolean isConnected(){return running;}
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
@@ -168,7 +174,7 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                 } else if("trust-denied".equals(p.type)){
                     pendingTrust=null;status("Windows declined trusted-device permission");
-                } else if(p.type.startsWith("reverse-")){
+                } else if(allowedWindowsControlType(p.type)){
                     handleWindowsControl(p);
                 } else if("goodbye".equals(p.type)) break;
             }

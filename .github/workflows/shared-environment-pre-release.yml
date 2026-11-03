@@ -1,0 +1,105 @@
+name: DeskTouch Shared Environment - pre-release verification (no publish)
+
+on:
+  push:
+    branches: [feature/shared-environment-relay-v0312]
+    paths:
+      - 'DeskTouchVision/**'
+      - 'AndroidDeskTouch/**'
+      - '.github/workflows/shared-environment-pre-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-environment:
+    name: Windows - multi-device TLS and packaging
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Run live TLS hub, 3-client authority, 8-client stress tests twice
+        shell: pwsh
+        run: |
+          foreach ($pass in @(1, 2)) {
+            Write-Host "DeskTouch environment integration run $pass / 2"
+            dotnet run --project DeskTouchVision/DeviceSharing.PolicyTests/DeviceSharing.PolicyTests.csproj -c Release
+            if ($LASTEXITCODE -ne 0) { throw "Shared environment acceptance failed on run $pass" }
+          }
+      - name: Validate updater and package integrity without installing
+        shell: pwsh
+        run: |
+          & 'DeskTouchVision/TEST_TRAY_UPDATES.ps1'
+          & 'DeskTouchVision/TEST_PAYLOAD_INTEGRITY.ps1'
+          & 'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1'
+      - name: Compile Windows runtime without publishing
+        shell: pwsh
+        run: |
+          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o preview/DeviceSharing
+          if ($LASTEXITCODE -ne 0) { throw "Sharing runtime compile failed" }
+          dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o preview
+          if ($LASTEXITCODE -ne 0) { throw "Windows app compile failed" }
+          if (!(Test-Path preview/DeskTouchVision.exe) -or
+              !(Test-Path preview/DeviceSharing/DeskTouch.DeviceShare.exe)) {
+            throw "Missing required Windows preview executables"
+          }
+      - name: Record Windows test summary
+        shell: pwsh
+        run: |
+          "source_sha=${{ github.sha }}" | Set-Content windows-verify.txt
+          "environment_integration_passes=2" | Add-Content windows-verify.txt
+          "hub_capacity_test=8_peers" | Add-Content windows-verify.txt
+          "release_published=false" | Add-Content windows-verify.txt
+          Get-FileHash preview/DeskTouchVision.exe -Algorithm SHA256 |
+            ForEach-Object { "app_sha256=$($_.Hash)" } | Add-Content windows-verify.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouch-Windows-PreRelease-Verification
+          path: windows-verify.txt
+          if-no-files-found: error
+
+  android-environment:
+    name: Android - unit tests and APK compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Android protocol and discovery regression tests twice
+        working-directory: AndroidDeskTouch
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in 1 2; do
+            echo "DeskTouch Android unit run $pass / 2"
+            gradle --no-daemon :app:testDebugUnitTest
+          done
+          gradle --no-daemon :app:assembleDebug
+          test -s app/build/outputs/apk/debug/app-debug.apk
+      - name: Record Android test summary without releasing APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "source_sha=${{ github.sha }}"
+            echo "android_unit_passes=2"
+            echo "production_signed=false"
+            echo "release_published=false"
+            echo "debug_apk_sha256=$(sha256sum AndroidDeskTouch/app/build/outputs/apk/debug/app-debug.apk | cut -d' ' -f1)"
+          } > android-verify.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouch-Android-PreRelease-Verification
+          path: android-verify.txt
+          if-no-files-found: error

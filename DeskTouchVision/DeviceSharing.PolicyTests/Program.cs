@@ -605,7 +605,25 @@ try
         "Second device must request a new lease after release");
     await secondGrant.Task.WaitAsync(TimeSpan.FromSeconds(8));
     peer3.TrySend(new Packet("release",2002));
-    Console.WriteLine("PASS: simultaneous TLS devices with one exclusive input authority lease and safe peer-to-peer transfer.");
+    // The Windows keyboard/mouse capture is pinned to its original TLS peer.
+    // Selecting another device must never misroute a delayed key or release.
+    var original = multiServer.ConnectedPeers.OrderBy(x => x.Id).First();
+    var alternate = multiServer.ConnectedPeers.OrderBy(x => x.Id).Last();
+    Check(multiServer.SelectConnectedPeer(original.Id),
+        "First authenticated Windows peer should be selectable");
+    IInputSession bound = multiServer.BindSelectedInput();
+    Check(multiServer.SelectConnectedPeer(alternate.Id),
+        "Second authenticated Windows peer should be selectable without disconnect");
+    Check(bound.TrySend(new Packet("release",3003)),
+        "Old capture must still address its original connected input peer");
+    peer2.Dispose();
+    for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
+        await Task.Delay(100,timeout.Token);
+    Check(multiServer.SelectedPeerId==alternate.Id,
+        "Switching targets must retain the other connected Windows peer");
+    Check(!bound.TrySend(new Packet("release",3004)),
+        "Old capture must not route a stale release into the newly selected peer");
+    Console.WriteLine("PASS: simultaneous TLS devices, exclusive authority and pinned input routing on target switches.");
 }
 finally
 {

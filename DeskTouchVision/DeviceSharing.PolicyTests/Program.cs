@@ -257,7 +257,7 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
     receiver.PeerConnected += peer => connected.TrySetResult(peer);
     receiver.PeerPlacementChanged += edge => remoteArrangement.TrySetResult(edge);
     receiver.PeerTopologyChanged += peer => remoteRefresh.TrySetResult(peer);
-    receiver.PeerDisconnected += () => ended.TrySetResult(true);
+    receiver.PeerDisconnected += peerId => ended.TrySetResult(peerId > 0);
     receiver.Start();
     using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
     try

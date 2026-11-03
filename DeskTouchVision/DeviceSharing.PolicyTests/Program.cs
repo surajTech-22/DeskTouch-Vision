@@ -34,6 +34,20 @@ Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.
     "Windows sign-in command must launch the sharing app to tray");
 Console.WriteLine("PASS: two Windows peers, busy device, Android beacon and sign-in startup command.");
 
+// An idle, discoverable DeskTouch listener must never install global input
+// hooks or grant remote authority. Only a connected, monitored peer can claim.
+Check(!InputClaimLifecyclePolicy.CanGrant(false, false, false),
+    "No remote input authority is permitted while no peer is paired.");
+Check(!InputClaimLifecyclePolicy.CanGrant(false, true, false),
+    "A stale remote-active flag cannot bypass inactive physical monitoring.");
+Check(InputClaimLifecyclePolicy.CanGrant(true, false, false),
+    "An authenticated monitored peer may request input authority.");
+Check(!InputClaimLifecyclePolicy.CanGrant(true, true, false),
+    "Forward remote claim must be refused during reverse input control.");
+Check(!InputClaimLifecyclePolicy.CanGrant(true, false, true),
+    "Forward remote claim must be refused during pending reverse handoff.");
+Console.WriteLine("PASS: discovery-only startup cannot grant input; global monitoring required for sharing.");
+
 long fakeClock = 100000;
 var priority = new LocalInputPriority(() => fakeClock);
 int nativePreemptions = 0;

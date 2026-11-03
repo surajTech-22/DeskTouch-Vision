@@ -390,8 +390,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_receiver != null || _host != null || _connecting || _closing.IsCancellationRequested) return;
         try
         {
+            // Discovery and trusted auto-connect do not need global keyboard
+            // or mouse hooks. Arm input monitoring only after TLS pairing has
+            // authenticated an active incoming peer.
             _nativeInput = new PhysicalInputMonitor(this);
-            _nativeInput.Start();
             _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync,
                 _trusted, ConfirmTrustAsync);
             _receiver.PeerConnected += OnIncomingPeerConnected;
@@ -400,7 +402,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
             _receiver.ReverseControlMessage += HandleReverseState;
             _receiver.AllowForwardClaim = () =>
-                _capture == null || (!_capture.RemoteActive && !_capture.IsClaimPending);
+                InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
+                    _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
             _receiver.Start();
             try
             {
@@ -416,7 +419,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     });
                     _discovery.Start();
                 }
-                Status("Ready. Nearby Windows PCs and Android devices can find this computer.");
+                Status("Ready for trusted device discovery. No global input hooks while unpaired.");
             }
             catch (Exception ex)
             {
@@ -475,6 +478,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
+            if (_receiver == null) return;
+            try
+            {
+                _nativeInput?.Start();
+                if (_nativeInput?.IsRunning != true)
+                    throw new InvalidOperationException("Native input safety monitor could not start.");
+            }
+            catch (Exception ex)
+            {
+                // Never allow remote SendInput injection if the native local
+                // priority monitor cannot be established. Disconnect the peer.
+                Status("Safe input monitoring unavailable; pairing disconnected: " + ex.Message);
+                _receiver.DisconnectPeer();
+                return;
+            }
             _incomingPeer = peer;
             RefreshDisplays();
             if (_receiver != null && _capture == null)
@@ -508,10 +526,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 _capture?.Dispose();
                 _capture = null;
+                // Remove system-wide hooks again on disconnect, but keep the
+                // same priority instance for the next authenticated peer.
+                _nativeInput?.Dispose();
             }
             _incomingPeer = null;
             RefreshDisplays();
-            Status("Two-way peer disconnected. Local keyboard/mouse remain available.");
+            Status("Peer disconnected. Input hooks released; discovery remains available.");
         });
     }
 

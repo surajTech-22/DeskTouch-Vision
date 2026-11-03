@@ -1,79 +1,56 @@
-# DeskTouch Vision — Offline Visual Keyboard & Mouse (Preview)
+# DeskTouch Vision — Windows display-style keyboard and mouse sharing
 
-This is the **official standalone repository** for the experimental DeskTouch Vision Windows application. It is separate from DeskSpace.
+DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-## Verified build and installation
+**Version:** 0.2.1 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
 
-- The **first independent Windows build and release succeeded**: https://github.com/surajTech-22/DeskTouch-Vision/actions/runs/41449397062
-- Official preview release: https://github.com/surajTech-22/DeskTouch-Vision/releases/tag/v0.1.0
-- Installer: https://github.com/surajTech-22/DeskTouch-Vision/releases/download/v0.1.0/DeskTouchVision-win-x64.zip
-- Matching checksum: https://github.com/surajTech-22/DeskTouch-Vision/releases/download/v0.1.0/DeskTouchVision-win-x64.zip.sha256
-- Release ZIP SHA-256: `055ebbdc99cee88d9a4e24d4af2e4c46e9e68ca913f8fd1571f20ae55f490036`
+## How it should work
 
-The ZIP is a Windows x64 preview installer. CI verified compilation, packaging and release publishing, **not real-world recognition accuracy or automatic update installation on a laptop**.
+1. Install DeskTouch Vision on both authorized Windows computers. Open the app on both computers. Each shows its own numbered Windows monitors automatically. The native Windows **Extend displays** arrangement remains authoritative and untouched.
+2. On the computer with the keyboard/mouse you want to share, select **Add a computer**. Nearby DeskTouch PCs are discovered over the LAN (when private-network broadcast is permitted).
+3. Choose the target computer. The receiving Windows computer asks **Allow connection?**. Approving pairs a certificate-pinned, encrypted channel. If LAN discovery fails, use **Copy pairing code** on the receiver and paste it into the Add dialog instead.
+4. After connecting, the remote computer appears as another set of numbered displays in the same arrangement. Drag the remote group left, right, up or down. This changes **DeskTouch's cross-computer switching boundary**, not the positions of monitors configured in Windows.
+5. Move the mouse across the configured outside edge. DeskTouch requests keyboard/mouse control only after the receiver's physical devices have been idle for two seconds. Internal native Windows monitor seams continue to work normally.
+6. The receiver's **own built-in or attached keyboard, touchpad and mouse always override** shared input immediately. A disconnected but idle device does not block sharing. Remote access requires a new deliberate edge crossing after local activity ceases.
+7. Move across the opposite external edge, press **Ctrl+Alt+Shift+F12**, disconnect, or close DeskTouch to restore control to the source computer.
 
-## Windows keyboard and mouse sharing — v0.2.0 experimental preview
+**Important distinction:** Windows' native Display Settings controls monitors connected to a *single* PC. DeskTouch presents other *computers* as additional draggable groups in its own interface; it does not create fake Windows monitors, change registry display settings, disable native keyboard/mouse hardware, stream desktops, or alter the Windows driver stack.
 
-**The Windows-to-Windows feature is opt-in and not yet validated on two physical PCs.** It does not require camera recognition. Install the same DeskTouch Vision app on two authorized Windows computers connected to a trusted local network.
+## Install on Windows
 
-1. On PC 2, open **Windows device sharing** in DeskTouch, then click **Start receiver on this PC**. Allow inbound access on trusted **Private** networks if Windows Firewall asks. The UI displays the receiver's local IPv4 address, certificate fingerprint and temporary pairing secret.
-2. On PC 1, open **Windows device sharing**; enter the IPv4 address, full certificate fingerprint and pairing secret from PC 2. Check the authorization box, then click **Connect to receiver** and **Arm right-edge switching**.
-3. Move the cursor to the right **external edge** of PC 1's Windows extended desktop. The receiver explicitly grants control only when its physical input devices have been idle for at least 2 seconds. Native monitor seams remain normal Windows cursor movement.
-4. Type or move the connected input devices on PC 1 to control PC 2. Move past the left edge on PC 2 or press **Ctrl+Alt+Shift+F12** on PC 1 to regain local control.
-5. If anyone uses PC 2's own built-in or attached keyboard, touchpad, or mouse, its native input **takes priority immediately** and the sender returns to local control. A disconnected network link also releases remotely held buttons and keys after the heartbeat timeout.
-6. To stop sharing, click **Disconnect / return local** or close the Windows Device Sharing window on either computer. DeskTouch does not disable native drivers.
+Use the latest release: https://github.com/surajTech-22/DeskTouch-Vision/releases/latest
 
-**Limitations:** Only two Windows computers and a right-edge handoff are implemented in this preview; configurable multi-PC layouts and Android are future work. Windows secure desktop/UAC and elevated apps may reject injected input. Keyboard-layout differences and high-DPI multi-monitor behavior require real-hardware validation. Do not rely on experimental remote control as the only way to access a computer. The old camera-only disconnected keyboard/mouse feature and touchpad conversion remain on hold.
+- Download `DeskTouchVision-win-x64.zip` and the accompanying `.sha256` file.
+- Extract the ZIP and run `INSTALL_DESKTOUCH.cmd`. The installation is per-user and does not require .NET on the computer.
+- Desktop shortcut `DeskTouch Vision` now opens the **Displays** interface directly. The camera window will no longer open behind it.
+- If Windows Firewall prompts, permit the program only on **Private** networks. Discovery uses UDP 37378, and the encrypted pairing/input connection uses TCP 37377.
+- **Windows display settings** opens Microsoft's native display configuration screen for local monitor reordering and resolution changes.
+- All runtime gesture/input processing is local. Only optional update checks contact GitHub/ntfy.
+- Release-event auto-update checks GitHub's newest release, verifies a SHA-256 checksum, gracefully exits the input sharing app, replaces the package with rollback protection and restarts. Its end-to-end unattended operation on the user's PC still needs field testing.
 
-**Standalone package:** `DeskTouchVision-win-x64.zip` includes `app/DeskTouchVision.exe` and `app/DeviceSharing/DeskTouch.DeviceShare.exe`. The installer is `INSTALL_DESKTOUCH.cmd`. After installing, the optional release-event updater obtains subsequent tagged GitHub releases, verifies the SHA-256 checksum, closes both app processes gracefully, and restarts. It never disables native keyboard or mouse drivers. Unattended updates and input handoff must still be verified on two real PCs.
+### Manual pairing fallback
 
-## Critical feasibility requirements
+On the receiving PC, click **Copy pairing code**. Paste this complete code in the lower section of **Add a computer** on the controlling PC. The 32-digit secret is never advertised during automatic LAN discovery. Treat the code like a temporary access credential.
 
-The laptop's built-in webcam **must be able to see** the physical keyboard, mouse and fingers during use. A standard front-facing laptop webcam usually looks toward the user, not the desk, and cannot see behind/below itself. Software cannot infer precise actions outside the camera view. Full disconnected-device keyboard/mouse emulation is a research goal, not a currently working capability.
+## Safety and limitations
 
-## Currently implemented
+- **Preview:** builds and automated input-priority logic tests do not establish stable real hardware operation. Verify with a mouse and keyboard physically attached to each PC before relying on cross-computer input.
+- Initial release supports **two Windows PCs per active connection**. Multiple-PC mesh/topology, Android input sharing, shared clipboard and persistent remembered trust are later milestones.
+- Native Windows multi-monitor configurations are recognized but not changed. The receiver must remain in a logged-in desktop session; UAC secure desktop, Windows lock screens and elevated apps may refuse synthetic input.
+- LAN discovery can be blocked by Windows firewalls, client isolation, VPNs or different subnets. Manual code pairing remains available.
+- No keyboard content is logged. The shared source computer's own keyboard is intentionally forwarded while remote control is active; use a return edge or emergency shortcut to reclaim it.
+- The offline camera-disconnected-keyboard feature and the touchpad-to-touchscreen experiment are **on hold**. The prior camera calibration preview can be opened explicitly with `DeskTouchVision.exe --camera-experiment`; it is not the main experience.
 
-- Offline built-in camera preview (no cloud inference and no video recording).
-- Manual calibration of keyboard and mouse rectangles in camera view.
-- Simple approximate 3-row QWERTY visual guide, and basic change-from-idle movement visualization, NOT true automatic key identification or keystroke detection.
-- Local calibration file in `%LOCALAPPDATA%\DeskTouchVision\camera-calibration.json`.
-- Privacy Stop button; no simulated keypresses or mouse events.
-- Per-user Windows installation via `INSTALL_DESKTOUCH.cmd` and a self-contained x64 .NET 8 packaged executable.
-- Optional auto-update scaffold: check the official separate GitHub repository's latest release on app launch, listen for release events (ntfy SSE), download asset + SHA-256, close the app, install via independent PowerShell updater, restart. **This is staged, not active until the separate repo and releases are configured and published.**
-- No hourly polling; SSE reconnects after disconnection. Network only for optional updates.
+## Developer notes
 
-## Install preview (Windows x64)
+The repository contains the main `DeskTouchVision` launcher, separate `DeskTouch.DeviceShare` Windows module, release-event updater, Windows installer scripts, monitor mapping and LAN authentication, and deterministic priority/topology regression tests.
 
-1. Open the official v0.1.0 release linked above.
-2. Download asset `DeskTouchVision-win-x64.zip`.
-3. Extract the ZIP.
-4. Double-click `INSTALL_DESKTOUCH.cmd`.
-5. It installs under `%LOCALAPPDATA%\Programs\DeskTouchVision` and creates a desktop shortcut.
-6. In the app, press **Start camera**, allow Windows webcam access, then **Set keyboard area** / **Set mouse area**.
-7. Camera preview and motion overlays will work only if the camera sees those objects.
+Build both applications on a Windows x64 build machine:
 
-You can also build locally:
 ```powershell
-dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+dotnet run --project DeskTouchVision/DeviceSharing.PolicyTests/DeviceSharing.PolicyTests.csproj -c Release
+dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
-## Official release and updates
-
-Windows packages are built by the repository's own GitHub Actions workflow. The first preview release is generated when the app is built on main, with version `v0.1.0` and SHA-256 checksum; later releases need a version bump and successful Windows build. Installed apps look for releases from this repository and accept release event notifications; end-to-end update operation remains unverified until a subsequent release.
-
-## Implementation milestones
-
-- [x] Standalone build + installer packaging CI.
-- [x] Preview camera and manual calibration.
-- [x] Offline motion visualization.
-- [x] Optional event-based update infrastructure, staged.
-- [x] Dedicated repository created and project migrated.
-- [ ] End-to-end v0.1.0→v0.2.0 updater validation on a physical Windows installation; preview artifacts are not code signed.
-- [ ] Camera-view geometry feasibility test on real laptop.
-- [ ] Offline model for keyboard and keycap layout recognition.
-- [ ] Accurate finger-contact inference, including two-handed typing and false-positive suppression.
-- [ ] Mouse movement, click-button and wheel motion recognition.
-- [ ] Explicit opt-in OS input emulation with keyboard emergency stop.
-- [ ] Benchmarked accuracy, latency, CPU use, darkness and occlusion handling.
-
-The older **absolute physical touchpad mapping** experiment remains ON HOLD, separate from this project.
+Do not claim actual two-PC functional acceptance without testing local native preemption, USB/Bluetooth devices, split-monitor seams, all four edge directions, wired/Wi-Fi disconnect, recovery from app exit and delayed updater restarts on real hardware.

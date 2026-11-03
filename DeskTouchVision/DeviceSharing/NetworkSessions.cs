@@ -11,9 +11,11 @@ using System.Text.Json;
 namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
-    bool SupportsReverseInput = true, string? DeviceFingerprint = null);
+    bool SupportsReverseInput = true, string? DeviceFingerprint = null,
+    string Platform = "Windows");
 internal sealed record PeerHello(string Name, string Layout,
-    bool? ReverseInputSupported = null, string? Fingerprint = null);
+    bool? ReverseInputSupported = null, string? Fingerprint = null,
+    string? Platform = null);
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -310,8 +312,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // it to authenticate the source or grant remote keyboard authority.
         string? hint = hello.Fingerprint is { Length:64 } id &&
             id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
+        string platform = string.Equals(hello.Platform, "Android",
+            StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true, hint);
+            hello.ReverseInputSupported ?? true, hint, platform);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -422,7 +426,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     bool granted=false;
                     lock(_authorityGate)
                     {
-                        if(p.A>0 && (_owner==null || ReferenceEquals(_owner,session)) &&
+                        // One-way Android mode: never accept Android->Windows
+                        // keyboard/mouse claims. Android remains paired for
+                        // Windows->Android control via reverse-* packets.
+                        if(p.A>0 && session.Peer.Platform!="Android" &&
+                           (_owner==null || ReferenceEquals(_owner,session)) &&
                            (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
                         {
                             _owner=session;
@@ -750,7 +758,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             string sourceId = Convert.ToHexString(
                 SHA256.HashData(identity.RawData));
             var hello = JsonSerializer.Serialize(
-                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId));
+                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId, "Windows"));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             return new HostSession(client, ssl, monitors, onFailure);

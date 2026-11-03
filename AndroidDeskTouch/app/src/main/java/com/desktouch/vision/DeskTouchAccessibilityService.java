@@ -37,6 +37,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         new java.util.concurrent.atomic.AtomicBoolean();
     private int downX,downY;
     private boolean held,shift,control,alt,remoteGesture;
+    private volatile boolean remoteActive;
 
     static boolean allowed(Context context){
         return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
@@ -47,7 +48,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             .putBoolean(ALLOWED,allowed).apply();
         if(!allowed){
             DeskTouchAccessibilityService service=instance;
-            if(service!=null)service.ui.post(service::removePointer);
+            if(service!=null){
+            service.remoteActive=false;
+            service.ui.post(service::removePointer);
+        }
             DeskTouchRuntime.remoteNativeTouch();
         }
     }
@@ -119,6 +123,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     static boolean pointer(int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return false;
+        service.remoteActive=true;
         // Retain the newest position on fast mice/touchpads instead of
         // filling Android's UI queue with hundreds of obsolete moves.
         service.pendingX=px;
@@ -130,12 +135,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     private void flushPointer(){
         int px=pendingX,py=pendingY;
-        if(ready(this))showPointer(px,py);
+        if(remoteActive&&ready(this))showPointer(px,py);
         Runnable ack=pendingApplied;
         pendingApplied=null;
         moveScheduled.set(false);
-        if(cursor!=null&&ack!=null&&ready(this))ack.run();
-        if(ready(this)&&(px!=pendingX||py!=pendingY) &&
+        if(remoteActive&&cursor!=null&&ack!=null&&ready(this))ack.run();
+        if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
             moveScheduled.compareAndSet(false,true))
             ui.post(this::flushPointer);
     }

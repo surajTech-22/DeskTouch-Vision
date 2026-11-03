@@ -5,6 +5,7 @@ import android.content.*;
 import android.graphics.*;
 import android.os.*;
 import android.provider.Settings;
+import android.text.*;
 import android.view.*;
 import android.widget.*;
 import java.util.List;
@@ -19,6 +20,8 @@ public final class MainActivity extends Activity {
     private float prevX,prevY,downX,downY;
     private boolean dragged;
     private volatile boolean scanning;
+    private float pointerSpeed=2.8f;
+    private boolean suppressTypedText;
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
@@ -53,7 +56,7 @@ public final class MainActivity extends Activity {
         heading.setTextColor(Color.WHITE);
         page.addView(heading);
         TextView hint=new TextView(this);
-        hint.setText("One-way mode: control this Android screen from connected Windows PCs");
+        hint.setText("One linked network • Windows ↔ Android mouse and keyboard sharing");
         hint.setTextColor(Color.LTGRAY);
         hint.setPadding(0,dp(4),0,dp(12));
         page.addView(hint);
@@ -64,6 +67,15 @@ public final class MainActivity extends Activity {
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
         addButton(page,"Find devices",this::scan);
+        addButton(page,"Take control of selected Windows screen",()->{
+            DeskTouchRuntime.releaseAll();
+            session=DeskTouchRuntime.session(this);
+            session.claimControl();
+        });
+        addButton(page,"Return keyboard and mouse control to this device",()->{
+            DeskTouchRuntime.releaseAll();
+            status.setText("Remote Windows input returned. Secure connections remain open.");
+        });
         connectionSummary=new TextView(this);
         connectionSummary.setTextColor(Color.rgb(171,216,188));
         connectionSummary.setPadding(0,dp(5),0,dp(9));
@@ -117,14 +129,120 @@ public final class MainActivity extends Activity {
         // Only checks official GitHub metadata; never downloads or silently
         // installs an executable without explicit user action.
         AndroidUpdater.checkForUpdates(this,false);
+        TextView padLabel=new TextView(this);
+        padLabel.setText("Mobile touchpad / connected mouse");
+        padLabel.setTextColor(Color.WHITE);padLabel.setTextSize(16);
+        padLabel.setPadding(0,dp(12),0,dp(6));page.addView(padLabel);
+        SeekBar pointerSensitivity=new SeekBar(this);
+        pointerSensitivity.setMax(400);pointerSensitivity.setProgress(180);
+        pointerSensitivity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
+            public void onProgressChanged(SeekBar b,int progress,boolean fromUser){
+                pointerSpeed=1f+progress/100f;
+            }
+            public void onStartTrackingTouch(SeekBar b){}
+            public void onStopTrackingTouch(SeekBar b){}
+        });
+        page.addView(pointerSensitivity);
+        pointerPad=new View(this){
+            final Paint paint=new Paint(3);
+            @Override protected void onDraw(Canvas c){
+                paint.setColor(Color.rgb(49,56,69));
+                c.drawRoundRect(0,0,getWidth(),getHeight(),dp(12),dp(12),paint);
+                paint.setColor(Color.rgb(200,208,220));
+                paint.setTextAlign(Paint.Align.CENTER);paint.setTextSize(dp(14));
+                c.drawText("Move to navigate • tap to click",getWidth()/2f,getHeight()/2f,paint);
+                c.drawText("Swipe across a group edge to switch PC",getWidth()/2f,
+                    getHeight()/2f+dp(22),paint);
+            }
+            @Override public boolean onCapturedPointerEvent(MotionEvent e){
+                if(e.getActionMasked()==MotionEvent.ACTION_MOVE){
+                    session.moveBy(e.getX()*pointerSpeed,e.getY()*pointerSpeed);
+                    return true;
+                }
+                if(e.getActionMasked()==MotionEvent.ACTION_SCROLL){
+                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_VSCROLL)*120),false);
+                    session.wheel(Math.round(e.getAxisValue(MotionEvent.AXIS_HSCROLL)*120),true);
+                    return true;
+                }
+                if(e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS ||
+                    e.getActionMasked()==MotionEvent.ACTION_BUTTON_RELEASE){
+                    int button=e.getActionButton()==MotionEvent.BUTTON_SECONDARY?2:
+                        e.getActionButton()==MotionEvent.BUTTON_TERTIARY?3:1;
+                    session.button(button,e.getActionMasked()==MotionEvent.ACTION_BUTTON_PRESS);
+                    return true;
+                }
+                return super.onCapturedPointerEvent(e);
+            }
+        };
+        pointerPad.setFocusable(true);pointerPad.setFocusableInTouchMode(true);
+        page.addView(pointerPad,new LinearLayout.LayoutParams(-1,dp(185)));
+        pointerPad.setOnTouchListener((v,event)->{
+            switch(event.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:
+                    prevX=downX=event.getX();prevY=downY=event.getY();dragged=false;
+                    v.requestFocus();return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx=event.getX()-prevX,dy=event.getY()-prevY;
+                    if(Math.abs(event.getX()-downX)+Math.abs(event.getY()-downY)>dp(9))
+                        dragged=true;
+                    session.moveBy(dx*pointerSpeed,dy*pointerSpeed);
+                    prevX=event.getX();prevY=event.getY();return true;
+                case MotionEvent.ACTION_UP:
+                    if(!dragged)session.click(1);
+                    v.performClick();return true;
+                default:return true;
+            }
+        });
+        addButton(page,"Capture connected physical mouse",()->{
+            pointerPad.requestFocus();pointerPad.requestPointerCapture();
+            status.setText("Physical mouse captured; use Back to release it.");
+        });
+        TextView keyboardLabel=new TextView(this);
+        keyboardLabel.setText("Type on the selected Windows screen using Android keyboard");
+        keyboardLabel.setTextColor(Color.WHITE);page.addView(keyboardLabel);
+        EditText keyboardInput=new EditText(this);
+        keyboardInput.setHint("Tap to open the Android keyboard");
+        keyboardInput.setSingleLine(false);
+        keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
+            android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        page.addView(keyboardInput);
+        keyboardInput.addTextChangedListener(new TextWatcher(){
+            private String last="";
+            public void beforeTextChanged(CharSequence text,int start,int count,int after){}
+            public void onTextChanged(CharSequence text,int start,int before,int count){}
+            public void afterTextChanged(Editable editable){
+                if(suppressTypedText)return;
+                String next=editable.toString();
+                if(session!=null&&session.isActive()){
+                    int common=0;
+                    while(common<last.length()&&common<next.length()&&
+                        last.charAt(common)==next.charAt(common))common++;
+                    for(int n=common;n<last.length();n++){
+                        session.key(8,true);session.key(8,false);
+                    }
+                    if(common<next.length())session.text(next.substring(common));
+                }
+                last=next;
+                if(next.length()>800){
+                    suppressTypedText=true;
+                    editable.clear();last="";
+                    suppressTypedText=false;
+                }
+            }
+        });
+        addButton(page,"Clear mobile typing field",()->{
+            suppressTypedText=true;keyboardInput.setText("");suppressTypedText=false;
+        });
+        addButton(page,"Android keyboard settings",()->
+            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
+        addButton(page,"Android Bluetooth keyboard / mouse settings",()->
+            startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
         TextView note=new TextView(this);
-        note.setText("1. Enable Windows control and approve the Android Accessibility service. " +
-            "2. Reconnect this phone to the Windows DeskTouch app. " +
-            "3. In Windows Displays select this Android phone and position its screen. " +
-            "4. Move the Windows cursor to that outside edge. Windows mouse taps and " +
-            "typing in ordinary editable fields then control Android. " +
-            "Android touch always cancels remote control. Password fields remain protected. " +
-            "This is not an Android virtual display or full hardware keyboard driver.");
+        note.setText("Join the linked Windows group once, approving pairing separately on " +
+            "each Windows PC. Select an active screen and take input control. " +
+            "The mobile keyboard works in the typing field while a Windows claim is active. " +
+            "For Windows to control Android, enable Accessibility above; ordinary editable " +
+            "non-password fields are supported. Android remains in control of local touch.");
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);

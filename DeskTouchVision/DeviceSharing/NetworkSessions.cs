@@ -489,6 +489,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 lock(_authorityGate)
                     lease=ReferenceEquals(_owner,session)?session.Lease:0;
                 bool applied=false;
+                bool injectionAttempted=false;
                 if(lease>0 && _priority.CanApplyRemote &&
                    p.Type is ("move" or "button" or "key" or "wheel"))
                 {
@@ -498,10 +499,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         {
                             if(ReferenceEquals(_owner,session) && lease==session.Lease &&
                                _priority.CanApplyRemote)
+                            {
+                                injectionAttempted=true;
                                 applied=session.Injector.Handle(p);
+                            }
                         }
                     }
-                    if(!applied && p.Type=="key" &&
+                    if(injectionAttempted && !applied && p.Type=="key" &&
                        Interlocked.CompareExchange(ref session.KeyboardFailureReported,1,0)==0)
                     {
                         // Never log characters, scan codes, or personal input.

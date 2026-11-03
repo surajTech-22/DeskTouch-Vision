@@ -5,10 +5,45 @@ param(
   [Parameter(Mandatory=$true)][string]$ExpectedHash
 )
 $ErrorActionPreference = 'Stop'
+# Set current directory OUTSIDE the application before touching install files.
+# Windows refuses to rename folders that are another process's current dir.
+$oldWorkingDirectory = (Get-Location).ProviderPath
+$independentWorkingDirectory = [IO.Path]::GetFullPath($env:TEMP)
+Set-Location -LiteralPath $independentWorkingDirectory
+$installMutex = New-Object System.Threading.Mutex($false, 'Local\DeskTouchVision.Installer')
+$hasInstallMutex = $false
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 $log = Join-Path $logs 'update.log'
 function Log([string]$text) { ("{0:u} {1}" -f (Get-Date), $text) | Out-File $log -Append -Encoding utf8 }
+
+function Assert-InstallDirectoryAvailable([string]$directory) {
+  # The application folder may have a transient handle during shutdown.
+  # Retry the RENAME several times; do not force-kill input-sharing apps.
+  if (-not (Test-Path -LiteralPath $directory)) { return }
+  $targetBackup = Join-Path (Split-Path $directory -Parent) (
+    'DeskTouchVision.backup-' + [guid]::NewGuid().ToString('N'))
+  for ($attempt = 1; $attempt -le 8; $attempt++) {
+    try {
+      Move-Item -LiteralPath $directory -Destination $targetBackup -ErrorAction Stop
+      return $targetBackup
+    } catch {
+      Log "Install directory still held (attempt $attempt/8). Waiting for graceful release."
+      if ($attempt -eq 8) {
+        $owners = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+          Where-Object { $_.ExecutablePath -and
+            $_.ExecutablePath.StartsWith($directory + '\',
+              [StringComparison]::OrdinalIgnoreCase) } |
+          Select-Object Name, ProcessId)
+        foreach ($owner in $owners) {
+          Log ("Potential lock owner {0} PID={1}" -f $owner.Name, $owner.ProcessId)
+        }
+        throw "Installation folder remains in use. Please close any open Explorer windows inside DeskTouch and retry. Updater working directory: $independentWorkingDirectory"
+      }
+      Start-Sleep -Milliseconds 750
+    }
+  }
+}
 
 function Stop-InstalledApplications([string]$installDir) {
   foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
@@ -36,6 +71,16 @@ $backup = $null
 $movedOriginal = $false
 $activated = $false
 try {
+  try {
+    $hasInstallMutex = $installMutex.WaitOne(0)
+  } catch [System.Threading.AbandonedMutexException] {
+    $hasInstallMutex = $true
+  }
+  if (-not $hasInstallMutex) {
+    Log 'Another DeskTouch installer is already running; skipping duplicate attempt.'
+    return
+  }
+  Log "Installer launched with outside working directory: $independentWorkingDirectory"
   $targetFull = [IO.Path]::GetFullPath($Target).TrimEnd('\')
   $expectedTarget = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision')).TrimEnd('\')
   if (-not [string]::Equals($targetFull, $expectedTarget, [StringComparison]::OrdinalIgnoreCase)) {
@@ -65,10 +110,10 @@ try {
 
   $parentDir = Split-Path $targetFull -Parent
   New-Item -ItemType Directory -Force -Path $parentDir | Out-Null
-  $backup = Join-Path $parentDir ('DeskTouchVision.backup-' + [guid]::NewGuid().ToString('N'))
   if (Test-Path -LiteralPath $targetFull) {
-    Move-Item -LiteralPath $targetFull -Destination $backup
+    $backup = Assert-InstallDirectoryAvailable $targetFull
     $movedOriginal = $true
+    Log "Existing install safely renamed to $backup"
   }
   Move-Item -LiteralPath $payload -Destination $targetFull
   if (-not (Test-Path (Join-Path $targetFull 'DeskTouchVision.exe'))) {
@@ -115,4 +160,8 @@ finally {
   if ($stage -and (Test-Path -LiteralPath $stage)) {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   }
+  if ($hasInstallMutex) {
+    try { $installMutex.ReleaseMutex() } catch { }
+  }
+  $installMutex.Dispose()
 }

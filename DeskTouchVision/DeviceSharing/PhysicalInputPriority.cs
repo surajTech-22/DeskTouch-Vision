@@ -54,6 +54,17 @@ internal sealed class LocalInputPriority
 }
 
 /// <summary>
+/// Refuse remote authority unless physical-input safety monitoring is active.
+/// Independent, testable gate: inactive app discovery never injects input.
+/// </summary>
+internal static class InputClaimLifecyclePolicy
+{
+    internal static bool CanGrant(bool physicalMonitoringActive,
+        bool reverseRemoteActive, bool reverseClaimPending) =>
+        physicalMonitoringActive && !reverseRemoteActive && !reverseClaimPending;
+}
+
+/// <summary>
 /// Local hardware keyboard, touchpad and mouse activity, including when this
 /// window is in the background. Never blocks/disables native input.
 /// LL hooks are an additional detector where touchpad activity does not appear

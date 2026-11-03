@@ -567,7 +567,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             if (_host != null && _currentFingerprint.Length == 64)
                                 neighbours.Add(_currentFingerprint);
                             return neighbours;
-                        });
+                        }, () => _host == null);
                     _discovery.Start();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");

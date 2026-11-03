@@ -400,7 +400,14 @@ internal sealed class PeerReceiverSession : IInputSession, IDisposable
                     lock (_inputGate) injector.ReleaseAll();
                     continue;
                 }
-                if (p.Type == "ping") continue;
+                if (p.Type == "ping")
+                {
+                    // Android requires a reply to its own heartbeat. Prior
+                    // Windows code silently ignored pings; Android's 22-second
+                    // read timeout therefore tore down healthy connections.
+                    await SendControlAsync(new Packet("pong"), token);
+                    continue;
+                }
                 int lease = Volatile.Read(ref _forwardLease);
                 bool cursorApplied = false;
                 lock (_inputGate)

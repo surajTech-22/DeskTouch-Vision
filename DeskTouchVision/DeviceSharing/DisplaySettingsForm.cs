@@ -76,7 +76,11 @@ internal sealed class DisplaySettingsForm : Form
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52,
-            FlowDirection = FlowDirection.LeftToRight, AutoSize = false, WrapContents = true };
+            Name = "ConnectionActions",
+            FlowDirection = FlowDirection.LeftToRight, AutoSize = false,
+            // Wrapping creates a hidden second row beneath the fixed-height
+            // action bar at high Windows DPI. Keep one stable visible row.
+            WrapContents = false, AutoScroll = true };
         foreach (var b in new[] { _add, _copyCode, _disconnect, _nativeDisplaySettings })
         {
             b.Height = 35;

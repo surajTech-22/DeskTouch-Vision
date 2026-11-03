@@ -62,6 +62,17 @@ Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.
     "Windows sign-in command must launch the sharing app to tray");
 Console.WriteLine("PASS: two Windows peers, busy device, Android beacon and sign-in startup command.");
 
+Check(SourceCapture.ScaleRawDelta(1, 10) >= 1,
+    "Slow physical mouse movement must remain visible on the remote PC");
+Check(SourceCapture.ScaleRawDelta(10, 10) > 10,
+    "Remote Windows mouse should honor native sensitivity instead of raw slow deltas");
+Check(SourceCapture.ScaleRawDelta(10, 20) >
+    SourceCapture.ScaleRawDelta(10, 10),
+    "Windows pointer speed settings must affect remote movement");
+Check(SourceCapture.ScaleRawDelta(0, 10) == 0,
+    "Idle mouse must not generate artificial movement");
+Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow movements.");
+
 // An idle, discoverable DeskTouch listener must never install global input
 // hooks or grant remote authority. Only a connected, monitored peer can claim.
 Check(!InputClaimLifecyclePolicy.CanGrant(false, false, false),

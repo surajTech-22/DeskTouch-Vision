@@ -34,6 +34,7 @@ internal sealed class ShareForm : Form
         ForeColor = Color.White, AutoSize = true, Padding = new Padding(3, 6, 0, 0) };
 
     private ReceiverServer? _receiver;
+    private PhysicalInputMonitor? _nativeInput;
     private HostSession? _host;
     private SourceCapture? _capture;
 
@@ -52,8 +53,8 @@ internal sealed class ShareForm : Form
             Font = new Font("Segoe UI Semibold", 23), ForeColor = Color.White,
             Padding = new Padding(18, 12, 0, 0) };
         var subtitle = new Label {
-            Text = "Native Windows Extend displays are preserved on each PC. Only external monitor edges switch computers.\n" +
-                   "Two-PC experimental LAN input sharing; no screen streaming or virtual monitor drivers.",
+            Text = "Every PC's physical keyboard/mouse always wins; remote control pauses immediately on native activity.\n" +
+                   "Windows Extended Desktop is preserved; only external edges transfer between computers.",
             Dock = DockStyle.Top, Height = 73, ForeColor = Color.FromArgb(186, 208, 229),
             Padding = new Padding(22, 1, 15, 4) };
         var columns = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
@@ -96,8 +97,9 @@ internal sealed class ShareForm : Form
         panel.Controls.Add(_listen);
         panel.Controls.Add(_stopReceive);
         panel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(405, 0),
-            Text = "Windows firewall may ask permission. Allow only on trusted PRIVATE networks. " +
-                   "Certificate and secret change when the receiver restarts. Elevated apps and secure desktop may block injected input.",
+            Text = "Built-in keyboard, touchpad and any physically connected mouse ALWAYS have priority. " +
+                   "After local activity, remote access can be requested again once this PC is idle for 2 seconds. " +
+                   "Windows firewall: allow trusted PRIVATE networks only.",
             ForeColor = Color.FromArgb(180, 193, 213) });
         return panel;
     }
@@ -195,7 +197,9 @@ internal sealed class ShareForm : Form
         if (_receiver != null || _host != null) return;
         try
         {
-            _receiver = new ReceiverServer(Status);
+            _nativeInput = new PhysicalInputMonitor(this);
+            _nativeInput.Start();
+            _receiver = new ReceiverServer(Status, _nativeInput.Priority);
             _receiver.Start();
             _localIPs.Text = string.Join(" / ", Dns.GetHostAddresses(Dns.GetHostName())
                 .Where(x => x.AddressFamily == AddressFamily.InterNetwork).Select(x => x.ToString()));
@@ -217,6 +221,8 @@ internal sealed class ShareForm : Form
     {
         _receiver?.Dispose();
         _receiver = null;
+        _nativeInput?.Dispose();
+        _nativeInput = null;
         _fingerprint.Clear(); _secret.Clear();
         _listen.Enabled = true;
         _stopReceive.Enabled = false;
@@ -242,6 +248,7 @@ internal sealed class ShareForm : Form
                 }, CancellationToken.None);
             if (IsDisposed) { _host.Dispose(); return; }
             _capture = new SourceCapture(this, _host, Status);
+            _host.RemoteControlState += HandleRemoteControlState;
             RefreshMonitorMaps();
             _arm.Enabled = _disconnect.Enabled = true;
             _return.Enabled = true;
@@ -252,6 +259,22 @@ internal sealed class ShareForm : Form
             Status("Connection failed: " + ex.Message);
             _connect.Enabled = true;
         }
+    }
+
+    private void HandleRemoteControlState(string result)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (IsDisposed) return;
+                if (result == "granted") _capture?.GrantRemote();
+                else if (result == "busy") _capture?.ReceiverBusy();
+                else if (result == "local-active") _capture?.ReceiverNativePriority();
+            });
+        }
+        catch (InvalidOperationException) { }
     }
 
     private void Arm()
@@ -266,6 +289,7 @@ internal sealed class ShareForm : Form
 
     private void DisconnectHost()
     {
+        if (_host != null) _host.RemoteControlState -= HandleRemoteControlState;
         _capture?.Dispose();
         _capture = null;
         _host?.Dispose();
@@ -278,7 +302,13 @@ internal sealed class ShareForm : Form
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == Win.WM_INPUT) _capture?.OnRawInput(m.LParam);
+        if (m.Msg == Win.WM_INPUT)
+        {
+            // Only one role can register Raw Input on this form at a time.
+            // Receiver detects native physical input; source forwards input.
+            if (_nativeInput != null) _nativeInput.HandleRawInput(m.LParam);
+            else _capture?.OnRawInput(m.LParam);
+        }
         if (m.Msg == 0x007E && IsHandleCreated) // WM_DISPLAYCHANGE
         {
             // Do not mutate connection / controls during a Windows message callback.

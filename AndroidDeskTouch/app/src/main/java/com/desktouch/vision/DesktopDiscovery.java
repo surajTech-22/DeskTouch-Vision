@@ -58,6 +58,31 @@ final class DesktopDiscovery {
         while(!next.equals(parent.get(next)))next=parent.get(next);
         return next;
     }
+    /**
+     * One visible Windows network for each advertised connected component.
+     * Members keep their OWN TLS certificate; never use groupId as a trust
+     * token or network address. A membership card is not an input relay.
+     */
+    static LinkedHashMap<String,List<Device>> windowsGroups(List<Device> devices){
+        LinkedHashMap<String,List<Device>> groups=new LinkedHashMap<>();
+        for(Device d:devices){
+            if(d.android)continue;
+            groups.computeIfAbsent(d.groupId,k->new ArrayList<>()).add(d);
+        }
+        for(List<Device> group:groups.values())
+            group.sort(Comparator.comparing(x->x.name,String.CASE_INSENSITIVE_ORDER));
+        return groups;
+    }
+    static Device chooseGateway(List<Device> group,Set<String> connected,
+            Set<String> trusted){
+        // Prefer an EXISTING connection. No second TLS handshake is required
+        // to display or select the already connected group.
+        for(Device d:group)if(connected.contains(d.fingerprint))return d;
+        // If reconnecting, prefer a previously approved certificate.
+        for(Device d:group)if(d.ready&&trusted.contains(d.fingerprint))return d;
+        for(Device d:group)if(d.ready)return d;
+        return group.isEmpty()?null:group.get(0);
+    }
     static List<Device> scan() throws Exception {
         // These IPs exist only during the current discovery and TCP connection;
         // saved identities always use cryptographic fingerprints, never IP.

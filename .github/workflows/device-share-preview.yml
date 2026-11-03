@@ -30,6 +30,7 @@ jobs:
                               'DeskTouchVision/RECOVER_DESKTOUCH.ps1',
                               'DeskTouchVision/TEST_UPDATE_DIRECTORY_LOCK.ps1',
                               'DeskTouchVision/TEST_TRAY_UPDATES.ps1',
+                              'DeskTouchVision/DeviceSharing/ALLOW_PRIVATE_LAN.ps1',
                               'DeskTouchVision/TEST_INSTALL_MUTEX.ps1',
                               'DeskTouchVision/CHECK_UPDATE_LOCK.ps1')) {
             $tokens = $null

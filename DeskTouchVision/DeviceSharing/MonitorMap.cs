@@ -11,7 +11,7 @@ namespace DeskTouch.DeviceShare;
 internal sealed class MonitorMap : Control
 {
     private MonitorTopology? _layout;
-    internal MonitorTopology? Layout
+    internal MonitorTopology? Topology
     {
         get => _layout;
         set { _layout = value; Invalidate(); }

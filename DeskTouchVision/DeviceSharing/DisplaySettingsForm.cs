@@ -429,11 +429,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 // controller. Busy PCs remain visible instead of disappearing.
                 if (_discovery == null)
                 {
-                    _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint, () =>
-                    {
-                        var receiver = Volatile.Read(ref _receiver);
-                        return receiver != null && receiver.CanAcceptNewPeer;
-                    });
+                    _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint,
+                        () => Volatile.Read(ref _receiver)?.CanAcceptNewPeer == true,
+                        () =>
+                        {
+                            // These are grouping hints only, not trust material.
+                            // Secure TLS identity validation stays per device.
+                            var related = _receiver?.ConnectedPeers
+                                .Select(p => p.DeviceFingerprint)
+                                .Where(id => !string.IsNullOrWhiteSpace(id))
+                                .Cast<string>()
+                                .ToList() ?? new List<string>();
+                            if (_host != null && _currentFingerprint.Length == 64)
+                                related.Add(_currentFingerprint);
+                            return related;
+                        });
                     _discovery.Start();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");

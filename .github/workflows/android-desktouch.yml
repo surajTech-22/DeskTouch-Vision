@@ -34,11 +34,32 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Unit tests and installable Android debug APK
+      - name: Unit tests and installable Android APK (stable signing when configured)
+        env:
+          DESKTOUCH_ANDROID_KEYSTORE_B64: ${{ secrets.DESKTOUCH_ANDROID_KEYSTORE_B64 }}
+          DESKTOUCH_ANDROID_STORE_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_STORE_PASSWORD }}
+          DESKTOUCH_ANDROID_KEY_ALIAS: ${{ secrets.DESKTOUCH_ANDROID_KEY_ALIAS }}
+          DESKTOUCH_ANDROID_KEY_PASSWORD: ${{ secrets.DESKTOUCH_ANDROID_KEY_PASSWORD }}
         run: |
-          gradle --no-daemon --stacktrace :app:testDebugUnitTest :app:assembleDebug
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+          gradle --no-daemon --stacktrace :app:testDebugUnitTest
+          if [ -n "$DESKTOUCH_ANDROID_KEYSTORE_B64" ] &&
+             [ -n "$DESKTOUCH_ANDROID_STORE_PASSWORD" ] &&
+             [ -n "$DESKTOUCH_ANDROID_KEY_ALIAS" ] &&
+             [ -n "$DESKTOUCH_ANDROID_KEY_PASSWORD" ]; then
+            umask 077
+            printf '%s' "$DESKTOUCH_ANDROID_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/desktouch-android-signing.jks"
+            export DESKTOUCH_ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/desktouch-android-signing.jks"
+            gradle --no-daemon --stacktrace :app:assembleRelease
+            test -s app/build/outputs/apk/release/app-release.apk
+            cp app/build/outputs/apk/release/app-release.apk DeskTouchVision-android-preview.apk
+            echo "Android package built with encrypted, persistent release signing."
+            rm -f "$RUNNER_TEMP/desktouch-android-signing.jks"
+          else
+            gradle --no-daemon --stacktrace :app:assembleDebug
+            test -s app/build/outputs/apk/debug/app-debug.apk
+            cp app/build/outputs/apk/debug/app-debug.apk DeskTouchVision-android-preview.apk
+            echo "PREVIEW ONLY: CI-generated debug signing changes across runs; existing app cannot be updated in place."
+          fi
           sha256sum DeskTouchVision-android-preview.apk > DeskTouchVision-android-preview.apk.sha256
       - name: Archive Android APK
         uses: actions/upload-artifact@v4

@@ -322,6 +322,15 @@ try
             "Saved trusted receiver must not contain ANY IP address");
         Check(restartSender.FindAutoConnect(fingerprint)?.Token == token,
             "Restarted sender must recognize permanent receiver fingerprint, not IP");
+        var homeWifi = new NearbyComputer("My PC", "192.168.1.40", fingerprint);
+        var officeLan = new NearbyComputer("Renamed PC", "10.7.8.90", fingerprint);
+        var impersonator = new NearbyComputer("My PC", "10.7.8.90",
+            new string('A', 64));
+        Check(restartSender.FindAutoConnect(homeWifi.Fingerprint) != null &&
+            restartSender.FindAutoConnect(officeLan.Fingerprint) != null,
+            "Changing Wi-Fi, DHCP address or computer label must not lose trusted device");
+        Check(restartSender.FindAutoConnect(impersonator.Fingerprint) == null,
+            "A familiar name or address is never sufficient to impersonate a trusted computer");
         // Receiver must finish the old TLS session before another connects.
         await Task.Delay(800, trustTestDeadline.Token);
         using (var trustedSession = await HostSession.ConnectTrustedAsync(

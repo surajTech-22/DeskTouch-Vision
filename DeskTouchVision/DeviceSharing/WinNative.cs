@@ -17,7 +17,7 @@ internal static class Win
     internal const uint MOUSEEVENTF_MIDDLEDOWN = 32, MOUSEEVENTF_MIDDLEUP = 64;
     internal const uint MOUSEEVENTF_WHEEL = 0x0800, MOUSEEVENTF_HWHEEL = 0x1000;
     internal const uint MOUSEEVENTF_VIRTUALDESK = 0x4000, MOUSEEVENTF_ABSOLUTE = 0x8000;
-    internal const uint KEYEVENTF_EXTENDEDKEY = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_SCANCODE = 8;
+    internal const uint KEYEVENTF_EXTENDEDKEY = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_UNICODE = 4, KEYEVENTF_SCANCODE = 8;
     internal const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1;
 
     [StructLayout(LayoutKind.Sequential)] internal struct POINT { public int X, Y; }
@@ -148,6 +148,25 @@ internal sealed class InputInjector
                     if (down) _keys.Add(id); else _keys.Remove(id);
                 }
                 return ok;
+            }
+            case "text":
+            {
+                // Android input methods commit Unicode text, not physical key events.
+                // Input is delivered only while an authenticated remote lease is active.
+                if (p.Text is not { Length: > 0 and <= 512 } value ||
+                    value.Any(c => c == '\0' ||
+                        (char.IsControl(c) && c is not '\r' and not '\n' and not '\t')))
+                    return false;
+                foreach (char codeUnit in value)
+                {
+                    var key = new Win.INPUT { Type = Win.INPUT_KEYBOARD,
+                        Data = new Win.INPUTUNION { Key = new Win.KEYBDINPUT {
+                            Vk = 0, Scan = codeUnit, Flags = Win.KEYEVENTF_UNICODE } } };
+                    if (!Inject(key)) return false;
+                    key.Data.Key.Flags = Win.KEYEVENTF_UNICODE | Win.KEYEVENTF_KEYUP;
+                    if (!Inject(key)) return false;
+                }
+                return true;
             }
             case "button":
             {

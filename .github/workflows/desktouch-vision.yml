@@ -24,12 +24,22 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
-      - name: Publish self-contained Windows app
+      - name: Check local hardware priority regression tests
+        shell: pwsh
+        run: |
+          dotnet run --project DeskTouchVision/DeviceSharing.PolicyTests/DeviceSharing.PolicyTests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Input priority regression tests failed" }
+      - name: Publish both self-contained Windows applications
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           dotnet publish DeskTouchVision/DeskTouchVision.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o DeskTouchVision/dist/app
-          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+          if ($LASTEXITCODE -ne 0) { throw "DeskTouch main application failed" }
+          dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o DeskTouchVision/dist/app/DeviceSharing
+          if ($LASTEXITCODE -ne 0) { throw "Windows device-sharing module failed" }
+          if (!(Test-Path 'DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe')) {
+            throw "Windows device-sharing module missing from installable app"
+          }
       - name: Package installer + SHA-256
         shell: pwsh
         run: |
@@ -42,6 +52,7 @@ jobs:
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText("$zip.sha256", "$hash  DeskTouchVision-win-x64.zip" + [Environment]::NewLine, [Text.Encoding]::ASCII)
           if (-not (Test-Path "DeskTouchVision/dist/app/DeskTouchVision.exe")) { throw "App executable missing" }
+          if (-not (Test-Path "DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe")) { throw "Input-sharing executable missing" }
       - name: Upload installable ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -65,7 +76,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL: offline webcam preview, manual keyboard/mouse zone calibration and motion study only. Does not emulate disconnected devices yet. Hardware validation pending."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL Windows two-PC keyboard/mouse sharing preview. Native hardware always takes priority; automatic monitor detection and explicit pairing included. Not tested end-to-end on two real PCs. Camera-based disconnected-device mode remains on hold. To use, launch Windows device sharing from the app. Requires two authorized Windows PCs on a trusted private network."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

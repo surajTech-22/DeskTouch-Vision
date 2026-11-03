@@ -10,15 +10,27 @@ function Log([string]$msg) {
 }
 try {
   if (-not (Test-Path (Join-Path $source 'DeskTouchVision.exe'))) { throw 'App payload missing: app\DeskTouchVision.exe' }
-  Get-CimInstance Win32_Process -Filter "Name='DeskTouchVision.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($target,[StringComparison]::OrdinalIgnoreCase) } |
-    ForEach-Object {
-      $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-      if ($p) {
-        [void]$p.CloseMainWindow()
-        if (-not $p.WaitForExit(6000)) { Stop-Process -Id $p.Id -Force }
+  # Never forcibly terminate active keyboard/mouse sharing: it must release
+  # held keys/buttons and network ownership through its normal FormClosing path.
+  foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
+    $expected = if ($exeName -eq 'DeskTouchVision.exe') {
+      Join-Path $target $exeName
+    } else { Join-Path $target "DeviceSharing\$exeName" }
+    Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop |
+      Where-Object { [string]::Equals($_.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase) } |
+      ForEach-Object {
+        $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+        if ($process) {
+          [void]$process.CloseMainWindow()
+          if (-not $process.WaitForExit(12000)) {
+            throw "$exeName is still running; install deferred to preserve native input safety."
+          }
+        }
       }
-    }
+  }
+  if (-not (Test-Path (Join-Path $source 'DeviceSharing\DeskTouch.DeviceShare.exe'))) {
+    throw 'Package missing Windows Device Sharing module'
+  }
   Copy-Item -Path (Join-Path $source '*') -Destination $target -Recurse -Force
   $exe = Join-Path $target 'DeskTouchVision.exe'
   $w = New-Object -ComObject WScript.Shell
@@ -28,7 +40,7 @@ try {
   $shortcut.Save()
   Log "Installed to $target"
   Start-Process -FilePath $exe
-  Write-Host "DeskTouch Vision installed. Remember: this is a camera calibration PREVIEW, not a working disconnected keyboard." -ForegroundColor Cyan
+  Write-Host 'DeskTouch Vision installed. Windows sharing is experimental: opt in on both PCs. Disconnected camera devices are not supported yet.' -ForegroundColor Cyan
 } catch {
   Log "FAILED: $($_.Exception.Message)"
   throw

@@ -526,13 +526,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 _capture?.Dispose();
                 _capture = null;
-                // Remove system-wide hooks again on disconnect, but keep the
-                // same priority instance for the next authenticated peer.
-                _nativeInput?.Dispose();
+                // A primary peer may have switched while other devices remain
+                // authenticated. Never disarm physical-input safety monitoring
+                // for the remaining sessions; only the final peer releases it.
+                if (_receiver?.ConnectedPeerCount == 0)
+                    _nativeInput?.Dispose();
             }
             _incomingPeer = null;
             RefreshDisplays();
-            Status("Peer disconnected. Input hooks released; discovery remains available.");
+            Status(_receiver?.ConnectedPeerCount > 0
+                ? $"Selected device changed. {_receiver.ConnectedPeerCount} devices connected."
+                : "Last peer disconnected; input hooks released, discovery remains available.");
         });
     }
 

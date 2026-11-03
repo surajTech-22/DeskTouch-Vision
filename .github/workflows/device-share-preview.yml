@@ -2,7 +2,7 @@ name: Device Share Windows preview build (no release)
 
 on:
   push:
-    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9]
+    branches: [feature/native-lan-kvm, fix/device-sharing-responsive-ui, fix/updates-v0.2.2-diagnostics, fix/pairing-transport-v0.2.3, fix/update-directory-lock-v0.2.4, fix/recovery-checksum-winps51, fix/stable-duplex-peer-v0.2.5, fix/edge-handoff-ui-v0.2.6, fix/update-lock-lifecycle-v0.2.7, fix/slow-edge-tray-updates-v0.2.8, feat/trusted-device-autoreconnect-v0.2.9, fix/duplex-authority-v0.3.0]
     paths:
       - 'DeskTouchVision/**'
       - '.github/workflows/device-share-preview.yml'

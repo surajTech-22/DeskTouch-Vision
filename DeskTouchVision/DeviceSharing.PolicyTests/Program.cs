@@ -177,8 +177,13 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
 {
     var status = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    // Monotonic time is controllable for authority permission tests; no
+    // physical mouse or keyboard is disabled on the Windows CI runner.
+    long authorityClock = 10000;
+    var receiverPriority = new LocalInputPriority(() => Interlocked.Read(ref authorityClock));
+    var hostPriority = new LocalInputPriority(() => Interlocked.Read(ref authorityClock));
     using var receiver = new ReceiverServer(message => status.Enqueue(message),
-        new LocalInputPriority(), (_, _) => Task.FromResult(true));
+        receiverPriority, (_, _) => Task.FromResult(true));
     var connected = new TaskCompletionSource<ConnectedPeer>(
         TaskCreationOptions.RunContinuationsAsynchronously);
     var remoteArrangement = new TaskCompletionSource<MonitorEdge>(
@@ -234,6 +239,87 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
         await Task.Delay(3500, testTimeout.Token);
         Check(!ended.Task.IsCompleted,
             "A stable paired connection must persist after display synchronization and mouse bursts");
+
+        // TRUE BIDIRECTIONAL INPUT AUTHORITY over the SAME authenticated TLS
+        // connection, not two independent outgoing pairing sessions.
+        // Both devices can request/control the other; native input on the
+        // destination always revokes granted authority.
+        session.AttachReverseInput(hostPriority, () => true);
+        Interlocked.Add(ref authorityClock, 3000);
+        var forwardGrant = new TaskCompletionSource<Packet>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var forwardApplied = new TaskCompletionSource<Packet>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var reverseGrant = new TaskCompletionSource<Packet>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var reverseApplied = new TaskCompletionSource<Packet>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var reverseRevoked = new TaskCompletionSource<Packet>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        session.AuthorityControlPacket += packet =>
+        {
+            if (packet.Type == "granted") forwardGrant.TrySetResult(packet);
+            if (packet.Type == "active") forwardApplied.TrySetResult(packet);
+        };
+        receiver.ReverseControlMessage += packet =>
+        {
+            if (packet.Type == "reverse-granted") reverseGrant.TrySetResult(packet);
+            if (packet.Type == "reverse-active") reverseApplied.TrySetResult(packet);
+            if (packet.Type == "reverse-local-active") reverseRevoked.TrySetResult(packet);
+        };
+        Check(session.TrySend(new Packet("claim", 101)),
+            "Source PC must be able to request authority over receiver PC");
+        Check((await forwardGrant.Task.WaitAsync(testTimeout.Token)).A == 101,
+            "Receiver must echo exact forward handoff authority ID");
+        await Task.Delay(130, testTimeout.Token);
+        Check(!forwardApplied.Task.IsCompleted,
+            "Forward grant alone must NOT claim keyboard/cursor authority");
+        var point = System.Windows.Forms.Cursor.Position;
+        Check(session.TrySend(new Packet("move", point.X, point.Y)),
+            "Source must send first cursor position to complete authority handoff");
+        Check((await forwardApplied.Task.WaitAsync(testTimeout.Token)).A == 101,
+            "Receiver must confirm a successfully applied forward cursor event");
+        Check(session.TrySend(new Packet("release", 101)),
+            "Source must release its own forward authority ID");
+        await Task.Delay(250, testTimeout.Token);
+
+        Check(((IInputSession)receiver).RemoteMonitors.Monitors.Count >= 1,
+            "The receiving PC must know original source monitors for REVERSE control");
+        Check(((IInputSession)receiver).TrySend(new Packet("claim", 202)),
+            "Receiving PC must initiate reverse control on the existing TLS pairing");
+        Check((await reverseGrant.Task.WaitAsync(testTimeout.Token)).A == 202,
+            "Original source must explicitly grant the reverse authority ID");
+        await Task.Delay(130, testTimeout.Token);
+        Check(!reverseApplied.Task.IsCompleted,
+            "Reverse grant alone must NOT capture native mouse or keyboard");
+        Check(((IInputSession)receiver).TrySend(new Packet("move", point.X, point.Y)),
+            "Receiving PC must transmit reverse cursor movement");
+        Check((await reverseApplied.Task.WaitAsync(testTimeout.Token)).A == 202,
+            "Original source must acknowledge successful reverse cursor application");
+        hostPriority.RecordPhysicalActivity();
+        Check((await reverseRevoked.Task.WaitAsync(testTimeout.Token)).A == 202,
+            "Physical native input on original source must revoke reverse authority");
+        Check(!hostPriority.RemoteGranted,
+            "Physical input override must release reverse input ownership");
+        Check(((IInputSession)receiver).TrySend(new Packet("release", 202)),
+            "Reverse PC must explicitly release authority on return");
+        Check(!ended.Task.IsCompleted,
+            "Forward and reverse claims must not disconnect the authenticated pairing");
+
+        var claims = new AuthorityRequestTracker();
+        int abandonedClaim = claims.Begin();
+        claims.Cancel();
+        int newClaim = claims.Begin();
+        Check(newClaim != abandonedClaim && !claims.Accept(abandonedClaim) &&
+            claims.Accept(newClaim),
+            "A delayed acknowledgment from an abandoned handoff cannot take authority");
+        Check(ReverseInputProtocol.TryDecode(
+            ReverseInputProtocol.Encode(new Packet("key", 2, 0, 1, 65)),
+            out var decoded) && decoded.Type == "key",
+            "Reverse protocol must preserve keyboard and mouse packet structure");
+        Check(!ReverseInputProtocol.TryDecode(new Packet("reverse-auth-trusted"),
+            out _), "Reverse input parser must reject identity and trust protocol commands");
+        Console.WriteLine("PASS: BOTH DIRECTIONS authority grant + cursor-applied ACK, native override, stale claim rollback and same TLS pairing.");
     }
     catch
     {

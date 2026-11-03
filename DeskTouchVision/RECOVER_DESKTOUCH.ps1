@@ -5,10 +5,10 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$release = 'v0.3.2'
+$release = 'v0.3.3'
 $baseUrl = "https://github.com/surajTech-22/DeskTouch-Vision/releases/download/$release"
 $archiveName = 'DeskTouchVision-win-x64.zip'
-$expectedAppVersion = '0.3.2.0'
+$expectedAppVersion = '0.3.3.0'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -64,6 +64,7 @@ try {
       -not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw 'Release package missing Windows sharing executable or installer.'
   }
+  & (Join-Path $unpack 'app\VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root (Join-Path $unpack 'app')
   $payloadVersion = (Get-Item -LiteralPath $app).VersionInfo.FileVersion
   if ($payloadVersion -ne $expectedAppVersion) {
     throw "Unexpected package version $payloadVersion; expected $expectedAppVersion."
@@ -130,6 +131,7 @@ try {
   if (-not (Test-Path -LiteralPath $installedSharing)) {
     throw 'Installation exited without creating the sharing module.'
   }
+  & (Join-Path $installRoot 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $installRoot
   $installedVersion = (Get-Item $installedSharing).VersionInfo.FileVersion
   if ($installedVersion -ne $expectedAppVersion) {
     throw "Expected $expectedAppVersion, but sharing module remains $installedVersion."

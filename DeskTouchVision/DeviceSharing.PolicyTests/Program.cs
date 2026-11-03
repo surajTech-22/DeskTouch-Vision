@@ -55,6 +55,15 @@ var threeDevices = NearbyComputerDiscovery.DistinctDevices(new [] {
 });
 Check(threeDevices.Count == 3 && threeDevices.Count(p => !p.IsAndroid) == 2,
     "Two distinct Windows PCs and Android must all be visible without duplicates");
+var discoveredHub = new NearbyComputer("HUB", "192.168.1.25",
+    new string('D',64),IsAndroid:false,CanReceive:true,IsHub:true);
+var discoveredLeaf = new NearbyComputer("LEAF", "192.168.1.26",
+    new string('E',64),IsAndroid:false,CanReceive:true,IsHub:false);
+var sortedEnvironment=NearbyComputerDiscovery.DistinctDevices(
+    new[]{discoveredLeaf,discoveredHub});
+Check(sortedEnvironment[0].IsHub &&
+    sortedEnvironment[0].Name=="HUB",
+    "Windows discovery must prioritize one environment hub over member endpoints");
 Check(NearbyComputerDiscovery.ParseReply("DT1-READY|Fake|BAD",
     local1) == null, "Invalid discovery identity must never be accepted");
 Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.exe")

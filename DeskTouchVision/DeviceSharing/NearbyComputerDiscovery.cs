@@ -27,17 +27,20 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
     private readonly Func<IEnumerable<string>> _connectedFingerprints;
+    private readonly Func<bool> _isEnvironmentHub;
     private UdpClient? _listener;
     private Task? _loop;
 
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
-        Func<IEnumerable<string>>? connectedFingerprints = null)
+        Func<IEnumerable<string>>? connectedFingerprints = null,
+        Func<bool>? isEnvironmentHub = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A stable TLS fingerprint is required.");
         _fingerprint = fingerprint;
         _canAcceptConnections = canAcceptConnections ?? (() => true);
         _connectedFingerprints = connectedFingerprints ?? (() => Array.Empty<string>());
+        _isEnvironmentHub = isEnvironmentHub ?? (() => true);
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -77,6 +80,14 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 var prefix = accepting ? ReadyPrefix : BusyPrefix;
                 byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
                 await _listener.SendAsync(reply,msg.RemoteEndPoint,_stop.Token);
+                // A member with an outgoing hub connection is a LEAF, even if
+                // it keeps its own incoming listener. Android should prefer a
+                // real environment hub instead of creating a split network.
+                if (_isEnvironmentHub())
+                {
+                    byte[] hubHint=Encoding.ASCII.GetBytes("DT1-HUB|"+_fingerprint);
+                    await _listener.SendAsync(hubHint,msg.RemoteEndPoint,_stop.Token);
+                }
                 // Optional second datagram announces connected PC membership.
                 // The original READY/BUSY packet is untouched for older apps.
                 // These hints are VISUAL only and never authorize pairing.

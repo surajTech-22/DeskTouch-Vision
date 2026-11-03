@@ -77,6 +77,11 @@ jobs:
         run: |
           dotnet publish DeskTouchVision/DeviceSharing/DeviceSharing.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:IncludeNativeLibrariesForSelfExtract=false -o out/DeviceSharing
           if ($LASTEXITCODE -ne 0) { throw "Device share compile failed" }
+          if (!(Test-Path out/DeviceSharing/DeskTouch.DeviceShare.deps.json) -or
+              !(Test-Path out/DeviceSharing/DeskTouch.DeviceShare.runtimeconfig.json) -or
+              @(Get-ChildItem -Path out/DeviceSharing -Filter *.dll).Count -lt 10) {
+            throw "Expected standard .NET Windows sharing runtime files are missing"
+          }
       - name: Compile existing DeskTouch Vision shell
         shell: pwsh
         run: |

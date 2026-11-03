@@ -66,6 +66,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
+    internal event Action? PeerListChanged;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
@@ -364,6 +365,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
         if(!_sessions.TryAdd(id,session))
             throw new InvalidOperationException("Duplicate peer session ID");
+        PeerListChanged?.Invoke();
         using var linked=CancellationTokenSource.CreateLinkedTokenSource(token);
         var sendTask=Task.Run(()=>ReverseSendLoopAsync(session,linked.Token));
         try
@@ -506,6 +508,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            PeerListChanged?.Invoke();
             Session? previous=null, next=null;
             bool released=false;
             lock(_authorityGate)

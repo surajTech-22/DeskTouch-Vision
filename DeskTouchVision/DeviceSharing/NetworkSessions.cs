@@ -491,6 +491,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
+            await PublishEnvironmentAsync(token);
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -522,6 +523,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type=="topology")
                 {
                     session.Peer=session.Peer with {Monitors=MonitorTopology.FromWire(p.Text)};
+                    await PublishEnvironmentAsync(token);
                     if(ReferenceEquals(Volatile.Read(ref _selected),session))
                         PeerTopologyChanged?.Invoke(session.Peer);
                     continue;
@@ -536,8 +538,94 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
-                    if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                    RelayLease? relay;
+                    lock (_authorityGate)
+                    {
+                        _relayByTarget.TryGetValue(session.Id, out relay);
+                        if (relay != null && relay.Claim != p.A) relay=null;
+                        if (relay != null && p.Type=="reverse-granted")
+                            relay.Granted=true;
+                    }
+                    if (relay != null)
+                    {
+                        // Deliver the destination's real grant/applied ACK to
+                        // the original authenticated controller, not the hub UI.
+                        if (p.Type is "reverse-busy" or "reverse-local-active")
+                            RemoveRelayFromSource(relay.Source.Id);
+                        string response=p.Type["reverse-".Length..];
+                        if (p.Type!="reverse-active" || relay.Granted)
+                            try { await SendToAsync(relay.Source,
+                                new Packet(response,p.A),token); }
+                            catch (Exception) { }
+                    }
+                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
                         ReverseControlMessage?.Invoke(p);
+                    continue;
+                }
+                if(p.Type=="environment-select")
+                {
+                    // The hub owns routing decisions. Clients may request
+                    // only connection IDs issued on this authenticated link.
+                    Session? target=p.A==0 ? null :
+                        _sessions.TryGetValue(p.A,out var targetPeer)?targetPeer:null;
+                    bool valid=p.A==0 ||
+                        (target!=null && !ReferenceEquals(target,session) &&
+                         target.Peer.SupportsReverseInput);
+                    if(!valid)
+                    {
+                        await SendToAsync(session,new Packet("environment-unavailable",p.A),token);
+                        continue;
+                    }
+                    var previous=RemoveRelayFromSource(session.Id);
+                    if(previous!=null)
+                        await RevokeRelayAsync(previous,false,token);
+                    bool localOwner=false;
+                    lock(_authorityGate)
+                    {
+                        if(ReferenceEquals(_owner,session))
+                        {
+                            _owner=null;session.Lease=0;session.AppliedLease=0;
+                            _priority.ReleaseRemote();localOwner=true;
+                        }
+                        session.EnvironmentTargetId=p.A;
+                    }
+                    if(localOwner)lock(session.InputLock)session.Injector.ReleaseAll();
+                    await SendToAsync(session,new Packet("environment-selected",p.A),token);
+                    continue;
+                }
+                if(p.Type=="claim" && session.EnvironmentTargetId!=0)
+                {
+                    RelayLease? relay=null;
+                    lock(_authorityGate)
+                    {
+                        if(_sessions.TryGetValue(session.EnvironmentTargetId,
+                                out var destination) &&
+                           CanRoute(session.Peer,destination.Peer,
+                                !ReferenceEquals(session,destination),p.A) &&
+                           !_relayBySource.ContainsKey(session.Id) &&
+                           !_relayByTarget.ContainsKey(destination.Id) &&
+                           !_relayByTarget.ContainsKey(session.Id) &&
+                           !_relayBySource.ContainsKey(destination.Id) &&
+                           !ReferenceEquals(_owner,session))
+                        {
+                            relay=new RelayLease { Source=session,
+                                Target=destination,Claim=p.A };
+                            _relayBySource.Add(session.Id,relay);
+                            _relayByTarget.Add(destination.Id,relay);
+                        }
+                    }
+                    if(relay==null)
+                        await SendToAsync(session,new Packet("busy",p.A),token);
+                    else
+                    {
+                        try { await SendToAsync(relay.Target,
+                            new Packet("reverse-claim",p.A),token); }
+                        catch(Exception)
+                        {
+                            RemoveRelayFromSource(session.Id);
+                            await SendToAsync(session,new Packet("busy",p.A),token);
+                        }
+                    }
                     continue;
                 }
                 if(p.Type=="claim")
@@ -572,6 +660,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="reset" || p.Type=="release")
                 {
+                    RelayLease? activeRelay=null;
+                    lock(_authorityGate)
+                        if(_relayBySource.TryGetValue(session.Id,out var candidate) &&
+                            (p.Type=="reset" || p.A==candidate.Claim))
+                            activeRelay=candidate;
+                    if(activeRelay!=null)
+                    {
+                        var removed=RemoveRelayFromSource(session.Id);
+                        if(removed!=null)await RevokeRelayAsync(removed,false,token);
+                        continue;
+                    }
                     bool wasOwner=false;
                     lock(_authorityGate)
                     {
@@ -593,6 +692,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     await SendToAsync(session,new Packet("pong"),token);
                     continue;
                 }
+                RelayLease? forward=null;
+                lock(_authorityGate)
+                    _relayBySource.TryGetValue(session.Id,out forward);
+                if(forward!=null)
+                {
+                    if(forward.Granted &&
+                        p.Type is ("move" or "button" or "key" or "wheel" or "text"))
+                    {
+                        try { await SendToAsync(forward.Target,
+                            ReverseInputProtocol.Encode(p),token); }
+                        catch(Exception)
+                        {
+                            var removed=RemoveRelayFromSource(session.Id);
+                            if(removed!=null)
+                                await RevokeRelayAsync(removed,true,token);
+                        }
+                    }
+                    continue;
+                }
+                if(session.EnvironmentTargetId!=0)
+                    continue; // Never accidentally inject an unrouted packet locally.
                 int lease;
                 lock(_authorityGate)
                     lease=ReferenceEquals(_owner,session)?session.Lease:0;
@@ -636,6 +756,23 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            var disconnectedRoutes=new List<RelayLease>();
+            lock(_authorityGate)
+            {
+                if(_relayBySource.TryGetValue(id,out var from))
+                    disconnectedRoutes.Add(from);
+                if(_relayByTarget.TryGetValue(id,out var to) &&
+                    !disconnectedRoutes.Contains(to))
+                    disconnectedRoutes.Add(to);
+                foreach(var route in disconnectedRoutes)
+                {
+                    _relayBySource.Remove(route.Source.Id);
+                    _relayByTarget.Remove(route.Target.Id);
+                }
+            }
+            foreach(var route in disconnectedRoutes)
+                await RevokeRelayAsync(route,route.Target.Id==id,token);
+            await PublishEnvironmentAsync(token);
             PeerListChanged?.Invoke();
             Session? previous=null, next=null;
             bool released=false;

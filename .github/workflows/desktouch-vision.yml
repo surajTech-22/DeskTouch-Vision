@@ -99,7 +99,7 @@ jobs:
           $entries = @(Get-ChildItem -LiteralPath $app -Recurse -File |
             Where-Object { $_.Name -ne 'payload-integrity.json' } |
             Sort-Object FullName | ForEach-Object {
-              $relative = $_.FullName.Substring(([IO.Path]::GetFullPath($app)).Length).TrimStart('\') -replace '\','/'
+              $relative = $_.FullName.Substring(([IO.Path]::GetFullPath($app)).Length).TrimStart('\') -replace '\\','/'
               [pscustomobject]@{
                 path = $relative
                 sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

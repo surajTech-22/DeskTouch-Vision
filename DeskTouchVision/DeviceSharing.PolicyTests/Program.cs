@@ -28,7 +28,10 @@ Check(!ReceiverServer.AllowsForwardInput(new ConnectedPeer("Phone",testDisplay,
 Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Desktop",testDisplay,
     SupportsReverseInput:true,Platform:"Windows")),
     "Windows PCs must retain duplex authority where locally approved");
-Console.WriteLine("PASS: Android one-way policy cannot control Windows; PC duplex preserved.");
+Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Approved phone",testDisplay,
+    SupportsReverseInput:true,Platform:"Android",SupportsForwardInput:true)),
+    "Only an Android session explicitly enabled for forward control may request an input lease");
+Console.WriteLine("PASS: Android input opt-in enforced; Windows PC duplex preserved.");
 
 // A LAN with two Windows PCs and one Android phone must not be collapsed to
 // a single PC, and busy receivers must be visible but not connectable.

@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $oldWorkingDirectory = (Get-Location).ProviderPath
 $independentWorkingDirectory = [IO.Path]::GetFullPath($env:TEMP)
 Set-Location -LiteralPath $independentWorkingDirectory
-$installMutex = New-Object System.Threading.Mutex($false, 'Local\DeskTouchVision.Installer')
+$installMutex = [System.Threading.Mutex]::new($false, 'Local\DeskTouchVision.Installer')
 $hasInstallMutex = $false
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null

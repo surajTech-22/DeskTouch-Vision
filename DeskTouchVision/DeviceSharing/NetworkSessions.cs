@@ -13,7 +13,7 @@ internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors);
 
 internal sealed record PeerHello(string Name, string Layout);
 
-internal sealed class ReceiverServer : IDisposable
+internal sealed class ReceiverServer : IInputSession, IDisposable
 {
     private readonly Action<string> _status;
     private readonly CancellationTokenSource _cancel = new();
@@ -30,6 +30,13 @@ internal sealed class ReceiverServer : IDisposable
     private InputInjector? _currentInjector;
     private SslStream? _currentStream;
     private TcpClient? _currentClient;
+    private MonitorTopology? _connectedRemoteMonitors;
+    private Channel<Packet>? _reverseQueue;
+    private Packet? _latestReverseMove;
+    private int _reverseMoveSignaled;
+    private int _forwardLease;
+    internal Func<bool>? AllowForwardClaim;
+    internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
@@ -106,15 +113,75 @@ internal sealed class ReceiverServer : IDisposable
         {
             lock (_inputGate) _currentInjector?.ReleaseAll();
         });
-        _status("Local physical keyboard/mouse has priority; remote input paused.");
+        int revokedLease = Interlocked.Exchange(ref _forwardLease, 0);
+        _status("Local physical keyboard/mouse has priority; forward authority revoked.");
         _ = Task.Run(async () =>
         {
-            try { await SendControlAsync(new Packet("local-active"), _cancel.Token); }
+            try { await SendControlAsync(new Packet("local-active", revokedLease), _cancel.Token); }
             catch (Exception) { } // Source connection may already have ended.
         });
     }
 
     internal void DisconnectPeer() => Volatile.Read(ref _currentClient)?.Close();
+
+    internal MonitorTopology RemoteMonitors =>
+        Volatile.Read(ref _connectedRemoteMonitors) ??
+        throw new InvalidOperationException("No authenticated peer monitor layout yet.");
+
+    MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
+    bool IInputSession.TrySend(Packet packet) => TrySendReverse(packet);
+
+    internal bool TrySendReverse(Packet packet)
+    {
+        if (Volatile.Read(ref _currentStream) == null) return false;
+        var queue = Volatile.Read(ref _reverseQueue);
+        if (queue == null) return false;
+        // Do not put a packet per pixel into the network; keep the newest
+        // coordinate, like HostSession's forward-direction send loop.
+        if (packet.Type == "move")
+        {
+            Interlocked.Exchange(ref _latestReverseMove, packet);
+            if (Interlocked.CompareExchange(ref _reverseMoveSignaled, 1, 0) == 0 &&
+                !queue.Writer.TryWrite(new Packet("move-flush")))
+            {
+                Interlocked.Exchange(ref _reverseMoveSignaled, 0);
+                return false;
+            }
+            return true;
+        }
+        if (queue.Writer.TryWrite(packet)) return true;
+        _status("Reverse input control queue stalled; reconnecting to restore local authority.");
+        DisconnectPeer();
+        return false;
+    }
+
+    private async Task ReverseSendLoopAsync(Channel<Packet> queue, CancellationToken token)
+    {
+        try
+        {
+            await foreach (var queued in queue.Reader.ReadAllAsync(token))
+            {
+                if (queued.Type == "move-flush")
+                {
+                    Interlocked.Exchange(ref _reverseMoveSignaled, 0);
+                    var move = Interlocked.Exchange(ref _latestReverseMove, null);
+                    if (move != null)
+                        await SendControlAsync(ReverseInputProtocol.Encode(move), token);
+                    continue;
+                }
+                var last = Interlocked.Exchange(ref _latestReverseMove, null);
+                if (last != null)
+                    await SendControlAsync(ReverseInputProtocol.Encode(last), token);
+                await SendControlAsync(ReverseInputProtocol.Encode(queued), token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _status("Reverse input transport stopped: " + ex.Message);
+            DisconnectPeer(); // cannot leave the remote host holding keys
+        }
+    }
 
     internal void PublishPlacement(MonitorEdge side)
     {
@@ -205,13 +272,20 @@ internal sealed class ReceiverServer : IDisposable
             if (trustedSource != null)
                 peer = peer with { Name = trustedSource.Name };
             incoming = peer;
+            Volatile.Write(ref _connectedRemoteMonitors, peer.Monitors);
             Volatile.Write(ref _currentClient, client);
-            PeerConnected?.Invoke(peer);
         }
-        _status("Authenticated Windows peer connected; waiting for requested control.");
+        _status("Authenticated Windows peers connected; both computers may request input authority.");
         var injector = new InputInjector();
+        var reverseQueue = Channel.CreateBounded<Packet>(
+            new BoundedChannelOptions(2048) { SingleReader = true,
+                SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
         Volatile.Write(ref _currentInjector, injector);
         Volatile.Write(ref _currentStream, ssl);
+        Volatile.Write(ref _reverseQueue, reverseQueue);
+        using var sessionCancel = CancellationTokenSource.CreateLinkedTokenSource(token);
+        _ = Task.Run(() => ReverseSendLoopAsync(reverseQueue, sessionCancel.Token));
+        PeerConnected?.Invoke(incoming!);
         try
         {
             while (!token.IsCancellationRequested)
@@ -257,6 +331,7 @@ internal sealed class ReceiverServer : IDisposable
                 {
                     var peerLayout = MonitorTopology.FromWire(p.Text);
                     incoming = incoming! with { Monitors = peerLayout };
+                    Volatile.Write(ref _connectedRemoteMonitors, peerLayout);
                     PeerTopologyChanged?.Invoke(incoming);
                     continue;
                 }
@@ -267,16 +342,25 @@ internal sealed class ReceiverServer : IDisposable
                     continue;
                 }
 
-                if (p.Type == "claim")
+                if (p.Type is "reverse-granted" or "reverse-busy" or "reverse-local-active")
                 {
-                    bool granted = _priority.TryClaim();
-                    // Respond explicitly; the source must not capture the
-                    // keyboard until an authenticated grant is received.
-                    await SendControlAsync(new Packet(granted ? "granted" : "busy"), token);
+                    ReverseControlMessage?.Invoke(p);
                     continue;
                 }
-                if (p.Type == "reset" || p.Type == "release")
+                if (p.Type == "claim")
                 {
+                    // The receiver may itself be controlling the source PC.
+                    // Never issue forward and reverse authority at once.
+                    bool allowed = p.A > 0 && (AllowForwardClaim?.Invoke() ?? true);
+                    bool granted = allowed && _priority.TryClaim();
+                    if (granted) Volatile.Write(ref _forwardLease, p.A);
+                    await SendControlAsync(new Packet(granted ? "granted" : "busy", p.A), token);
+                    continue;
+                }
+                if (p.Type == "reset" ||
+                    (p.Type == "release" && p.A > 0 && p.A == Volatile.Read(ref _forwardLease)))
+                {
+                    Interlocked.Exchange(ref _forwardLease, 0);
                     _priority.ReleaseRemote();
                     lock (_inputGate) injector.ReleaseAll();
                     continue;
@@ -284,9 +368,10 @@ internal sealed class ReceiverServer : IDisposable
                 if (p.Type == "ping") continue;
                 lock (_inputGate)
                 {
-                    // Every input is gated by LOCAL native priority. A newly
-                    // pressed local keyboard wins even during a live session.
-                    if (_priority.CanApplyRemote) injector.Handle(p);
+                    // An unacknowledged, expired or native-overridden lease
+                    // cannot inject a cursor or keys into this Windows PC.
+                    if (Volatile.Read(ref _forwardLease) > 0 &&
+                        _priority.CanApplyRemote) injector.Handle(p);
                 }
             }
         }
@@ -305,6 +390,13 @@ internal sealed class ReceiverServer : IDisposable
         catch (OperationCanceledException) { } // shutdown
         finally
         {
+            sessionCancel.Cancel();
+            reverseQueue.Writer.TryComplete();
+            Volatile.Write(ref _reverseQueue, null);
+            Volatile.Write(ref _connectedRemoteMonitors, null);
+            Interlocked.Exchange(ref _latestReverseMove, null);
+            Interlocked.Exchange(ref _reverseMoveSignaled, 0);
+            Interlocked.Exchange(ref _forwardLease, 0);
             _priority.ReleaseRemote();
             Volatile.Write(ref _currentStream, null);
             lock (_inputGate)

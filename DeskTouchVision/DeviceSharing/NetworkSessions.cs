@@ -17,6 +17,11 @@ internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
     string? Platform = null, bool? ForwardInputSupported = null);
 
+// Issued exclusively by the authenticated hub over an existing TLS session.
+// Id is a connection-scoped route identifier, not a device identity or trust proof.
+internal sealed record EnvironmentMember(int Id, string Name, string Platform,
+    string Layout, bool SupportsReverseInput);
+
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
 /// through the same existing TLS protocol. Only one peer holds the input lease.
@@ -44,6 +49,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int Lease;
         internal int AppliedLease;
         internal int KeyboardFailureReported;
+        internal int EnvironmentTargetId; // 0 is the local Windows hub
+    }
+
+    private sealed class RelayLease
+    {
+        internal required Session Source;
+        internal required Session Target;
+        internal required int Claim;
+        internal bool Granted;
     }
 
     private readonly Action<string> _status;
@@ -57,6 +71,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
     private readonly object _authorityGate = new();
+    // A single environment can have many authenticated peers but only one
+    // controller per destination. Every routed input is pinned to BOTH TLS
+    // sessions, not a name, IP address or broadcast group hint.
+    private readonly Dictionary<int, RelayLease> _relayBySource = new();
+    private readonly Dictionary<int, RelayLease> _relayByTarget = new();
     private Task? _serverTask;
     private int _nextClientId;
     private int _pendingAndActive;
@@ -79,6 +98,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+
+    internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
+        bool differentPeers, int claim) =>
+        claim > 0 && differentPeers && AllowsForwardInput(source) &&
+        target.SupportsReverseInput;
     internal bool SelectConnectedPeer(int id)
     {
         if (!_sessions.TryGetValue(id, out var session)) return false;
@@ -175,6 +199,57 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         await session.Write.WaitAsync(token);
         try { await Wire.WriteAsync(session.Stream, packet, token); }
         finally { session.Write.Release(); }
+    }
+
+    private RelayLease? RemoveRelayFromSource(int sourceId)
+    {
+        lock (_authorityGate)
+        {
+            if (!_relayBySource.Remove(sourceId, out var relay)) return null;
+            _relayByTarget.Remove(relay.Target.Id);
+            return relay;
+        }
+    }
+
+    private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
+        CancellationToken token)
+    {
+        if (_sessions.ContainsKey(relay.Target.Id))
+        {
+            try { await SendToAsync(relay.Target,
+                new Packet("reverse-reset", relay.Claim), token); }
+            catch (Exception) { }
+        }
+        if (notifySource && _sessions.ContainsKey(relay.Source.Id))
+        {
+            try { await SendToAsync(relay.Source,
+                new Packet("local-active", relay.Claim), token); }
+            catch (Exception) { }
+        }
+    }
+
+    private async Task PublishEnvironmentAsync(CancellationToken token)
+    {
+        if (token.IsCancellationRequested) return;
+        // Roster is an authenticated statement from this hub. Individual
+        // session IDs are ephemeral and may never authorize a new pairing.
+        var members = new List<EnvironmentMember> {
+            new(0, Environment.MachineName, "Windows",
+                MonitorTopology.Capture().ToWire(), true)
+        };
+        foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
+            members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
+                peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput));
+        string payload = JsonSerializer.Serialize(members);
+        if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
+        {
+            _status("Environment roster too large; refusing to advertise incomplete routes.");
+            return;
+        }
+        foreach (var recipient in _sessions.Values)
+            try { await SendToAsync(recipient,
+                new Packet("environment-roster", recipient.Id, Text: payload), token); }
+            catch (Exception) { /* peer may have disconnected */ }
     }
 
     private void NotifySelection(Session? previous, Session? next)

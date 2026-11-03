@@ -280,9 +280,19 @@ internal sealed class ReceiverServer : IDisposable
                 }
             }
         }
-        catch (EndOfStreamException) { }
-        catch (IOException) { }
-        catch (OperationCanceledException) { } // shut down or heartbeat timed out
+        catch (EndOfStreamException)
+        {
+            _status("Remote peer closed the TCP connection.");
+        }
+        catch (IOException ex)
+        {
+            _status("Remote peer network stream ended: " + ex.Message);
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            _status("No peer heartbeat for 18 seconds; releasing any held input for safety.");
+        }
+        catch (OperationCanceledException) { } // shutdown
         finally
         {
             _priority.ReleaseRemote();

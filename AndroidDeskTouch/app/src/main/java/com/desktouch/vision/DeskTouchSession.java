@@ -279,10 +279,22 @@ final class DeskTouchSession implements AutoCloseable {
             cursorX=bx;cursorY=by;
         }
     }
+    void prepareGroupEntry(int direction){
+        synchronized(monitors){
+            cursorX=direction>0 ? screenX : screenX+screenWidth-1;
+            cursorY=screenY+screenHeight/2;
+            clampToMonitor();
+        }
+    }
     void moveBy(float dx,float dy){
         if(!active)return;
         synchronized(monitors){
-            cursorX+=Math.round(dx);cursorY+=Math.round(dy);
+            int nextX=cursorX+Math.round(dx);
+            if(nextX<screenX && dx<0 &&
+                DeskTouchRuntime.crossLinkedEdge(this,-1))return;
+            if(nextX>=screenX+screenWidth && dx>0 &&
+                DeskTouchRuntime.crossLinkedEdge(this,1))return;
+            cursorX=nextX;cursorY+=Math.round(dy);
             clampToMonitor();
             send(new Packet("move",cursorX,cursorY));
         }

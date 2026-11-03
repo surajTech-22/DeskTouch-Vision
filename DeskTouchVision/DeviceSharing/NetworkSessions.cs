@@ -76,6 +76,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     // sessions, not a name, IP address or broadcast group hint.
     private readonly Dictionary<int, RelayLease> _relayBySource = new();
     private readonly Dictionary<int, RelayLease> _relayByTarget = new();
+    // The hub itself is also a controller. Its selected reverse-input claim
+    // must arbitrate against routed peers targeting the same device.
+    private readonly Dictionary<int,int> _hubClaims = new();
     private Task? _serverTask;
     private int _nextClientId;
     private int _pendingAndActive;
@@ -340,6 +343,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private bool TrySendReverseTo(int id, Packet packet)
     {
         if (!_sessions.TryGetValue(id, out var selected)) return false;
+        lock (_authorityGate)
+        {
+            if (packet.Type=="claim")
+            {
+                if (packet.A<=0 || _relayByTarget.ContainsKey(id) ||
+                    _hubClaims.ContainsKey(id))
+                    return false;
+                _hubClaims[id]=packet.A;
+            }
+            else if(packet.Type is "reset" or "release")
+            {
+                if(_hubClaims.TryGetValue(id,out int claim) &&
+                    (packet.Type=="reset" || claim==packet.A))
+                    _hubClaims.Remove(id);
+            }
+            else if (!_hubClaims.ContainsKey(id))
+                return false;
+        }
         if (packet.Type == "move")
         {
             Interlocked.Exchange(ref selected.LatestReverseMove, packet);
@@ -559,7 +580,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             catch (Exception) { }
                     }
                     else if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                    {
+                        if(p.Type is "reverse-busy" or "reverse-local-active")
+                            lock(_authorityGate) _hubClaims.Remove(session.Id);
                         ReverseControlMessage?.Invoke(p);
+                    }
                     continue;
                 }
                 if(p.Type=="environment-select")
@@ -604,6 +629,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                                 !ReferenceEquals(session,destination),p.A) &&
                            !_relayBySource.ContainsKey(session.Id) &&
                            !_relayByTarget.ContainsKey(destination.Id) &&
+                           !_hubClaims.ContainsKey(destination.Id) &&
                            !_relayByTarget.ContainsKey(session.Id) &&
                            !_relayBySource.ContainsKey(destination.Id) &&
                            !ReferenceEquals(_owner,session))
@@ -756,6 +782,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            lock(_authorityGate) _hubClaims.Remove(id);
             var disconnectedRoutes=new List<RelayLease>();
             lock(_authorityGate)
             {

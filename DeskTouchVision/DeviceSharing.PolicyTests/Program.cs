@@ -73,6 +73,18 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
     var status = new System.Collections.Concurrent.ConcurrentQueue<string>();
     using var receiver = new ReceiverServer(message => status.Enqueue(message),
         new LocalInputPriority(), (_, _) => Task.FromResult(true));
+    var connected = new TaskCompletionSource<ConnectedPeer>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var remoteArrangement = new TaskCompletionSource<MonitorEdge>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var remoteRefresh = new TaskCompletionSource<ConnectedPeer>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var ended = new TaskCompletionSource<bool>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    receiver.PeerConnected += peer => connected.TrySetResult(peer);
+    receiver.PeerPlacementChanged += edge => remoteArrangement.TrySetResult(edge);
+    receiver.PeerTopologyChanged += peer => remoteRefresh.TrySetResult(peer);
+    receiver.PeerDisconnected += () => ended.TrySetResult(true);
     receiver.Start();
     using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
     try
@@ -82,6 +94,40 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
             testTimeout.Token);
         Check(session.RemoteMonitors.Monitors.Count >= 1,
             "Authenticated TLS receiver must return at least one Windows display");
+        var peer = await connected.Task.WaitAsync(testTimeout.Token);
+        Check(peer.Name == Environment.MachineName &&
+            peer.Monitors.Monitors.Count >= 1,
+            "The receiving PC must show the authenticated source monitor layout");
+        session.PublishSourcePlacement(MonitorEdge.Right);
+        Check(await remoteArrangement.Task.WaitAsync(testTimeout.Token) == MonitorEdge.Right,
+            "Receiver should mirror source PC monitor placement");
+        session.PublishSourceTopology(MonitorTopology.Capture());
+        var updated = await remoteRefresh.Task.WaitAsync(testTimeout.Token);
+        Check(updated.Name == Environment.MachineName && updated.Monitors.Monitors.Count >= 1,
+            "Receiver should retain identity when monitor layout updates");
+
+        var incomingArrangement = new TaskCompletionSource<MonitorEdge>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var incomingRefresh = new TaskCompletionSource<MonitorTopology>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        session.RemotePlacementChanged += e => incomingArrangement.TrySetResult(e);
+        session.RemoteTopologyChanged += m => incomingRefresh.TrySetResult(m);
+        receiver.PublishPlacement(MonitorEdge.Left);
+        Check(await incomingArrangement.Task.WaitAsync(testTimeout.Token) == MonitorEdge.Left,
+            "Source should follow a monitor placement change made on receiving PC");
+        receiver.PublishLocalTopology(MonitorTopology.Capture());
+        Check((await incomingRefresh.Task.WaitAsync(testTimeout.Token)).Monitors.Count >= 1,
+            "Receiver display changes should sync to source without reconnecting");
+
+        // Physical mouse movement can generate huge bursts. Dropping OLD
+        // movement coordinates rather than disconnecting is safe as long as
+        // the latest position eventually reaches the receiver.
+        for (int i = 0; i < 5000; i++)
+            Check(session.TrySend(new Packet("move", i % 1800, i % 950)),
+                "High-frequency mouse motion must never disconnect the session");
+        await Task.Delay(3500, testTimeout.Token);
+        Check(!ended.Task.IsCompleted,
+            "A stable paired connection must persist after display synchronization and mouse bursts");
     }
     catch
     {

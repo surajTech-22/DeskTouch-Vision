@@ -34,6 +34,11 @@ final class DesktopDiscovery {
         // These IPs exist only during the current discovery and TCP connection;
         // saved identities always use cryptographic fingerprints, never IP.
         Map<String,Device> devices=new LinkedHashMap<>();
+        // The local phone's beacon is for Windows, not a remote Android peer.
+        String ownAndroidIdentity=null;
+        try {ownAndroidIdentity=MobileDiscoveryResponder.mobileFingerprint();}
+        catch(Exception ignored) { /* keep scanning other devices */ }
+
         byte[] probe="DT1-DISCOVER".getBytes(StandardCharsets.US_ASCII);
         try(DatagramSocket socket=new DatagramSocket()) {
             socket.setBroadcast(true);
@@ -69,6 +74,10 @@ final class DesktopDiscovery {
                 String ip=result.getAddress().getHostAddress();
                 Device device=parse(message,ip);
                 if(device==null)continue;
+                if(device.android && device.fingerprint.equalsIgnoreCase(ownAndroidIdentity))
+                    continue;
+                if(result.getAddress().isLoopbackAddress()||
+                   result.getAddress().isAnyLocalAddress())continue;
                 String key=(device.android?"android:":"windows:")+device.fingerprint;
                 Device old=devices.get(key);
                 if(old==null||(!old.ready&&device.ready))devices.put(key,device);

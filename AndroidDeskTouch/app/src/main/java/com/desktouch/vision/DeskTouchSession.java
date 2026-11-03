@@ -30,6 +30,10 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile int reverseLease,reverseApplied;
     private final ExecutorService sender=Executors.newSingleThreadExecutor();
     private final Object writeLock=new Object();
+    private final java.util.concurrent.atomic.AtomicReference<Packet> newestMove =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicBoolean moveEnqueued =
+        new java.util.concurrent.atomic.AtomicBoolean();
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
     private volatile DataOutputStream output;
@@ -50,7 +54,8 @@ final class DeskTouchSession implements AutoCloseable {
         this.trust=trust; this.events=events;
     }
     static boolean allowedInputType(String type) {
-        return "move".equals(type)||"button".equals(type)||"key".equals(type)||"wheel".equals(type);
+        return "move".equals(type)||"button".equals(type)||"key".equals(type)||
+            "wheel".equals(type)||"text".equals(type);
     }
     static boolean allowedWindowsControlType(String type) {
         return "reverse-claim".equals(type)||"reverse-release".equals(type)||
@@ -91,6 +96,7 @@ final class DeskTouchSession implements AutoCloseable {
                 context.init(null,new TrustManager[]{manager},new SecureRandom());
                 SSLSocket ssl=(SSLSocket)context.getSocketFactory().createSocket();
                 ssl.connect(new java.net.InetSocketAddress(device.address,37377),12000);
+                ssl.setTcpNoDelay(true);
                 ssl.setSoTimeout(50000);
                 ssl.startHandshake();
                 DataInputStream in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
@@ -121,6 +127,7 @@ final class DeskTouchSession implements AutoCloseable {
                     .put("Layout",myLayout.toString())
                     .put("ReverseInputSupported",
                         DeskTouchAccessibilityService.ready(application))
+                    .put("ForwardInputSupported",true)
                     .put("Platform","Android");
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
@@ -233,12 +240,21 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     void claimControl(){
-        // Explicit one-way mode. Android cannot initiate control of Windows.
-        status("One-way mode: select this phone in Windows DeskTouch Displays.");
+        if(!running){status("Connect to a Windows PC first");return;}
+        // Never start keyboard events until the target has confirmed that
+        // the first remote cursor movement was actually applied.
+        if(reverseLease>0)clearReverseControl(true);
+        active=false;
+        claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
+        send(new Packet("claim",claim));
+        status("Requesting Windows mouse and keyboard authority");
     }
     void releaseControl(){
+        int lease=claim;
+        claim=0;active=false;
+        if(lease>0 && running)send(new Packet("release",lease));
         clearReverseControl(true);
-        status("Windows control of Android released.");
+        status("Input control released; connections remain available.");
     }
     void requestTrust(){
         if(!running){status("Pair with Windows first");return;}
@@ -263,16 +279,58 @@ final class DeskTouchSession implements AutoCloseable {
             cursorX=bx;cursorY=by;
         }
     }
-    void moveBy(float dx,float dy){ /* one-way Windows -> Android */ }
-    void click(int button){ /* one-way Windows -> Android */ }
-    void button(int button,boolean down){ /* one-way mode */ }
-    void wheel(int amount,boolean horizontal){ /* one-way mode */ }
-    void key(int vk,boolean down){ /* one-way mode */ }
+    void moveBy(float dx,float dy){
+        if(!active)return;
+        synchronized(monitors){
+            cursorX+=Math.round(dx);cursorY+=Math.round(dy);
+            clampToMonitor();
+            send(new Packet("move",cursorX,cursorY));
+        }
+    }
+    void click(int button){
+        if(!active)return;
+        button(button,true);button(button,false);
+    }
+    void button(int button,boolean down){
+        if(active && button>=1 && button<=3)
+            send(new Packet("button",button,down?1:0));
+    }
+    void wheel(int amount,boolean horizontal){
+        if(active&&amount!=0)send(new Packet("wheel",amount,horizontal?1:0));
+    }
+    void key(int vk,boolean down){
+        if(active&&vk>0&&vk<=255)
+            send(new Packet("key",0,0,down?1:0,vk));
+    }
+    void text(String value){
+        if(!active || value==null || value.isEmpty())return;
+        // Never include typed characters in diagnostics.
+        for(int at=0;at<value.length();at+=Math.min(512,value.length()-at))
+            send(new Packet("text",0,0,0,0,
+                value.substring(at,Math.min(value.length(),at+512))));
+    }
+    private void writeNow(Packet p){
+        if(!running || output==null)return;
+        try {synchronized(writeLock){p.write(output);}}
+        catch(Exception e){status("Connection lost: "+e.getMessage());closeConnection();}
+    }
     private void send(Packet p){
-        sender.execute(()->{
-            if(!running)return;
-            try {synchronized(writeLock){p.write(output);}}
-            catch(Exception e){status("Connection lost: "+e.getMessage());closeConnection();}
+        if(sender.isShutdown())return;
+        if("move".equals(p.type)){
+            newestMove.set(p);
+            if(moveEnqueued.compareAndSet(false,true))
+                sender.execute(()->{
+                    do {
+                        Packet latest=newestMove.getAndSet(null);
+                        if(latest!=null)writeNow(latest);
+                        moveEnqueued.set(false);
+                    } while(newestMove.get()!=null &&
+                        moveEnqueued.compareAndSet(false,true));
+                });
+        }else sender.execute(()->{
+            Packet preceding=newestMove.getAndSet(null);
+            if(preceding!=null)writeNow(preceding);
+            writeNow(p);
         });
     }
     private synchronized void closeConnection(){

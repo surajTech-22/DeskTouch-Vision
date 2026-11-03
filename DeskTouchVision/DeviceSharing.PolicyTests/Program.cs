@@ -89,4 +89,20 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
         throw;
     }
     Console.WriteLine("PASS: Windows loopback TLS pairing, explicit receiver approval and monitor exchange.");
+    // The original v0.2.0 manual pairing flow must remain functional.
+    await Task.Delay(250);
+    try
+    {
+        using var manual = await HostSession.ConnectAsync(
+            "127.0.0.1", receiver.Fingerprint, receiver.Secret,
+            message => status.Enqueue(message), testTimeout.Token);
+        Check(manual.RemoteMonitors.Monitors.Count >= 1,
+            "Manual pairing code must authenticate and exchange monitors");
+    }
+    catch
+    {
+        Console.Error.WriteLine("MANUAL RECEIVER STATUS: " + string.Join(" | ", status));
+        throw;
+    }
+    Console.WriteLine("PASS: Windows loopback TLS manual pairing code and monitor exchange.");
 }

@@ -88,7 +88,7 @@ public final class AutoConnectService extends Service {
             Set<String> verified=trust.fingerprints();
             if(verified.isEmpty()) return; // no silent first-time pairing
             for(DesktopDiscovery.Device device:DesktopDiscovery.scan()) {
-                if(!verified.contains(device.fingerprint))continue;
+                if(!device.ready||device.android||!verified.contains(device.fingerprint))continue;
                 if(session.isConnected()||session.isConnecting())break;
                 android.util.DisplayMetrics display=getResources().getDisplayMetrics();
                 session.connect(device,Math.max(200,display.widthPixels),
@@ -107,7 +107,8 @@ public final class AutoConnectService extends Service {
     @Override public void onDestroy() {
         if(scheduler!=null)scheduler.shutdownNow();
         if(responder!=null)responder.close();
-        DeskTouchRuntime.clear();
+        // An active Android UI may still hold this same session when the user
+        // disables startup. Stop background work without closing their UI session.
         super.onDestroy();
     }
 }

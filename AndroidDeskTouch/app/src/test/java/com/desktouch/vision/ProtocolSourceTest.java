@@ -44,4 +44,20 @@ public final class ProtocolSourceTest {
         assertFalse(AndroidUpdateClient.isNewer("v0.3.9","0.4.0"));
         assertTrue(AndroidUpdateClient.isNewer("v1.0.0","0.9.99"));
     }
+    @Test public void linkedWindowsGroupKeepsDistinctSecureIdentities() {
+        DesktopDiscovery.Device pc1=DesktopDiscovery.parse(
+            "DT1-READY|PC1|"+"A".repeat(64),"192.168.1.11");
+        DesktopDiscovery.Device pc2=DesktopDiscovery.parse(
+            "DT1-READY|PC2|"+"B".repeat(64),"192.168.1.12");
+        DesktopDiscovery.Device pc3=DesktopDiscovery.parse(
+            "DT1-READY|PC3|"+"C".repeat(64),"192.168.1.13");
+        assertNotNull(pc1);assertNotNull(pc2);assertNotNull(pc3);
+        java.util.List<DesktopDiscovery.Device> devices=
+            java.util.Arrays.asList(pc1,pc2,pc3);
+        DesktopDiscovery.applyConnectedGroups(devices,java.util.Collections.singletonList(
+            new String[]{"A".repeat(64),"B".repeat(64)}));
+        assertEquals(pc1.groupId,pc2.groupId);
+        assertNotEquals(pc1.groupId,pc3.groupId);
+        assertNotEquals(pc1.fingerprint,pc2.fingerprint);
+    }
 }

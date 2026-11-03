@@ -161,6 +161,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         UpdateButtons();
     }
 
+    internal bool IsRunningInTray => _isHiddenInTray;
+    internal bool HasTrayIcon => _trayIcon?.Visible == true;
+
     internal static bool ShouldStayInTray(CloseReason reason, bool intentionalExit) =>
         reason == CloseReason.UserClosing && !intentionalExit;
 

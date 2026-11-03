@@ -141,6 +141,7 @@ internal sealed class SourceCapture : IDisposable
         };
         var localReturn = _localMonitors.ClampToRealMonitor(interior);
         Win.SetCursorPos(localReturn.X, localReturn.Y);
+        _hasLastPhysicalPointer = false;
         _status("Control returned to this Windows computer.");
     }
 
@@ -379,8 +380,13 @@ internal sealed class SourceCapture : IDisposable
             };
             if (leaving && _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
             {
-                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
-                    Post(() => { Interlocked.Exchange(ref _switchPending, 0); ReturnLocal(); });
+                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0 &&
+                    !Post(() =>
+                    {
+                        try { ReturnLocal(); }
+                        finally { Interlocked.Exchange(ref _switchPending, 0); }
+                    }))
+                    Interlocked.Exchange(ref _switchPending, 0);
                 return;
             }
         }

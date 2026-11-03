@@ -25,6 +25,8 @@ internal sealed class SourceCapture : IDisposable
     private int _anchorX, _anchorY;
     private long _cooldownUntil;
     private long _lastRawMs;
+    private System.Drawing.Point _lastPhysicalPointer;
+    private bool _hasLastPhysicalPointer;
     private bool _controlPressed, _altPressed, _shiftPressed;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
@@ -52,6 +54,7 @@ internal sealed class SourceCapture : IDisposable
     {
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
+        _hasLastPhysicalPointer = false;
         _edge = side;
     }
 
@@ -65,6 +68,7 @@ internal sealed class SourceCapture : IDisposable
         _localMonitors = local;
         _remoteMonitors = remote;
         _local = local.Bounds;
+        _hasLastPhysicalPointer = false;
         var home = local.Monitors.FirstOrDefault(m => m.Primary) ?? local.Monitors[0];
         _anchorX = home.X + home.Width / 2;
         _anchorY = home.Y + home.Height / 2;
@@ -97,6 +101,7 @@ internal sealed class SourceCapture : IDisposable
             Disarm();
             throw new InvalidOperationException("Windows global low-level hooks unavailable.");
         }
+        _hasLastPhysicalPointer = false;
         Interlocked.Exchange(ref _armed, 1);
         _status($"Ready. Move to the {_edge.ToString().ToLowerInvariant()} outside edge to control the connected PC.");
     }
@@ -136,6 +141,7 @@ internal sealed class SourceCapture : IDisposable
         };
         var localReturn = _localMonitors.ClampToRealMonitor(interior);
         Win.SetCursorPos(localReturn.X, localReturn.Y);
+        _hasLastPhysicalPointer = false;
         _status("Control returned to this Windows computer.");
     }
 
@@ -167,7 +173,9 @@ internal sealed class SourceCapture : IDisposable
         _remoteX = entry.X;
         _remoteY = entry.Y;
         Win.SetCursorPos(_anchorX, _anchorY);
-        _lastRawMs = Environment.TickCount64;
+        // Let touchpads without Raw Input fall back to the low-level mouse
+        // hook immediately; do not leave their first 650 ms unresponsive.
+        _lastRawMs = 0;
         Interlocked.Exchange(ref _active, 1);
         if (!_session.TrySend(new Packet("move", _remoteX, _remoteY)))
             ReturnLocal();
@@ -192,14 +200,43 @@ internal sealed class SourceCapture : IDisposable
         _status("Remote PC is currently being used locally. Native input has priority.");
     }
 
-    private void Post(Action action)
+    private bool Post(Action action)
     {
         try
         {
             if (_owner.IsHandleCreated && !_owner.IsDisposed)
+            {
                 _owner.BeginInvoke(action);
+                return true;
+            }
         }
         catch (InvalidOperationException) { }
+        return false;
+    }
+
+    private void RequestAtOuterEdge(System.Drawing.Point cursor, string source)
+    {
+        if (!IsArmed || RemoteActive || Volatile.Read(ref _pending) != 0 ||
+            Environment.TickCount64 < _cooldownUntil ||
+            Interlocked.CompareExchange(ref _switchPending, 1, 0) != 0)
+            return;
+        if (!Post(() =>
+        {
+            try
+            {
+                // The pointer may have moved away before the UI thread gets
+                // the queued action. Do not switch based on a stale event.
+                if (IsArmed && !RemoteActive &&
+                    _localMonitors.IsExternalEdge(Cursor.Position, _edge,
+                        EdgeHandoffPolicy.EdgeZonePixels + 2))
+                {
+                    _status($"Outward {source} detected at {_edge.ToString().ToLowerInvariant()} external Windows screen edge.");
+                    EnterRemote(cursor);
+                }
+            }
+            finally { Interlocked.Exchange(ref _switchPending, 0); }
+        }))
+            Interlocked.Exchange(ref _switchPending, 0);
     }
 
     private IntPtr MouseHook(int code, IntPtr wParam, IntPtr lParam)
@@ -237,14 +274,17 @@ internal sealed class SourceCapture : IDisposable
                 return (IntPtr)1;
             }
         }
-        else if (IsArmed && msg == Win.WM_MOUSEMOVE &&
-            Environment.TickCount64 >= _cooldownUntil &&
-            _localMonitors.IsExternalEdge(
-                new System.Drawing.Point(mouse.pt.X, mouse.pt.Y), _edge) &&
-            Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
+        else if (IsArmed && msg == Win.WM_MOUSEMOVE)
         {
-            var point = new System.Drawing.Point(mouse.pt.X, mouse.pt.Y);
-            Post(() => { Interlocked.Exchange(ref _switchPending, 0); EnterRemote(point); });
+            var cursor = new System.Drawing.Point(mouse.pt.X, mouse.pt.Y);
+            int dx = _hasLastPhysicalPointer ? cursor.X - _lastPhysicalPointer.X : 0;
+            int dy = _hasLastPhysicalPointer ? cursor.Y - _lastPhysicalPointer.Y : 0;
+            _lastPhysicalPointer = cursor;
+            _hasLastPhysicalPointer = true;
+            // Fallback for laptop touchpads which provide ordinary mouse
+            // messages but no usable Raw Input relative motion.
+            if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor, _edge, dx, dy))
+                RequestAtOuterEdge(cursor, "mouse-hook movement");
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
@@ -282,7 +322,7 @@ internal sealed class SourceCapture : IDisposable
 
     internal void OnRawInput(IntPtr lParam)
     {
-        if (!RemoteActive) return;
+        if (!IsArmed) return;
         uint size = 0;
         uint headerSize = (uint)Marshal.SizeOf<Win.RAWINPUTHEADER>();
         uint result = Win.GetRawInputData(lParam, Win.RID_INPUT, IntPtr.Zero, ref size, headerSize);
@@ -294,8 +334,21 @@ internal sealed class SourceCapture : IDisposable
             if (read == uint.MaxValue) return;
             var input = Marshal.PtrToStructure<Win.RAWINPUT>(memory);
             if (input.Header.Type != 0 || (input.Mouse.Flags & 1) != 0) return;
-            _lastRawMs = Environment.TickCount64;
-            MoveRemote(input.Mouse.LastX, input.Mouse.LastY);
+            if (RemoteActive)
+            {
+                _lastRawMs = Environment.TickCount64;
+                MoveRemote(input.Mouse.LastX, input.Mouse.LastY);
+            }
+            else
+            {
+                // Windows may clamp the pointer at the last physical screen
+                // pixel. WM_INPUT still reports the mouse pushing outward.
+                // This is the missing-edge case that the old LL hook missed.
+                var cursor = Cursor.Position;
+                if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
+                    _edge, input.Mouse.LastX, input.Mouse.LastY))
+                    RequestAtOuterEdge(cursor, "raw-mouse movement");
+            }
         }
         finally { Marshal.FreeHGlobal(memory); }
     }
@@ -327,8 +380,13 @@ internal sealed class SourceCapture : IDisposable
             };
             if (leaving && _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
             {
-                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
-                    Post(() => { Interlocked.Exchange(ref _switchPending, 0); ReturnLocal(); });
+                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0 &&
+                    !Post(() =>
+                    {
+                        try { ReturnLocal(); }
+                        finally { Interlocked.Exchange(ref _switchPending, 0); }
+                    }))
+                    Interlocked.Exchange(ref _switchPending, 0);
                 return;
             }
         }

@@ -65,6 +65,55 @@ var mapped = nonrectangular.ClampToRealMonitor(new System.Drawing.Point(120, -40
 Check(nonrectangular.MonitorAt(mapped) != null,
     "Mapped remote cursor must never land in unoccupied virtual-screen gaps");
 
+// A saturated cursor can stop generating ordinary WM_MOUSEMOVE, but raw
+// mouse motion continues. The new handoff policy must still recognize a
+// *deliberate outward push* within a generous physical-pixel edge band.
+Check(EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(4479, 600), MonitorEdge.Right, 9, 0),
+    "Right-edge RAW motion must hand off while Windows clamps the cursor");
+Check(EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(4468, 600), MonitorEdge.Right, 9, 0),
+    "Fast mouse may hand off shortly before its final screen pixel");
+Check(!EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(4448, 600), MonitorEdge.Right, 9, 0),
+    "Handoff must not trigger far from an outer boundary");
+Check(!EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(4479, 600), MonitorEdge.Right, -2, 0),
+    "Moving inward at the boundary must never switch computers");
+Check(!EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(4479, 600), MonitorEdge.Right, 0, 0),
+    "Resting at the boundary must never switch computers");
+Check(!EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(1919, 600), MonitorEdge.Right, 8, 0),
+    "Native Windows display seams must never hand off to a remote PC");
+Check(EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(0, 900), MonitorEdge.Left, -5, 0),
+    "Left screen boundary must recognize outward motion");
+Check(EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(250, 0), MonitorEdge.Top, 0, -5),
+    "Top screen boundary must recognize outward motion");
+Check(EdgeHandoffPolicy.ShouldRequest(extended,
+    new System.Drawing.Point(250, 1079), MonitorEdge.Bottom, 0, 5),
+    "Bottom screen boundary must recognize outward motion");
+Check(EdgeHandoffPolicy.ShouldRequest(nonrectangular,
+    new System.Drawing.Point(-1920, -450), MonitorEdge.Left, -3, 0),
+    "Negative-coordinate multi-monitor layouts must recognize edges");
+
+var monitorTile = new System.Drawing.RectangleF(640, 130, 130, 85);
+var rightClamped = DisplayArrangementControl.ConstrainDrag(
+    monitorTile, new System.Drawing.Size(800, 350), new System.Drawing.Point(300, 0));
+Check(rightClamped.X == 22,
+    "Dragging a connected PC beyond the right window edge must keep it visible");
+var leftClamped = DisplayArrangementControl.ConstrainDrag(
+    monitorTile, new System.Drawing.Size(800, 350), new System.Drawing.Point(-1000, 0));
+Check(leftClamped.X == -632,
+    "Dragging a remote screen beyond the left window edge must keep it visible");
+var bottomClamped = DisplayArrangementControl.ConstrainDrag(
+    monitorTile, new System.Drawing.Size(800, 350), new System.Drawing.Point(0, 1000));
+Check(bottomClamped.Y == 127,
+    "Dragging past bottom must not hide the connected screen group");
+Console.WriteLine("PASS: clipped-pointer raw edge handoff, four outward directions, internal seams and UI drag bounds.");
+
 Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four outer edges, and nonrectangular monitor layouts.");
 
 
@@ -152,3 +201,50 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
     }
     Console.WriteLine("PASS: Windows loopback TLS manual pairing code and monitor exchange.");
 }
+
+
+// Windows Forms layout smoke test runs on a dedicated STA thread. It never
+// displays a window or starts the LAN receiver, and it can run on GitHub's
+// Windows test runner without touching real monitor/input settings.
+var uiCompletion = new TaskCompletionSource<bool>(
+    TaskCreationOptions.RunContinuationsAsynchronously);
+var uiThread = new Thread(() =>
+{
+    try
+    {
+        using var view = new DisplaySettingsForm();
+        view.CreateControl();
+        var actionRow = view.Controls.Find("ConnectionActions", true)
+            .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
+        Check(!actionRow.WrapContents && actionRow.AutoScroll,
+            "High-DPI action buttons must not collapse into an invisible second row");
+        var diagram = view.Controls.Find("DisplayDiagram", true)
+            .OfType<DisplayArrangementControl>().Single();
+        diagram.Local = extended;
+        diagram.Remote = nonrectangular;
+        foreach (var windowSize in new[] {
+            new System.Drawing.Size(780, 600),
+            new System.Drawing.Size(1000, 690) })
+        {
+            view.ClientSize = windowSize;
+            view.PerformLayout();
+            foreach (System.Windows.Forms.Control outer in view.Controls)
+                outer.PerformLayout();
+            diagram.Parent?.PerformLayout();
+            diagram.PerformLayout();
+            Check(diagram.Width > 250 && diagram.Height > 80,
+                "Native display diagram must retain meaningful dimensions");
+            using var rendered = new System.Drawing.Bitmap(
+                diagram.Width, diagram.Height);
+            diagram.DrawToBitmap(rendered,
+                new System.Drawing.Rectangle(0, 0, diagram.Width, diagram.Height));
+        }
+        uiCompletion.TrySetResult(true);
+    }
+    catch (Exception ex) { uiCompletion.TrySetException(ex); }
+});
+uiThread.SetApartmentState(ApartmentState.STA);
+uiThread.Start();
+await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
+uiThread.Join();
+Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");

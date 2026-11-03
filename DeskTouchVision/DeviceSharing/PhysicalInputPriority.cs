@@ -64,7 +64,8 @@ internal sealed class PhysicalInputMonitor : IDisposable
     private readonly Control _window;
     private readonly Win.HookProc _keyboardProc, _mouseProc;
     private IntPtr _keyboardHook, _mouseHook;
-    private bool _running;
+    private volatile bool _running;
+    internal bool IsRunning => _running;
     internal LocalInputPriority Priority { get; } = new();
 
     internal PhysicalInputMonitor(Control window)
@@ -98,6 +99,10 @@ internal sealed class PhysicalInputMonitor : IDisposable
             throw new InvalidOperationException("Unable to set up physical-input hooks.");
         }
         _running = true;
+        // Physical input might have occurred while this monitoring session was
+        // intentionally idle. Require a fresh 2-second local idle interval
+        // before the first remotely granted input lease.
+        Priority.RecordPhysicalActivity();
     }
 
     private IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)

@@ -24,8 +24,15 @@ internal static class Program
             "DeviceSharing", "DeskTouch.DeviceShare.exe");
         if (!File.Exists(share))
         {
-            // Graceful fallback for older installations without the module.
-            Application.Run(new MainForm());
+            // Never show the old camera experiment for a damaged installation:
+            // this made the user think the v0.2.0 UI was still the main app.
+            MessageBox.Show(
+                "DeskTouch Windows Displays is missing from this installation.\\n\\n" +
+                "Repair using the complete latest ZIP from:\\n" +
+                "https://github.com/surajTech-22/DeskTouch-Vision/releases/latest\\n\\n" +
+                "Extract it and run INSTALL_DESKTOUCH.cmd.",
+                "DeskTouch Vision — repair installation",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
         try

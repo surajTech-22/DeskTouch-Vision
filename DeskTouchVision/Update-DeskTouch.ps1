@@ -80,6 +80,10 @@ try {
   if ($movedOriginal) { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }
   # Downloaded release archive and extracted payload are transient after success.
   Remove-Item -LiteralPath $pkg -Force -ErrorAction SilentlyContinue
+  $downloadFolder = Split-Path -Path $pkg -Parent
+  if ($downloadFolder -like (Join-Path $env:TEMP 'DeskTouchVision-Update*')) {
+    Remove-Item -LiteralPath $downloadFolder -Force -ErrorAction SilentlyContinue
+  }
 }
 catch {
   Log "FAILED: $($_.Exception.Message)"
@@ -90,8 +94,20 @@ catch {
       }
       Move-Item -LiteralPath $backup -Destination $targetFull -ErrorAction Stop
       Log 'Previous installed version restored after update failure.'
-      Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe')
     } catch { Log "Rollback FAILED: $($_.Exception.Message)" }
+  }
+  # If a network/download/staging/close check failed *before* replacement,
+  # do not leave the user with NO DeskTouch window after the updater exited.
+  if ($targetFull -and (Test-Path -LiteralPath (Join-Path $targetFull 'DeskTouchVision.exe'))) {
+    try {
+      $running = @(Get-CimInstance Win32_Process -Filter "Name='DeskTouch.DeviceShare.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($targetFull,
+          [StringComparison]::OrdinalIgnoreCase) })
+      if ($running.Count -eq 0) {
+        Log 'Restarting previous DeskTouch installation after failed update.'
+        Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ErrorAction Stop
+      }
+    } catch { Log "Restart after failure unavailable: $($_.Exception.Message)" }
   }
   throw
 }

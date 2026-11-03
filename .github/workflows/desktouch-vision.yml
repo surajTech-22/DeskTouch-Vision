@@ -24,6 +24,18 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+      - name: Verify installer, updater and diagnostics PowerShell syntax
+        shell: pwsh
+        run: |
+          foreach ($path in @('DeskTouchVision/Install-DeskTouch.ps1',
+                              'DeskTouchVision/Update-DeskTouch.ps1',
+                              'DeskTouchVision/CHECK_DESKTOUCH.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path), [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) { throw "PowerShell parse error in $path : $($errors -join '; ')" }
+          }
       - name: Check local hardware priority regression tests
         shell: pwsh
         run: |
@@ -46,6 +58,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Copy-Item DeskTouchVision/Install-DeskTouch.ps1 DeskTouchVision/dist/
           Copy-Item DeskTouchVision/INSTALL_DESKTOUCH.cmd DeskTouchVision/dist/
+          Copy-Item DeskTouchVision/CHECK_DESKTOUCH.ps1 DeskTouchVision/dist/
           New-Item -ItemType Directory -Force DeskTouchVision/published | Out-Null
           $zip = "DeskTouchVision/published/DeskTouchVision-win-x64.zip"
           Compress-Archive -Path DeskTouchVision/dist/* -DestinationPath $zip -CompressionLevel Optimal
@@ -53,6 +66,8 @@ jobs:
           [IO.File]::WriteAllText("$zip.sha256", "$hash  DeskTouchVision-win-x64.zip" + [Environment]::NewLine, [Text.Encoding]::ASCII)
           if (-not (Test-Path "DeskTouchVision/dist/app/DeskTouchVision.exe")) { throw "App executable missing" }
           if (-not (Test-Path "DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe")) { throw "Input-sharing executable missing" }
+          if (-not (Test-Path "DeskTouchVision/dist/app/Update-DeskTouch.ps1")) { throw "Installed updater script missing" }
+          if (-not (Test-Path "DeskTouchVision/dist/CHECK_DESKTOUCH.ps1")) { throw "Diagnostics script missing" }
       - name: Upload installable ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -76,7 +91,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.1: opens Windows Display Settings-style arrangement directly. Detect nearby DeskTouch PCs over trusted LAN; select a computer and approve the request on its own screen. Drag the remote group to select left/right/top/bottom edge. Native monitors and physical keyboards/mice stay authoritative. No screen streaming, and no camera tracking. Two-PC field input and updater testing are still required."
+            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes "EXPERIMENTAL v0.2.2: fixes updater falsely reporting no newer release during an active automatic download, adds per-version update checks, checksum and error logs, an atomic repair installer with rollback, and read-only update diagnostics. The Windows-style Displays window remains the default. Please run INSTALL_DESKTOUCH.cmd manually once if an old v0.2.0/v0.2.1 installation cannot upgrade itself. Input sharing still requires testing on real Windows PCs."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
             Write-Host "Release event sent: $tag"

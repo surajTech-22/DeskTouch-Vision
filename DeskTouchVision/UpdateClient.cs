@@ -2,17 +2,17 @@ using System;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Windows.Forms;
 
 namespace DeskTouchVision;
 
 /// <summary>
-/// Release-driven updates for the future separate DeskTouch-Vision repository.
-/// The application works fully offline; only this optional updater contacts
-/// GitHub/ntfy. Releases are downloaded ONLY from the configured official repo,
-/// checked against a SHA-256 asset, and staged outside the running app.
-/// The repo and release must exist before this is operational.
+/// Independent release-event updater for both the DeskTouch launcher and the
+/// Windows Displays application. Avoids false "up to date" when a background
+/// download is already running, logs failures, and verifies release archives.
 /// </summary>
 internal static class UpdateClient
 {
@@ -20,156 +20,262 @@ internal static class UpdateClient
     private const string Repo = "DeskTouch-Vision";
     private const string Topic = "desktouch-vision-surajtech22-qrp9f4x2";
     private const string ArchiveName = "DeskTouchVision-win-x64.zip";
-    private const string ChecksumName = "DeskTouchVision-win-x64.zip.sha256";
-    private static readonly Version CurrentVersion = new(0, 2, 1);
-    private static readonly HttpClient Http = MakeHttp();
-    private static int _updateStarted;
+    private const string ChecksumName = ArchiveName + ".sha256";
+    private static readonly Version CurrentVersion =
+        Assembly.GetEntryAssembly()?.GetName().Version ?? new Version(0, 2, 2, 0);
+    private static readonly HttpClient Downloads = MakeHttp(false);
+    private static readonly HttpClient Events = MakeHttp(true);
+    private static readonly SemaphoreSlim UpdateGate = new(1, 1);
+    private static int _started;
 
-    private static HttpClient MakeHttp()
+    private enum CheckResult { UpToDate, NoReleases, InstallationStarted }
+
+    private static HttpClient MakeHttp(bool stream)
     {
-        var c = new HttpClient { Timeout = TimeSpan.FromMinutes(4) };
-        c.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("DeskTouchVision", "0.2.1"));
-        return c;
+        var client = new HttpClient
+        {
+            Timeout = stream ? Timeout.InfiniteTimeSpan : TimeSpan.FromMinutes(12)
+        };
+        client.DefaultRequestHeaders.UserAgent.Add(
+            new ProductInfoHeaderValue("DeskTouchVision", CurrentVersion.ToString()));
+        client.DefaultRequestHeaders.Accept.Add(
+            new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        return client;
+    }
+
+    private static void Log(string message)
+    {
+        try
+        {
+            string folder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DeskTouchVision", "logs");
+            Directory.CreateDirectory(folder);
+            File.AppendAllText(Path.Combine(folder, "update-check.log"),
+                DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
+        }
+        catch { /* Failed logging must never affect local Windows input. */ }
+    }
+
+    private static void Post(Form window, Action action)
+    {
+        try
+        {
+            if (!window.IsDisposed && window.IsHandleCreated)
+                window.BeginInvoke(() => { if (!window.IsDisposed) action(); });
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+    }
+
+    private static void SetStatus(Form window, string status)
+    {
+        Post(window, () => window.Text = "DeskTouch Vision — " + status);
     }
 
     internal static void StartEventUpdates(Form window)
     {
+        if (Interlocked.Exchange(ref _started, 1) == 1) return;
+        var lifecycle = new CancellationTokenSource();
+        window.FormClosed += (_, _) => lifecycle.Cancel();
         _ = Task.Run(async () =>
         {
-            // One initial check. There is NO interval polling for versions.
-            try { await TryInstallNewVersion(window, false); } catch { }
-            // Release notifications are events over SSE, not an hourly polling loop.
-            while (!window.IsDisposed)
+            try
             {
-                try
+                try { await CheckForUpdatesAsync(window, manual: false, lifecycle.Token); }
+                catch (Exception ex) { Log("Automatic startup update failed: " + ex.Message); }
+
+                // The local input-sharing program works even if this SSE stream
+                // is unreachable. No interval-based version polling is used.
+                while (!lifecycle.IsCancellationRequested)
                 {
-                    using var request = new HttpRequestMessage(HttpMethod.Get,
-                        $"https://ntfy.sh/{Topic}/sse");
-                    using var response = await Http.SendAsync(request,
-                        HttpCompletionOption.ResponseHeadersRead);
-                    response.EnsureSuccessStatusCode();
-                    using var stream = await response.Content.ReadAsStreamAsync();
-                    using var reader = new StreamReader(stream);
-                    while (!reader.EndOfStream && !window.IsDisposed)
+                    try
                     {
-                        var line = await reader.ReadLineAsync();
-                        if (line == null) break;
-                        if (!line.StartsWith("data: ", StringComparison.Ordinal)) continue;
-                        try
+                        using var request = new HttpRequestMessage(HttpMethod.Get,
+                            $"https://ntfy.sh/{Topic}/sse");
+                        using var response = await Events.SendAsync(request,
+                            HttpCompletionOption.ResponseHeadersRead, lifecycle.Token);
+                        response.EnsureSuccessStatusCode();
+                        using var stream = await response.Content.ReadAsStreamAsync(lifecycle.Token);
+                        using var reader = new StreamReader(stream);
+                        while (!lifecycle.IsCancellationRequested)
                         {
-                            using var notice = JsonDocument.Parse(line[6..]);
-                            if (notice.RootElement.TryGetProperty("message", out var msg) &&
-                                msg.GetString()?.StartsWith("desktouch-release:", StringComparison.Ordinal) == true)
-                                await TryInstallNewVersion(window, false);
+                            var line = await reader.ReadLineAsync(lifecycle.Token);
+                            if (line == null) break;
+                            if (!line.StartsWith("data: ", StringComparison.Ordinal)) continue;
+                            try
+                            {
+                                using var msg = JsonDocument.Parse(line[6..]);
+                                if (msg.RootElement.TryGetProperty("message", out var text) &&
+                                    text.GetString()?.StartsWith("desktouch-release:", StringComparison.Ordinal) == true)
+                                    await CheckForUpdatesAsync(window, manual: false, lifecycle.Token);
+                            }
+                            catch (JsonException) { /* unrelated notifications */ }
+                            catch (Exception ex) { Log("Release notification update: " + ex.Message); }
                         }
-                        catch (JsonException) { }
                     }
+                    catch (OperationCanceledException) when (lifecycle.IsCancellationRequested) { break; }
+                    catch (Exception ex) { Log("Release event stream disconnected: " + ex.Message); }
+                    await Task.Delay(TimeSpan.FromSeconds(15), lifecycle.Token);
                 }
-                catch { }
-                await Task.Delay(TimeSpan.FromSeconds(20));
             }
+            catch (OperationCanceledException) { }
+            finally { lifecycle.Dispose(); }
         });
     }
 
     internal static async Task CheckManuallyAsync(Form window)
     {
+        if (window.IsDisposed) return;
+        SetStatus(window, "checking GitHub releases");
         try
         {
-            bool updated = await TryInstallNewVersion(window, true);
-            if (!updated && !window.IsDisposed)
-                window.BeginInvoke(() => MessageBox.Show(window,
-                    "No newer published DeskTouch release is available, or the new repository has no releases yet.",
-                    "DeskTouch updates", MessageBoxButtons.OK, MessageBoxIcon.Information));
+            // Manual requests WAIT for the automatic startup check/download to
+            // finish; they never mistake an in-progress update for "no release".
+            var result = await CheckForUpdatesAsync(window, manual: true, CancellationToken.None);
+            if (window.IsDisposed || result == CheckResult.InstallationStarted) return;
+            string message = result switch
+            {
+                CheckResult.NoReleases =>
+                    "No published releases were returned by the official DeskTouch repository.",
+                _ => $"This installation is already current (v{CurrentVersion.ToString(3)})."
+            };
+            SetStatus(window, "Displays");
+            Post(window, () => MessageBox.Show(window, message, "DeskTouch updates",
+                MessageBoxButtons.OK, MessageBoxIcon.Information));
         }
         catch (Exception ex)
         {
-            if (!window.IsDisposed)
-                window.BeginInvoke(() => MessageBox.Show(window,
-                    "Update check unavailable: " + ex.Message + "\n\nCamera features still work offline.",
-                    "DeskTouch updates", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+            SetStatus(window, "Displays — update check failed");
+            Log("Manual update failed: " + ex);
+            Post(window, () => MessageBox.Show(window,
+                "The update could not be checked or installed.\n\n" + ex.Message +
+                "\n\nDiagnostics: %LOCALAPPDATA%\\DeskTouchVision\\logs\\update-check.log" +
+                "\nInstaller: https://github.com/surajTech-22/DeskTouch-Vision/releases/latest",
+                "DeskTouch updates", MessageBoxButtons.OK, MessageBoxIcon.Warning));
         }
     }
 
-    private static async Task<bool> TryInstallNewVersion(Form window, bool manual)
+    private static async Task<CheckResult> CheckForUpdatesAsync(
+        Form window, bool manual, CancellationToken cancellation)
     {
-        if (window.IsDisposed || Interlocked.CompareExchange(ref _updateStarted, 0, 0) != 0) return false;
-        var uri = $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest";
-        using var res = await Http.GetAsync(uri);
-        if (res.StatusCode == HttpStatusCode.NotFound) return false;
-        res.EnsureSuccessStatusCode();
-        using var json = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
-        var root = json.RootElement;
-        string? tag = root.GetProperty("tag_name").GetString();
-        if (!Version.TryParse(tag?.TrimStart('v', 'V'), out var releaseVersion) ||
-            releaseVersion <= CurrentVersion) return false;
-        string? archiveUrl = null, checksumUrl = null;
-        foreach (var asset in root.GetProperty("assets").EnumerateArray())
-        {
-            var name = asset.GetProperty("name").GetString();
-            var link = asset.GetProperty("browser_download_url").GetString();
-            if (name == ArchiveName) archiveUrl = link;
-            if (name == ChecksumName) checksumUrl = link;
-        }
-        if (archiveUrl == null || checksumUrl == null) return false;
-        if (!Uri.TryCreate(archiveUrl, UriKind.Absolute, out var a) ||
-            !Uri.TryCreate(checksumUrl, UriKind.Absolute, out var b) ||
-            !string.Equals(a.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(b.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
-            !a.AbsolutePath.StartsWith($"/{Owner}/{Repo}/releases/download/", StringComparison.OrdinalIgnoreCase) ||
-            !b.AbsolutePath.StartsWith($"/{Owner}/{Repo}/releases/download/", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("Unexpected release asset URL.");
-        if (Interlocked.CompareExchange(ref _updateStarted, 1, 0) != 0) return false;
+        // Automatic events never start a duplicate update in progress.
+        if (!manual && !await UpdateGate.WaitAsync(0, cancellation))
+            return CheckResult.UpToDate;
+        if (manual) await UpdateGate.WaitAsync(cancellation);
         try
         {
-            // Download to a new temporary folder to avoid overwriting the running app.
-            string rootTemp = Path.Combine(Path.GetTempPath(), "DeskTouchVision-Update", releaseVersion.ToString());
-            Directory.CreateDirectory(rootTemp);
-            string zipPath = Path.Combine(rootTemp, ArchiveName);
-            string hashText = (await Http.GetStringAsync(checksumUrl)).Trim();
-            var hash = hashText.Split([' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-            if (hash == null || hash.Length != 64 || !hash.All(Uri.IsHexDigit))
-                throw new InvalidDataException("Invalid checksum file.");
-            await using (var target = File.Create(zipPath))
-            await using (var source = await Http.GetStreamAsync(archiveUrl))
-                await source.CopyToAsync(target);
-            string actual = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(zipPath)));
-            if (!actual.Equals(hash, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("Release archive failed SHA-256 verification.");
-            string dir = AppContext.BaseDirectory;
-            // v0.2.1 opens the stand-alone DeviceSharing process as the main
-            // visible window. Its update root is the enclosing app directory.
-            if (string.Equals(Path.GetFileName(Path.TrimEndingDirectorySeparator(dir)),
-                "DeviceSharing", StringComparison.OrdinalIgnoreCase))
-                dir = Directory.GetParent(Path.TrimEndingDirectorySeparator(dir))!.FullName;
-            string script = Path.Combine(dir, "Update-DeskTouch.ps1");
-            if (!File.Exists(script)) throw new FileNotFoundException("Updater not installed", script);
-            var psi = new ProcessStartInfo("powershell.exe")
+            if (window.IsDisposed) return CheckResult.UpToDate;
+            using var response = await Downloads.GetAsync(
+                $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest", cancellation);
+            if (response.StatusCode == HttpStatusCode.NotFound)
+                return CheckResult.NoReleases;
+            response.EnsureSuccessStatusCode();
+            using var release = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation));
+            var root = release.RootElement;
+            var tag = root.GetProperty("tag_name").GetString();
+            if (!Version.TryParse(tag?.TrimStart('v', 'V'), out var latest))
+                throw new InvalidDataException("GitHub returned an invalid DeskTouch release version.");
+            if (latest <= CurrentVersion) return CheckResult.UpToDate;
+
+            string? archiveUrl = null, checksumUrl = null;
+            foreach (var item in root.GetProperty("assets").EnumerateArray())
             {
-                UseShellExecute = false, CreateNoWindow = true
-            };
-            foreach (var argument in new[] {
-                "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                "-File", script, "-Package", zipPath, "-Target", dir,
-                "-CurrentPid", Environment.ProcessId.ToString(), "-ExpectedHash", hash })
-                psi.ArgumentList.Add(argument);
-            Process.Start(psi);
-            if (!window.IsDisposed)
-            {
-                window.BeginInvoke(() =>
-                {
-                    if (!window.IsDisposed)
-                    {
-                        window.Close(); // Releases webcam and exits app; updater completes install.
-                    }
-                });
+                var name = item.GetProperty("name").GetString();
+                if (name == ArchiveName)
+                    archiveUrl = item.GetProperty("browser_download_url").GetString();
+                if (name == ChecksumName)
+                    checksumUrl = item.GetProperty("browser_download_url").GetString();
             }
-            return true;
+            if (archiveUrl == null || checksumUrl == null)
+                throw new InvalidDataException($"Release v{latest} does not contain the required installer and checksum.");
+            ValidateReleaseUrl(archiveUrl);
+            ValidateReleaseUrl(checksumUrl);
+
+            string installedRoot = AppContext.BaseDirectory;
+            if (Path.GetFileName(Path.TrimEndingDirectorySeparator(installedRoot))
+                .Equals("DeviceSharing", StringComparison.OrdinalIgnoreCase))
+                installedRoot = Directory.GetParent(Path.TrimEndingDirectorySeparator(installedRoot))!.FullName;
+            string expectedRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Programs", "DeskTouchVision");
+            if (!Path.GetFullPath(installedRoot).TrimEnd(Path.DirectorySeparatorChar).Equals(
+                Path.GetFullPath(expectedRoot).TrimEnd(Path.DirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    "DeskTouch is running from an extracted or nonstandard folder. Run INSTALL_DESKTOUCH.cmd from the release once to install updates properly.");
+            string updater = Path.Combine(installedRoot, "Update-DeskTouch.ps1");
+            if (!File.Exists(updater))
+                throw new FileNotFoundException("Installed updater script missing; reinstall DeskTouch from GitHub.", updater);
+
+            string downloadFolder = Path.Combine(Path.GetTempPath(), "DeskTouchVision-Update",
+                latest.ToString() + "-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(downloadFolder);
+            string archivePath = Path.Combine(downloadFolder, ArchiveName);
+
+            try
+            {
+                SetStatus(window, $"downloading verified update v{latest.ToString(3)}");
+                Log($"Update available: installed={CurrentVersion.ToString(3)}, release={latest.ToString(3)}");
+                string checksumText = (await Downloads.GetStringAsync(checksumUrl, cancellation)).Trim();
+                string? expectedHash = checksumText.Split(
+                    [' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                if (expectedHash == null || expectedHash.Length != 64 ||
+                    !expectedHash.All(Uri.IsHexDigit) ||
+                    !checksumText.Contains(ArchiveName, StringComparison.Ordinal))
+                    throw new InvalidDataException("The release SHA-256 checksum file is malformed.");
+
+                await using (var destination = new FileStream(
+                    archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                await using (var source = await Downloads.GetStreamAsync(archiveUrl, cancellation))
+                    await source.CopyToAsync(destination, cancellation);
+
+                await using var hashStream = new FileStream(
+                    archivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+                string actualHash = Convert.ToHexString(
+                    await SHA256.HashDataAsync(hashStream, cancellation));
+                if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Downloaded DeskTouch archive failed SHA-256 verification.");
+
+                // The independent host waits for all *installed* DeskTouch
+                // executables to exit gracefully before replacing either.
+                var process = new ProcessStartInfo("powershell.exe")
+                { UseShellExecute = false, CreateNoWindow = true };
+                foreach (var arg in new[] {
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                    "-File", updater, "-Package", archivePath, "-Target", expectedRoot,
+                    "-CurrentPid", Environment.ProcessId.ToString(),
+                    "-ExpectedHash", expectedHash })
+                    process.ArgumentList.Add(arg);
+                if (Process.Start(process) == null)
+                    throw new InvalidOperationException("Unable to start the independent update installer.");
+                Log("Checksum verified; separate installer launched. Closing old DeskTouch window.");
+                SetStatus(window, "installing update");
+                Post(window, window.Close);
+                return CheckResult.InstallationStarted;
+            }
+            catch
+            {
+                try { Directory.Delete(downloadFolder, true); } catch { }
+                throw;
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            Interlocked.Exchange(ref _updateStarted, 0);
-            if (!manual) return false;
-            throw;
+            Log("Update check failed: " + ex.Message);
+            if (manual) throw;
+            return CheckResult.UpToDate; // background error is logged, never shown as "current"
         }
+        finally { UpdateGate.Release(); }
+    }
+
+    private static void ValidateReleaseUrl(string value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            uri.Scheme != Uri.UriSchemeHttps ||
+            !uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) ||
+            !uri.AbsolutePath.StartsWith($"/{Owner}/{Repo}/releases/download/",
+                StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("A release download URL was not hosted in the official DeskTouch repository.");
     }
 }

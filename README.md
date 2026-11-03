@@ -4,6 +4,22 @@ DeskTouch Vision is a standalone Windows application for sharing one keyboard an
 
 **Version:** 0.2.1 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
 
+## v0.2.2 — repair old camera screen and misleading update results
+
+If the window title still says **"DeskTouch Vision 0.2.0 — offline Windows sharing preview"**, the older camera-calibration application is still running: it is **not** the updated Windows Displays interface. A dialog saying "No newer published release" in v0.2.0 can be inaccurate: that older code returns the same result when an automatic update is already downloading or has a hidden error.
+
+**Reliable one-time repair:**
+
+1. Get the latest official `DeskTouchVision-win-x64.zip` from [GitHub Releases](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest).
+2. Download the matching `.zip.sha256` and verify the ZIP checksum if possible.
+3. Extract the ZIP into a new temporary directory, close the old "DeskTouch updates" message, and run `INSTALL_DESKTOUCH.cmd`.
+4. The script stages the complete application under `%LOCALAPPDATA%\\Programs\\DeskTouchVision`, closes only matching installed DeskTouch processes gracefully, retains settings and can roll back a failed replacement. It never disables local input hardware.
+5. Launch the existing **DeskTouch Vision** desktop shortcut again. The title should be **"DeskTouch Vision — Displays"**, with a Windows-style monitor layout rather than a camera preview.
+
+**Read-only diagnostic:** `CHECK_DESKTOUCH.ps1` is included beside the installer. It prints installed file versions, process paths and the last updater log messages without accessing pairing secrets or typed content. Application logs: `%LOCALAPPDATA%\\DeskTouchVision\\logs\\update-check.log`, `update.log` and `install.log`.
+
+**Automatic updates:** installed v0.2.2 uses its compiled assembly version to compare releases, waits for any startup download before presenting a manual status, shows failures rather than claiming no release, downloads to a unique temporary folder, verifies the official release SHA-256 file, launches an independent updater, closes both app processes gracefully and restarts. Older v0.2.0/v0.2.1 clients are not retroactively fixed; use the manual repair once if they cannot upgrade.
+
 ## How it should work
 
 1. Install DeskTouch Vision on both authorized Windows computers. Open the app on both computers. Each shows its own numbered Windows monitors automatically. The native Windows **Extend displays** arrangement remains authoritative and untouched.

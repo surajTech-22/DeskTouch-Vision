@@ -2,46 +2,93 @@ param()
 $ErrorActionPreference = 'Stop'
 $source = Join-Path $PSScriptRoot 'app'
 $target = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
-$logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
-New-Item -ItemType Directory -Force -Path $logs, $target | Out-Null
-$log = Join-Path $logs 'install.log'
-function Log([string]$msg) {
-  ("{0:u} {1}" -f (Get-Date), $msg) | Out-File $log -Append -Encoding utf8
+$parent = Split-Path $target -Parent
+$logFolder = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
+New-Item -ItemType Directory -Force -Path $parent, $logFolder | Out-Null
+$log = Join-Path $logFolder 'install.log'
+function Log([string]$message) {
+  ("{0:u} {1}" -f (Get-Date), $message) | Out-File -FilePath $log -Append -Encoding utf8
 }
-try {
-  if (-not (Test-Path (Join-Path $source 'DeskTouchVision.exe'))) { throw 'App payload missing: app\DeskTouchVision.exe' }
-  # Never forcibly terminate active keyboard/mouse sharing: it must release
-  # held keys/buttons and network ownership through its normal FormClosing path.
+
+function Stop-DeskTouchGracefully([string]$root) {
   foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
     $expected = if ($exeName -eq 'DeskTouchVision.exe') {
-      Join-Path $target $exeName
-    } else { Join-Path $target "DeviceSharing\$exeName" }
-    Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop |
-      Where-Object { [string]::Equals($_.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase) } |
-      ForEach-Object {
-        $process = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-        if ($process) {
-          [void]$process.CloseMainWindow()
-          if (-not $process.WaitForExit(12000)) {
-            throw "$exeName is still running; install deferred to preserve native input safety."
-          }
-        }
+      Join-Path $root $exeName
+    } else {
+      Join-Path $root "DeviceSharing\$exeName"
+    }
+    $installed = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop)
+    foreach ($info in $installed) {
+      if (-not $info -or -not $info.ExecutablePath -or
+        -not [string]::Equals($info.ExecutablePath, $expected,
+          [StringComparison]::OrdinalIgnoreCase)) { continue }
+      $process = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
+      if (!$process) { continue }
+      Log "Closing installed $exeName PID=$($process.Id) gracefully"
+      [void]$process.CloseMainWindow()
+      if (-not $process.WaitForExit(15000)) {
+        throw "$exeName did not stop normally. Installation was cancelled without terminating native input hooks."
       }
+    }
   }
-  if (-not (Test-Path (Join-Path $source 'DeviceSharing\DeskTouch.DeviceShare.exe'))) {
-    throw 'Package missing Windows Device Sharing module'
+}
+
+$stage = Join-Path $parent ('DeskTouchVision.stage-' + [guid]::NewGuid().ToString('N'))
+$backup = Join-Path $parent ('DeskTouchVision.backup-' + [guid]::NewGuid().ToString('N'))
+$movedOriginal = $false
+$activated = $false
+try {
+  if (-not (Test-Path -LiteralPath (Join-Path $source 'DeskTouchVision.exe') -PathType Leaf)) {
+    throw 'Incomplete installer package: DeskTouchVision.exe not found.'
   }
-  Copy-Item -Path (Join-Path $source '*') -Destination $target -Recurse -Force
+  if (-not (Test-Path -LiteralPath (Join-Path $source 'DeviceSharing\DeskTouch.DeviceShare.exe') -PathType Leaf)) {
+    throw 'Incomplete installer package: Windows Displays module not found.'
+  }
+  New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
+  Copy-Item -Path (Join-Path $source '*') -Destination $stage -Recurse -Force -ErrorAction Stop
+  if (-not (Test-Path -LiteralPath (Join-Path $stage 'DeviceSharing\DeskTouch.DeviceShare.exe'))) {
+    throw 'Staged installation is missing the Windows Displays module.'
+  }
+
+  Stop-DeskTouchGracefully $target
+  if (Test-Path -LiteralPath $target) {
+    Move-Item -LiteralPath $target -Destination $backup -ErrorAction Stop
+    $movedOriginal = $true
+  }
+  Move-Item -LiteralPath $stage -Destination $target -ErrorAction Stop
+  $activated = $true
+
   $exe = Join-Path $target 'DeskTouchVision.exe'
-  $w = New-Object -ComObject WScript.Shell
-  $shortcut = $w.CreateShortcut((Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'DeskTouch Vision.lnk'))
+  $shortcutPath = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'DeskTouch Vision.lnk'
+  $wsh = New-Object -ComObject WScript.Shell
+  $shortcut = $wsh.CreateShortcut($shortcutPath)
   $shortcut.TargetPath = $exe
   $shortcut.WorkingDirectory = $target
   $shortcut.Save()
-  Log "Installed to $target"
-  Start-Process -FilePath $exe
-  Write-Host 'DeskTouch Vision installed. Windows sharing is experimental: opt in on both PCs. Disconnected camera devices are not supported yet.' -ForegroundColor Cyan
-} catch {
-  Log "FAILED: $($_.Exception.Message)"
+  Start-Process -FilePath $exe -ErrorAction Stop
+  Log "Installed Windows Displays application from package under $target"
+  if ($movedOriginal) {
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Write-Host 'DeskTouch Windows Displays installed and launched. Native keyboard/mouse drivers remain unchanged.' -ForegroundColor Cyan
+}
+catch {
+  Log "Installation FAILED: $($_.Exception.Message)"
+  if ($movedOriginal -and (Test-Path -LiteralPath $backup)) {
+    try {
+      if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+      }
+      Move-Item -LiteralPath $backup -Destination $target -ErrorAction Stop
+      Log 'Previous installation restored after failure.'
+      Start-Process -FilePath (Join-Path $target 'DeskTouchVision.exe') -ErrorAction SilentlyContinue
+    }
+    catch { Log "Rollback failed: $($_.Exception.Message)" }
+  }
   throw
+}
+finally {
+  if (Test-Path -LiteralPath $stage) {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }

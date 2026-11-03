@@ -144,7 +144,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var id = Interlocked.Increment(ref _lastId);
                 var peer = new PeerReceiverSession(_status, _priority, _approval,
                     _trusted, _trustApproval, _identityPath, id, _authority, Secret);
-                peer.AllowForwardClaim = () => AllowForwardClaim?.Invoke() == true;
+                peer.AllowForwardClaim = () => AllowForwardClaim?.Invoke() ?? true;
                 peer.PeerConnected += connected =>
                 {
                     _connected[id] = connected;

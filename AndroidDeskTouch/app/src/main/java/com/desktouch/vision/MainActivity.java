@@ -14,7 +14,6 @@ public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList;
     private DeskTouchSession session;
-    private MobileDiscoveryResponder mobileDiscovery;
     private View pointerPad;
     private float prevX,prevY,downX,downY;
     private boolean dragged;
@@ -22,8 +21,15 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
-        session=new DeskTouchSession(new TrustedWindows(this),message->
+        session=DeskTouchRuntime.session(this);
+        DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{if(status!=null)status.setText(message);}));
+        if(AutoConnectService.enabled(this)) {
+            try {AutoConnectService.start(this);}
+            catch(RuntimeException startupError) {
+                android.util.Log.w("DeskTouch","Background startup not available",startupError);
+            }
+        }
         LinearLayout page=new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
         page.setPadding(dp(16),dp(16),dp(16),dp(12));
@@ -55,9 +61,23 @@ public final class MainActivity extends Activity {
         addButton(page,"Take control of Windows",()->session.claimControl());
         addButton(page,"Return control to this device",()->session.releaseControl());
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
-        addButton(page,"Disconnect",()->{session.releaseControl();session.close();session=
-            new DeskTouchSession(new TrustedWindows(this),message->
-                runOnUiThread(()->status.setText(message)));});
+        addButton(page,"Disconnect",()->{
+            AutoConnectService.setReconnect(this,false);
+            session.releaseControl();
+            session.disconnect();
+        });
+        android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
+        autoStart.setText("Launch on Android startup and reconnect trusted devices");
+        autoStart.setTextColor(Color.WHITE);
+        autoStart.setChecked(AutoConnectService.enabled(this));
+        autoStart.setOnCheckedChangeListener((button,checked)->{
+            AutoConnectService.setEnabled(this,checked);
+            AutoConnectService.setReconnect(this,checked);
+            status.setText(checked
+                ? "Android startup enabled; trusted PCs reconnect automatically when reachable."
+                : "Android startup and background reconnect disabled.");
+        });
+        page.addView(autoStart);
         TextView padLabel=new TextView(this);
         padLabel.setText("Touchpad / external mouse area");
         padLabel.setTextColor(Color.WHITE);
@@ -136,14 +156,7 @@ public final class MainActivity extends Activity {
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
-        mobileDiscovery = new MobileDiscoveryResponder();
-        new Thread(() -> {
-            try { mobileDiscovery.start(getApplicationContext()); }
-            catch (Exception error) {
-                runOnUiThread(() -> status.setText(
-                    "Android device discovery unavailable: " + error.getMessage()));
-            }
-        }, "DeskTouch mobile responder start").start();
+
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){
@@ -172,6 +185,7 @@ public final class MainActivity extends Activity {
                             .setPositiveButton("Connect",(dialog,which)->{
                                 android.graphics.Point size=new android.graphics.Point();
                                 getWindowManager().getDefaultDisplay().getRealSize(size);
+                                AutoConnectService.setReconnect(this,true);
                                 session.connect(d,size.x,size.y);
                             }).show();
                         });
@@ -220,8 +234,8 @@ public final class MainActivity extends Activity {
         if(!focus&&session!=null)session.releaseControl();
     }
     @Override protected void onDestroy(){
-        if(mobileDiscovery!=null)mobileDiscovery.close();
-        if(session!=null)session.close();
+        DeskTouchRuntime.setListener(null);
+        if(session!=null)session.releaseControl();
         super.onDestroy();
     }
 }

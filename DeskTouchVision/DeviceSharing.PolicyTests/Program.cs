@@ -260,6 +260,119 @@ Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four ou
 }
 
 
+// TRUSTED DEVICE REGRESSIONS: persistent cryptographic identity and signed
+// permission decision; the trusted list stores NO remembered IP addresses.
+var trustRoot = Path.Combine(Path.GetTempPath(),
+    "DeskTouch-trusted-lan-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(trustRoot);
+try
+{
+    var identityPath = Path.Combine(trustRoot, "receiver-identity.dpapi");
+    var inboundPath = Path.Combine(trustRoot, "incoming.dpapi");
+    var outboundPath = Path.Combine(trustRoot, "outgoing.dpapi");
+    string fingerprint;
+    using (var cert = PersistentReceiverIdentity.LoadOrCreate(identityPath))
+    {
+        Check(cert.HasPrivateKey, "Permanent TLS device identity must include its private key");
+        fingerprint = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(cert.RawData));
+    }
+    using (var reloaded = PersistentReceiverIdentity.LoadOrCreate(identityPath))
+    {
+        var fingerprintAfterRestart = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(reloaded.RawData));
+        Check(fingerprintAfterRestart == fingerprint,
+            "Permanent cryptographic device ID must be unchanged across process restarts");
+    }
+
+    var receiverGrants = new TrustedDeviceStore(inboundPath);
+    var senderGrants = new TrustedDeviceStore(outboundPath);
+    var approvalCount = 0;
+    var receiver = new ReceiverServer(_ => { },
+        new LocalInputPriority(), (_, _) =>
+        {
+            approvalCount++;
+            return Task.FromResult(true);
+        }, receiverGrants, (_, _) =>
+        {
+            approvalCount++;
+            return Task.FromResult(true);
+        }, identityPath);
+    try
+    {
+        Check(receiver.Fingerprint == fingerprint,
+            "Discovery must advertise the same device identity after a receiver restart");
+        receiver.Start();
+        using var trustTestDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        string token;
+        using (var first = await HostSession.ConnectWithApprovalAsync(
+            "127.0.0.1", fingerprint, _ => { }, trustTestDeadline.Token))
+        {
+            token = await first.RequestTrustAsync(trustTestDeadline.Token) ??
+                throw new Exception("Trusted enrollment requires receiver's explicit approval");
+            senderGrants.TrustOutgoing("Trusted Windows receiver", fingerprint, token);
+            Check(approvalCount == 2, "Initial pairing and trusted enrollment each require explicit consent");
+        }
+        var restartSender = new TrustedDeviceStore(outboundPath);
+        var restartReceiver = new TrustedDeviceStore(inboundPath);
+        Check(restartSender.Outgoing.Count == 1 &&
+            restartReceiver.Incoming.Count == 1,
+            "Trusted identity and authorization must persist under the Windows user's DPAPI");
+        Check(restartSender.Outgoing[0].GetType().GetProperty("Address") == null,
+            "Saved trusted receiver must not contain ANY IP address");
+        Check(restartSender.FindAutoConnect(fingerprint)?.Token == token,
+            "Restarted sender must recognize permanent receiver fingerprint, not IP");
+        var homeWifi = new NearbyComputer("My PC", "192.168.1.40", fingerprint);
+        var officeLan = new NearbyComputer("Renamed PC", "10.7.8.90", fingerprint);
+        var impersonator = new NearbyComputer("My PC", "10.7.8.90",
+            new string('A', 64));
+        Check(restartSender.FindAutoConnect(homeWifi.Fingerprint) != null &&
+            restartSender.FindAutoConnect(officeLan.Fingerprint) != null,
+            "Changing Wi-Fi, DHCP address or computer label must not lose trusted device");
+        Check(restartSender.FindAutoConnect(impersonator.Fingerprint) == null,
+            "A familiar name or address is never sufficient to impersonate a trusted computer");
+        // Receiver must finish the old TLS session before another connects.
+        await Task.Delay(800, trustTestDeadline.Token);
+        using (var trustedSession = await HostSession.ConnectTrustedAsync(
+            "127.0.0.1", fingerprint, token, _ => { }, trustTestDeadline.Token))
+        {
+            Check(trustedSession.RemoteMonitors.Monitors.Count > 0,
+                "Trusted reconnect must exchange native Windows display layout");
+            Check(approvalCount == 2,
+                "Trusted reconnect must NOT prompt again after explicit enrollment");
+        }
+        await Task.Delay(800, trustTestDeadline.Token);
+        restartSender.SetAutoConnect(fingerprint, false);
+        Check(restartSender.FindAutoConnect(fingerprint) == null,
+            "User must be able to pause automatic reconnect for an individual device");
+        restartSender.SetAutoConnect(fingerprint, true);
+        restartSender.AutoConnectEnabled = false;
+        Check(!new TrustedDeviceStore(outboundPath).AutoConnectEnabled,
+            "Manual disconnect must persist pause of automatic reconnection");
+        restartSender.AutoConnectEnabled = true;
+        receiverGrants.ForgetIncoming(receiverGrants.Incoming[0].TokenSha256);
+        using var attemptDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        try
+        {
+            using var rejected = await HostSession.ConnectTrustedAsync(
+                "127.0.0.1", fingerprint, token, _ => { }, attemptDeadline.Token);
+            throw new Exception("Revoked trusted grant incorrectly accepted");
+        }
+        catch (IOException) { /* expected unapproved attempt */ }
+        restartSender.ForgetOutgoing(fingerprint);
+        Check(new TrustedDeviceStore(outboundPath).Outgoing.Count == 0,
+            "Forgetting a trusted receiver must erase saved auto-connect authorization");
+        Check(approvalCount == 2,
+            "Revoked authorization must not silently fall back to receiver approval");
+        Console.WriteLine("PASS: persistent Windows cryptographic identity, two-sided trust enrollment, no remembered IP, silent trusted reconnect and revocation.");
+    }
+    finally { receiver.Dispose(); }
+}
+finally
+{
+    try { Directory.Delete(trustRoot, recursive: true); } catch { }
+}
+
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never
 // displays a window or starts the LAN receiver, and it can run on GitHub's
 // Windows test runner without touching real monitor/input settings.
@@ -275,6 +388,17 @@ var uiThread = new Thread(() =>
             .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
         Check(!actionRow.WrapContents && actionRow.AutoScroll,
             "High-DPI action buttons must not collapse into an invisible second row");
+        var trustButton = view.Controls.Find("TrustedDevicesButton", true)
+            .OfType<System.Windows.Forms.Button>().Single();
+        trustButton.Parent?.PerformLayout();
+        Check(trustButton.Width >= 110 && !trustButton.IsDisposed,
+            "Trusted-device settings must retain a usable control area");
+        var headerLinks = trustButton.Parent?.Controls
+            .OfType<System.Windows.Forms.LinkLabel>().ToArray() ??
+            Array.Empty<System.Windows.Forms.LinkLabel>();
+        foreach (var link in headerLinks)
+            Check(!trustButton.Bounds.IntersectsWith(link.Bounds),
+                "Trusted devices must not overlap the existing Check for updates link");
         var diagram = view.Controls.Find("DisplayDiagram", true)
             .OfType<DisplayArrangementControl>().Single();
         diagram.Local = extended;

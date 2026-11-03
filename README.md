@@ -2,7 +2,19 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.8 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.9 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.9 — trusted computers by permanent cryptographic identity, never remembered IP
+
+**Trusted Device** is opt-in, per Windows computer. On an existing authenticated pairing, choose **Trust device** on the controlling PC, confirm, and approve **Trust this device** once on the receiving PC. Only then does the sender record a secure 256-bit trust authorization bound to the recipient's verified, persistent TLS certificate fingerprint. The receiver stores the authorization **hash**; it never stores the source's claimed address as an identity.
+
+The receiver has a new ten-year Windows-user-specific cryptographic certificate persisted in a **DPAPI-encrypted, atomically created** file at `%LOCALAPPDATA%\DeskTouchVision\receiver-identity.dpapi`. Its public-key fingerprint remains constant through DeskTouch restarts, desktop/tray transitions, and application updates. The source's outgoing trusted-device list and receiver's incoming authorization list are also protected for the current Windows user in `trusted-devices.dpapi`. They store **no remembered IP address, router address, Wi-Fi SSID, MAC address, or mutable hostname as authentication**. A computer name is only a human-readable label.
+
+Every 8.5 seconds when DeskTouch is running (in the window or Windows tray), the controlling PC discovers currently reachable LAN computers. It uses the **newly discovered current network address** solely to open TLS and compares that peer's live certificate fingerprint with the previously approved permanent identity. It then proves the paired authorization token inside TLS. A same-name computer with a different certificate or token cannot reconnect automatically. A genuine trusted PC can be rediscovered when DHCP assigns another IP, or when moving between **reachable private Wi-Fi and Ethernet networks**. DeskTouch is still a LAN keyboard/mouse-sharing app: it does **not** connect computers on unrelated, non-routable networks or over the public Internet just because they are physically nearby.
+
+**Manage trust** through **Trusted devices** in the header or tray menu. The manager lets you toggle automatic reconnect globally and separately for each trusted outgoing computer, and **Forget device** removes previously granted access on the selected PC. For full revocation, forget it on the receiving PC too. Deliberately choosing **Disconnect** pauses automatic reconnect until the user enables it again; a temporary Wi-Fi/network drop retains trust and is retried with a brief cooldown. Device trust never bypasses physical keyboard/mouse priority and never automatically seizes remote control; the established monitor-edge gesture still determines when remote control begins.
+
+Both PCs should install **v0.2.9**: earlier versions use transient TLS identities and do not understand trusted peer authorization. Existing untrusted/manual pairing still requires the receiver's explicit approval. The Windows CI integration test covers encrypted persistent certificate identity across restart, source and receiver permissions, silent authenticated reconnect, deliberate revocation, simulated switch from a `192.168.x.x` to a `10.x.x.x` network, rejection of same-name impostors, DPAPI persistence and WinForms UI layout. Tests cannot guarantee real discovery on arbitrary LAN routers, and actual two-PC hardware acceptance remains required.
 
 ## v0.2.8 — slow cursor handoff, persistent tray mode and per-PC automatic updates
 

@@ -21,6 +21,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _add = Button("Add a computer", true);
     private readonly Button _copyCode = Button("Copy pairing code");
     private readonly Button _disconnect = Button("Disconnect");
+    private readonly Button _trustDevice = Button("Trust device");
+    private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
     private readonly LinkLabel _checkUpdates = new()
     {
@@ -35,6 +37,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     };
 
     private readonly CancellationTokenSource _closing = new();
+    private readonly TrustedDeviceStore? _trusted;
+    private readonly string? _trustLoadError;
+    private System.Windows.Forms.Timer? _trustedScanTimer;
+    private bool _scanningTrusted;
+    private bool _manualPairDialogOpen;
+    private DateTime _retryTrustedAfter = DateTime.MinValue;
+    private string _currentFingerprint = "";
     private NotifyIcon? _trayIcon;
     private ContextMenuStrip? _trayMenu;
     private bool _exitRequested;
@@ -58,6 +67,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     internal DisplaySettingsForm(bool startInTray = false)
     {
         _startInTray = startInTray;
+        try { _trusted = new TrustedDeviceStore(); }
+        catch (Exception ex) { _trustLoadError = ex.Message; }
         Text = "DeskTouch Vision — Displays";
         Font = new Font("Segoe UI", 10);
         BackColor = Color.FromArgb(31, 32, 36);
@@ -78,6 +89,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ForeColor = Color.FromArgb(188, 190, 198), AutoEllipsis = true };
         header.Controls.Add(subtitle);
         header.Controls.Add(title);
+        _manageTrusted.Name = "TrustedDevicesButton";
+        _manageTrusted.Text = "Trusted devices";
+        _manageTrusted.Width = 128;
+        _manageTrusted.Dock = DockStyle.Right;
+        _manageTrusted.Margin = new Padding(5);
+        header.Controls.Add(_manageTrusted);
         header.Controls.Add(_checkUpdates);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
@@ -88,7 +105,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _copyCode, _disconnect, _nativeDisplaySettings })
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -140,7 +157,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
         _add.Click += async (_, _) => await AddComputerAsync();
         _copyCode.Click += (_, _) => CopyPairingCode();
-        _disconnect.Click += (_, _) => DisconnectAndListen();
+        _disconnect.Click += (_, _) => DisconnectByUser();
+        _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
+        _manageTrusted.Click += (_, _) => ManageTrustedDevices();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
@@ -154,6 +173,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             RefreshDisplays();
             StartListening();
             UpdateClient.StartEventUpdates(this);
+            _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 8500 };
+            _trustedScanTimer.Tick += async (_, _) => await ScanTrustedAsync();
+            _trustedScanTimer.Start();
+            if (_trustLoadError != null)
+                Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
             if (_startInTray) HideToTray(showBalloon: false);
         };
         InitializeTray();
@@ -176,7 +200,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ShowFromTray();
             await UpdateClient.CheckManuallyAsync(this);
         });
-        _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectAndListen());
+        _trayMenu.Items.Add("Trusted devices", null, (_, _) =>
+        {
+            ShowFromTray();
+            ManageTrustedDevices();
+        });
+        _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 
@@ -230,6 +259,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             return;
         }
         _closing.Cancel();
+        _trustedScanTimer?.Stop();
         // Revoke remote control and close the TLS peer before destroying
         // Windows input hooks or receiver listening state.
         DisconnectHost();
@@ -289,6 +319,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void UpdateButtons()
     {
         if (IsDisposed) return;
+        _trustDevice.Enabled = _trusted != null && _host != null &&
+            !string.IsNullOrEmpty(_currentFingerprint) &&
+            !_trusted.IsTrustedReceiver(_currentFingerprint);
+        _trustDevice.Visible = _trusted != null && _host != null &&
+            !string.IsNullOrEmpty(_currentFingerprint) &&
+            !_trusted.IsTrustedReceiver(_currentFingerprint);
+        _manageTrusted.Enabled = _trusted != null;
         _add.Enabled = _host == null && _incomingPeer == null && !_connecting;
         _copyCode.Enabled = _receiver != null && _incomingPeer == null &&
             !_connecting && _host == null;
@@ -323,7 +360,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _nativeInput = new PhysicalInputMonitor(this);
             _nativeInput.Start();
-            _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync);
+            _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync,
+                _trusted, ConfirmTrustAsync);
             _receiver.PeerConnected += OnIncomingPeerConnected;
             _receiver.PeerDisconnected += OnIncomingPeerDisconnected;
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
@@ -493,7 +531,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (_host != null || _incomingPeer != null || _connecting || _closing.IsCancellationRequested) return;
         using var dialog = new PairComputerDialog();
-        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        _manualPairDialogOpen = true;
+        DialogResult choice;
+        try { choice = dialog.ShowDialog(this); }
+        finally { _manualPairDialogOpen = false; }
+        if (choice != DialogResult.OK) return;
+        if (_host != null || _incomingPeer != null || _connecting ||
+            _closing.IsCancellationRequested) return;
         _connecting = true;
         StopListening();
         UpdateButtons();
@@ -516,15 +560,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 candidate.Dispose();
                 return;
             }
-            _host = candidate;
-            _remoteAddress = dialog.ComputerName;
-            _capture = new SourceCapture(this, _host, Status, _preferredEdge);
-            _host.RemoteControlState += HandleRemoteState;
-            _host.RemoteTopologyChanged += HandleRemoteTopology;
-            _host.RemotePlacementChanged += HandleRemotePlacement;
-            RefreshDisplays();
-            _capture.Arm();
-            _host.PublishSourcePlacement(_preferredEdge); // authorized pairing arms edge switching, not remote control itself
+            AdoptHost(candidate, dialog.ComputerName, dialog.Fingerprint);
             Status($"Connected to {_remoteAddress}. Move to the {_preferredEdge.ToString().ToLowerInvariant()} outer edge to share input.");
         }
         catch (Exception ex)
@@ -545,6 +581,173 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (_host == null) StartListening();
             UpdateButtons();
         }
+    }
+
+    private void AdoptHost(HostSession session, string name, string fingerprint)
+    {
+        _host = session;
+        _remoteAddress = name;
+        _currentFingerprint = fingerprint;
+        _capture = new SourceCapture(this, session, Status, _preferredEdge);
+        session.RemoteControlState += HandleRemoteState;
+        session.RemoteTopologyChanged += HandleRemoteTopology;
+        session.RemotePlacementChanged += HandleRemotePlacement;
+        RefreshDisplays();
+        _capture.Arm();
+        session.PublishSourcePlacement(_preferredEdge);
+        UpdateButtons();
+    }
+
+    private async Task<bool> ConfirmTrustAsync(string name, CancellationToken cancellation)
+    {
+        if (IsDisposed || !IsHandleCreated || cancellation.IsCancellationRequested)
+            return false;
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var registration = cancellation.Register(() => completion.TrySetResult(false));
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (IsDisposed || cancellation.IsCancellationRequested)
+                {
+                    completion.TrySetResult(false);
+                    return;
+                }
+                if (!Visible) ShowFromTray();
+                Activate();
+                string safeName = name.Replace("\r", " ").Replace("\n", " ");
+                var result = MessageBox.Show(this,
+                    $"Trust {safeName} for automatic reconnection?\n\n" +
+                    "After approval, this computer can accept connections from the trusted " +
+                    "device when it is on the same reachable local network, without asking again. " +
+                    "Native keyboard and mouse always retain priority. " +
+                    "You can revoke trust using Trusted devices.",
+                    "DeskTouch — Trust this device?",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2);
+                completion.TrySetResult(result == DialogResult.Yes);
+            });
+        }
+        catch (InvalidOperationException) { completion.TrySetResult(false); }
+        return await completion.Task;
+    }
+
+    private async Task TrustConnectedDeviceAsync()
+    {
+        if (_host == null || _trusted == null ||
+            string.IsNullOrEmpty(_currentFingerprint)) return;
+        var name = _remoteAddress;
+        var fingerprint = _currentFingerprint;
+        if (MessageBox.Show(this,
+            $"Trust {name}?\n\nAfter the other computer approves, DeskTouch will " +
+            "recognize its permanent encrypted Windows identity, even when its " +
+            "IP address changes. Both computers must remain reachable on the LAN.\n\n" +
+            "You may revoke trust at any time.",
+            "Trust connected computer?", MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        _trustDevice.Enabled = false;
+        try
+        {
+            var token = await _host.RequestTrustAsync(_closing.Token);
+            if (token == null)
+            {
+                Status("Trusted device request declined or interrupted. Normal pairing remains available.");
+                return;
+            }
+            _trusted.TrustOutgoing(name, fingerprint, token);
+            _trusted.AutoConnectEnabled = true;
+            Status($"{name} trusted. Automatic reconnect enabled when this verified computer is discovered.");
+        }
+        catch (Exception ex) { Status("Could not save trusted device: " + ex.Message); }
+        finally { UpdateButtons(); }
+    }
+
+    private void ManageTrustedDevices()
+    {
+        if (_trusted == null) return;
+        using var dialog = new TrustedDevicesDialog(_trusted);
+        dialog.ShowDialog(this);
+        UpdateButtons();
+    }
+
+    private void DisconnectByUser()
+    {
+        // An intentional Disconnect must not instantly reconnect the same PC.
+        // Pause automatic reconnection until explicitly turned on again.
+        if (_trusted != null && _trusted.AutoConnectEnabled)
+        {
+            try { _trusted.AutoConnectEnabled = false; }
+            catch (Exception ex) { Status("Could not pause automatic reconnect: " + ex.Message); }
+        }
+        DisconnectAndListen();
+        UpdateButtons();
+    }
+
+    private async Task ScanTrustedAsync()
+    {
+        if (_scanningTrusted || _connecting || _manualPairDialogOpen || _host != null ||
+            _incomingPeer != null || _closing.IsCancellationRequested ||
+            _trusted?.AutoConnectEnabled != true || _trusted.Outgoing.Count == 0 ||
+            DateTime.UtcNow < _retryTrustedAfter || _receiver == null)
+            return;
+        _scanningTrusted = true;
+        try
+        {
+            // Discovery finds CURRENT network addresses; the saved file has
+            // NO IP address, only the receiver's persistent TLS fingerprint.
+            var peers = await NearbyComputerDiscovery.FindAsync(_closing.Token);
+            var found = peers.Select(p => new { Peer = p,
+                Saved = _trusted.FindAutoConnect(p.Fingerprint) })
+                .FirstOrDefault(x => x.Saved != null);
+            if (found == null || _host != null || _incomingPeer != null ||
+                _connecting || !_trusted.AutoConnectEnabled)
+                return;
+            _connecting = true;
+            StopListening();
+            Status($"Trusted {found.Saved!.Name} discovered. Verifying persistent device identity...");
+            try
+            {
+                void OnFailure(string reason)
+                {
+                    Status(reason);
+                    PostToUi(DisconnectAndListen);
+                }
+                // The token is bound to the saved pinned TLS certificate.
+                // Never use a matching name or previously seen IP as proof.
+                var session = await HostSession.ConnectTrustedAsync(
+                    found.Peer.Address, found.Saved.Fingerprint, found.Saved.Token,
+                    OnFailure, _closing.Token);
+                if (IsDisposed || _closing.IsCancellationRequested ||
+                    !_trusted.AutoConnectEnabled)
+                {
+                    session.Dispose();
+                    return;
+                }
+                AdoptHost(session, found.Saved.Name, found.Saved.Fingerprint);
+                Status($"Trusted computer {found.Saved.Name} reconnected automatically.");
+            }
+            catch (OperationCanceledException) when (_closing.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                Status("Trusted reconnection failed; will check again: " + ex.Message);
+                _retryTrustedAfter = DateTime.UtcNow.AddSeconds(25);
+            }
+            finally
+            {
+                _connecting = false;
+                if (_host == null && !_closing.IsCancellationRequested) StartListening();
+                UpdateButtons();
+            }
+        }
+        catch (OperationCanceledException) when (_closing.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            _retryTrustedAfter = DateTime.UtcNow.AddSeconds(25);
+            Status("Trusted device discovery unavailable: " + ex.Message);
+        }
+        finally { _scanningTrusted = false; }
     }
 
     private void HandleRemoteState(string result)
@@ -609,6 +812,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _host?.Dispose();
         _host = null;
         _remoteAddress = "";
+        _currentFingerprint = "";
         _display.Remote = null;
         UpdateButtons();
     }
@@ -707,6 +911,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (disposing)
         {
             _closing.Cancel();
+            _trustedScanTimer?.Dispose();
+            _trustedScanTimer = null;
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;

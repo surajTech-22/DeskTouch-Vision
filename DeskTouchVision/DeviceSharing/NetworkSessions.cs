@@ -19,11 +19,12 @@ internal sealed class ReceiverServer : IDisposable
     private readonly CancellationTokenSource _cancel = new();
     private readonly TcpListener _listener = new(IPAddress.Any, Wire.Port);
     private readonly X509Certificate2 _certificate;
-    private readonly RSA _key;
+    private readonly TrustedDeviceStore? _trusted;
     private Task? _serverTask;
     private int _active;
     private readonly LocalInputPriority _priority;
     private readonly Func<string, CancellationToken, Task<bool>>? _requestApproval;
+    private readonly Func<string, CancellationToken, Task<bool>>? _requestTrustApproval;
     private readonly object _inputGate = new();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private InputInjector? _currentInjector;
@@ -37,43 +38,20 @@ internal sealed class ReceiverServer : IDisposable
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
 
     internal ReceiverServer(Action<string> status, LocalInputPriority priority,
-        Func<string, CancellationToken, Task<bool>>? requestApproval = null)
+        Func<string, CancellationToken, Task<bool>>? requestApproval = null,
+        TrustedDeviceStore? trusted = null,
+        Func<string, CancellationToken, Task<bool>>? requestTrustApproval = null,
+        string? identityPath = null)
     {
         _status = status;
         _priority = priority;
         _requestApproval = requestApproval;
+        _trusted = trusted;
+        _requestTrustApproval = requestTrustApproval;
         _priority.PhysicalOverride += OnPhysicalOverride;
-        _key = RSA.Create(2048);
-        var req = new CertificateRequest("CN=DeskTouch-LAN", _key,
-            HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        req.CertificateExtensions.Add(new X509KeyUsageExtension(
-            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
-        var serverUsage = new OidCollection();
-        serverUsage.Add(new Oid("1.3.6.1.5.5.7.3.1")); // TLS server authentication
-        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(serverUsage, false));
-        req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
-
-        // CRITICAL Windows fix: Schannel cannot use .NET's ephemeral RSA key
-        // directly for SslStream server authentication ("platform does not
-        // support ephemeral keys"). Reimport a password-protected PKCS#12
-        // into CURRENT USER Windows key storage, never machine-wide. The key
-        // is NOT kept permanently after the certificate is disposed.
-        using var temporaryCertificate = req.CreateSelfSigned(
-            DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(3));
-        string pfxPassword = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-        byte[] pkcs12 = temporaryCertificate.Export(X509ContentType.Pkcs12, pfxPassword);
-        try
-        {
-            _certificate = new X509Certificate2(pkcs12, pfxPassword,
-                X509KeyStorageFlags.UserKeySet);
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(pkcs12);
-        }
-        if (!_certificate.HasPrivateKey)
-            throw new CryptographicException("TLS server certificate private key unavailable.");
+        // Stable TLS identity is required for pinning across restart/updates.
+        // It lives in a DPAPI-encrypted file scoped to the Windows user.
+        _certificate = PersistentReceiverIdentity.LoadOrCreate(identityPath);
         Fingerprint = Convert.ToHexString(SHA256.HashData(_certificate.RawData));
     }
 
@@ -183,8 +161,10 @@ internal sealed class ReceiverServer : IDisposable
             CertificateRevocationCheckMode = X509RevocationMode.NoCheck
         }, handshakeLimit.Token);
         var request = await Wire.ReadAsync(ssl, handshakeLimit.Token);
-        bool approved = request.Type == "auth" &&
-            ConstantTimeSecret(request.Text, Secret);
+        var trustedSource = request.Type == "auth-trusted"
+            ? _trusted?.AuthenticateIncoming(request.Text) : null;
+        bool approved = trustedSource != null ||
+            (request.Type == "auth" && ConstantTimeSecret(request.Text, Secret));
         if (!approved && request.Type == "auth-request" && _requestApproval != null)
         {
             // Discovery advertises only a public certificate fingerprint.
@@ -220,6 +200,10 @@ internal sealed class ReceiverServer : IDisposable
             if (helloPacket.Type != "hello")
                 throw new InvalidDataException("Missing authenticated peer hello.");
             var peer = ReadHello(helloPacket.Text);
+            // Treat advertised names as labels, not identities. For automatic
+            // trusted sessions, use the name stored when trust was approved.
+            if (trustedSource != null)
+                peer = peer with { Name = trustedSource.Name };
             incoming = peer;
             Volatile.Write(ref _currentClient, client);
             PeerConnected?.Invoke(peer);
@@ -243,6 +227,32 @@ internal sealed class ReceiverServer : IDisposable
                 receiveDeadline.CancelAfter(TimeSpan.FromSeconds(18));
                 var p = await Wire.ReadAsync(ssl, receiveDeadline.Token);
                 if (p.Type == "goodbye") break;
+                if (p.Type == "trust-request")
+                {
+                    bool allowed = false;
+                    if (_trusted != null && _requestTrustApproval != null &&
+                        p.Text is { Length: 64 } proposal &&
+                        proposal.All(Uri.IsHexDigit))
+                    {
+                        using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        approvalLimit.CancelAfter(TimeSpan.FromSeconds(50));
+                        try
+                        {
+                            allowed = await _requestTrustApproval(incoming!.Name,
+                                approvalLimit.Token);
+                            if (allowed) _trusted.AllowIncoming(incoming!.Name, proposal);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            _status("Cannot save device trust: " + ex.Message);
+                            allowed = false;
+                        }
+                        catch (OperationCanceledException) { allowed = false; }
+                    }
+                    await SendControlAsync(new Packet(
+                        allowed ? "trust-granted" : "trust-denied"), token);
+                    continue;
+                }
                 if (p.Type == "topology")
                 {
                     var peerLayout = MonitorTopology.FromWire(p.Text);
@@ -316,7 +326,6 @@ internal sealed class ReceiverServer : IDisposable
         _listener.Stop();
         DisconnectPeer();
         _certificate.Dispose();
-        _key.Dispose();
         _cancel.Dispose();
     }
 }
@@ -339,6 +348,7 @@ internal sealed class HostSession : IDisposable
     private MonitorTopology _remoteMonitors;
     private Packet? _latestMove;
     private int _moveSignaled;
+    private TaskCompletionSource<bool>? _pendingTrust;
 
     private HostSession(TcpClient client, SslStream ssl,
         MonitorTopology monitors, Action<string> onFailure)
@@ -359,16 +369,42 @@ internal sealed class HostSession : IDisposable
         CancellationToken cancellation) =>
             ConnectCoreAsync(ip, pinnedFingerprint, "", true, onFailure, cancellation);
 
+    internal static Task<HostSession> ConnectTrustedAsync(
+        string ip, string pinnedFingerprint, string trustToken,
+        Action<string> onFailure, CancellationToken cancellation) =>
+            ConnectCoreAsync(ip, pinnedFingerprint, trustToken, false,
+                onFailure, cancellation, trustedConnection: true);
+
+    internal async Task<string?> RequestTrustAsync(CancellationToken cancellation)
+    {
+        if (Volatile.Read(ref _closed) != 0) return null;
+        string token = TrustedDeviceStore.NewSecret();
+        var pending = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _pendingTrust, pending, null) != null)
+            throw new InvalidOperationException("A trust request is already pending.");
+        try
+        {
+            if (!TrySend(new Packet("trust-request", Text: token))) return null;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(55));
+            return await pending.Task.WaitAsync(deadline.Token) ? token : null;
+        }
+        finally { Interlocked.CompareExchange(ref _pendingTrust, null, pending); }
+    }
+
     private static async Task<HostSession> ConnectCoreAsync(
         string ip, string pinnedFingerprint, string secret, bool askReceiver,
-        Action<string> onFailure, CancellationToken cancellation)
+        Action<string> onFailure, CancellationToken cancellation,
+        bool trustedConnection = false)
     {
         pinnedFingerprint = new string(pinnedFingerprint.Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
         secret = secret.Trim().ToUpperInvariant();
         if (pinnedFingerprint.Length != 64 || !pinnedFingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("Enter the receiver's complete 64-digit SHA-256 fingerprint.");
-        if (!askReceiver && (secret.Length != 32 || !secret.All(Uri.IsHexDigit)))
-            throw new ArgumentException("Enter the receiver's 32-digit pairing secret.");
+        if (!askReceiver && (secret.Length != (trustedConnection ? 64 : 32) ||
+            !secret.All(Uri.IsHexDigit)))
+            throw new ArgumentException("Invalid authenticated pairing credential.");
         if (!IPAddress.TryParse(ip.Trim(), out var address) ||
             address.AddressFamily != AddressFamily.InterNetwork)
             throw new ArgumentException("Enter the receiver's IPv4 address.");
@@ -397,7 +433,8 @@ internal sealed class HostSession : IDisposable
             }, timeout.Token);
             stage = "receiver approval";
             await Wire.WriteAsync(ssl, new Packet(
-                askReceiver ? "auth-request" : "auth",
+                askReceiver ? "auth-request" :
+                    trustedConnection ? "auth-trusted" : "auth",
                 Text: askReceiver ? Environment.MachineName : secret), timeout.Token);
             // The receiver may need time for the owner to click Approve.
             using var acceptedLimit = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
@@ -487,6 +524,8 @@ internal sealed class HostSession : IDisposable
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
                     RemotePlacementChanged?.Invoke(changedEdge);
+                else if (p.Type is "trust-granted" or "trust-denied")
+                    Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
                 else if (p.Type is "granted" or "busy" or "local-active")
                     RemoteControlState?.Invoke(p.Type);
             }
@@ -543,6 +582,7 @@ internal sealed class HostSession : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+        Interlocked.Exchange(ref _pendingTrust, null)?.TrySetResult(false);
         _cancel.Cancel();
         _queue.Writer.TryComplete();
         _ssl.Dispose();

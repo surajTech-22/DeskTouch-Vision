@@ -4,7 +4,7 @@
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <application android:label="DeskTouch Vision" android:allowBackup="false"
+    <application android:label="DeskTouch Vision" android:icon="@drawable/ic_desktouch" android:allowBackup="false"
         android:usesCleartextTraffic="false" android:theme="@android:style/Theme.Material.NoActionBar"
         android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true"

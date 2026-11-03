@@ -1,6 +1,6 @@
 # DeskTouch Vision for Android (same product and repository)
 
-**Android preview 0.3.2** reuses the Windows DeskTouch LAN discovery (UDP 37378),
+**Android release 0.3.8** reuses the Windows DeskTouch LAN discovery (UDP 37378),
 TLS endpoint (TCP 37377), existing approval prompt, monitor geometry, Wire
 framing and two-phase authority handoff. There is **no separate remote-desktop
 protocol, login system, or replacement keyboard/mouse settings**.
@@ -12,20 +12,25 @@ cd AndroidDeskTouch
 gradle :app:testDebugUnitTest :app:assembleDebug
 ```
 
-GitHub Actions builds and uploads an installable debug-preview APK. After a
-matching Windows release completes, its workflow attaches
-`DeskTouchVision-android-preview.apk` to the same release. The Windows app's
-**Get Android app** button or tray menu displays a QR only if the official APK
-is already present in the latest release.
+GitHub Actions runs Android unit tests and development-only debug builds on
+branches. After a successful Windows release on **main**, the Android release
+workflow **requires the same permanent signing certificate** and attaches the
+verified, signed APK to that release. If the private signing secrets are absent
+or incorrect, the official Android release **fails closed**. The existing
+Android APK asset filename is unchanged to preserve Windows QR and Android
+updater compatibility.
 
-**Signing limitation:** this CI debug-preview uses ephemeral debug signatures.
-An upgrade from a different CI run may need uninstall/reinstall and may lose
-local trusted-device state. Production Android auto-updates require a stable,
-privately held signing key, supplied as a CI secret. Do **not** commit it.
+**First signed release:** v0.3.8 uses the persistent DeskTouch Android signing
+identity. An Android installation of the earlier debug-signed v0.3.7 may need
+one manual uninstall/reinstall, which resets app-local trusted devices. Then
+all later releases signed with this same identity can update in place with
+Android package installer approval. See
+`ANDROID_UPDATES_AND_SIGNING.md` for the pinned public certificate and
+one-time secret configuration. Do **not** commit the private keystore.
 
 ## Use
 
-1. Run DeskTouch Vision v0.3.2 or newer on Windows and keep it visible or in tray.
+1. Run DeskTouch Vision v0.3.8 or newer on Windows and keep it visible or in tray.
 2. Install the APK via Android's own package installer after scanning Windows QR.
 3. Open the Android app and **Find devices** on the same private LAN.
 4. Select Windows PC and approve the pairing prompt on **Windows**.

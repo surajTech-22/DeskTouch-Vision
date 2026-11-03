@@ -13,6 +13,8 @@ internal sealed class DisplayArrangementControl : Control
     private MonitorTopology? _local, _remote;
     private MonitorEdge _remoteEdge = MonitorEdge.Right;
     private RectangleF _remoteHit;
+    private RectangleF _remoteBaseHit;
+    private RectangleF _localHit;
     private RectangleF _placeholderHit;
     private bool _draggingRemote;
     private Point _dragOrigin;
@@ -90,6 +92,8 @@ internal sealed class DisplayArrangementControl : Control
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
         g.Clear(BackColor);
         _remoteHit = RectangleF.Empty;
+        _remoteBaseHit = RectangleF.Empty;
+        _localHit = RectangleF.Empty;
         _placeholderHit = RectangleF.Empty;
 
         if (_local == null)
@@ -118,6 +122,10 @@ internal sealed class DisplayArrangementControl : Control
         float offsetX = (Width - full.Width * scale) / 2f;
         float offsetY = (Height - full.Height * scale) / 2f;
 
+        _localHit = new RectangleF(
+            offsetX + (l.Left - full.Left) * scale,
+            offsetY + (l.Top - full.Top) * scale,
+            l.Width * scale, l.Height * scale);
         int id = 1;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
         {
@@ -130,6 +138,7 @@ internal sealed class DisplayArrangementControl : Control
             var group = new RectangleF(offsetX + (remotePos.Left - full.Left) * scale,
                 offsetY + (remotePos.Top - full.Top) * scale,
                 remotePos.Width * scale, remotePos.Height * scale);
+            _remoteBaseHit = group;
             if (_draggingRemote)
             {
                 group.X += _dragCurrent.X - _dragOrigin.X;
@@ -254,10 +263,19 @@ internal sealed class DisplayArrangementControl : Control
         var dy = _dragCurrent.Y - _dragOrigin.Y;
         if (Math.Max(Math.Abs(dx), Math.Abs(dy)) >= 25)
         {
-            // Windows-style dragging changes only the REMOTE device placement.
-            var next = Math.Abs(dx) >= Math.Abs(dy)
-                ? dx > 0 ? MonitorEdge.Right : MonitorEdge.Left
-                : dy > 0 ? MonitorEdge.Bottom : MonitorEdge.Top;
+            // Judge the DROP LOCATION relative to the Windows monitor group,
+            // not merely the direction of a short drag.
+            var remoteCenter = new PointF(
+                _remoteBaseHit.Left + dx + _remoteBaseHit.Width / 2,
+                _remoteBaseHit.Top + dy + _remoteBaseHit.Height / 2);
+            var localCenter = new PointF(
+                _localHit.Left + _localHit.Width / 2,
+                _localHit.Top + _localHit.Height / 2);
+            float horizontal = remoteCenter.X - localCenter.X;
+            float vertical = remoteCenter.Y - localCenter.Y;
+            var next = Math.Abs(horizontal) >= Math.Abs(vertical)
+                ? horizontal >= 0 ? MonitorEdge.Right : MonitorEdge.Left
+                : vertical >= 0 ? MonitorEdge.Bottom : MonitorEdge.Top;
             RemoteEdge = next;
             RemoteEdgeChanged?.Invoke(next);
         }

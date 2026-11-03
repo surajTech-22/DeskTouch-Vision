@@ -2,7 +2,29 @@
 
 DeskTouch Vision is a standalone Windows application for sharing one keyboard and mouse between Windows computers over a trusted local network. The **primary screen follows the Windows Display Settings arrangement style**, without separate "PC 1" and "PC 2" technical setup columns.
 
-**Version:** 0.2.1 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+**Version:** 0.2.3 experimental preview, not yet verified on two real Windows machines. The existing v0.2.0 UI was replaced following feedback that the split PC1/PC2 window was difficult to use.
+
+## v0.2.3 — Windows connection fix
+
+**Confirmed defect:** The original Windows TLS receiver used an ephemeral RSA private key. Windows Schannel rejected it with `Authentication failed because the platform does not support ephemeral keys`, so discovery worked but keyboard/mouse pairing could fail. The receiver now imports a temporary certificate into the Windows current-user key store (not machine-wide). Our Windows build test exercises a genuine encrypted TLS connection with the receiver approval flow and manual-code authentication.
+
+**To connect:** Install the **same latest DeskTouch version on both Windows PCs**, keep the app open on both, select **Add a computer**, then approve the prompt on the receiving PC. The keyboard and mouse physically attached to that computer always have priority when used.
+
+If discovery works but secure input still cannot connect, Windows Firewall may allow UDP discovery port **37378** while blocking TCP **37377**. On the receiving PC, allow `DeskTouch.DeviceShare.exe` to accept incoming connections **only for Private networks**, or use the included read-only `CHECK_CONNECTION.ps1` script:
+
+```powershell
+# On receiving PC: verify TCP listener and network profile.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\CHECK_CONNECTION.ps1
+
+# On controlling PC: test the receiver IP found in the Add dialog.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\CHECK_CONNECTION.ps1 -ReceiverIp 192.168.1.20
+```
+
+Replace the example IP with the actual receiving PC's IPv4 address. This command does not modify the firewall, and does not read or store keyboard content or pairing secrets. On a failed connection, DeskTouch now distinguishes blocked TCP, TLS, local approval, and monitor data failures and logs sanitized connection stages under `%LOCALAPPDATA%\DeskTouchVision\logs\connection.log`.
+
+**Security:** No automatic firewall exception is silently added; first-time pairing always requires receiver consent or a full locally copied pairing code. The program never bypasses Windows secure desktop/UAC restrictions.
+
+**Status:** CI can test the encrypted protocol on a Windows runner; real two-computer input switching, Windows Firewall configurations and unattended updates still need hardware checks.
 
 ## v0.2.2 — repair old camera screen and misleading update results
 

@@ -652,22 +652,22 @@ finally
     environment.AllowForwardClaim=()=>false; // never inject into CI runner
     environment.Start();
     using var deadline=new CancellationTokenSource(TimeSpan.FromSeconds(25));
-    using var phone=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
+    using var mobileSource=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
         environment.Fingerprint,_=>{},deadline.Token);
     using var desktop=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
         environment.Fingerprint,_=>{},deadline.Token);
     using var otherPhone=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
         environment.Fingerprint,_=>{},deadline.Token);
-    for(int i=0;i<80 && phone.EnvironmentMembers.Count<4;i++)
+    for(int i=0;i<80 && mobileSource.EnvironmentMembers.Count<4;i++)
         await Task.Delay(75,deadline.Token);
-    Check(phone.EnvironmentMembers.Count==4 &&
-        phone.EnvironmentMembers.Single(m=>m.Id==0).Platform=="Windows",
+    Check(mobileSource.EnvironmentMembers.Count==4 &&
+        mobileSource.EnvironmentMembers.Single(m=>m.Id==0).Platform=="Windows",
         "One hub must advertise itself and ALL three simultaneous members");
-    var routed=phone.EnvironmentMembers
+    var routed=mobileSource.EnvironmentMembers
         .Where(m=>m.Id>0).OrderBy(m=>m.Id).Skip(1).First();
-    Check(phone.SelectEnvironmentTarget(routed.Id),
+    Check(mobileSource.SelectEnvironmentTarget(routed.Id),
         "Android-style controller must route across the original hub connection");
-    Check(phone.SelectedEnvironmentTargetId==routed.Id,
+    Check(mobileSource.SelectedEnvironmentTargetId==routed.Id,
         "Selected input target must be an environment member, not another socket");
     var destinationPriority=new LocalInputPriority(
         ()=>Interlocked.Read(ref clock));
@@ -681,7 +681,7 @@ finally
         TaskCreationOptions.RunContinuationsAsynchronously);
     var revoked=new TaskCompletionSource<int>(
         TaskCreationOptions.RunContinuationsAsynchronously);
-    phone.AuthorityControlPacket += p=>{
+    mobileSource.AuthorityControlPacket += p=>{
         if(p.Type=="granted"&&p.A==501)granted.TrySetResult(p.A);
     };
     otherPhone.AuthorityControlPacket += p=>{
@@ -689,7 +689,7 @@ finally
         if(p.Type=="granted"&&p.A==503)competitorGrant.TrySetResult(p.A);
         if(p.Type=="local-active"&&p.A==503)revoked.TrySetResult(p.A);
     };
-    Check(phone.TrySend(new Packet("claim",501)),"Controller claim must queue");
+    Check(mobileSource.TrySend(new Packet("claim",501)),"Controller claim must queue");
     Check(await granted.Task.WaitAsync(deadline.Token)==501,
         "Destination's actual reverse grant must be relayed back to source");
     Check(destinationPriority.RemoteGranted,
@@ -700,7 +700,7 @@ finally
         "Competing controller claim should reach environment hub");
     Check(await competitorBusy.Task.WaitAsync(deadline.Token)==502,
         "Two peers cannot own keyboard/mouse authority on the same destination");
-    Check(phone.TrySend(new Packet("release",501)),
+    Check(mobileSource.TrySend(new Packet("release",501)),
         "Original controller must release routed lease");
     for(int i=0;i<60&&destinationPriority.RemoteGranted;i++)
         await Task.Delay(50,deadline.Token);
@@ -713,8 +713,8 @@ finally
     destinationPriority.RecordPhysicalActivity();
     Check(await revoked.Task.WaitAsync(deadline.Token)==503,
         "Physical activity at destination must revoke the routed source lease");
-    Check(phone.SelectEnvironmentTarget(0) &&
-        phone.SelectedEnvironmentTargetId==0,
+    Check(mobileSource.SelectEnvironmentTarget(0) &&
+        mobileSource.SelectedEnvironmentTargetId==0,
         "Returning to environment hub cannot disconnect other connected members");
     Check(environment.ConnectedPeerCount==3,
         "All devices must remain in one environment while authority changes");

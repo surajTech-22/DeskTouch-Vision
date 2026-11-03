@@ -296,7 +296,9 @@ final class DeskTouchSession implements AutoCloseable {
     // the SAME authenticated session. Native phone touch retains priority.
     private void handleWindowsControl(Packet p){
         if("reverse-claim".equals(p.type)){
-            if(p.a<=0 || !DeskTouchAccessibilityService.ready(application) ||
+            if(p.a<=0 || hasClaim() ||
+                !DeskTouchAccessibilityService.ready(application) ||
+                (reverseLease>0 && reverseLease!=p.a) ||
                 !DeskTouchRuntime.claimAndroidControl(this)){
                 send(new Packet("reverse-busy",p.a));
                 return;

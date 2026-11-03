@@ -5,6 +5,35 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// A LAN with two Windows PCs and one Android phone must not be collapsed to
+// a single PC, and busy receivers must be visible but not connectable.
+var fpOne = new string('A', 64);
+var fpTwo = new string('B', 64);
+var fpMobile = new string('C', 64);
+var local1 = System.Net.IPAddress.Parse("192.168.1.11");
+var local2 = System.Net.IPAddress.Parse("192.168.1.12");
+var phone = System.Net.IPAddress.Parse("192.168.1.2");
+var discoveredOne = NearbyComputerDiscovery.ParseReply("DT1-READY|PC1|" + fpOne, local1);
+var discoveredTwo = NearbyComputerDiscovery.ParseReply("DT1-BUSY|PC2|" + fpTwo, local2);
+var discoveredMobile = NearbyComputerDiscovery.ParseReply("DT1-MOBILE|Phone|" + fpMobile, phone);
+Check(discoveredOne != null && discoveredOne.CanReceive && !discoveredOne.IsAndroid,
+    "Ready PC discovery must remain connectable");
+Check(discoveredTwo != null && !discoveredTwo.CanReceive && !discoveredTwo.IsAndroid,
+    "Busy second Windows PC must remain visible but not falsely available");
+Check(discoveredMobile != null && discoveredMobile.IsAndroid && !discoveredMobile.CanReceive,
+    "Android discovery must not pretend the phone is a Windows TCP receiver");
+var threeDevices = NearbyComputerDiscovery.DistinctDevices(new [] {
+    discoveredOne!, discoveredTwo!, discoveredMobile!, discoveredOne!
+});
+Check(threeDevices.Count == 3 && threeDevices.Count(p => !p.IsAndroid) == 2,
+    "Two distinct Windows PCs and Android must all be visible without duplicates");
+Check(NearbyComputerDiscovery.ParseReply("DT1-READY|Fake|BAD",
+    local1) == null, "Invalid discovery identity must never be accepted");
+Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.exe")
+    .EndsWith("\" --tray", StringComparison.Ordinal),
+    "Windows sign-in command must launch the sharing app to tray");
+Console.WriteLine("PASS: two Windows peers, busy device, Android beacon and sign-in startup command.");
+
 long fakeClock = 100000;
 var priority = new LocalInputPriority(() => fakeClock);
 int nativePreemptions = 0;

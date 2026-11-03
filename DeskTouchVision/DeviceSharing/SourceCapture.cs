@@ -17,9 +17,10 @@ internal sealed class SourceCapture : IDisposable
     private readonly Action<string> _status;
     private readonly MonitorTopology _localMonitors, _remoteMonitors;
     private readonly System.Drawing.Rectangle _local;
+    private MonitorEdge _edge;
     private IntPtr _keyHook, _mouseHook;
     private int _armed, _active, _switchPending, _pending;
-    private int _pendingY;
+    private System.Drawing.Point _pendingPoint;
     private int _remoteX, _remoteY;
     private readonly int _anchorX, _anchorY;
     private long _cooldownUntil;
@@ -29,9 +30,11 @@ internal sealed class SourceCapture : IDisposable
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
     internal bool IsArmed => Volatile.Read(ref _armed) != 0;
 
-    internal SourceCapture(Control owner, HostSession session, Action<string> status)
+    internal SourceCapture(Control owner, HostSession session, Action<string> status,
+        MonitorEdge exitEdge = MonitorEdge.Right)
     {
         _owner = owner;
+        _edge = exitEdge;
         _session = session;
         _status = status;
         _localMonitors = MonitorTopology.Capture();
@@ -44,6 +47,22 @@ internal sealed class SourceCapture : IDisposable
         _keyboardDelegate = KeyboardHook;
         _mouseDelegate = MouseHook;
     }
+
+    internal void SetEdge(MonitorEdge side)
+    {
+        ReturnLocal();
+        Interlocked.Exchange(ref _pending, 0);
+        _edge = side;
+    }
+
+    private static MonitorEdge Opposite(MonitorEdge edge) => edge switch
+    {
+        MonitorEdge.Left => MonitorEdge.Right,
+        MonitorEdge.Right => MonitorEdge.Left,
+        MonitorEdge.Top => MonitorEdge.Bottom,
+        MonitorEdge.Bottom => MonitorEdge.Top,
+        _ => MonitorEdge.Left
+    };
 
     internal void Arm()
     {
@@ -63,7 +82,7 @@ internal sealed class SourceCapture : IDisposable
             throw new InvalidOperationException("Windows global low-level hooks unavailable.");
         }
         Interlocked.Exchange(ref _armed, 1);
-        _status("Armed. Move to the RIGHT edge of this PC to enter the remote Windows screen.");
+        _status($"Ready. Move to the {_edge.ToString().ToLowerInvariant()} outside edge to control the connected PC.");
     }
 
     internal void Disarm()
@@ -87,19 +106,28 @@ internal sealed class SourceCapture : IDisposable
         if (Interlocked.Exchange(ref _active, 0) == 0) return;
         _session.TrySend(new Packet("release"));
         _cooldownUntil = Environment.TickCount64 + 1000;
-        // Put local cursor inside display, rather than immediately on switching boundary.
-        var localReturn = _localMonitors.ClampToRealMonitor(
-            new System.Drawing.Point(_local.Right - Math.Min(100, _local.Width / 4),
-                _anchorY));
+        // Return to the real Windows screen the cursor left, not an empty
+        // rectangle or another physical monitor.
+        var nativeEdge = _localMonitors.EntryPoint(
+            _edge, _localMonitors.EdgeFraction(_pendingPoint, _edge));
+        var interior = _edge switch
+        {
+            MonitorEdge.Left => new System.Drawing.Point(nativeEdge.X + 72, nativeEdge.Y),
+            MonitorEdge.Right => new System.Drawing.Point(nativeEdge.X - 72, nativeEdge.Y),
+            MonitorEdge.Top => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y + 72),
+            MonitorEdge.Bottom => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y - 72),
+            _ => nativeEdge
+        };
+        var localReturn = _localMonitors.ClampToRealMonitor(interior);
         Win.SetCursorPos(localReturn.X, localReturn.Y);
         _status("Control returned to this Windows computer.");
     }
 
-    private void EnterRemote(int localY)
+    private void EnterRemote(System.Drawing.Point sourcePoint)
     {
         if (!IsArmed || RemoteActive ||
             Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return;
-        _pendingY = localY;
+        _pendingPoint = sourcePoint;
         // Do not capture/suppress any source keyboard or mouse event until the
         // receiver explicitly confirms its native devices have been idle.
         if (!_session.TrySend(new Packet("claim")))
@@ -118,10 +146,8 @@ internal sealed class SourceCapture : IDisposable
             _session.TrySend(new Packet("release"));
             return;
         }
-        int localY = _pendingY;
-        var entry = _remoteMonitors.EntryPoint(MonitorEdge.Left,
-            _localMonitors.EdgeFraction(new System.Drawing.Point(_local.Right - 1, localY),
-                MonitorEdge.Right));
+        var entry = _remoteMonitors.EntryPoint(Opposite(_edge),
+            _localMonitors.EdgeFraction(_pendingPoint, _edge));
         _remoteX = entry.X;
         _remoteY = entry.Y;
         Win.SetCursorPos(_anchorX, _anchorY);
@@ -198,11 +224,11 @@ internal sealed class SourceCapture : IDisposable
         else if (IsArmed && msg == Win.WM_MOUSEMOVE &&
             Environment.TickCount64 >= _cooldownUntil &&
             _localMonitors.IsExternalEdge(
-                new System.Drawing.Point(mouse.pt.X, mouse.pt.Y), MonitorEdge.Right) &&
+                new System.Drawing.Point(mouse.pt.X, mouse.pt.Y), _edge) &&
             Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
         {
-            int y = mouse.pt.Y;
-            Post(() => { Interlocked.Exchange(ref _switchPending, 0); EnterRemote(y); });
+            var point = new System.Drawing.Point(mouse.pt.X, mouse.pt.Y);
+            Post(() => { Interlocked.Exchange(ref _switchPending, 0); EnterRemote(point); });
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
@@ -264,14 +290,31 @@ internal sealed class SourceCapture : IDisposable
         int nextX = _remoteX + dx;
         int nextY = _remoteY + dy;
         var monitor = _remoteMonitors.MonitorAt(new System.Drawing.Point(_remoteX, _remoteY));
-        if (dx < 0 && monitor != null &&
-            nextX < monitor.X &&
-            _remoteMonitors.IsExternalEdge(
-                new System.Drawing.Point(monitor.X, _remoteY), MonitorEdge.Left, 1))
+        var returnEdge = Opposite(_edge);
+        if (monitor != null)
         {
-            if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
-                Post(() => { Interlocked.Exchange(ref _switchPending, 0); ReturnLocal(); });
-            return;
+            bool leaving = returnEdge switch
+            {
+                MonitorEdge.Left => dx < 0 && nextX < monitor.X,
+                MonitorEdge.Right => dx > 0 && nextX >= monitor.X + monitor.Width,
+                MonitorEdge.Top => dy < 0 && nextY < monitor.Y,
+                MonitorEdge.Bottom => dy > 0 && nextY >= monitor.Y + monitor.Height,
+                _ => false
+            };
+            var borderPoint = returnEdge switch
+            {
+                MonitorEdge.Left => new System.Drawing.Point(monitor.X, _remoteY),
+                MonitorEdge.Right => new System.Drawing.Point(monitor.X + monitor.Width - 1, _remoteY),
+                MonitorEdge.Top => new System.Drawing.Point(_remoteX, monitor.Y),
+                MonitorEdge.Bottom => new System.Drawing.Point(_remoteX, monitor.Y + monitor.Height - 1),
+                _ => new System.Drawing.Point(_remoteX, _remoteY)
+            };
+            if (leaving && _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
+            {
+                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0)
+                    Post(() => { Interlocked.Exchange(ref _switchPending, 0); ReturnLocal(); });
+                return;
+            }
         }
         // The OS can have real monitors with gaps / negative screen coordinates.
         // Never inject the pointer into an unoccupied part of the virtual bounding box.

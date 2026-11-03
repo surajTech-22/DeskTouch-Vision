@@ -13,7 +13,7 @@ import java.util.List;
 /** DeskTouch Vision Android: hardware keyboard/mouse settings belong to Android itself. */
 public final class MainActivity extends Activity {
     private TextView status,devices;
-    private LinearLayout deviceList;
+    private LinearLayout deviceList,environmentList;
     private TextView connectionSummary;
     private DeskTouchSession session;
     private View pointerPad;
@@ -27,7 +27,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedState);
         session=DeskTouchRuntime.session(this);
         DeskTouchRuntime.setListener(message ->
-            runOnUiThread(()->{if(status!=null)status.setText(message);}));
+            runOnUiThread(()->{
+                if(status!=null)status.setText(message);
+                if(environmentList!=null)refreshEnvironmentMembers();
+            }));
         // Android 13+ requires permission to show the persistent connection
         // notification in the shade. The foreground service itself is still
         // subject to Android's background lifecycle rules.
@@ -67,7 +70,7 @@ public final class MainActivity extends Activity {
         status.setPadding(0,dp(6),0,dp(14));
         page.addView(status);
         addButton(page,"Find devices",this::scan);
-        addButton(page,"Take control of selected Windows screen",()->{
+        addButton(page,"Take control of active environment screen",()->{
             DeskTouchRuntime.releaseAll();
             session=DeskTouchRuntime.session(this);
             session.claimControl();
@@ -84,6 +87,10 @@ public final class MainActivity extends Activity {
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
+        environmentList=new LinearLayout(this);
+        environmentList.setOrientation(LinearLayout.VERTICAL);
+        page.addView(environmentList);
+        refreshEnvironmentMembers();
         android.widget.CheckBox allowWindows=new android.widget.CheckBox(this);
         allowWindows.setText("Allow approved Windows PCs to control this Android screen");
         allowWindows.setTextColor(Color.WHITE);
@@ -105,7 +112,7 @@ public final class MainActivity extends Activity {
             status.setText("Windows input authority returned to Android.");
         });
         addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
-        addButton(page,"Disconnect selected device",()->{
+        addButton(page,"Leave shared environment",()->{
             AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
             session.releaseControl();
             session.disconnect();
@@ -240,11 +247,12 @@ public final class MainActivity extends Activity {
         addButton(page,"Android Bluetooth keyboard / mouse settings",()->
             startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
         TextView note=new TextView(this);
-        note.setText("Join the linked Windows group once, approving pairing separately on " +
-            "each Windows PC. Select an active screen and take input control. " +
-            "The mobile keyboard works in the typing field while a Windows claim is active. " +
-            "For Windows to control Android, enable Accessibility above; ordinary editable " +
-            "non-password fields are supported. Android remains in control of local touch.");
+        note.setText("Join one DeskTouch environment hub. Other approved devices " +
+            "on that hub appear together without opening separate phone connections. " +
+            "Select an active destination and take keyboard/mouse authority. " +
+            "The Android typing field sends text to the selected Windows PC. " +
+            "Enable Accessibility to allow approved Windows devices to control " +
+            "supported editable Android fields.");
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
@@ -257,126 +265,102 @@ public final class MainActivity extends Activity {
         b.setOnClickListener(v->action.run());
         parent.addView(b,new LinearLayout.LayoutParams(-1,-2));
     }
+    private void refreshEnvironmentMembers(){
+        if(environmentList==null)return;
+        environmentList.removeAllViews();
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
+        if(targets.isEmpty()){
+            connectionSummary.setText(active.isConnected()
+                ?"Waiting for authenticated environment membership..."
+                :"No environment joined yet.");
+            return;
+        }
+        connectionSummary.setText("One DeskTouch environment • "+
+            targets.size()+" device(s) online");
+        TextView heading=new TextView(this);
+        heading.setText("Connected devices — same environment");
+        heading.setTextColor(Color.WHITE);heading.setTextSize(18);
+        environmentList.addView(heading);
+        for(DeskTouchSession.EnvironmentTarget device:targets){
+            String label=(device.id==active.selectedEnvironmentTarget()?"● ":"")
+                +device.platform+" • "+device.name;
+            addButton(environmentList,label,()->{
+                active.selectEnvironmentTarget(device.id);
+                if(device.supportsInput)active.claimControl();
+            });
+        }
+    }
     private void scan(){
         if(scanning)return;
         scanning=true;
-        status.setText("Finding trusted Windows PCs; Windows will control this phone, not vice versa...");
+        status.setText("Finding a DeskTouch environment hub on your private LAN...");
         deviceList.removeAllViews();
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
-                    connectionSummary.setText("Connected devices: "+
-                        DeskTouchRuntime.connectedCount()+" / 8");
-                    if(list.isEmpty())status.setText("No devices found. Check trusted Wi-Fi and DeskTouch tray/background service.");
-                    else status.setText("DeskTouch found "+list.size()+" nearby device(s). "+
-                        "Interconnected PCs are grouped; connect the network once.");
-                    // One visible connection card per linked Windows network.
-                    // Direct TLS identities remain separate underneath; a group
-                    // must never be substituted for a certificate fingerprint.
                     java.util.LinkedHashMap<String,List<DesktopDiscovery.Device>> groups=
                         DesktopDiscovery.windowsGroups(list);
-                    java.util.Set<String> connectedFingerprints=new java.util.HashSet<>();
-                    for(DesktopDiscovery.Device device:list)
-                        if(!device.android&&DeskTouchRuntime.isConnected(device.fingerprint))
-                            connectedFingerprints.add(device.fingerprint);
+                    java.util.Set<String> connected=new java.util.HashSet<>();
+                    for(DesktopDiscovery.Device member:list)
+                        if(!member.android&&DeskTouchRuntime.isConnected(member.fingerprint))
+                            connected.add(member.fingerprint);
                     java.util.Set<String> approved=new java.util.HashSet<>();
                     try {approved.addAll(new TrustedWindows(this).fingerprints());}
                     catch(Exception ignored){}
-                    long activeGroups=groups.values().stream().filter(members->
-                        members.stream().anyMatch(m->connectedFingerprints.contains(m.fingerprint)))
-                        .count();
-                    connectionSummary.setText("Connected Windows networks: "+
-                        activeGroups+" / "+groups.size());
-                    DeskTouchRuntime.rememberGroups(groups);
+                    if(groups.isEmpty())
+                        status.setText("No DeskTouch environment found. Start DeskTouch on a Windows hub.");
+                    else status.setText("Choose one environment. Connected members will "+
+                        "appear automatically after joining the hub.");
                     for(List<DesktopDiscovery.Device> members:groups.values()){
-                        long online=members.stream().filter(m->
-                            DeskTouchRuntime.isConnected(m.fingerprint)).count();
+                        DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
+                            members,connected,approved);
+                        if(gateway==null)continue;
                         String names=String.join(" + ",members.stream()
                             .map(m->m.name).toArray(String[]::new));
-                        String label=(members.size()>1?"Linked Windows network":"Windows PC")
-                            +" • "+names+" • "+online+"/"+members.size()+" connected";
+                        String label="DeskTouch environment • "+names+
+                            (DeskTouchRuntime.isConnected(gateway.fingerprint)
+                                ?" • Joined":" • Join");
                         addButton(deviceList,label,()->{
-                            if(online==members.size()){
-                                DesktopDiscovery.Device first=DesktopDiscovery.chooseGateway(
-                                    members,connectedFingerprints,approved);
-                                if(first!=null){
-                                    session=DeskTouchRuntime.select(this,first.fingerprint);
-                                    session.claimControl();
-                                    status.setText("Windows network connected. Selected "+first.name+
-                                        " for keyboard and mouse.");
-                                }
+                            if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
+                                session=DeskTouchRuntime.select(this,gateway.fingerprint);
+                                refreshEnvironmentMembers();return;
+                            }
+                            if(DeskTouchRuntime.connectedCount()>0){
+                                status.setText("Already joined a DeskTouch environment. "+
+                                    "Leave it before switching hubs.");return;
+                            }
+                            if(!gateway.ready){
+                                status.setText("Environment gateway is at capacity or unavailable.");
                                 return;
                             }
                             new AlertDialog.Builder(this)
-                                .setTitle("Connect the linked Windows network")
-                                .setMessage("Connect "+names+" using one group action. " +
-                                    "Each Windows PC will verify its own permanent TLS " +
-                                    "identity and require its own first-time pairing approval. " +
-                                    "All connected members remain online together.")
+                                .setTitle("Join DeskTouch environment")
+                                .setMessage("Connect once to "+gateway.name+
+                                    ". Other Windows PCs and Android phones attached "+
+                                    "to that hub will appear inside the same environment. "+
+                                    "Each device joins through its own approved TLS "+
+                                    "connection to the hub; this phone does not need to "+
+                                    "pair separately with every member.")
                                 .setNegativeButton("Cancel",null)
-                                .setPositiveButton("Connect all",(dialog,which)->{
+                                .setPositiveButton("Join environment",(dialog,which)->{
                                     android.graphics.Point size=new android.graphics.Point();
                                     getWindowManager().getDefaultDisplay().getRealSize(size);
                                     AutoConnectService.setReconnect(this,true);
-                                    int requested=0;
-                                    for(DesktopDiscovery.Device member:members){
-                                        if(DeskTouchRuntime.isConnected(member.fingerprint)||
-                                            DeskTouchRuntime.isConnecting(member.fingerprint))
-                                            continue;
-                                        if(!member.ready)continue;
-                                        try {
-                                            AutoConnectService.resumePeer(this,member.fingerprint);
-                                            DeskTouchRuntime.forPeer(this,member.fingerprint)
-                                                .connect(member,size.x,size.y);
-                                            requested++;
-                                        }catch(IllegalStateException limit){
-                                            status.setText("Eight device limit reached; " +
-                                                "existing connections remain available.");
-                                            break;
-                                        }
-                                    }
-                                    DesktopDiscovery.Device preferred=DesktopDiscovery.chooseGateway(
-                                        members,connectedFingerprints,approved);
-                                    if(preferred!=null)
-                                        session=DeskTouchRuntime.select(this,preferred.fingerprint);
-                                    status.setText("Connecting "+requested+" Windows network " +
-                                        "member(s); accept first-time pairing on each PC.");
+                                    AutoConnectService.resumePeer(this,gateway.fingerprint);
+                                    session=DeskTouchRuntime.select(this,gateway.fingerprint);
+                                    session.connect(gateway,size.x,size.y);
+                                    status.setText("Connecting to shared environment through "+
+                                        gateway.name+". Approve pairing on that Windows PC.");
                                 }).show();
                         });
-                        if(members.size()>1){
-                            addButton(deviceList,"Choose active Windows screen (same network)",()->{
-                                String[] choices=members.stream().map(m->m.name+
-                                    (DeskTouchRuntime.isConnected(m.fingerprint)
-                                        ?" • ready":" • not connected"))
-                                    .toArray(String[]::new);
-                                new AlertDialog.Builder(this)
-                                    .setTitle("Active screen in "+names)
-                                    .setItems(choices,(dialog,index)->{
-                                        DesktopDiscovery.Device member=members.get(index);
-                                        if(!DeskTouchRuntime.isConnected(member.fingerprint)){
-                                            status.setText("Connect this member through the " +
-                                                "linked network first.");
-                                            return;
-                                        }
-                                        session=DeskTouchRuntime.select(this,member.fingerprint);
-                                        session.claimControl();
-                                        status.setText("Requesting mouse and keyboard on "+member.name);
-                                    }).show();
-                            });
-                        }
                     }
-                    // Android peers remain individually identifiable: only
-                    // interconnected Windows PCs share a network grouping.
-                    for(DesktopDiscovery.Device d:list)
-                        if(d.android)
-                            addButton(deviceList,"Android • "+d.name+
-                                " • discoverable only",()->status.setText(
-                                "Select Windows control from that Android device."));
                 });
-            }catch(Exception e){runOnUiThread(()->status.setText("LAN scan failed: "+e.getMessage()));}
-            finally{scanning=false;}
-        },"DeskTouch LAN discovery").start();
+            }catch(Exception e){
+                runOnUiThread(()->status.setText("Environment discovery failed: "+e.getMessage()));
+            }finally{scanning=false;}
+        },"DeskTouch LAN environment discovery").start();
     }
     @Override public boolean dispatchKeyEvent(KeyEvent e){
         // The Android IME EditText handles composed Unicode text through

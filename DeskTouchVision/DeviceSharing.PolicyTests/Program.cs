@@ -939,6 +939,23 @@ finally
     Check(inline.Where(item=>item.Device.IsAndroid)
         .All(item=>item.World.Height>item.World.Width),
         "Android members must be displayed as portrait screen tiles, not footer labels");
+    var spatial=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+        (EnvironmentRouteOrder.Local,new(0,0,300,220)),
+        (7,new(330,0,300,220)),
+        (-5,new(330,250,165,255)),
+        (-6,new(-190,0,165,260))
+    };
+    Check(DisplayArrangementControl.SpatialNeighbor(spatial,7,
+        MonitorEdge.Bottom)==-5 &&
+        DisplayArrangementControl.SpatialNeighbor(spatial,-5,
+            MonitorEdge.Top)==7,
+        "Dragging Xiaomi BELOW Windows must route keyboard/mouse through bottom/top edge");
+    Check(DisplayArrangementControl.SpatialNeighbor(spatial,
+        EnvironmentRouteOrder.Local,MonitorEdge.Left)==-6,
+        "Dragging an authorized Android to the left of Windows must use its left edge");
+    Check(DisplayArrangementControl.SpatialNeighbor(spatial,7,
+        MonitorEdge.Left)==EnvironmentRouteOrder.Local,
+        "PC must remain reachable when Android is visible below another PC");
     var liveRoute=new EnvironmentRouteOrder(
         new[]{EnvironmentRouteOrder.Local,7,-2,-3});
     Check(liveRoute.Neighbor(7,MonitorEdge.Right)==-2 &&

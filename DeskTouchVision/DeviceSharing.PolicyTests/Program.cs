@@ -5,6 +5,39 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// Bluetooth HID eligibility is read-only. A candidate is NOT proof of an
+// Android HID connection, and adapter selection cannot change input leases.
+var candidate = new BluetoothHidCapability("Candidate", true, true,
+    "BLE peripheral role available.");
+var unsupported = new BluetoothHidCapability("Unsupported", true, false,
+    "BLE peripheral role unavailable.");
+Check(BluetoothHidCapability.Valid(candidate) &&
+    BluetoothHidCapability.Valid(unsupported),
+    "Valid adapter reports can travel over the authenticated environment");
+Check(!BluetoothHidCapability.Valid(
+    new BluetoothHidCapability("Candidate", true, false, "Impossible")),
+    "The hub must reject a falsely qualified peripheral candidate");
+Check(!BluetoothHidCapability.Valid(
+    new BluetoothHidCapability("Candidate", true, true, "Unsafe\\nidentity")),
+    "The hub must reject multiline, untrusted adapter reports");
+var radios = new[] {
+    new BluetoothHidDeviceStatus(0, "Hub", unsupported),
+    new BluetoothHidDeviceStatus(1, "Peer-A", candidate),
+    new BluetoothHidDeviceStatus(2, "Peer-B", unsupported)
+};
+Check(BluetoothHidSelection.PreferredCandidate(radios)==1,
+    "Only eligible peer should be preferred even if the hub lacks Bluetooth");
+Check(BluetoothHidSelection.PreferredCandidate(
+    new[] { radios[0], radios[2] })==null,
+    "Never choose an unsupported Windows Bluetooth adapter");
+Check(BluetoothHidSelection.PreferredCandidate(
+    new[] { radios[1], new BluetoothHidDeviceStatus(3,"Peer-C",candidate) },3)==3,
+    "Keep the previously chosen eligible endpoint to avoid bouncing");
+Check(BluetoothHidSelection.IsMateriallyStronger(-76,-62) &&
+    !BluetoothHidSelection.IsMateriallyStronger(-76,-71),
+    "Only a measured, stable RSSI improvement could justify future roaming");
+Console.WriteLine("PASS: cross-PC Bluetooth report validation, safe candidate choice and RSSI hysteresis.");
+
 // Native Windows DISPLAYn identifiers must be stable PER computer. The
 // previous UI incorrectly numbered every PC and phone in one running sequence.
 Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(

@@ -10,6 +10,11 @@ public final class BootReceiver extends BroadcastReceiver {
         String action=intent==null?null:intent.getAction();
         if(!Intent.ACTION_BOOT_COMPLETED.equals(action) &&
             !Intent.ACTION_MY_PACKAGE_REPLACED.equals(action))return;
+        // Android owns Accessibility authorization. If Xiaomi/HyperOS
+        // disables the service after an in-place update, notify the user
+        // rather than silently pretending permission has survived.
+        if(Intent.ACTION_MY_PACKAGE_REPLACED.equals(action))
+            PermissionContinuity.onPackageReplaced(context);
         if(!AutoConnectService.enabled(context))return;
         try{AutoConnectService.start(context);}
         catch(RuntimeException e){

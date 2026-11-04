@@ -95,6 +95,12 @@ adb logcat -d -s DeskTouchExternalEditor:I |
   grep -F 'IME_REQUEST command=key accepted=true' || failed=$((failed+1))
 # Left-arrow moves the caret without changing the text; verify insertion.
 editor_send "insert-at-caret" "hell!o" --es command text --es value '!'
+# Next use the SAME Android-side handlers as actual authenticated reverse
+# packets from Windows, rather than calling the IME endpoint directly.
+editor_send "DeskTouch reverse-text" "hell!#o" \
+  --es command reverse-text --es value '#'
+editor_send "DeskTouch reverse-key" "hell!o" \
+  --es command reverse-key --ei vk 8
 
 if [[ "$failed" -ne 0 ]]; then
   echo "FAIL: $failed Android real-input probes did not pass"

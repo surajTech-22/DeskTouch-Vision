@@ -625,6 +625,54 @@ try
         "Second device must request a new lease after release");
     await secondGrant.Task.WaitAsync(TimeSpan.FromSeconds(8));
     peer3.TrySend(new Packet("release",2002));
+    for(int t=0;t<50 && multiPriority.RemoteGranted;t++)
+        await Task.Delay(40,timeout.Token);
+
+    // REGRESSION: a phone or other client that claims the HUB INPUT must not
+    // hijack the hub operator's separately selected remote display. Both
+    // destinations may have one controller simultaneously without severing TLS.
+    var selectedWindows=multiServer.ConnectedPeers.OrderBy(x=>x.Id).First();
+    var phoneController=multiServer.ConnectedPeers.OrderBy(x=>x.Id).Last();
+    Check(multiServer.SelectConnectedPeer(selectedWindows.Id),
+        "Windows hub must select its remote Windows destination");
+    var destinationInput=new LocalInputPriority();
+    peer2.AttachReverseInput(destinationInput,()=>true);
+    await Task.Delay(LocalInputPriority.IdleBeforeRemoteMilliseconds+100,timeout.Token);
+    var remoteGrant=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    var hubGrant=new TaskCompletionSource<int>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+    multiServer.ReverseControlMessage+=p=>{
+        if(p.Type=="reverse-granted" && p.A==3100)remoteGrant.TrySetResult(p.A);
+    };
+    peer3.AuthorityControlPacket+=p=>{
+        if(p.Type=="granted"&&p.A==3200)hubGrant.TrySetResult(p.A);
+    };
+    IInputSession pcDestination=multiServer.BindSelectedInput();
+    Check(pcDestination.TrySend(new Packet("claim",3100)),
+        "Hub must send the reverse control request to the selected PC");
+    Check(await remoteGrant.Task.WaitAsync(timeout.Token)==3100 &&
+        destinationInput.RemoteGranted,
+        "Hub operator must control the selected PC independently");
+    Check(peer3.TrySend(new Packet("claim",3200)),
+        "Another authenticated device must be able to claim the hub concurrently");
+    Check(await hubGrant.Task.WaitAsync(timeout.Token)==3200,
+        "Hub should grant this second independent destination");
+    Check(multiServer.SelectedPeerId==selectedWindows.Id &&
+        destinationInput.RemoteGranted && multiPriority.RemoteGranted &&
+        multiServer.ConnectedPeerCount==2,
+        "Android controlling hub must NOT switch, disconnect or revoke hub-to-PC input");
+    Check(peer3.TrySend(new Packet("release",3200)),
+        "Hub control can be released independently of Windows remote control");
+    Check(pcDestination.TrySend(new Packet("release",3100)),
+        "Windows remote control can release without dropping its source");
+    for(int t=0;t<50 &&
+        (destinationInput.RemoteGranted || multiPriority.RemoteGranted);t++)
+        await Task.Delay(40,timeout.Token);
+    Check(!destinationInput.RemoteGranted && !multiPriority.RemoteGranted,
+        "Independent lease releases must not strand keyboard/mouse authority");
+    Console.WriteLine("PASS: Android->hub AND hub->Windows keyboard authority concurrently; no capture selection theft.");
+
     // The Windows keyboard/mouse capture is pinned to its original TLS peer.
     // Selecting another device must never misroute a delayed key or release.
     var original = multiServer.ConnectedPeers.OrderBy(x => x.Id).First();

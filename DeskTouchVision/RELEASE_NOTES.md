@@ -1,3 +1,34 @@
+# DeskTouch Vision v0.3.15 — simultaneous authority, Android keyboard and updater recovery
+
+## One environment, all devices functional
+- Fixed the root cause of Android selection disabling the other Windows system: a phone or PC claiming **input on the hub** was incorrectly changing the hub operator's **remote target**. Forward ownership and reverse destination selection are now independent; authenticated clients stay online and can simultaneously control different destinations.
+- Repaired Windows selected-peer event handling. Peer-list updates and selection callbacks can no longer dispose the newly armed keyboard/mouse capture for a still-connected screen.
+- Added automatic horizontal edge navigation based on the existing screen diagram (e.g., **SURAJ ← Windows → Android**, or **hub → second PC → phone**). Switching uses the already authenticated environment, never a new pairwise connection, and waits for each destination's fresh two-phase input grant.
+- Screen positions are now stable regardless of which peer currently has keyboard/mouse authority; Android never replaces or rearranges the Windows display tiles just because it is selected. One physical keyboard controls a single destination at an instant; multiple destinations may be controlled concurrently by different computers/phones.
+
+## Android keyboard, mouse responsiveness and diagnostics
+- Android 13+ now prefers the **current live Accessibility InputConnection** for ordinary non-password text entry, including Chrome/WebView editors whose Accessibility root may not expose an editable focused node. Window focus fallback is supported when the editor is exposed by another interactive window. Existing editable-field ACTION_SET_TEXT remains the older-version fallback.
+- Delete/backspace uses the supported Android Accessibility InputConnection where available. Password/numeric-password/Web-password fields remain protected.
+- Windows Raw Input and touchpad mouse hook can both report the same physical movement. Immediate duplicate deltas are suppressed to reduce alternating fast/slow cursor movement.
+- The Android remote cursor now uses a single non-touchable Accessibility overlay surface and redraws only its changed coordinates at display VSync; no per-motion WindowManager relayout. A privacy-safe `DeskTouchTiming` log reports only aggregate frame count, coalesced moves and worst local UI frame delay, never text, keys, screen coordinates or device identifiers.
+- Real Xiaomi Wi-Fi jitter and target application focus cannot be certified by GitHub runners. Actual-device acceptance remains essential for latency claims.
+
+## Android permissions survive in-place upgrades
+- Persists the user's DeskTouch control approval synchronously and retains existing Android Keystore-encrypted trusted device data. Android package replacement preserves app storage when package ID and permanent signing identity match; an uninstall or data clear does not.
+- After `MY_PACKAGE_REPLACED`, checks whether Android/Xiaomi has disabled the separately granted Accessibility service. Shows permission health and, if notifications are allowed, a one-tap reminder to revisit system Settings. **Never** silently turns Accessibility back on or bypasses user consent.
+- Once the user restores Accessibility, sends an authenticated capability update to the current hub over the **existing TLS session**, without forcing a second pairing, and revokes active input leases immediately when permission is disabled.
+
+## Second Windows PC updater recovery
+- Manual **Checking GitHub releases** now has a 12-second deadline for an occupied update gate and a 25-second deadline for GitHub metadata. Instead of hanging behind a background download or blocked API, it reports a clear busy/timeout/error and writes diagnostics to `%LOCALAPPDATA%\\DeskTouchVision\\logs\\update-check.log`.
+- Retains verified checksum, detached updater, safe process shutdown, tray restart, and release-event SSE; no unsafe forced process termination or old updater installation.
+
+## Verification
+- Windows shared-environment loopback TLS tests include simultaneous phone→hub plus hub→Windows leases, multi-device edge routing, independent release, eight-peer capacity, native input override, and updater checks.
+- Android JUnit tests check input protocol, WebView/nonnative editor safety and password exclusions, and Accessibility system-vs-app permission decisions. The Android 35 emulator checks launch, service enablement, and in-place app-data persistence.
+- Publish only with the original permanent Android certificate, the standard Windows SHA-256 package, and successful GitHub pre-release workflow.
+
+---
+
 # DeskTouch Vision v0.3.14 — inline Android display and lower-latency input
 
 ## Main display correction

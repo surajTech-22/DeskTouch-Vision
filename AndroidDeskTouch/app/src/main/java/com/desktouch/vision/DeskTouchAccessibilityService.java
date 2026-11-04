@@ -15,6 +15,8 @@ import android.graphics.Paint;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.Choreographer;
 import android.graphics.Rect;
@@ -40,6 +42,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private View cursor;
     private volatile int x,y;
     private volatile int pendingX,pendingY;
+    private volatile long pendingArrivalNanos;
+    private final java.util.concurrent.atomic.AtomicInteger coalescedMoves=
+        new java.util.concurrent.atomic.AtomicInteger();
+    private long lastPerfReportNanos;
+    private int renderFrames,maxLocalFrameDelayMs;
     private volatile Runnable pendingApplied;
     private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
         new java.util.concurrent.atomic.AtomicBoolean();
@@ -192,15 +199,33 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         // filling Android's UI queue with hundreds of obsolete moves.
         service.pendingX=px;
         service.pendingY=py;
+        service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true))
             service.ui.post(()->Choreographer.getInstance()
                 .postFrameCallback(service.pointerFrame));
+        else service.coalescedMoves.incrementAndGet();
         return true;
     }
     private void flushPointer(){
         int px=pendingX,py=pendingY;
+        long arrival=pendingArrivalNanos;
+        long now=SystemClock.elapsedRealtimeNanos();
         if(remoteActive&&ready(this))showPointer(px,py);
+        if(remoteActive && arrival>0 && now>=arrival){
+            int ageMs=(int)Math.min(5000,(now-arrival)/1_000_000L);
+            maxLocalFrameDelayMs=Math.max(maxLocalFrameDelayMs,ageMs);
+            renderFrames++;
+            if(lastPerfReportNanos==0)lastPerfReportNanos=now;
+            if(now-lastPerfReportNanos>=5_000_000_000L){
+                // No coordinates, text, keys, device identities or IPs.
+                Log.i("DeskTouchTiming","frames="+renderFrames+
+                    " newest_moves_coalesced="+coalescedMoves.getAndSet(0)+
+                    " worst_local_ui_delay_ms="+maxLocalFrameDelayMs);
+                lastPerfReportNanos=now;
+                maxLocalFrameDelayMs=renderFrames=0;
+            }
+        }
         Runnable ack=pendingApplied;
         pendingApplied=null;
         moveScheduled.set(false);

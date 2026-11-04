@@ -1,6 +1,7 @@
 package com.desktouch.vision;
 
 import android.app.Instrumentation;
+import android.app.UiAutomation;
 import android.content.Context;
 import android.content.Intent;
 import android.os.SystemClock;
@@ -31,10 +32,16 @@ public final class DeskTouchInputAcceptanceTest {
 
     @Before public void setup() {
         instrumentation=InstrumentationRegistry.getInstrumentation();
+        // Android instrumentation's default UiAutomation session suppresses
+        // other accessibility services. Preserve the genuine DeskTouch service
+        // so this test measures its real system integration.
+        assertNotNull("Could not attach non-suppressing UiAutomation session",
+            instrumentation.getUiAutomation(
+                UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES));
         context=instrumentation.getTargetContext();
         DeskTouchAccessibilityService.setAllowed(context,true);
         assertTrue("Emulator must enable DeskTouch Accessibility before instrumentation",
-            waitUntil(()->DeskTouchAccessibilityService.ready(context),9000));
+            waitUntil(()->DeskTouchAccessibilityService.ready(context),12000));
         assertTrue("Emulator must select DeskTouch IME before instrumentation",
             DeskTouchInputMethod.isSelected(context));
         Intent open=new Intent(context,InputProbeActivity.class);

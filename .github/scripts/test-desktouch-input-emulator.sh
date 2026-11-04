@@ -42,6 +42,8 @@ for probe in status keyboard click drag scroll; do
   if [[ "$result" != pass ]]; then
     echo "FAIL: Android $probe input behavior was not verified" | tee -a android-input-emulator.txt
     adb shell dumpsys accessibility | grep -E 'Enabled services|Bound services|DeskTouch' | head -30 || true
+    adb shell dumpsys input_method | grep -E 'mCurId|mCurMethodId|mShowRequested|mInputShown|mServedView|DeskTouchInputMethod|mCurFocusedWindow' | head -45 || true
+    adb logcat -d -s DeskTouchInputProbe:V | grep -E 'KEYBOARD_FOCUS|KEYBOARD_AFTER_FOCUS|RESULT_' | tail -45 || true
     adb logcat -d -s AndroidRuntime:E DeskTouchInputProbe:V | tail -80 || true
     failed=$((failed+1))
   fi

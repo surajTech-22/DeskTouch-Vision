@@ -45,6 +45,7 @@ public final class InputProbeActivity extends Activity {
         root.setBackgroundColor(Color.WHITE);
         editor=new EditText(this);
         editor.setSingleLine(true);
+        editor.setFocusableInTouchMode(true);
         editor.setHint("Remote keyboard probe");
         editor.setTextColor(Color.BLACK);
         root.addView(editor,new LinearLayout.LayoutParams(-1,dp(64)));
@@ -123,10 +124,20 @@ public final class InputProbeActivity extends Activity {
         }
         if("keyboard".equals(name)) {
             editor.setText("");
-            editor.requestFocus();
+            editor.requestFocusFromTouch();
+            getWindow().setSoftInputMode(
+                android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
             InputMethodManager manager=
                 (InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
-            if(manager!=null)manager.showSoftInput(editor,InputMethodManager.SHOW_IMPLICIT);
+            if(manager!=null){
+                manager.restartInput(editor);
+                manager.showSoftInput(editor,InputMethodManager.SHOW_IMPLICIT);
+            }
+            Log.i(TAG,"KEYBOARD_FOCUS editorFocused="+editor.hasFocus()+
+                " windowFocused="+hasWindowFocus()+" "+
+                DeskTouchInputMethod.stateForTesting(this));
+            ui.postDelayed(()->Log.i(TAG,"KEYBOARD_AFTER_FOCUS "+
+                DeskTouchInputMethod.stateForTesting(this)),1900);
             checkUntil("KEYBOARD",DeskTouchInputMethod::hasActiveEditor,28,()->{
                 boolean accepted=DeskTouchInputMethod.commitRemoteText("hello") &&
                     DeskTouchInputMethod.sendRemoteKey(8) &&

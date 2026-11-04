@@ -105,6 +105,16 @@ final class DeskTouchRuntime {
         for(DeskTouchSession session:sessions.values())
             session.publishAccessibilityCapability();
     }
+    static void pointerOverlayUnavailable(){
+        // Report an actionable status without leaking pointer coordinates,
+        // typed characters, IP addresses, or paired-device identity.
+        lastStatus="Android refused the DeskTouch pointer overlay. " +
+            "Check Xiaomi Accessibility and display-over-other-apps restrictions, " +
+            "then enable DeskTouch Windows control again.";
+        Consumer<String> current=listener;
+        if(current!=null)current.accept(lastStatus);
+        remoteNativeTouch();
+    }
     static void remoteNativeTouch(){
         for(DeskTouchSession s:sessions.values())s.revokeRemoteFromNative();
     }

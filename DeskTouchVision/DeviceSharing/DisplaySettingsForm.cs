@@ -198,6 +198,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _display.AddComputerRequested += async () => await AddComputerAsync();
         _display.EnvironmentDeviceSelected += SelectConnectedTarget;
         _display.EnvironmentArrangementChanged += SavePreferredEdge;
+        _display.EnvironmentMemberMoved += OnEnvironmentMemberMoved;
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
 
         LoadPreferredEdge();
@@ -437,7 +438,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId)continue;
                     tiles.Add(new EnvironmentDisplayTile(-member.Id,member.Name,
                         member.Platform,MonitorTopology.FromWire(member.Layout).Monitors.Count,
-                        member.SupportsReverseInput));
+                        member.SupportsReverseInput,member.StableIdentity));
                 }
             }
             else
@@ -693,6 +694,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerConnected += OnIncomingPeerConnected;
             _receiver.PeerDisconnected += OnIncomingPeerDisconnected;
             _receiver.PeerListChanged += OnPeerListChanged;
+            _receiver.InitializeEnvironmentLayout(_display.StoredMemberOffsets);
+            _receiver.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
             _receiver.ReverseControlMessage += HandleReverseState;
@@ -753,6 +756,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerConnected -= OnIncomingPeerConnected;
             _receiver.PeerDisconnected -= OnIncomingPeerDisconnected;
             _receiver.PeerListChanged -= OnPeerListChanged;
+            _receiver.EnvironmentLayoutChanged -= HandleSharedEnvironmentLayout;
             _receiver.PeerTopologyChanged -= OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged -= OnIncomingPeerPlacementChanged;
             _receiver.ReverseControlMessage -= HandleReverseState;
@@ -1095,6 +1099,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;
+        session.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
+        if(session.SharedLayout.Count>0)
+            _display.RestoreMemberOffsets(session.SharedLayout);
         if (session.RemoteSystemName is { Length: > 0 } actual)
             _remoteAddress = DisplayArrangementControl.CleanDeviceName(actual,
                 _remoteAddress);
@@ -1288,6 +1295,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
     }
 
+    private void OnEnvironmentMemberMoved(string key,PointF point)
+    {
+        // Send a dragged member's layout position to the authenticated hub;
+        // never create an independent PC-to-PC layout or another pairing.
+        if(_host!=null)
+        {
+            if(!_host.PublishEnvironmentPlacement(key,point))
+                Status("Could not synchronize this device position to the environment hub.");
+        }
+        else if(_receiver!=null && !_receiver.UpdateEnvironmentPlacement(key,point))
+            Status("Cannot synchronize position for an offline or untrusted device.");
+    }
+
+    private void HandleSharedEnvironmentLayout(
+        IReadOnlyDictionary<string,PointF> canonicalPositions) => PostToUi(() =>
+    {
+        _display.RestoreMemberOffsets(canonicalPositions);
+        SavePreferredEdge();
+        // Applying a hub snapshot MUST NOT re-send it as a local drag.
+        RefreshDisplays();
+    });
+
     private void HandleEnvironmentRoster() => PostToUi(() =>
     {
         if(_host == null) return;
@@ -1354,6 +1383,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;
             _host.EnvironmentRosterChanged -= HandleEnvironmentRoster;
+            _host.EnvironmentLayoutChanged -= HandleSharedEnvironmentLayout;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
         _capture?.Dispose();

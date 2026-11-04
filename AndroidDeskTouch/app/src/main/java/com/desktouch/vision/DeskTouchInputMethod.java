@@ -87,6 +87,12 @@ public final class DeskTouchInputMethod extends InputMethodService {
         return getCurrentInputConnection();
     }
 
+    /** A real focused editor connection exists; used by emulator acceptance. */
+    static boolean hasActiveEditor() {
+        DeskTouchInputMethod service=current;
+        return service!=null && service.approvedEditor()!=null;
+    }
+
     /** Called on the Android UI thread from the existing authorized input path. */
     static boolean commitRemoteText(String value) {
         DeskTouchInputMethod service=current;

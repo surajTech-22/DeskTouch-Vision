@@ -319,7 +319,7 @@ internal sealed class DisplayArrangementControl : Control
                     DisplayNumber(m, ++remoteOrdinal), m.Primary, false);
             }
         }
-        else if(extras.Count == 0)
+        else if(extras.Length == 0)
         {
             _placeholderHit = Fit(remotePos, full, scale, offsetX, offsetY);
             DrawPlaceholder(g, _placeholderHit);
@@ -502,12 +502,12 @@ internal sealed class DisplayArrangementControl : Control
         if(_draggingMemberId!=int.MinValue)
         {
             int id=_draggingMemberId;
-            int dx=_dragCurrent.X-_dragOrigin.X;
-            int dy=_dragCurrent.Y-_dragOrigin.Y;
+            int memberDeltaX=_dragCurrent.X-_dragOrigin.X;
+            int memberDeltaY=_dragCurrent.Y-_dragOrigin.Y;
             _draggingMemberId=int.MinValue;
             Capture=false;
             Cursor=Cursors.Default;
-            if(Math.Max(Math.Abs(dx),Math.Abs(dy)) < 8)
+            if(Math.Max(Math.Abs(memberDeltaX),Math.Abs(memberDeltaY)) < 8)
                 EnvironmentDeviceSelected?.Invoke(id);
             else
             {
@@ -517,8 +517,8 @@ internal sealed class DisplayArrangementControl : Control
                     string key=member.LayoutKey;
                     var old=_memberOffsets.GetValueOrDefault(key);
                     _memberOffsets[key]=new PointF(
-                        Math.Clamp(old.X+dx/Math.Max(.001f,_layoutScale),-80000,80000),
-                        Math.Clamp(old.Y+dy/Math.Max(.001f,_layoutScale),-80000,80000));
+                        Math.Clamp(old.X+memberDeltaX/Math.Max(.001f,_layoutScale),-80000,80000),
+                        Math.Clamp(old.Y+memberDeltaY/Math.Max(.001f,_layoutScale),-80000,80000));
                     EnvironmentArrangementChanged?.Invoke();
                 }
             }

@@ -483,40 +483,53 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         });
     }
 
-    static void key(int vk,boolean pressed){
+    static void key(int vk,boolean pressed,Runnable rejected){
         DeskTouchAccessibilityService service=instance;
-        if(service==null||!ready(service))return;
-        service.ui.post(()->service.applyKey(vk,pressed));
+        if(service==null || !ready(service)){
+            if(pressed && rejected!=null)rejected.run();
+            return;
+        }
+        service.ui.post(()->{
+            if(!ready(service)||!service.remoteActive ||
+                !service.applyKey(vk,pressed)){
+                if(pressed && rejected!=null)rejected.run();
+            }
+        });
     }
-    private void applyKey(int vk,boolean pressed){
-        if(vk==16||vk==160||vk==161){shift=pressed;return;}
-        if(vk==17||vk==162||vk==163){control=pressed;return;}
-        if(vk==18||vk==164||vk==165){alt=pressed;return;}
-        if(!pressed||control||alt)return;
-        if(vk==27){performGlobalAction(GLOBAL_ACTION_BACK);return;}
-        if(vk==0x24 && !isTextFieldFocused()){performGlobalAction(GLOBAL_ACTION_HOME);return;}
+    private boolean applyKey(int vk,boolean pressed){
+        if(vk==16||vk==160||vk==161){shift=pressed;return true;}
+        if(vk==17||vk==162||vk==163){control=pressed;return true;}
+        if(vk==18||vk==164||vk==165){alt=pressed;return true;}
+        if(!pressed)return true;
+        if(control||alt)return false;
+        if(vk==27)return performGlobalAction(GLOBAL_ACTION_BACK);
+        if(vk==0x24 && !isTextFieldFocused())
+            return performGlobalAction(GLOBAL_ACTION_HOME);
         AccessibilityNodeInfo field=focusedEditor();
         String printable=WindowsKeyText.printable(vk,shift);
-        if(printable!=null && commitNativeText(printable,field))return;
-        if(nativeDelete(vk,field))return;
-        if(field==null || !field.isEditable() || field.isPassword())return;
-        CharSequence text=field.getText();
-        String original=text==null?"":text.toString();
+        if(printable!=null && commitNativeText(printable,field))return true;
+        if(nativeDelete(vk,field))return true;
+        if(field==null || !field.isEditable() || field.isPassword())
+            return false;
+        CharSequence value=field.getText();
+        String original=value==null?"":value.toString();
         WindowsKeyText.Edit change=WindowsKeyText.apply(original,
             field.getTextSelectionStart()<0?original.length():field.getTextSelectionStart(),
             field.getTextSelectionEnd()<0?original.length():field.getTextSelectionEnd(),
             vk,shift);
-        if(change==null)return;
+        if(change==null)return false;
         if(!change.text.equals(original)){
-            Bundle value=new Bundle();
-            value.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                change.text);
-            if(!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,value))return;
+            Bundle update=new Bundle();
+            update.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,change.text);
+            if(!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,update))
+                return false;
         }
         Bundle caret=new Bundle();
         caret.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,change.cursor);
         caret.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,change.cursor);
         field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,caret);
+        return true;
     }
     private boolean isTextFieldFocused(){
         AccessibilityNodeInfo root=getRootInActiveWindow();

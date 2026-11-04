@@ -185,6 +185,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
+        _display.EnvironmentDeviceSelected += SelectConnectedTarget;
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
 
         LoadPreferredEdge();
@@ -383,12 +384,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver?.ConnectedPeerCount > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
         if (_host != null && !_captureUsesInbound)
+        {
+            int members=_host.EnvironmentMembers.Count;
+            int android=_host.EnvironmentMembers.Count(m=>m.Platform=="Android");
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
-                            $"{_remoteAddress}  ·  {_host.RemoteMonitors.Monitors.Count} display(s)";
+                            $"{_remoteAddress}  ·  {_host.RemoteMonitors.Monitors.Count} display(s)" +
+                            $"     ·     {members} environment device(s), {android} Android";
+        }
         else if (_incomingPeer != null)
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
                             $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  " +
-                            $"{_receiver?.ConnectedPeerCount ?? 0} devices online";
+                            $"{_receiver?.ConnectedPeerCount ?? 0} devices online" +
+                            $" ({_receiver?.ConnectedPeers.Count(p=>p.Peer.Platform=="Android")??0} Android)";
         else
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -405,7 +412,38 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.Remote = inbound ? _incomingPeer!.Monitors :
                 _host?.RemoteMonitors ?? _incomingPeer?.Monitors;
             _display.RemoteDeviceName = inbound ? _incomingPeer!.Name :
-                _host != null ? _remoteAddress : _incomingPeer?.Name ?? "Connected device";
+                _host != null ? (_host.RemoteSystemName ?? _remoteAddress) :
+                _incomingPeer?.Name ?? "Connected device";
+
+            // The diagram previously drew ONLY the selected remote monitor
+            // topology. List all other live authenticated members here too,
+            // including Android phones and their screen count, without changing
+            // Windows monitor numbering or opening another connection.
+            var tiles = new List<EnvironmentDisplayTile>();
+            int selectedTargetId;
+            if(_host != null && !inbound)
+            {
+                selectedTargetId=-_host.SelectedEnvironmentTargetId;
+                foreach(var member in _host.EnvironmentMembers)
+                {
+                    if(member.Id==_host.OwnEnvironmentMemberId)continue;
+                    int id=member.Id==0?0:-member.Id;
+                    int screens=MonitorTopology.FromWire(member.Layout).Monitors.Count;
+                    tiles.Add(new EnvironmentDisplayTile(id,member.Name,
+                        member.Platform,screens,member.SupportsReverseInput));
+                }
+            }
+            else
+            {
+                selectedTargetId=_receiver?.SelectedPeerId ?? 0;
+                foreach(var (id,peer) in _receiver?.ConnectedPeers ??
+                    Array.Empty<(int Id,ConnectedPeer Peer)>())
+                    tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
+                        peer.Platform,peer.Monitors.Monitors.Count,
+                        peer.SupportsReverseInput));
+            }
+            _display.EnvironmentDevices =
+                DisplayArrangementControl.ProjectEnvironment(tiles,selectedTargetId);
             UpdateTargetChoice();
             UpdateButtons();
         }
@@ -629,10 +667,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnPeerListChanged() => PostToUi(() =>
     {
-        // An additional authenticated phone must appear even if Windows is
-        // already linked to another PC. Do not create a second TLS session.
-        UpdateTargetChoice();
-        UpdateButtons();
+        // Receiver roster updates and topology changes must redraw the
+        // diagram, not just the target drop-down.
+        RefreshDisplays();
     });
 
     private void OnIncomingPeerConnected(ConnectedPeer peer)

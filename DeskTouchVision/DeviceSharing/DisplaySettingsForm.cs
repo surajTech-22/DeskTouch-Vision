@@ -24,6 +24,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     };
     private bool _updatingTargetChoice;
     private bool _captureUsesInbound;
+    private int _captureInboundPeerId;
     private sealed record TargetOption(int Id, string Name)
     {
         public override string ToString() => Name;
@@ -504,6 +505,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 _capture?.Dispose();
                 _capture = null;
+                _captureInboundPeerId=0;
             }
             _captureUsesInbound = false;
             if (_capture == null)
@@ -541,10 +543,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture?.Dispose();
             _capture = null;
         }
+        // Explicit selection replaces ONLY this local input destination.
+        // It must not close the hub, the Windows peer or the Android peer.
+        if(_captureInboundPeerId!=id && _capture != null)
+        {
+            _capture.ReturnLocal();
+            _capture.Dispose();
+            _capture=null;
+        }
+        _captureInboundPeerId=0;
         _captureUsesInbound = true;
         if (!_receiver.SelectConnectedPeer(id)) return;
-        // PeerConnected fires on selection. If the same peer was already
-        // selected, ensure the capture starts without opening a new socket.
+        _incomingPeer = target.Peer; // deterministic: no async UI callback race
         ArmSelectedInbound();
         RefreshDisplays();
     }
@@ -559,6 +569,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
             _capture.Arm();
+            _captureInboundPeerId=_receiver.SelectedPeerId;
             Status("Windows controls " + _incomingPeer.Name +
                 " across the existing authenticated connection.");
         }
@@ -689,14 +700,23 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _receiver.DisconnectPeer();
                 return;
             }
-            // This selected peer is the screen displayed in the arrangement.
-            _incomingPeer = peer;
+            // A peer becoming connected is not permission to steal keyboard
+            // authority from a DIFFERENT selected Windows or Android target.
+            // Use the receiver's actual selected ID, never the most recent
+            // discovery event, and keep an existing capture for that same peer.
+            int selectedId=_receiver.SelectedPeerId;
+            if(selectedId==0){ RefreshDisplays();return; }
+            var selected=_receiver.ConnectedPeers.FirstOrDefault(p=>p.Id==selectedId);
+            if(selected.Peer==null)return;
+            _incomingPeer=selected.Peer;
             if (_host == null) _captureUsesInbound = true;
-            if (_captureUsesInbound && peer.SupportsReverseInput)
+            if (_captureUsesInbound && _incomingPeer.SupportsReverseInput)
             {
-                if (_capture != null && _capture.RemoteActive) _capture.ReturnLocal();
-                _capture?.Dispose();
-                _capture = null;
+                if(_capture!=null && _captureInboundPeerId!=selectedId)
+                {
+                    _capture.ReturnLocal();_capture.Dispose();_capture=null;
+                    _captureInboundPeerId=0;
+                }
                 ArmSelectedInbound();
             }
             else if (peer.Platform == "Android" && !peer.SupportsReverseInput)
@@ -712,28 +732,39 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
-            if (_captureUsesInbound && _capture != null)
+            int selectedId=_receiver?.SelectedPeerId ?? 0;
+            // A selection change raises "previous disconnected" even when
+            // its TLS session is still online. Never dispose a just-armed
+            // capture for the next selected device on that callback.
+            if(selectedId>0)
             {
-                _capture.Dispose();
-                _capture = null;
+                var selected=_receiver!.ConnectedPeers.FirstOrDefault(p=>p.Id==selectedId);
+                if(selected.Peer!=null)
+                {
+                    _incomingPeer=selected.Peer;
+                    if(_captureUsesInbound && _captureInboundPeerId!=selectedId)
+                    {
+                        _capture?.ReturnLocal();
+                        _capture?.Dispose();_capture=null;
+                        _captureInboundPeerId=0;
+                        ArmSelectedInbound();
+                    }
+                    RefreshDisplays();
+                    return;
+                }
             }
-            if (_receiver?.ConnectedPeerCount == 0 && _host == null)
-                _nativeInput?.Dispose();
-            _incomingPeer = null;
-            // The server raises a selection-change "disconnect" callback
-            // before "connect". If another incoming peer has already been
-            // selected, preserve that target rather than switching back to
-            // the outgoing PC and losing the newly selected Android display.
-            bool anotherInboundSelected = _receiver?.SelectedPeerId > 0;
-            if (_host != null && !anotherInboundSelected && _captureUsesInbound)
+            if(_captureUsesInbound)
             {
-                _captureUsesInbound = false;
+                _capture?.ReturnLocal();_capture?.Dispose();_capture=null;
+                _captureInboundPeerId=0;
+            }
+            _incomingPeer=null;
+            if(_host!=null && _captureUsesInbound)
+            {
+                _captureUsesInbound=false;
                 SelectConnectedTarget(0);
             }
             RefreshDisplays();
-            Status(_receiver?.ConnectedPeerCount > 0
-                ? $"Selected peer changed. {_receiver.ConnectedPeerCount} devices online."
-                : "No incoming device selected; discovery stays available.");
         });
     }
 

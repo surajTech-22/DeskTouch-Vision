@@ -17,6 +17,7 @@ internal sealed class BluetoothHidCheckForm : Form
         BackColor=Color.FromArgb(40,42,49), ForeColor=Color.WhiteSmoke,
         BorderStyle=BorderStyle.None
     };
+    private int? _previousCandidate;
     private readonly Label _message = new() {
         Dock=DockStyle.Bottom, Height=115, Padding=new Padding(14,10,14,8),
         ForeColor=Color.FromArgb(189,202,216)
@@ -64,7 +65,8 @@ internal sealed class BluetoothHidCheckForm : Form
     {
         if(IsDisposed)return;
         var reports=_read();
-        var preferred=BluetoothHidSelection.PreferredCandidate(reports);
+        var preferred=BluetoothHidSelection.PreferredCandidate(reports,_previousCandidate);
+        _previousCandidate=preferred;
         _devices.BeginUpdate();
         try
         {
@@ -84,7 +86,6 @@ internal sealed class BluetoothHidCheckForm : Form
                     _=>"Unable to verify"
                 });
                 item.ToolTipText=r.Capability.Detail;
-                if(r.Id==preferred)item.Font=new Font(Font,FontStyle.Bold);
                 _devices.Items.Add(item);
             }
         }

@@ -2,6 +2,8 @@ package com.desktouch.vision;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.accessibilityservice.InputMethod;
+import android.os.Build;
 import android.content.Context;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
@@ -304,6 +306,26 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(pendingGestures.isEmpty())remoteGesture=false;
         pumpGestures();
     }
+    private boolean commitNativeText(String incoming,
+        AccessibilityNodeInfo focusedField)
+    {
+        // API 33+ Accessibility IME is Android's own editable-field input
+        // channel. Never use it on non-editable or password UI components.
+        if(Build.VERSION.SDK_INT<33 || focusedField==null ||
+            !focusedField.isEditable() || focusedField.isPassword())return false;
+        try {
+            InputMethod.AccessibilityInputConnection editor=
+                getInputMethod().getCurrentInputConnection();
+            if(editor==null)return false;
+            editor.commitText(incoming,1,null);
+            return true;
+        }catch(RuntimeException unavailable){
+            // A custom editor may not supply an InputConnection; use the
+            // existing ACTION_SET_TEXT route instead of losing input.
+            return false;
+        }
+    }
+
     static void text(String incoming){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service)||
@@ -313,6 +335,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             if(root==null)return;
             AccessibilityNodeInfo field=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
             if(field==null||!field.isEditable()||field.isPassword())return;
+            if(service.commitNativeText(incoming,field))return;
             CharSequence original=field.getText();
             String content=original==null?"":original.toString();
             int start=field.getTextSelectionStart();
@@ -353,6 +376,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(root==null)return;
         AccessibilityNodeInfo field=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
         if(field==null || !field.isEditable() || field.isPassword())return;
+        String printable=WindowsKeyText.printable(vk,shift);
+        if(printable!=null && commitNativeText(printable,field))return;
         CharSequence text=field.getText();
         String original=text==null?"":text.toString();
         WindowsKeyText.Edit change=WindowsKeyText.apply(original,

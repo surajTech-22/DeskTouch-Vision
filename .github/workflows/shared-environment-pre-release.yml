@@ -2,7 +2,7 @@ name: DeskTouch Shared Environment - pre-release verification (no publish)
 
 on:
   push:
-    branches: [feature/shared-environment-relay-v0312]
+    branches: [feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313]
     paths:
       - 'DeskTouchVision/**'
       - 'AndroidDeskTouch/**'

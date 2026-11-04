@@ -686,7 +686,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             granted=true;
                         }
                     }
-                    if(granted && !Select(session))
+                    // A forward Android/Windows INPUT CLAIM controls the
+                    // local hub only. It is NOT a request to change which
+                    // remote destination the hub operator is controlling.
+                    // Selecting the claimant here revoked the selected PC's
+                    // reverse keyboard lease whenever a phone touched its UI.
+                    // Forward owner (_owner) and reverse target (_selected)
+                    // must remain independent while all peers stay connected.
+                    if(granted && !_sessions.ContainsKey(session.Id))
                     {
                         lock(_authorityGate)
                         {

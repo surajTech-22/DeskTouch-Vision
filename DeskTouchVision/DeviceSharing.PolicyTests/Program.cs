@@ -1073,6 +1073,40 @@ var uiThread = new Thread(() =>
             .SelectMany(x=>x.Controls.OfType<System.Windows.Forms.ComboBox>())
             .All(c=>c.Name!="ConnectedDeviceTarget"),
             "The old two-item one-to-one target dropdown must not be presented");
+        // One global hook owner must survive device-target changes. Using a
+        // fake IInputSession checks exact claim/release ownership without
+        // installing global keyboard or mouse hooks on the CI runner.
+        var monitorA=new MonitorTopology(new[]{
+            new MonitorRect("PC_A",0,0,1920,1080,true)});
+        var monitorB=new MonitorTopology(new[]{
+            new MonitorRect("ANDROID",0,0,1080,2400,true)});
+        var recorderA=new RecordingInputSession(monitorA);
+        var recorderB=new RecordingInputSession(monitorB);
+        using(var capture=new SourceCapture(diagram,recorderA,_=>{},
+            MonitorEdge.Right,preserveRawInput:true))
+        {
+            var armed=typeof(SourceCapture).GetField("_armed",
+                System.Reflection.BindingFlags.Instance|
+                System.Reflection.BindingFlags.NonPublic)!;
+            // Mark the pure state machine armed without creating OS hooks.
+            armed.SetValue(capture,1);
+            var enter=typeof(SourceCapture).GetMethod("EnterRemote",
+                System.Reflection.BindingFlags.Instance|
+                System.Reflection.BindingFlags.NonPublic)!;
+            enter.Invoke(capture,new object[]{new System.Drawing.Point(1890,440)});
+            Check(recorderA.Packets.Any(p=>p.Type=="claim"),
+                "First Windows PC must receive the original claim");
+            capture.Retarget(recorderB,MonitorEdge.Right);
+            Check(recorderA.Packets.Any(p=>p.Type=="release") &&
+                !recorderB.Packets.Any(p=>p.Type=="release") &&
+                capture.SameInputSession(recorderB) &&
+                capture.ActiveRemoteMonitors.Bounds==monitorB.Bounds,
+                "Old Windows PC must receive release before Android replaces the destination");
+            capture.BeginLinkedHandoff(MonitorEdge.Right,0.4);
+            Check(recorderB.Packets.Any(p=>p.Type=="claim") &&
+                !recorderA.Packets.Skip(2).Any(p=>p.Type=="claim"),
+                "Android receives the next claim over the existing capture, without new hook installation");
+        }
         // A real WinForms UserClosing event must hide the existing HWND,
         // not dispose the receiver/input hooks or close the TLS pairing.
         // We create the HWND without showing the form, so Shown/StartListening
@@ -1099,3 +1133,11 @@ uiThread.Start();
 await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
 uiThread.Join();
 Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");
+
+internal sealed class RecordingInputSession : IInputSession
+{
+    internal List<Packet> Packets { get; } = new();
+    public MonitorTopology RemoteMonitors { get; }
+    internal RecordingInputSession(MonitorTopology geometry) => RemoteMonitors=geometry;
+    public bool TrySend(Packet packet){ Packets.Add(packet);return true; }
+}

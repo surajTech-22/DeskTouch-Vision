@@ -423,8 +423,9 @@ internal sealed class SourceCapture : IDisposable
                 {
                     _status($"Outward {source} detected at {edge.ToString().ToLowerInvariant()} external Windows screen edge.");
                     double fraction=_localMonitors.EdgeFraction(cursor,edge);
-                    if(NavigateEnvironment?.Invoke(edge,fraction)!=true &&
-                        edge==_edge)
+                    if(NavigateEnvironment!=null)
+                        NavigateEnvironment(edge,fraction); // no arbitrary PC fallback
+                    else if(edge==_edge)
                         EnterRemote(cursor);
                 }
             }
@@ -644,8 +645,10 @@ internal sealed class SourceCapture : IDisposable
                     {
                         try
                         {
-                            if(NavigateEnvironment?.Invoke(side,fraction)!=true)
-                                ReturnLocal();
+                            // Invalid/unpaired screen edges are SOLID.
+                            // Never teleport back to the hub on an unrelated
+                            // right/top/bottom edge of the second computer.
+                            NavigateEnvironment?.Invoke(side,fraction);
                         }
                         finally{Interlocked.Exchange(ref _switchPending,0);}
                     }))
@@ -672,7 +675,8 @@ internal sealed class SourceCapture : IDisposable
                 MonitorEdge.Bottom => new System.Drawing.Point(_remoteX, monitor.Y + monitor.Height - 1),
                 _ => new System.Drawing.Point(_remoteX, _remoteY)
             };
-            if (leaving && _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
+            if (NavigateEnvironment==null && leaving &&
+                _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
             {
                 if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0 &&
                     !Post(() =>

@@ -31,6 +31,7 @@ public final class MainActivity extends Activity {
             runOnUiThread(()->{
                 if(status!=null)status.setText(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
+                updateVisibleScreenAwake();
             }));
         // Android 13+ requires permission to show the persistent connection
         // notification in the shade. The foreground service itself is still
@@ -100,6 +101,7 @@ public final class MainActivity extends Activity {
             DeskTouchAccessibilityService.setAllowed(this,enabled);
             DeskTouchRuntime.accessibilityPermissionChanged();
             refreshPermissionState();
+            updateVisibleScreenAwake();
             if(enabled && !DeskTouchAccessibilityService.ready(this)){
                 status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings, then reconnect.");
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
@@ -285,8 +287,18 @@ public final class MainActivity extends Activity {
         super.onConfigurationChanged(config);
         DeskTouchRuntime.publishPhoneGeometry();
     }
+    private void updateVisibleScreenAwake(){
+        // A connected, explicitly enabled phone must not fall asleep while
+        // this setup/control screen is visible. Android owns this Activity
+        // flag; system/third-party app power policies remain authoritative.
+        boolean keep=DeskTouchRuntime.connectedCount()>0 &&
+            DeskTouchAccessibilityService.ready(this);
+        if(keep)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
     @Override protected void onResume(){
         super.onResume();
+        updateVisibleScreenAwake();
         refreshPermissionState();
     }
     private void refreshPermissionState(){

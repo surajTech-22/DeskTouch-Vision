@@ -1,30 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# This is an emulator-only integration test for the real Android IME and
-# Accessibility APIs. The production APK cannot silently enable either.
-apk="AndroidDeskTouch/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
-test -s "$apk"
-adb install -r "$apk"
-adb wait-for-device
-
+# Exercise the ACTUAL Android IME and Accessibility services in their normal
+# application process. ADB only enables system services on this isolated CI
+# emulator; no bypass or test receiver is included in the release build.
 ime="com.desktouch.vision/.DeskTouchInputMethod"
+adb wait-for-device
 adb shell ime enable "$ime"
 adb shell ime set "$ime"
 adb shell settings get secure default_input_method | tr -d '\r' | grep -F 'DeskTouchInputMethod'
 adb shell dumpsys accessibility | grep -F 'DeskTouchAccessibilityService'
 
-echo "RUNNING: Android real IME input and Accessibility mouse acceptance"
-set +e
-adb shell am instrument -w -r \
-  com.desktouch.vision.test/androidx.test.runner.AndroidJUnitRunner \
-  > android-input-instrumentation.txt 2>&1
-status=$?
-set -e
-cat android-input-instrumentation.txt
-if [[ "$status" != 0 ]] || ! grep -Eq '^OK \(3 tests?\)' android-input-instrumentation.txt; then
-  echo "FAIL: Android input behavior did not satisfy all three runtime tests"
-  adb logcat -d -s AndroidRuntime:E | tail -90 || true
-  exit 1
-fi
-echo "PASS: Real Android editor typing/caret, Accessibility click, drag and scroll"
+: > android-input-emulator.txt
+for probe in status keyboard click drag scroll; do
+  label="$(echo "$probe" | tr '[:lower:]' '[:upper:]')"
+  adb logcat -c
+  adb shell am start -n com.desktouch.vision/.InputProbeActivity \
+    --es probe "$probe"
+  result=timeout
+  for attempt in $(seq 1 30); do
+    logs="$(adb logcat -d -s DeskTouchInputProbe:V 2>/dev/null || true)"
+    if echo "$logs" | grep -Fq "RESULT_${label}_PASS"; then
+      result=pass
+      echo "PASS: $probe" | tee -a android-input-emulator.txt
+      break
+    fi
+    if echo "$logs" | grep -Fq "RESULT_${label}_FAIL"; then
+      result=fail
+      echo "FAIL: $probe" | tee -a android-input-emulator.txt
+      echo "$logs" | grep -F "RESULT_${label}_FAIL" | tail -5
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$result" != pass ]]; then
+    echo "FAIL: Android $probe input behavior was not verified" | tee -a android-input-emulator.txt
+    adb shell dumpsys accessibility | grep -E 'Enabled services|Bound services|DeskTouch' | head -30 || true
+    adb logcat -d -s AndroidRuntime:E DeskTouchInputProbe:V | tail -80 || true
+    exit 1
+  fi
+done
+echo "PASS: Android real editor input and click, drag, wheel events in emulator"

@@ -196,6 +196,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 service.held=true;service.downX=service.x;service.downY=service.y;
             }else if(service.held){
                 service.held=false;
+                // A normal tap can use the application's native click
+                // action immediately. Drag paths still use opt-in gestures.
+                if(service.downX==service.x && service.downY==service.y &&
+                    service.performNativeClick())return;
                 service.enqueueGesture(service.downX,service.downY,
                     service.x,service.y,45);
             }
@@ -217,6 +221,27 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             int ey=horizontal?sy:sy+(amount>0?-distance:distance);
             service.enqueueGesture(sx,sy,ex,ey,85);
         });
+    }
+
+    private boolean performNativeClick(){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root==null)return false;
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        AccessibilityNodeInfo target=null;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=96){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(x,y))continue;
+            if(node.isClickable() && node.isEnabled())target=node;
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        return target!=null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     private boolean performNativeScroll(int amount){

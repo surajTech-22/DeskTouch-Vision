@@ -32,6 +32,9 @@ internal sealed class SourceCapture : IDisposable
     private long _cooldownUntil;
     private long _lastRawMs;
     private long _lastFallbackMs;
+    private bool _continuingAcrossDevices;
+    internal bool OutboundInputReserved => RemoteActive ||
+        (_continuingAcrossDevices && IsClaimPending);
     private System.Drawing.Point _lastPhysicalPointer;
     private bool _hasLastPhysicalPointer;
     private readonly SlowEdgeApproach _slowEdge = new();
@@ -120,9 +123,15 @@ internal sealed class SourceCapture : IDisposable
     // destination change must release the previous session while still
     // bound to it, and then attach the next already-authenticated stream
     // WITHOUT disposing/reattaching global Windows hooks or Raw Input.
-    internal void Retarget(IInputSession next, MonitorEdge entryEdge)
+    internal void Retarget(IInputSession next, MonitorEdge entryEdge,
+        bool continuingRemoteHandoff=false)
     {
+        // A native mouse that was already controlling another screen
+        // should not revoke an independent inbound controller of this PC
+        // during the two-phase transition to a neighboring screen.
+        bool continuation=continuingRemoteHandoff || RemoteActive;
         ReturnLocal();
+        _continuingAcrossDevices=continuation;
         _session=next;
         _remoteMonitors=next.RemoteMonitors;
         _edge=entryEdge;
@@ -210,6 +219,7 @@ internal sealed class SourceCapture : IDisposable
 
     internal void ReturnLocal()
     {
+        _continuingAcrossDevices=false;
         int pendingClaim = _claims.Pending;
         int awaitingApplied = Interlocked.Exchange(ref _awaitingAppliedClaim, 0);
         _claims.Cancel();
@@ -301,6 +311,7 @@ internal sealed class SourceCapture : IDisposable
         _lastRawMs = 0;
         _lastFallbackMs = 0;
         Interlocked.Exchange(ref _active, 1);
+        _continuingAcrossDevices=false;
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
     }
 

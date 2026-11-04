@@ -12,13 +12,7 @@ adb shell dumpsys accessibility | grep -F 'DeskTouchAccessibilityService'
 
 : > android-input-emulator.txt
 failed=0
-for probe in status keyboard click drag scroll; do
-  # An actual Android tap establishes input focus; a programmatic request
-  # alone is not equivalent to a user focusing a text field.
-  if [[ "$probe" == keyboard ]]; then
-    adb shell input tap 240 110
-    sleep 1
-  fi
+for probe in status click drag scroll; do
   label="$(echo "$probe" | tr '[:lower:]' '[:upper:]')"
   adb logcat -c
   adb shell am start -n com.desktouch.vision/.InputProbeActivity \
@@ -48,6 +42,60 @@ for probe in status keyboard click drag scroll; do
     failed=$((failed+1))
   fi
 done
+
+# Android's InputConnection is ordinarily a Binder bridge from an IME process
+# into a DIFFERENT application process. Test that real boundary explicitly.
+adb shell am start -n com.desktouch.vision/.ExternalEditorProbeActivity >/dev/null
+sleep 2
+adb shell input tap 225 110
+sleep 1
+adb shell dumpsys input_method | grep -E 'mCurId|mServedView|mServedInputConnection' | head -12 || true
+
+editor_send() {
+  local label="$1"; shift
+  local expected="$1"; shift
+  adb logcat -c
+  adb shell am broadcast \
+    -a com.desktouch.vision.DEBUG_SEND_INPUT \
+    -n com.desktouch.vision/.DebugRemoteInputReceiver "$@" >/dev/null
+  local result=timeout
+  for attempt in $(seq 1 20); do
+    local trace
+    trace="$(adb logcat -d -s DeskTouchExternalEditor:I 2>/dev/null || true)"
+    if echo "$trace" | grep -Fq "EDITOR_VALUE=${expected} CARET="; then
+      if echo "$trace" | grep -Fq "IME_REQUEST command=" && \
+         echo "$trace" | grep -Fq "accepted=true"; then
+        result=pass
+        echo "PASS: Android cross-process keyboard $label" |
+          tee -a android-input-emulator.txt
+        break
+      fi
+    fi
+    sleep 1
+  done
+  if [[ "$result" != pass ]]; then
+    echo "FAIL: Android cross-process keyboard $label; expected=$expected" |
+      tee -a android-input-emulator.txt
+    adb logcat -d -s DeskTouchExternalEditor:I AndroidRuntime:E | tail -80 || true
+    adb shell dumpsys input_method | grep -E \
+      'mCurId|mInputShown|mServedView|mServedInputConnection|mInputBinding' |
+      head -35 || true
+    failed=$((failed+1))
+  fi
+}
+editor_send "text" "hello" --es command text --es value hello
+editor_send "Backspace" "hell" --es command key --ei vk 8
+editor_send "retype" "hello" --es command text --es value o
+adb logcat -c
+adb shell am broadcast -a com.desktouch.vision.DEBUG_SEND_INPUT \
+  -n com.desktouch.vision/.DebugRemoteInputReceiver \
+  --es command key --ei vk 37 >/dev/null
+sleep 1
+adb logcat -d -s DeskTouchExternalEditor:I |
+  grep -F 'IME_REQUEST command=key accepted=true' || failed=$((failed+1))
+# Left-arrow moves the caret without changing the text; verify insertion.
+editor_send "insert-at-caret" "hell!o" --es command text --es value '!'
+
 if [[ "$failed" -ne 0 ]]; then
   echo "FAIL: $failed Android real-input probes did not pass"
   exit 1

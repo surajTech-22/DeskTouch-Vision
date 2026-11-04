@@ -419,6 +419,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try
         {
             _display.LocalDeviceName = Environment.MachineName;
+            _display.LocalIsEnvironmentHub = _host == null;
             _display.Local = MonitorTopology.Capture();
             // Device placement is an ENVIRONMENT property, not a transient
             // keyboard-authority selection. Selecting Android must never

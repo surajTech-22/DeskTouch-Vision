@@ -341,7 +341,16 @@ final class DeskTouchSession implements AutoCloseable {
             });
         }else if("reverse-text".equals(p.type) && p.text!=null &&
             p.text.length()>0 && p.text.length()<=512){
-            DeskTouchAccessibilityService.text(p.text);
+            final int activeLease=reverseLease;
+            DeskTouchAccessibilityService.text(p.text,()->{
+                // Never send text, character values or typed data back to
+                // the hub; report only the failed authority lease number.
+                if(reverseLease==activeLease &&
+                    reportedMissingKeyboard!=activeLease){
+                    reportedMissingKeyboard=activeLease;
+                    send(new Packet("reverse-key-unavailable",activeLease));
+                }
+            });
         }
     }
     private void clearReverseControl(boolean notifyWindows){

@@ -244,6 +244,10 @@ final class AndroidUpdater {
                         .setPositiveButton("OK",null).show());
                     return;
                 }
+                // A legitimate update keeps the same app ID, signing
+                // identity and Android private storage. Snapshot only the
+                // user's permission state; never uninstall or clear data.
+                PermissionContinuity.checkpointBeforeInstaller(activity);
                 activity.runOnUiThread(()->openInstaller(activity,apk));
             }catch(Exception e){
                 activity.runOnUiThread(()->new AlertDialog.Builder(activity)

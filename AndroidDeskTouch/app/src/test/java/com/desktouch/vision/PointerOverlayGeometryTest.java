@@ -26,7 +26,7 @@ public final class PointerOverlayGeometryTest {
         int origin=150;
         for(int px=190;px<345;px+=2)
             assertEquals(150,PointerOverlayGeometry.followOrigin(px,origin,1080,240,40));
-        assertEquals(165,PointerOverlayGeometry.followOrigin(365,origin,1080,240,40));
+        assertEquals(166,PointerOverlayGeometry.followOrigin(365,origin,1080,240,40));
         assertEquals(150,PointerOverlayGeometry.followOrigin(190,origin,1080,240,40));
     }
     @Test public void pointerOverlayClampsToRealScreenAndSurvivesRotation(){

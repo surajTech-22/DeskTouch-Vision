@@ -642,6 +642,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         PeerPlacementChanged?.Invoke(edge);
                     continue;
                 }
+                if(p.Type=="reverse-key-unavailable")
+                {
+                    RelayLease? relay;
+                    lock(_authorityGate)
+                    {
+                        _relayByTarget.TryGetValue(session.Id,out relay);
+                        if(relay!=null && relay.Claim!=p.A)relay=null;
+                    }
+                    if(relay!=null)
+                    {
+                        try { await SendToAsync(relay.Source,
+                            new Packet("android-keyboard-unavailable"),token); }
+                        catch(Exception){}
+                    }
+                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                        _status("Android keyboard input unavailable: tap an editable field on the phone and verify DeskTouch Accessibility is enabled.");
+                    continue;
+                }
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
@@ -1371,6 +1389,9 @@ internal sealed class HostSession : IInputSession, IDisposable
                     HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
+                else if (p.Type == "android-keyboard-unavailable")
+                    InputDeliveryWarning?.Invoke(
+                        "Android has no supported focused text field. Click an editable field on the phone, then type. Check Android Accessibility settings if needed.");
                 else if (p.Type == "keyboard-unavailable")
                     InputDeliveryWarning?.Invoke("The receiving Windows PC rejected keyboard " +
                         "input. Click a normal text field on that PC and check whether " +

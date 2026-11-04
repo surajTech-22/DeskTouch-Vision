@@ -97,8 +97,8 @@ adb logcat -d -s DeskTouchExternalEditor:I |
 editor_send "insert-at-caret" "hell!o" --es command text --es value '!'
 # Next use the SAME Android-side handlers as actual authenticated reverse
 # packets from Windows, rather than calling the IME endpoint directly.
-editor_send "DeskTouch reverse-text" "hell!#o" \
-  --es command reverse-text --es value '#'
+editor_send "DeskTouch reverse-text" "hell!zo" \
+  --es command reverse-text --es value z
 editor_send "DeskTouch reverse-key" "hell!o" \
   --es command reverse-key --ei vk 8
 

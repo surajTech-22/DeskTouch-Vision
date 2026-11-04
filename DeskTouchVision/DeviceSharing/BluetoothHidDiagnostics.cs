@@ -1,4 +1,5 @@
 using Windows.Devices.Bluetooth;
+using Windows.Devices.Radios;
 
 namespace DeskTouch.DeviceShare;
 
@@ -15,7 +16,7 @@ internal sealed record BluetoothHidCapability(
 
     internal static bool Valid(BluetoothHidCapability? report) =>
         report != null &&
-        report.State is "Checking" or "Candidate" or "Unsupported" or "NoAdapter" or "Unknown" &&
+        report.State is "Checking" or "Candidate" or "Unsupported" or "NoAdapter" or "RadioOff" or "Unknown" &&
         report.Detail is { Length: <= 240 } &&
         !report.Detail.Any(char.IsControl) &&
         (report.State != "Candidate" ||
@@ -62,6 +63,29 @@ internal static class BluetoothHidDiagnostics
                     "Windows did not return a default Bluetooth radio.");
             bool lowEnergy = adapter.IsLowEnergySupported;
             bool peripheral = adapter.IsPeripheralRoleSupported;
+            if(lowEnergy && peripheral)
+            {
+                // A capable radio can still be switched OFF. Read state only;
+                // never enable Bluetooth or modify Windows settings.
+                try
+                {
+                    var radio=await Task.Run(async()=>
+                        await adapter.GetRadioAsync())
+                        .WaitAsync(TimeSpan.FromSeconds(5));
+                    if(radio==null)
+                        return new("Unknown",lowEnergy,peripheral,
+                            "Peripheral supported, but the Bluetooth radio state is unavailable.");
+                    if(radio.State!=RadioState.On)
+                        return new("RadioOff",lowEnergy,peripheral,
+                            "Bluetooth radio is "+radio.State+
+                            ". Enable Bluetooth in Windows settings before testing Android HID pairing.");
+                }
+                catch(Exception)
+                {
+                    return new("Unknown",lowEnergy,peripheral,
+                        "Peripheral supported, but Windows could not confirm the Bluetooth radio is on.");
+                }
+            }
             return new(lowEnergy && peripheral ? "Candidate" : "Unsupported",
                 lowEnergy, peripheral, lowEnergy && peripheral
                     ? "BLE peripheral role available. Android HID pairing not yet tested."

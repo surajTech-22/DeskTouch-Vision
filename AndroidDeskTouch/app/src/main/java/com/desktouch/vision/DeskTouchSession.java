@@ -59,6 +59,7 @@ final class DeskTouchSession implements AutoCloseable {
     private final List<int[]> monitors=new ArrayList<>();
     private int cursorX,cursorY;
     private int screenX,screenY,screenWidth,screenHeight;
+    private volatile int announcedPhoneWidth,announcedPhoneHeight;
     private volatile java.util.List<EnvironmentTarget> environmentTargets =
         java.util.Collections.emptyList();
     private volatile int environmentOwnId;
@@ -194,6 +195,7 @@ final class DeskTouchSession implements AutoCloseable {
                 SSLSocket ssl=(SSLSocket)context.getSocketFactory().createSocket();
                 ssl.connect(new java.net.InetSocketAddress(device.address,37377),12000);
                 ssl.setTcpNoDelay(true);
+                ssl.setKeepAlive(true);
                 ssl.setSoTimeout(50000);
                 ssl.startHandshake();
                 DataInputStream in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
@@ -216,7 +218,11 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 if(minX!=ready.a||minY!=ready.b||maxX-minX!=ready.c||maxY-minY!=ready.d)
                     throw new SecurityException("Windows display geometry mismatch");
-                int width=Math.max(200,androidWidth),height=Math.max(100,androidHeight);
+                // Reconnect must use the same physical display dimensions as
+                // the Accessibility pointer and its gesture coordinates.
+                android.graphics.Point physical=PhoneScreenGeometry.read(application);
+                int width=Math.max(200,physical.x>0?physical.x:androidWidth);
+                int height=Math.max(100,physical.y>0?physical.y:androidHeight);
                 JSONArray myLayout=new JSONArray();
                 myLayout.put(new JSONObject().put("Name","Android screen").put("X",0).put("Y",0)
                     .put("Width",width).put("Height",height).put("Primary",true));
@@ -232,8 +238,11 @@ final class DeskTouchSession implements AutoCloseable {
                 cursorX=parsed.get(0)[0]+parsed.get(0)[2]/2;
                 cursorY=parsed.get(0)[1]+parsed.get(0)[3]/2;
                 fingerprint=pinned;
+                announcedPhoneWidth=width;announcedPhoneHeight=height;
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
-                ssl.setSoTimeout(22000);
+                // Allow for transient Android CPU/Wi-Fi scheduling pauses.
+                // Heartbeats and the foreground auto-reconnect still detect real loss.
+                ssl.setSoTimeout(60000);
                 status("Connected to "+device.name+". Windows approved pairing.");
                 Thread heartbeat=new Thread(()->{
                     while(running){
@@ -304,6 +313,7 @@ final class DeskTouchSession implements AutoCloseable {
                 return;
             }
             reverseLease=p.a;reverseApplied=0;reportedMissingKeyboard=0;
+            RemoteInputPower.begin(application);
             send(new Packet("reverse-granted",p.a));
             status("Windows is allowed to control this Android screen.");
             return;
@@ -356,6 +366,7 @@ final class DeskTouchSession implements AutoCloseable {
     private void clearReverseControl(boolean notifyWindows){
         int lease=reverseLease;reverseLease=0;reverseApplied=0;
         DeskTouchRuntime.releaseAndroidControl(this);
+        if(lease>0)RemoteInputPower.end();
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
@@ -373,6 +384,22 @@ final class DeskTouchSession implements AutoCloseable {
         claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
         send(new Packet("claim",claim));
         status("Requesting Windows mouse and keyboard authority");
+    }
+    void publishPhoneGeometry(){
+        if(!running)return;
+        android.graphics.Point actual=PhoneScreenGeometry.read(application);
+        if(actual.x==announcedPhoneWidth&&actual.y==announcedPhoneHeight)return;
+        if(actual.x<200||actual.y<100)return;
+        try {
+            JSONArray layout=new JSONArray();
+            layout.put(new JSONObject().put("Name","Android screen")
+                .put("X",0).put("Y",0)
+                .put("Width",actual.x).put("Height",actual.y)
+                .put("Primary",true));
+            announcedPhoneWidth=actual.x;announcedPhoneHeight=actual.y;
+            // Publish rotations on the existing authenticated TLS link.
+            send(new Packet("topology",0,0,0,0,layout.toString()));
+        }catch(org.json.JSONException ignored){}
     }
     void publishAccessibilityCapability(){
         // A permission restored after an Android package update must become

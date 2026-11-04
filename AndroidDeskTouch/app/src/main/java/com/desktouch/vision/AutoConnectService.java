@@ -108,7 +108,7 @@ public final class AutoConnectService extends Service {
             Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
                 .getStringSet("pausedPeers",java.util.Collections.emptySet());
             if(verified.isEmpty()) return; // no silent first-time pairing
-            android.util.DisplayMetrics display=getResources().getDisplayMetrics();
+            android.graphics.Point display=PhoneScreenGeometry.read(this);
             // One logical environment => ONE TLS gateway session from this
             // Android device. Other Windows/phone members are authenticated
             // separately TO THAT HUB and routed by its environment roster.
@@ -124,8 +124,7 @@ public final class AutoConnectService extends Service {
                     !eligible.contains(gateway.fingerprint))continue;
                 if(DeskTouchRuntime.isConnecting(gateway.fingerprint))return;
                 DeskTouchSession selected=DeskTouchRuntime.select(this,gateway.fingerprint);
-                selected.connect(gateway,Math.max(200,display.widthPixels),
-                    Math.max(100,display.heightPixels));
+                selected.connect(gateway,display.x,display.y);
                 return; // never auto-open pairwise connections to group members
             }
         }catch(Exception error){

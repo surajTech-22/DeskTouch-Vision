@@ -101,6 +101,9 @@ final class DeskTouchRuntime {
     static synchronized void releaseAndroidControl(DeskTouchSession requester){
         if(androidController==requester)androidController=null;
     }
+    static void publishPhoneGeometry(){
+        for(DeskTouchSession session:sessions.values())session.publishPhoneGeometry();
+    }
     static void accessibilityPermissionChanged(){
         for(DeskTouchSession session:sessions.values())
             session.publishAccessibilityCapability();

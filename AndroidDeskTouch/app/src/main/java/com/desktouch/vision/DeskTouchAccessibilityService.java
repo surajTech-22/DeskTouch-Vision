@@ -41,6 +41,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private WindowManager windows;
     private View cursor;
     private WindowManager.LayoutParams compactPointerParams;
+    private volatile int displayWidth=1,displayHeight=1;
     private volatile int x,y;
     private volatile int pendingX,pendingY;
     private volatile long pendingArrivalNanos;
@@ -70,6 +71,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         PointerSurface(Context context){
             super(context);
             setWillNotDraw(false);
+            setKeepScreenOn(true); // Active approved remote pointer window only.
             fill.setColor(0xff37b6f6);
             ring.setColor(0xffffffff);
             ring.setStyle(Paint.Style.STROKE);
@@ -114,7 +116,18 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
         instance=this;
         windows=(WindowManager)getSystemService(WINDOW_SERVICE);
+        refreshDisplayGeometry();
         DeskTouchRuntime.accessibilityPermissionChanged();
+    }
+    private void refreshDisplayGeometry(){
+        android.graphics.Point size=PhoneScreenGeometry.read(this);
+        displayWidth=Math.max(1,size.x);displayHeight=Math.max(1,size.y);
+    }
+    @Override public void onConfigurationChanged(android.content.res.Configuration config){
+        super.onConfigurationChanged(config);
+        removePointer(); // Old overlay size is wrong after rotation.
+        refreshDisplayGeometry();
+        DeskTouchRuntime.publishPhoneGeometry();
     }
     @Override public void onAccessibilityEvent(AccessibilityEvent event){
         // Touch from the phone user takes priority over remote input.
@@ -139,8 +152,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private int dp(float px){return Math.round(px*getResources().getDisplayMetrics().density);}
     private void showPointer(int requestedX,int requestedY){
         if(!ready(this))return;
-        android.util.DisplayMetrics dm=getResources().getDisplayMetrics();
-        int screenWidth=Math.max(1,dm.widthPixels),screenHeight=Math.max(1,dm.heightPixels);
+        // Read the physical-display geometry once per rotation, not on every
+        // mouse frame. This matches the topology advertised by TCP hello.
+        int screenWidth=displayWidth,screenHeight=displayHeight;
         x=Math.max(0,Math.min(screenWidth-1,requestedX));
         y=Math.max(0,Math.min(screenHeight-1,requestedY));
         if(cursor==null){
@@ -148,15 +162,19 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             // accessibility overlay: no expensive relayout on each motion.
             PointerSurface pointer=new PointerSurface(this);
             WindowManager.LayoutParams params=new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
+                screenWidth,
+                screenHeight,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                 PixelFormat.TRANSLUCENT);
             params.gravity=Gravity.TOP|Gravity.LEFT;
             params.x=0;params.y=0;
+            // Do not silently shrink the overlay to the app's content area
+            // when the status and navigation bars occupy physical pixels.
+            if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
             try{
                 windows.addView(pointer,params);
                 cursor=pointer;
@@ -168,15 +186,17 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 // Retry with a compact, non-touchable native accessibility
                 // overlay inside THIS app; never request a separate app or
                 // silent SYSTEM_ALERT_WINDOW permission.
-                int width=Math.min(screenWidth,dp(52));
-                int height=Math.min(screenHeight,dp(52));
+                int width=Math.min(screenWidth,dp(96));
+                int height=Math.min(screenHeight,dp(96));
                 WindowManager.LayoutParams compact=new WindowManager.LayoutParams(
                     width,height,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
                     PixelFormat.TRANSLUCENT);
                 compact.gravity=Gravity.TOP|Gravity.LEFT;
+                if(Build.VERSION.SDK_INT>=30)compact.setFitInsetsTypes(0);
                 compact.x=PointerOverlayGeometry.origin(x,screenWidth,width);
                 compact.y=PointerOverlayGeometry.origin(y,screenHeight,height);
                 PointerSurface smaller=new PointerSurface(this);
@@ -204,8 +224,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(cursor==null)return;
         if(compactPointerParams!=null){
             WindowManager.LayoutParams compact=compactPointerParams;
-            int left=PointerOverlayGeometry.origin(x,screenWidth,compact.width);
-            int top=PointerOverlayGeometry.origin(y,screenHeight,compact.height);
+            int left=PointerOverlayGeometry.followOrigin(x,compact.x,
+                screenWidth,compact.width,compact.width/6);
+            int top=PointerOverlayGeometry.followOrigin(y,compact.y,
+                screenHeight,compact.height,compact.height/6);
             if(compact.x!=left || compact.y!=top){
                 compact.x=left;compact.y=top;
                 try{windows.updateViewLayout(cursor,compact);}
@@ -318,10 +340,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 service.held=true;service.downX=service.x;service.downY=service.y;
             }else if(service.held){
                 service.held=false;
-                // A normal tap can use the application's native click
-                // action immediately. Drag paths still use opt-in gestures.
-                if(service.downX==service.x && service.downY==service.y &&
-                    service.performNativeClick())return;
+                // Use the exact screen-space pixel for a tap. An ACTION_CLICK
+                // on a large accessibility node can activate a different
+                // control than the user's visibly positioned pointer.
                 service.enqueueGesture(service.downX,service.downY,
                     service.x,service.y,45);
             }
@@ -431,7 +452,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 finishGesture();
             }
         },ui);
-        if(!started)finishGesture();
+        if(!started){
+            // Some OEMs reject gestures; fall back to node-click only then.
+            if(command.sx==command.ex && command.sy==command.ey)
+                performNativeClick();
+            finishGesture();
+        }
     }
     private void finishGesture(){
         gestureRunning=false;

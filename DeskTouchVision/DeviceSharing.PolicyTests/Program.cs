@@ -1,5 +1,11 @@
 using DeskTouch.DeviceShare;
 
+// Mobile idle timeouts must tolerate brief Android screen/Wi-Fi transitions,
+// but never leave an abandoned authenticated TLS lease indefinitely.
+if (ReceiverServer.PeerIdleGraceSeconds < 40 ||
+    ReceiverServer.PeerIdleGraceSeconds > 65)
+    throw new Exception("Android heartbeat idle grace is outside the safe window");
+
 static void Check(bool test, string message)
 {
     if (!test) throw new Exception("Input priority regression: " + message);

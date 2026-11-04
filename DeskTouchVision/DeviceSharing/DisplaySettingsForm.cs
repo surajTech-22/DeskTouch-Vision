@@ -545,9 +545,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if(baseId==0 && _host==null)
             baseId=_receiver?.ConnectedPeers.OrderBy(p=>p.Id)
                 .Select(p=>p.Id).FirstOrDefault()??0;
-        int? destination=_display.AdjacentTarget(starting,edge,baseId);
-        if(destination==null && edge is MonitorEdge.Left or MonitorEdge.Right)
-            destination=order.Neighbor(starting,edge);
+        // A visual member in the same direction is NOT necessarily an
+        // adjacent screen. Check the exact boundary and crossing position.
+        // No fallback to sorted connection order or arbitrary left/right PC.
+        int? destination=_display.AdjacentTarget(starting,edge,baseId,fraction);
         if(destination==null)return false;
         if(destination==EnvironmentRouteOrder.Local)
         {

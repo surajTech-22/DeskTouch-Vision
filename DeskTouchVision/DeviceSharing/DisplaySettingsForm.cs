@@ -197,6 +197,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
         _display.EnvironmentDeviceSelected += SelectConnectedTarget;
+        _display.EnvironmentArrangementChanged += SavePreferredEdge;
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
 
         LoadPreferredEdge();
@@ -457,7 +458,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     if(id==baseTargetId)continue;
                     tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
                         peer.Platform,peer.Monitors.Monitors.Count,
-                        peer.SupportsReverseInput));
+                        peer.SupportsReverseInput,peer.DeviceFingerprint));
                 }
             }
             _display.EnvironmentDevices =
@@ -523,8 +524,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if(basePeer.Peer==null)return null;
             baseId=basePeer.Id;
         }
-        return new EnvironmentRouteOrder(baseId,
-            _display.EnvironmentDevices,_preferredEdge);
+        return new EnvironmentRouteOrder(
+            _display.ArrangedTargetOrder(baseId));
     }
 
     private int CurrentInputTargetId() =>
@@ -868,8 +869,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         PostToUi(() =>
         {
             _incomingPeer = peer;
-            if (_captureUsesInbound || _host == null)
-                _capture?.UpdateLayouts(MonitorTopology.Capture(), peer.Monitors);
+            if ((_captureUsesInbound || _host == null) &&
+                _receiver?.SelectedPeerId == _captureInboundPeerId)
+                _capture?.RefreshRemoteGeometry(peer.Monitors);
             RefreshDisplays();
             Status("Display geometry synchronized for " + peer.Name + ".");
         });
@@ -1279,7 +1281,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         PostToUi(() =>
         {
             if (!_captureUsesInbound)
-                _capture?.UpdateLayouts(MonitorTopology.Capture(), topology);
+                _capture?.RefreshRemoteGeometry(topology);
             RefreshDisplays();
             Status("Remote Windows monitor layout updated without disconnecting.");
         });
@@ -1366,6 +1368,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (doc.RootElement.TryGetProperty("RemoteEdge", out var edge) &&
                 Enum.TryParse<MonitorEdge>(edge.GetString(), true, out var parsed))
                 _preferredEdge = parsed;
+            if(doc.RootElement.TryGetProperty("MemberPositions",out var positions) &&
+                positions.ValueKind==JsonValueKind.Object)
+            {
+                var offsets=new Dictionary<string,PointF>(StringComparer.Ordinal);
+                foreach(var p in positions.EnumerateObject())
+                {
+                    if(p.Name.Length>150 || p.Value.ValueKind!=JsonValueKind.Object)
+                        continue;
+                    if(p.Value.TryGetProperty("X",out var x) &&
+                        p.Value.TryGetProperty("Y",out var y) &&
+                        x.TryGetSingle(out var px) && y.TryGetSingle(out var py))
+                        offsets[p.Name]=new PointF(px,py);
+                }
+                _display.RestoreMemberOffsets(offsets);
+            }
         }
         catch { /* invalid layout is ignored; Windows topology is unchanged */ }
     }
@@ -1376,7 +1393,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_layoutPath)!);
             File.WriteAllText(_layoutPath, JsonSerializer.Serialize(new {
-                RemoteEdge = _preferredEdge.ToString() }));
+                RemoteEdge = _preferredEdge.ToString(),
+                MemberPositions = _display.StoredMemberOffsets.ToDictionary(
+                    p=>p.Key,p=>new { X=p.Value.X,Y=p.Value.Y })
+            }));
         }
         catch { Status("Could not save display arrangement for next time."); }
     }

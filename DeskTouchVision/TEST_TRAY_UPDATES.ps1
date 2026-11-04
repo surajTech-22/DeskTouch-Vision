@@ -22,6 +22,8 @@ RequireText 'DeviceSharing\DeviceSharing.csproj' '../UpdateClient.cs'
 RequireText 'Program.cs' 'launch.ArgumentList.Add("--tray")'
 RequireText 'UpdateClient.cs' 'https://ntfy.sh/'
 RequireText 'UpdateClient.cs' 'sharingHost.CloseForVerifiedUpdate()'
+RequireText 'UpdateClient.cs' 'UpdateGate.WaitAsync(TimeSpan.FromSeconds(12)'
+RequireText 'UpdateClient.cs' 'metadataDeadline.CancelAfter(TimeSpan.FromSeconds(25))'
 RequireText 'UpdateClient.cs' 'process.ArgumentList.Add("-StartInTray")'
 RequireText 'Update-DeskTouch.ps1' '[switch]$StartInTray'
 RequireText 'Update-DeskTouch.ps1' "@('--tray')"

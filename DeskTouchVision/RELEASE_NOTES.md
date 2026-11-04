@@ -1,18 +1,19 @@
-# DeskTouch Vision v0.3.18 — Bluetooth HID eligibility inside the connected app
+# DeskTouch Vision v0.3.19 — Android keyboard input and shared-device verification
 
-## What changed
-- Open **Bluetooth check** in the Windows Displays window or tray menu to inspect all connected Windows PCs together. No separate PowerShell script is needed.
-- Every authenticated Windows peer checks its own default Bluetooth adapter using Windows' official API and sends only capability data over the existing DeskTouch TLS environment connection.
-- Results indicate Bluetooth LE support, peripheral/HID-advertising capability, and whether Bluetooth is enabled. The check identifies a preferred eligible candidate; an existing eligible candidate remains preferred to avoid needless changes.
-- A diagnostic request is triggered after the Windows app adopts its secure hub connection and whenever **Recheck connected PCs** is pressed. The scan runs off the input/heartbeat loop.
-- No keyboard content, Bluetooth MAC addresses, pairing secrets, device IDs, or raw input events are included in the transmitted report.
+## What's new
+- DeskTouch Vision for Android now includes an **optional, user-selected Android keyboard service** inside the existing application. It translates the approved Windows text, editing and navigation commands into an Android input connection for the currently focused editable field.
+- Enable and select **DeskTouch keyboard receiver** from the existing Android app. Android's system settings must authorize a third-party keyboard; DeskTouch never silently grants that permission.
+- Existing accessibility mouse cursor, clicks, dragging and scrolling remain in place. Existing Windows-to-Windows handoff, authenticated multi-device TLS environment, local physical-input priority, Android device placement, and trusted identity behavior are preserved.
+- After an in-place Android update, DeskTouch continues to report Accessibility permission health and prompts for Android's own reapproval if Xiaomi/Android disables it.
 
-## Scope and limitations
-- This is a **read-only compatibility diagnostic**, not Bluetooth HID keyboard/mouse emulation.
-- HID advertising, Android Bluetooth pairing, Android-observed RSSI and automatic selection of the strongest *actual* Bluetooth connection still require testing on the real PCs and Android phone.
-- Existing Windows keyboard/mouse handoff, Android accessibility input, device positions, and trust/auto-update protocols are unchanged.
+## GitHub verification before release
+- Android 35 emulator: real UI click, drag, scroll, selection of DeskTouch keyboard, and cross-process text entry including Backspace, caret movement and insertion.
+- Android 35 emulator: DeskTouch's existing reverse-text and reverse-key input handlers successfully update a separate-process editor.
+- Android JVM protocol/input tests, APK compilation, Windows 3-client authority and 8-peer load tests, Windows runtime build, tray/update regression tests and installer integrity checks.
+- Official Android APK must be signed by the *existing permanent DeskTouch signing key*; its signature is verified against the pinned certificate, never replaced by a new signing identity.
+- Windows release ZIP includes installer and SHA-256. Update notifications are sent after the permanently signed Android APK and Windows release assets are both available.
 
-## Validation
-- Windows KVM preview build and input priority policy checks.
-- Authenticated multi-peer TLS report collection plus existing two-way Windows input authority and update safety tests.
-- Android build/tests and Android emulator shared-environment smoke tests (no Android APK source changes).
+## Important limits
+- Android keyboard service is **not a Bluetooth peripheral, Bluetooth loopback, or true kernel HID device**. It operates through Android's allowed input-method and Accessibility APIs, with the permissions the user grants.
+- GitHub emulator tests use simulated approved input commands, not a real Xiaomi phone, live Windows-to-phone Wi-Fi handoff, physical Bluetooth pairing, or every third-party app. Confirm real-device keyboard focus, Chrome typing, pointer latency, two-PC placement and reconnect behavior on your own devices.
+- Do not uninstall the Android app to update: install the official matching-cert v0.3.19 APK over v0.3.18 so trusted pairings/app data can be preserved. Android may require reapproval of Accessibility or keyboard selection.

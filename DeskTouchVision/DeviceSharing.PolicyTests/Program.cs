@@ -71,6 +71,37 @@ Check(WindowsStartup.Command(@"C:\Program Files\DeskTouch\DeskTouch.DeviceShare.
     "Windows sign-in command must launch the sharing app to tray");
 Console.WriteLine("PASS: two Windows peers, busy device, Android beacon and sign-in startup command.");
 
+// The visual order SURAJ | native Windows screens | Android must
+// remain a single input environment, not pairwise connections. Physical
+// cursor edge movement chooses the adjacent already-authenticated member.
+var inlineAndroid = new EnvironmentDisplayTile(-5,
+    "Xiaomi 22041216I","Android",1,true);
+var inlineDisabled = new EnvironmentDisplayTile(-6,
+    "Android view only","Android",1,false);
+var leafRoute = new EnvironmentRouteOrder(0,
+    new[]{inlineAndroid,inlineDisabled},MonitorEdge.Left);
+Check(leafRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Left)==0 &&
+    leafRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==-5,
+    "Windows leaf routes left to hub and right to Android without changing TLS sessions");
+Check(leafRoute.Neighbor(-5,MonitorEdge.Left)==EnvironmentRouteOrder.Local &&
+    leafRoute.Neighbor(0,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
+    "Returning from phone/hub edge must restore local computer, not another peer");
+Check(!leafRoute.Order.Contains(-6) &&
+    leafRoute.Neighbor(-5,MonitorEdge.Right)==null,
+    "View-only Android device must never receive an unauthorized automatic input claim");
+var hubRoute=new EnvironmentRouteOrder(7,
+    new[]{new EnvironmentDisplayTile(8,"Phone","Android",1,true)},
+    MonitorEdge.Right);
+Check(hubRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==7 &&
+    hubRoute.Neighbor(7,MonitorEdge.Right)==8 &&
+    hubRoute.Neighbor(8,MonitorEdge.Left)==7,
+    "Hub -> Windows -> Android -> Windows edge navigation uses one persistent environment");
+Check(SourceCapture.ShouldDropDuplicateRaw(1000,1020) &&
+    !SourceCapture.ShouldDropDuplicateRaw(1000,1040) &&
+    !SourceCapture.ShouldDropDuplicateRaw(0,1030),
+    "Windows touchpad/raw input must not double count the same movement");
+Console.WriteLine("PASS: environment-wide edge routing plus raw input duplicate suppression.");
+
 Check(SourceCapture.ScaleRawDelta(1, 10) >= 1,
     "Slow physical mouse movement must remain visible on the remote PC");
 Check(SourceCapture.ScaleRawDelta(10, 10) > 10,

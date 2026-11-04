@@ -61,7 +61,10 @@ internal static class InputClaimLifecyclePolicy
 {
     internal static bool CanGrant(bool physicalMonitoringActive,
         bool reverseRemoteActive, bool reverseClaimPending) =>
-        physicalMonitoringActive && !reverseRemoteActive && !reverseClaimPending;
+        // A captured LOCAL keyboard/mouse is deliberately forwarded OUT
+        // to another screen. An independent authenticated peer may control
+        // THIS PC simultaneously. A pending handoff is still local input.
+        physicalMonitoringActive && !reverseClaimPending;
 }
 
 /// <summary>
@@ -78,6 +81,18 @@ internal sealed class PhysicalInputMonitor : IDisposable
     private volatile bool _running;
     internal bool IsRunning => _running;
     internal LocalInputPriority Priority { get; } = new();
+    internal Func<bool>? IsOutboundInputCaptured { get; set; }
+    internal static bool IsLocallyDirected(bool outboundCaptureActive) =>
+        !outboundCaptureActive;
+    private void RecordPhysicalIfLocal()
+    {
+        // When this keyboard is controlling another connected screen,
+        // it must NOT revoke an independent remote controller of this
+        // Windows PC. Physical ownership still wins whenever the capture
+        // is local or has returned via emergency shortcut.
+        if(IsLocallyDirected(IsOutboundInputCaptured?.Invoke()==true))
+            Priority.RecordPhysicalActivity();
+    }
 
     internal PhysicalInputMonitor(Control window)
     {
@@ -124,7 +139,7 @@ internal sealed class PhysicalInputMonitor : IDisposable
             int msg = unchecked((int)wParam.ToInt64());
             if ((key.flags & 0x10) == 0 &&
                 msg is Win.WM_KEYDOWN or Win.WM_SYSKEYDOWN)
-                Priority.RecordPhysicalActivity();
+                RecordPhysicalIfLocal();
         }
         return Win.CallNextHookEx(_keyboardHook, code, wParam, lParam);
     }
@@ -169,7 +184,7 @@ internal sealed class PhysicalInputMonitor : IDisposable
             {
                 var mouse = Marshal.PtrToStructure<Win.RAWINPUT>(ptr).Mouse;
                 if (mouse.LastX != 0 || mouse.LastY != 0 || mouse.Buttons != 0)
-                    Priority.RecordPhysicalActivity();
+                    RecordPhysicalIfLocal();
             }
         }
         finally { Marshal.FreeHGlobal(ptr); }

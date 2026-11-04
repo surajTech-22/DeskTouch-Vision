@@ -1113,6 +1113,15 @@ var uiThread = new Thread(() =>
             Check(recorderB.Packets.Any(p=>p.Type=="claim") &&
                 !recorderA.Packets.Skip(2).Any(p=>p.Type=="claim"),
                 "Android receives the next claim over the existing capture, without new hook installation");
+            capture.ReturnLocal();
+            capture.Retarget(recorderA,MonitorEdge.Right,
+                continuingRemoteHandoff:true);
+            capture.BeginLinkedHandoff(MonitorEdge.Right,0.5);
+            Check(capture.OutboundInputReserved,
+                "A chained handoff must preserve independent incoming hub control while pending");
+            capture.ReturnLocal();
+            Check(!capture.OutboundInputReserved,
+                "Cancel/timeout/emergency return must restore physical native-input priority");
         }
         // A real WinForms UserClosing event must hide the existing HWND,
         // not dispose the receiver/input hooks or close the TLS pairing.

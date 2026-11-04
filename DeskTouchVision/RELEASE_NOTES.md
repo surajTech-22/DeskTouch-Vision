@@ -1,3 +1,24 @@
+# DeskTouch Vision v0.3.14 — inline Android display and lower-latency input
+
+## Main display correction
+- Connected Android screens are now placed **beside** the Windows monitor tiles in the primary **Rearrange your displays** row, not a separate "Other connected devices" strip. A Xiaomi phone appears as its own portrait screen, named from the authenticated Android endpoint.
+- A phone tile is clickable to select the connected target over the existing shared-environment hub. Windows monitor numbering, physical layout and selected-PC drag/edge behavior are retained.
+- Live online membership is authoritative: a remembered or offline Android cannot be shown as connected. Android accessibility permission and input authority remain separate from visibility.
+- Inline screen-placement tests enforce shared vertical alignment, nonoverlapping hit targets, and Android portrait aspect ratios.
+
+## Android responsiveness and native platform input
+- Windows-to-Android pointer movement now coalesces to one **VSync-driven** overlay update per frame, instead of a WindowManager layout transaction for every incoming network packet. Unchanged cursor coordinates trigger no relayout.
+- A click/scroll flushes the latest pointer coordinate first so input cannot target the previous visual frame.
+- Where Android's Accessibility tree exposes a clickable/scrollable UI target, use its native **ACTION_CLICK** or **ACTION_SCROLL_FORWARD/BACKWARD** immediately. An accessibility gesture is a fallback for controls that lack actions.
+- Serialize fallback gestures so a new click/scroll does not cancel one already being processed. Tap/scroll gesture durations were reduced from 90/120ms to 45/85ms.
+- Original TLS identity, single logical environment, native Android touch priority, bounded text-entry permissions, and no-password-field policy remain in place.
+
+## Important platform limits
+- Android normal third-party applications cannot freely inject full system-wide hardware HID mouse/keyboard events through the public SDK. DeskTouch uses opt-in Accessibility actions and authorized gestures; a visual pointer overlay is not an actual operating-system cursor.
+- A GitHub emulator can validate builds and basic UI startup but not reproduce real phone Wi-Fi jitter or the Xiaomi display compositor. Physical input latency and drag behavior require testing on the device after installing the signed APK.
+- Release artifacts must use the original permanent Android signing identity and existing SHA-256/update workflow.
+
+---
 # DeskTouch Vision v0.3.13 — connected Android devices visible in Displays
 
 - The existing Windows **Displays** diagram now includes a compact row of all additional authenticated Windows/Android environment members, not just the single selected remote computer. Android devices are identified by their actual mobile name and **Android • Display 1**.

@@ -376,8 +376,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private InputMethod.AccessibilityInputConnection nativeEditor(
         AccessibilityNodeInfo focusedField)
     {
-        if(Build.VERSION.SDK_INT<33 || (focusedField!=null &&
-            (!focusedField.isEditable() || focusedField.isPassword())))
+        // Chrome/WebView sometimes exposes a non-editable parent as the
+        // Accessibility focus while Android still has a genuinely active,
+        // typed, non-password InputConnection to its actual editor.
+        if(Build.VERSION.SDK_INT<33 ||
+            (focusedField!=null && focusedField.isPassword()))
             return null;
         try {
             InputMethod method=getInputMethod();

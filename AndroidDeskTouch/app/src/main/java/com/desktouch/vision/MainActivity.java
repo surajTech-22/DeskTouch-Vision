@@ -98,6 +98,7 @@ public final class MainActivity extends Activity {
         allowWindows.setChecked(DeskTouchAccessibilityService.allowed(this));
         allowWindows.setOnCheckedChangeListener((v,enabled)->{
             DeskTouchAccessibilityService.setAllowed(this,enabled);
+            DeskTouchRuntime.accessibilityPermissionChanged();
             refreshPermissionState();
             if(enabled && !DeskTouchAccessibilityService.ready(this)){
                 status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings, then reconnect.");

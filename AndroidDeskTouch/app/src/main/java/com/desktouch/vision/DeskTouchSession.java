@@ -358,6 +358,14 @@ final class DeskTouchSession implements AutoCloseable {
         send(new Packet("claim",claim));
         status("Requesting Windows mouse and keyboard authority");
     }
+    void publishAccessibilityCapability(){
+        // A permission restored after an Android package update must become
+        // visible on the SAME authenticated environment connection, without
+        // asking the user to disconnect or pair the phone again.
+        if(running)send(new Packet("android-capability",
+            DeskTouchAccessibilityService.ready(application)?1:0));
+    }
+
     void releaseControl(){
         int lease=claim;
         claim=0;active=false;

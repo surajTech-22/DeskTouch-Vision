@@ -112,6 +112,11 @@ Check(hubRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==7 &&
     hubRoute.Neighbor(7,MonitorEdge.Right)==8 &&
     hubRoute.Neighbor(8,MonitorEdge.Left)==7,
     "Hub -> Windows -> Android -> Windows edge navigation uses one persistent environment");
+Check(!SourceCapture.ShouldUseHookFallback(1000,1020) &&
+    !SourceCapture.ShouldUseHookFallback(1000,1040) &&
+    SourceCapture.ShouldUseHookFallback(1000,1041) &&
+    SourceCapture.ShouldUseHookFallback(0,1001),
+    "Touchpad hook movement must resume after 40ms, not the old 650ms Raw Input blackout");
 Check(SourceCapture.ShouldDropDuplicateRaw(1000,1020) &&
     !SourceCapture.ShouldDropDuplicateRaw(1000,1040) &&
     !SourceCapture.ShouldDropDuplicateRaw(0,1030),
@@ -806,6 +811,11 @@ finally
     // world-coordinate origin. The old per-PC offset produced a different
     // arrangement after exactly the same drag broadcast.
     string canonicalKey="hub@"+sharedKey;
+    var defaultPhone=ReceiverServer.DefaultAndroidPosition(canonicalKey,
+        new System.Drawing.Rectangle(0,0,1920,1080),1920,1,0);
+    Check(defaultPhone.X==4040 && defaultPhone.Y==65 &&
+        defaultPhone.Key==canonicalKey,
+        "Phone without manual position must get one deterministic hub-relative default");
     var hubPeer=new ConnectedPeer("Second PC",
         MonitorTopology.Capture(),DeviceFingerprint:sharedKey);
     Check(ReceiverServer.OwnsPlacement(hubPeer,canonicalKey) &&

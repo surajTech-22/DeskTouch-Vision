@@ -37,3 +37,17 @@ grep -F 'Enabled services:{{com.desktouch.vision/com.desktouch.vision.DeskTouchA
   /tmp/desktouch-accessibility.txt
 adb shell pidof com.desktouch.vision
 echo "PASS: Android 35 Accessibility service enabled and app alive"
+
+# A package REPLACEMENT must preserve the existing Android app-data sandbox,
+# stored allow/deny preference and encrypted trusted-device records. The
+# platform may require the user to approve Accessibility again; that SYSTEM
+# permission is deliberately never granted silently by DeskTouch.
+adb shell "run-as com.desktouch.vision sh -c 'mkdir -p files; echo signed-upgrade-retains-appdata > files/upgrade-continuity-test.txt'"
+adb install -r AndroidDeskTouch/app/build/outputs/apk/debug/app-debug.apk
+adb shell run-as com.desktouch.vision cat files/upgrade-continuity-test.txt |
+  tr -d '\r' | grep -F 'signed-upgrade-retains-appdata'
+adb shell am start -n com.desktouch.vision/.MainActivity >/dev/null
+sleep 3
+adb shell pidof com.desktouch.vision
+echo "PASS: Android in-place APK upgrade retained app-private data and relaunched permission-health UI"
+

@@ -36,6 +36,19 @@ internal sealed class SourceCapture : IDisposable
     private bool _hasLastPhysicalPointer;
     private readonly SlowEdgeApproach _slowEdge = new();
     private readonly SlowEdgeApproach _alternateSlowEdge = new();
+    private readonly SlowEdgeApproach _orthogonalFirst = new();
+    private readonly SlowEdgeApproach _orthogonalSecond = new();
+    private (MonitorEdge First,MonitorEdge Second) OrthogonalEdges() =>
+        _edge is MonitorEdge.Left or MonitorEdge.Right
+            ? (MonitorEdge.Top,MonitorEdge.Bottom)
+            : (MonitorEdge.Left,MonitorEdge.Right);
+    private void ResetEdgeTracking()
+    {
+        _slowEdge.Reset();
+        _alternateSlowEdge.Reset();
+        _orthogonalFirst.Reset();
+        _orthogonalSecond.Reset();
+    }
     // Request a different already authenticated environment member when
     // crossing its actual screen boundary. Never connects another socket.
     internal Func<MonitorEdge,double,bool>? NavigateEnvironment { get; set; }
@@ -72,8 +85,7 @@ internal sealed class SourceCapture : IDisposable
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
         _hasLastPhysicalPointer = false;
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         _edge = side;
     }
 
@@ -88,8 +100,7 @@ internal sealed class SourceCapture : IDisposable
         _remoteMonitors = remote;
         _local = local.Bounds;
         _hasLastPhysicalPointer = false;
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         var home = local.Monitors.FirstOrDefault(m => m.Primary) ?? local.Monitors[0];
         _anchorX = home.X + home.Width / 2;
         _anchorY = home.Y + home.Height / 2;
@@ -115,8 +126,7 @@ internal sealed class SourceCapture : IDisposable
         _session=next;
         _remoteMonitors=next.RemoteMonitors;
         _edge=entryEdge;
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         Interlocked.Exchange(ref _pending,0);
         Interlocked.Exchange(ref _switchPending,0);
         _cooldownUntil=0;
@@ -169,8 +179,7 @@ internal sealed class SourceCapture : IDisposable
         }
         _hasLastPhysicalPointer = true;
         _lastPhysicalPointer = Cursor.Position;
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         _slowEdgeTimer ??= new System.Windows.Forms.Timer { Interval = 55 };
         _slowEdgeTimer.Tick -= SlowEdgeTick;
         _slowEdgeTimer.Tick += SlowEdgeTick;
@@ -182,8 +191,7 @@ internal sealed class SourceCapture : IDisposable
     internal void Disarm()
     {
         _slowEdgeTimer?.Stop();
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         ReturnLocal();
         Interlocked.Exchange(ref _pending, 0);
         Interlocked.Exchange(ref _armed, 0);
@@ -230,8 +238,7 @@ internal sealed class SourceCapture : IDisposable
         var localReturn = _localMonitors.ClampToRealMonitor(interior);
         Win.SetCursorPos(localReturn.X, localReturn.Y);
         _hasLastPhysicalPointer = false;
-        _slowEdge.Reset();
-        _alternateSlowEdge.Reset();
+        ResetEdgeTracking();
         _status("Control returned to this Windows computer.");
     }
 
@@ -357,6 +364,16 @@ internal sealed class SourceCapture : IDisposable
                 Opposite(_edge), Environment.TickCount64))
             RequestAtOuterEdge(cursor, "alternate shared environment edge",
                 Opposite(_edge));
+        if(NavigateEnvironment!=null)
+        {
+            var (first,second)=OrthogonalEdges();
+            if(_orthogonalFirst.Ready(_localMonitors,cursor,first,
+                Environment.TickCount64))
+                RequestAtOuterEdge(cursor,"dragged upper/lower device edge",first);
+            else if(_orthogonalSecond.Ready(_localMonitors,cursor,second,
+                Environment.TickCount64))
+                RequestAtOuterEdge(cursor,"dragged upper/lower device edge",second);
+        }
     }
 
     private void ObserveEdgeMotion(System.Drawing.Point cursor, int dx, int dy)
@@ -367,6 +384,11 @@ internal sealed class SourceCapture : IDisposable
                 dx, dy, Environment.TickCount64);
             _alternateSlowEdge.Observe(_localMonitors, cursor,
                 Opposite(_edge), dx, dy, Environment.TickCount64);
+            var (first,second)=OrthogonalEdges();
+            _orthogonalFirst.Observe(_localMonitors,cursor,first,
+                dx,dy,Environment.TickCount64);
+            _orthogonalSecond.Observe(_localMonitors,cursor,second,
+                dx,dy,Environment.TickCount64);
         }
     }
 
@@ -455,6 +477,16 @@ internal sealed class SourceCapture : IDisposable
                     Opposite(_edge), dx, dy))
                 RequestAtOuterEdge(cursor, "alternate environment movement",
                     Opposite(_edge));
+            else if(NavigateEnvironment!=null)
+            {
+                var (first,second)=OrthogonalEdges();
+                if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                    first,dx,dy))
+                    RequestAtOuterEdge(cursor,"draggable screen movement",first);
+                else if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                    second,dx,dy))
+                    RequestAtOuterEdge(cursor,"draggable screen movement",second);
+            }
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
@@ -531,6 +563,16 @@ internal sealed class SourceCapture : IDisposable
                         Opposite(_edge),input.Mouse.LastX,input.Mouse.LastY))
                     RequestAtOuterEdge(cursor, "raw alternate environment edge",
                         Opposite(_edge));
+                else if(NavigateEnvironment!=null)
+                {
+                    var (first,second)=OrthogonalEdges();
+                    if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                        first,input.Mouse.LastX,input.Mouse.LastY))
+                        RequestAtOuterEdge(cursor,"raw dragged device edge",first);
+                    else if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                        second,input.Mouse.LastX,input.Mouse.LastY))
+                        RequestAtOuterEdge(cursor,"raw dragged device edge",second);
+                }
             }
         }
         finally { Marshal.FreeHGlobal(memory); }
@@ -563,14 +605,26 @@ internal sealed class SourceCapture : IDisposable
             // The inline diagram may have another authenticated screen on
             // either side. Crossing its exterior edge should select that
             // device, not trap the cursor or terminate other TLS sessions.
-            foreach(var side in new[]{MonitorEdge.Left,MonitorEdge.Right})
+            foreach(var side in new[]{
+                MonitorEdge.Left,MonitorEdge.Right,MonitorEdge.Top,MonitorEdge.Bottom})
             {
-                bool outside=side==MonitorEdge.Left
-                    ? dx<0 && nextX<monitor.X
-                    : dx>0 && nextX>=monitor.X+monitor.Width;
+                bool outside=side switch{
+                    MonitorEdge.Left=>dx<0 && nextX<monitor.X,
+                    MonitorEdge.Right=>dx>0 && nextX>=monitor.X+monitor.Width,
+                    MonitorEdge.Top=>dy<0 && nextY<monitor.Y,
+                    MonitorEdge.Bottom=>dy>0 && nextY>=monitor.Y+monitor.Height,
+                    _=>false
+                };
                 if(!outside)continue;
-                var border=new System.Drawing.Point(side==MonitorEdge.Left
-                    ? monitor.X : monitor.X+monitor.Width-1,_remoteY);
+                var border=side switch{
+                    MonitorEdge.Left=>new System.Drawing.Point(monitor.X,_remoteY),
+                    MonitorEdge.Right=>new System.Drawing.Point(
+                        monitor.X+monitor.Width-1,_remoteY),
+                    MonitorEdge.Top=>new System.Drawing.Point(_remoteX,monitor.Y),
+                    MonitorEdge.Bottom=>new System.Drawing.Point(
+                        _remoteX,monitor.Y+monitor.Height-1),
+                    _=>new System.Drawing.Point(_remoteX,_remoteY)
+                };
                 if(!_remoteMonitors.IsExternalEdge(border,side,1))continue;
                 double fraction=_remoteMonitors.EdgeFraction(border,side);
                 if(Interlocked.CompareExchange(ref _switchPending,1,0)==0)

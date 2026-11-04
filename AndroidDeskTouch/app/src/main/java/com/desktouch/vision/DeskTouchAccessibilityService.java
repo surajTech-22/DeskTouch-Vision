@@ -311,7 +311,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
             if(clicked||focused)return true;
         }
-        return target!=null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if(target==null)return false;
+        // Some WebView editors receive a click but do not start the input
+        // connection until they are also marked as focused.
+        if(target.isEditable())
+            target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        return target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
     private boolean performNativeScroll(int amount){
@@ -451,14 +456,24 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         }catch(RuntimeException unavailable){return false;}
     }
 
-    static void text(String incoming){
+    static void text(String incoming,Runnable rejected){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service)||
-            incoming==null||incoming.length()==0||incoming.length()>512)return;
+            incoming==null||incoming.length()==0||incoming.length()>512){
+            if(rejected!=null)rejected.run();
+            return;
+        }
         service.ui.post(()->{
+            if(!service.remoteActive || !ready(service)){
+                if(rejected!=null)rejected.run();
+                return;
+            }
             AccessibilityNodeInfo field=service.focusedEditor();
             if(service.commitNativeText(incoming,field))return;
-            if(field==null||!field.isEditable()||field.isPassword())return;
+            if(field==null||!field.isEditable()||field.isPassword()){
+                if(rejected!=null)rejected.run();
+                return;
+            }
             CharSequence original=field.getText();
             String content=original==null?"":original.toString();
             int start=field.getTextSelectionStart();
@@ -479,7 +494,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 selection.putInt(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,caret);
                 field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,selection);
-            }
+            }else if(rejected!=null)rejected.run();
         });
     }
 

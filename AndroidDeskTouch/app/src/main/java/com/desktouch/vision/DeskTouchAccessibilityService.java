@@ -469,7 +469,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 return;
             }
             AccessibilityNodeInfo field=service.focusedEditor();
-            if(service.commitNativeText(incoming,field))return;
+            if(service.commitNativeText(incoming,field) ||
+                DeskTouchInputMethod.commitRemoteText(incoming))return;
             if(field==null||!field.isEditable()||field.isPassword()){
                 if(rejected!=null)rejected.run();
                 return;
@@ -522,8 +523,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             return performGlobalAction(GLOBAL_ACTION_HOME);
         AccessibilityNodeInfo field=focusedEditor();
         String printable=WindowsKeyText.printable(vk,shift);
-        if(printable!=null && commitNativeText(printable,field))return true;
-        if(nativeDelete(vk,field))return true;
+        if(printable!=null && (commitNativeText(printable,field) ||
+            DeskTouchInputMethod.commitRemoteText(printable)))return true;
+        if(nativeDelete(vk,field) || DeskTouchInputMethod.sendRemoteKey(vk))
+            return true;
         if(field==null || !field.isEditable() || field.isPassword())
             return false;
         CharSequence value=field.getText();

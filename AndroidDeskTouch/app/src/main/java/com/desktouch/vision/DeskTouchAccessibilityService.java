@@ -71,6 +71,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         PointerSurface(Context context){
             super(context);
             setWillNotDraw(false);
+            setKeepScreenOn(true); // Active approved remote pointer window only.
             fill.setColor(0xff37b6f6);
             ring.setColor(0xffffffff);
             ring.setStyle(Paint.Style.STROKE);

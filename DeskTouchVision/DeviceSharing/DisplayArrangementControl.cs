@@ -234,6 +234,11 @@ internal sealed class DisplayArrangementControl : Control
         return online.Where(p=>p.TargetId!=selectedTargetId)
             .GroupBy(p=>p.TargetId).Select(g=>g.First())
             .OrderBy(p=>p.IsAndroid?1:0)
+            // Keep input-capable phone tiles adjacent to the linked Windows
+            // displays. A view-only Android device still appears in the
+            // diagram but must not stand between the PC and a controllable
+            // phone, making that phone's outer edge unreachable.
+            .ThenBy(p=>p.SupportsInput?0:1)
             .ThenBy(p=>p.Name,StringComparer.OrdinalIgnoreCase).ToArray();
     }
 

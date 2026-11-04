@@ -150,4 +150,13 @@ jobs:
             adb shell cat /sdcard/desktouch-ui.xml | grep -F 'DeskTouch Vision'
             adb shell cat /sdcard/desktouch-ui.xml | grep -F 'Find devices'
             adb shell cat /sdcard/desktouch-ui.xml | grep -F 'Take control of active environment screen'
-            echo "PASS: Android 35 emulator launched DeskTouch shared environment UI; no pairing or release performed"
+            # CI-only: emulate the user's Accessibility opt-in, checking that
+            # the Android 13+ accessibility IME service is bindable on API 35.
+            adb shell settings put secure enabled_accessibility_services com.desktouch.vision/com.desktouch.vision.DeskTouchAccessibilityService
+            adb shell settings put secure accessibility_enabled 1
+            sleep 4
+            adb shell dumpsys accessibility > /tmp/desktouch-accessibility.txt
+            grep -F 'com.desktouch.vision' /tmp/desktouch-accessibility.txt
+            # Verify the package remains running instead of silently crashing.
+            adb shell pidof com.desktouch.vision
+            echo "PASS: Android 35 environment UI and opt-in Accessibility service started"

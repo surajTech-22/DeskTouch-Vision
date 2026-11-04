@@ -102,6 +102,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
 
+    internal static bool AllowsAndroidCapability(ConnectedPeer source, Packet packet) =>
+        source.Platform=="Android" && packet.Type=="android-capability" &&
+        packet.A is 0 or 1;
+
     internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
         bool differentPeers, int claim) =>
         claim > 0 && differentPeers && AllowsForwardInput(source) &&
@@ -599,6 +603,35 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             lock(_authorityGate) _hubClaims.Remove(session.Id);
                         ReverseControlMessage?.Invoke(p);
                     }
+                    continue;
+                }
+                if(p.Type=="android-capability")
+                {
+                    if(!AllowsAndroidCapability(session.Peer,p))continue;
+                    bool canReceive=p.A==1;
+                    if(session.Peer.SupportsReverseInput==canReceive)continue;
+                    session.Peer=session.Peer with {SupportsReverseInput=canReceive};
+                    if(!canReceive)
+                    {
+                        // Revoking Android Accessibility must immediately
+                        // stop any hub-local or routed keyboard/mouse lease.
+                        // Never silently keep a stale remote controller.
+                        TrySendReverseTo(session.Id,new Packet("reset"));
+                        RelayLease? relay;
+                        lock(_authorityGate)
+                            _relayByTarget.TryGetValue(session.Id,out relay);
+                        if(relay!=null)
+                        {
+                            var removed=RemoveRelayFromSource(relay.Source.Id);
+                            if(removed!=null)
+                                await RevokeRelayAsync(removed,true,token);
+                        }
+                    }
+                    await PublishEnvironmentAsync(token);
+                    PeerListChanged?.Invoke();
+                    _status(canReceive
+                        ? "Android Accessibility restored on an existing secure connection."
+                        : "Android Accessibility disabled; device stays connected in view-only mode.");
                     continue;
                 }
                 if(p.Type=="environment-select")

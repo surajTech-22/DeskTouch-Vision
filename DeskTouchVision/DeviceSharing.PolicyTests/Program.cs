@@ -808,6 +808,32 @@ finally
     finally {foreach(var endpoint in endpoints)endpoint.Dispose();}
 }
 
+// A hub/leaf roster can contain multiple phones plus Windows members.
+// The selected target remains in the original draggable monitor arrangement;
+// every OTHER online member must appear as a visible, selectable tile.
+{
+    var devices=new[] {
+        new EnvironmentDisplayTile(0,"SURAJ","Windows",1,true),
+        new EnvironmentDisplayTile(-2,"My Android Phone","Android",1,true),
+        new EnvironmentDisplayTile(-3,"Second Android","Android",1,false),
+        new EnvironmentDisplayTile(-4,"DESKTOP-IQ1KSJ9","Windows",2,true),
+        new EnvironmentDisplayTile(-2,"duplicate roster callback","Android",1,true)
+    };
+    var visible=DisplayArrangementControl.ProjectEnvironment(devices,0);
+    Check(visible.Count==3,
+        "Environment diagram must show two Android phones and other Windows peers");
+    Check(visible.Count(v=>v.IsAndroid)==2 &&
+        visible.Any(v=>v.Name=="Second Android"&&!v.SupportsInput),
+        "Android phones must appear even when input Accessibility is not enabled");
+    Check(!visible.Any(v=>v.TargetId==0) &&
+        visible.Select(v=>v.TargetId).Distinct().Count()==visible.Count,
+        "Selected device must not be drawn twice or lose its route identity");
+    Check(DisplayArrangementControl.ProjectEnvironment(devices,-2)
+        .Any(v=>v.TargetId==0),
+        "Hub must appear as another selectable member when Android is selected");
+    Console.WriteLine("PASS: multiple authenticated Android device tiles, view-only phones, and no duplicate Windows monitors.");
+}
+
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never
 // displays a window or starts the LAN receiver, and it can run on GitHub's
 // Windows test runner without touching real monitor/input settings.
@@ -838,6 +864,16 @@ var uiThread = new Thread(() =>
             .OfType<DisplayArrangementControl>().Single();
         diagram.Local = extended;
         diagram.Remote = nonrectangular;
+        diagram.EnvironmentDevices =
+            DisplayArrangementControl.ProjectEnvironment(new[] {
+                new EnvironmentDisplayTile(-5,"Android Phone A","Android",1,true),
+                new EnvironmentDisplayTile(-6,"Android Phone B","Android",1,false),
+                new EnvironmentDisplayTile(-7,"Windows peer","Windows",2,true)
+            },0);
+        Check(diagram.EnvironmentDevices.Count==3 &&
+            diagram.EnvironmentDevices.Count(t=>t.IsAndroid)==2,
+            "Display diagram must retain every connected phone alongside native screens");
+
         foreach (var windowSize in new[] {
             new System.Drawing.Size(780, 600),
             new System.Drawing.Size(1000, 690) })

@@ -795,7 +795,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
             await PublishEnvironmentAsync(token);
-            if(peer.Platform=="Windows")RequestBluetoothCheck();
+            // The Windows UI requests the first Bluetooth check after pairing
+            // and on the diagnostic button. Do not repeatedly query every
+            // adapter as peers join: it can delay live input-lease traffic.
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);

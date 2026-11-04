@@ -45,6 +45,10 @@ final class PermissionContinuity {
         return false;
     }
 
+    static boolean needsUserReapproval(boolean appApproved,boolean systemEnabled){
+        return appApproved && !systemEnabled;
+    }
+
     static String state(Context context){
         if(!DeskTouchAccessibilityService.allowed(context))
             return "Windows control disabled in DeskTouch (user preference retained).";
@@ -72,8 +76,8 @@ final class PermissionContinuity {
         boolean approved=DeskTouchAccessibilityService.allowed(context);
         boolean serviceEnabled=systemAccessibilityEnabled(context);
         preferences.edit().putBoolean("systemDisabledAfterUpgrade",
-            approved && !serviceEnabled).commit();
-        if(!approved || serviceEnabled)return;
+            needsUserReapproval(approved,serviceEnabled)).commit();
+        if(!needsUserReapproval(approved,serviceEnabled))return;
         NotificationManager manager=context.getSystemService(NotificationManager.class);
         if(manager==null)return;
         manager.createNotificationChannel(new NotificationChannel(CHANNEL,

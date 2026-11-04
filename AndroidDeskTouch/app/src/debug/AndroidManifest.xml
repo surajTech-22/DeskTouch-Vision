@@ -7,7 +7,7 @@
       android:windowSoftInputMode="adjustResize" />
     <!-- Debug-only separate process, no second APK and no production changes. -->
     <activity android:name=".ExternalEditorProbeActivity"
-      android:process=":editor-probe" android:exported="true"
+      android:process="com.desktouch.vision.editor_probe" android:exported="true"
       android:windowSoftInputMode="stateAlwaysVisible|adjustResize" />
     <receiver android:name=".DebugRemoteInputReceiver" android:exported="true">
       <intent-filter>

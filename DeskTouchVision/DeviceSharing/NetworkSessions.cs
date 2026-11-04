@@ -38,6 +38,9 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
 internal sealed class ReceiverServer : IInputSession, IDisposable
 {
     private const int MaxPeers = 8;
+    // Allow Android CPU/Wi-Fi rescheduling during screen transitions without
+    // disconnecting a still-authenticated peer on an 18-second idle gap.
+    internal const int PeerIdleGraceSeconds = 50;
     private sealed class Session
     {
         internal required int Id;
@@ -310,6 +313,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var id = Interlocked.Increment(ref _nextClientId);
                 _clients[id] = client;
                 client.NoDelay = true;
+                client.Client.SetSocketOption(SocketOptionLevel.Socket,
+                    SocketOptionName.KeepAlive,true);
                 // Do not block accept on another client's TLS, pairing prompt,
                 // heartbeat, or long-lived authenticated input session.
                 _ = Task.Run(async () =>
@@ -747,7 +752,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
-                deadline.CancelAfter(TimeSpan.FromSeconds(18));
+                deadline.CancelAfter(TimeSpan.FromSeconds(PeerIdleGraceSeconds));
                 var p=await Wire.ReadAsync(ssl,deadline.Token);
                 if(p.Type=="goodbye") break;
                 if(p.Type=="bluetooth-check-request" && peer.Platform=="Windows")

@@ -291,18 +291,25 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(root==null)return false;
         ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
         nodes.push(root);
-        AccessibilityNodeInfo target=null;
+        AccessibilityNodeInfo target=null,editor=null;
         int visited=0;
         Rect bounds=new Rect();
         while(!nodes.isEmpty() && ++visited<=96){
             AccessibilityNodeInfo node=nodes.pop();
             node.getBoundsInScreen(bounds);
             if(!bounds.contains(x,y))continue;
+            if(node.isEditable() && node.isEnabled())editor=node;
             if(node.isClickable() && node.isEnabled())target=node;
             for(int i=node.getChildCount()-1;i>=0;i--){
                 AccessibilityNodeInfo child=node.getChild(i);
                 if(child!=null)nodes.push(child);
             }
+        }
+        if(editor!=null){
+            boolean clicked=editor.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            boolean focused=editor.isFocused() ||
+                editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            if(clicked||focused)return true;
         }
         return target!=null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }

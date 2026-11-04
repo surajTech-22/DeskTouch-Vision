@@ -1419,10 +1419,10 @@ internal sealed class HostSession : IInputSession, IDisposable
                     EnvironmentRosterChanged?.Invoke();
                 }
                 else if (p.Type=="environment-layout" &&
-                    p.Text is { Length: > 1 and <= 4096 } layout)
+                    p.Text is { Length: > 1 and <= 4096 } serializedPositions)
                 {
                     EnvironmentPosition[]? list;
-                    try {list=JsonSerializer.Deserialize<EnvironmentPosition[]>(layout);}
+                    try {list=JsonSerializer.Deserialize<EnvironmentPosition[]>(serializedPositions);}
                     catch(JsonException){continue;}
                     if(list==null || list.Length>8 ||
                         list.Any(x=>!EnvironmentPosition.Valid(x)) ||

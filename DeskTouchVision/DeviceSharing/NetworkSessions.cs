@@ -65,6 +65,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal required Session Target;
         internal required int Claim;
         internal bool Granted;
+        // Routed pointer packets are coalesced while key and button events
+        // preserve their order. Never block the hub's TCP receive loop on
+        // every intermediate Android cursor coordinate.
+        internal readonly Channel<Packet> InputQueue=Channel.CreateBounded<Packet>(
+            new BoundedChannelOptions(512) {
+                SingleReader=true,SingleWriter=false,
+                FullMode=BoundedChannelFullMode.Wait });
+        internal Packet? LatestMove;
+        internal int MoveSignaled;
     }
 
     private readonly Action<string> _status;
@@ -274,12 +283,66 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         finally { session.Write.Release(); }
     }
 
+    private async Task RelayForwardLoopAsync(RelayLease relay,CancellationToken token)
+    {
+        try
+        {
+            await foreach(var packet in relay.InputQueue.Reader.ReadAllAsync(token))
+            {
+                lock(_authorityGate)
+                    if(!_relayBySource.TryGetValue(relay.Source.Id,out var current) ||
+                        !ReferenceEquals(current,relay))break;
+                if(packet.Type=="move-flush")
+                {
+                    Interlocked.Exchange(ref relay.MoveSignaled,0);
+                    var latest=Interlocked.Exchange(ref relay.LatestMove,null);
+                    if(latest!=null)
+                        await SendToAsync(relay.Target,
+                            ReverseInputProtocol.Encode(latest),token);
+                    continue;
+                }
+                var preceding=Interlocked.Exchange(ref relay.LatestMove,null);
+                if(preceding!=null)
+                    await SendToAsync(relay.Target,
+                        ReverseInputProtocol.Encode(preceding),token);
+                await SendToAsync(relay.Target,
+                    ReverseInputProtocol.Encode(packet),token);
+            }
+        }
+        catch(OperationCanceledException){}
+        catch(Exception ex)
+        {
+            _status("Routed input stream ended: "+ex.Message);
+            var removed=RemoveRelayFromSource(relay.Source.Id);
+            if(removed!=null)
+                await RevokeRelayAsync(removed,true,token);
+        }
+    }
+
+    private static bool QueueRoutedInput(RelayLease relay,Packet packet)
+    {
+        if(packet.Type=="move")
+        {
+            Interlocked.Exchange(ref relay.LatestMove,packet);
+            if(Interlocked.CompareExchange(ref relay.MoveSignaled,1,0)==0 &&
+                !relay.InputQueue.Writer.TryWrite(new Packet("move-flush")))
+            {
+                Interlocked.Exchange(ref relay.MoveSignaled,0);
+                return false;
+            }
+            return true;
+        }
+        return relay.InputQueue.Writer.TryWrite(packet);
+    }
+
     private RelayLease? RemoveRelayFromSource(int sourceId)
     {
         lock (_authorityGate)
         {
             if (!_relayBySource.Remove(sourceId, out var relay)) return null;
             _relayByTarget.Remove(relay.Target.Id);
+            Interlocked.Exchange(ref relay.LatestMove,null);
+            relay.InputQueue.Writer.TryComplete();
             return relay;
         }
     }
@@ -783,6 +846,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                                 Target=destination,Claim=p.A };
                             _relayBySource.Add(session.Id,relay);
                             _relayByTarget.Add(destination.Id,relay);
+                            _=Task.Run(()=>RelayForwardLoopAsync(relay,_cancel.Token));
                         }
                     }
                     if(relay==null)
@@ -878,9 +942,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if(forward.Granted &&
                         p.Type is ("move" or "button" or "key" or "wheel" or "text"))
                     {
-                        try { await SendToAsync(forward.Target,
-                            ReverseInputProtocol.Encode(p),token); }
-                        catch(Exception)
+                        if(!QueueRoutedInput(forward,p))
                         {
                             var removed=RemoveRelayFromSource(session.Id);
                             if(removed!=null)

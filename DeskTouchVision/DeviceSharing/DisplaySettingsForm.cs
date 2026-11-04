@@ -16,6 +16,13 @@ namespace DeskTouch.DeviceShare;
 internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 {
     private readonly DisplayArrangementControl _display = new();
+    private readonly Label _environmentHeader = new()
+    {
+        Dock=DockStyle.Right, Width=235, TextAlign=ContentAlignment.MiddleRight,
+        ForeColor=Color.FromArgb(186,216,241),
+        Font=new Font("Segoe UI Semibold",10),
+        Text="One environment"
+    };
     private readonly ComboBox _targetChoice = new()
     {
         Name = "ConnectedDeviceTarget", Dock = DockStyle.Right,
@@ -116,7 +123,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (!_updatingTargetChoice && _targetChoice.SelectedItem is TargetOption target)
                 SelectConnectedTarget(target.Id);
         };
-        header.Controls.Add(_targetChoice);
+        // Every connected phone/PC is selected by clicking its SCREEN tile.
+        // The previous two-option dropdown falsely implied two independent
+        // one-to-one links and was coupled to destructive input-hook switching.
+        header.Controls.Add(_environmentHeader);
 
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
@@ -395,7 +405,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         else if (_incomingPeer != null)
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
                             $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  " +
-                            $"{_receiver?.ConnectedPeerCount ?? 0} devices online" +
+                            $"{1+(_receiver?.ConnectedPeerCount??0)} devices in one environment" +
                             $" ({_receiver?.ConnectedPeers.Count(p=>p.Peer.Platform=="Android")??0} Android)";
         else
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} Windows display(s)" +
@@ -489,7 +499,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _targetChoice.SelectedIndex = i;
             if (_targetChoice.SelectedIndex == -1 && _targetChoice.Items.Count > 0)
                 _targetChoice.SelectedIndex = 0;
-            _targetChoice.Visible = _targetChoice.Items.Count > 0;
+            _targetChoice.Visible = false;
+            int online=_host!=null ? Math.Max(1,_host.EnvironmentMembers.Count) :
+                1+(_receiver?.ConnectedPeerCount??0);
+            _environmentHeader.Text=$"One environment  •  {online} devices";
         }
         finally { _updatingTargetChoice = false; }
     }
@@ -527,90 +540,97 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         bool remote=_capture?.RemoteActive==true;
         int starting=remote?CurrentInputTargetId():EnvironmentRouteOrder.Local;
         int? destination=order.Neighbor(starting,edge);
-        if(destination==null || destination==EnvironmentRouteOrder.Local)
-            return false; // safe return to this computer
-        int target=destination.Value;
-        if(target!=CurrentInputTargetId())
-            SelectConnectedTarget(target);
-        // An actual edge-crossing gesture is user input authority consent;
-        // the next destination MUST still confirm its independent grant and
-        // applied cursor acknowledgement before we capture any keys.
-        if(_capture?.IsArmed!=true)return false;
-        _capture.BeginLinkedHandoff(edge,fraction);
-        return true;
-    }
-
-    private void SelectConnectedTarget(int id)
-    {
-        // One authenticated environment session routes to all members.
-        // No disconnection/re-pairing occurs when selecting another screen.
-        if (id <= 0 && _host != null)
+        if(destination==null)return false;
+        if(destination==EnvironmentRouteOrder.Local)
         {
             _capture?.ReturnLocal();
-            int routedId = id < 0 ? -id : 0;
-            if (!_host.SelectEnvironmentTarget(routedId))
+            return true;
+        }
+        if(destination.Value==CurrentInputTargetId())
+            return false;
+        // One authenticated hub, one keyboard/mouse hook pair: retarget the
+        // SAME SourceCapture rather than disposing global hooks during the
+        // cursor-edge transition. The destination still grants its own lease.
+        return SelectConnectedTargetCore(destination.Value,edge,fraction,true);
+    }
+
+    private void SelectConnectedTarget(int id) =>
+        SelectConnectedTargetCore(id,_preferredEdge,0.5,false);
+
+    private bool _retargetingInput;
+    private bool SelectConnectedTargetCore(int id,MonitorEdge edge,
+        double fraction,bool requestHandoff)
+    {
+        if(_retargetingInput)return false;
+        _retargetingInput=true;
+        try
+        {
+            IInputSession? next=null;
+            ConnectedPeer? selectedPeer=null;
+            if(id<=0 && _host!=null)
             {
-                Status("Environment target unavailable or not authorized.");
-                RefreshDisplays();
-                return;
-            }
-            if (_captureUsesInbound)
-            {
-                _capture?.Dispose();
-                _capture = null;
+                int chosen=id<0 ? -id : 0;
+                if(_capture!=null && !_captureUsesInbound &&
+                    _host.SelectedEnvironmentTargetId==chosen)
+                    return false;
+                // A release MUST go over the PREVIOUS authenticated route;
+                // changing the hub destination first would release the wrong
+                // phone/PC and leave keyboard authority stranded.
+                _capture?.ReturnLocal();
+                if(!_host.SelectEnvironmentTarget(chosen))
+                {
+                    Status("Environment destination is disconnected or input permission is disabled.");
+                    RefreshDisplays();return false;
+                }
+                _captureUsesInbound=false;
                 _captureInboundPeerId=0;
+                next=_host;
             }
-            _captureUsesInbound = false;
-            if (_capture == null)
+            else if(id>0 && _receiver!=null)
             {
-                try
+                var peer=_receiver.ConnectedPeers.FirstOrDefault(p=>p.Id==id);
+                if(peer.Peer==null || !peer.Peer.SupportsReverseInput)
                 {
-                    _capture = new SourceCapture(this, _host, Status,
-                        _preferredEdge, preserveRawInput: true);
-                    _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                    _capture.Arm();
+                    Status("Connected device does not currently allow keyboard/mouse control.");
+                    return false;
                 }
-                catch (Exception ex)
-                {
-                    _capture?.Dispose();
-                    _capture = null;
-                    Status("Windows target cannot be armed: " + ex.Message);
-                }
+                if(_capture!=null && _captureUsesInbound &&
+                    _captureInboundPeerId==id)return false;
+                _capture?.ReturnLocal();
+                if(!_receiver.SelectConnectedPeer(id))return false;
+                _captureUsesInbound=true;
+                _captureInboundPeerId=id;
+                _incomingPeer=peer.Peer;
+                selectedPeer=peer.Peer;
+                next=_receiver.BindSelectedInput();
             }
-            _capture?.UpdateLayouts(MonitorTopology.Capture(),_host.RemoteMonitors);
+            if(next==null)return false;
+            // No SourceCapture.Dispose()/Arm() cycle on device switch: that
+            // discarded physical key/mouse events and caused intermittent
+            // Windows/Android handoff failures.
+            if(_capture!=null)
+                _capture.Retarget(next,edge);
+            else
+            {
+                _capture=new SourceCapture(this,next,Status,edge,
+                    preserveRawInput:true);
+                _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
+                _capture.Arm();
+            }
+            if(requestHandoff)
+                _capture.BeginLinkedHandoff(edge,fraction);
             RefreshDisplays();
-            return;
+            Status("Destination: "+(selectedPeer?.Name ??
+                _host?.RemoteSystemName ?? "shared environment")+
+                ". All connected devices remain online.");
+            return true;
         }
-        if (_receiver == null) return;
-        var target = _receiver.ConnectedPeers
-            .FirstOrDefault(p => p.Id == id);
-        if (target.Id != id || target.Peer == null) return;
-        if (!target.Peer.SupportsReverseInput)
+        catch(Exception ex)
         {
-            Status("Enable DeskTouch Accessibility control on " +
-                target.Peer.Name + " and reconnect it to allow Windows control.");
-            RefreshDisplays();
-            return;
+            Status("Input destination could not be changed: "+ex.Message);
+            return false;
         }
-        if (_host != null && !_captureUsesInbound)
-        {
-            _capture?.Dispose();
-            _capture = null;
-        }
-        // Explicit selection replaces ONLY this local input destination.
-        // It must not close the hub, the Windows peer or the Android peer.
-        if(_captureInboundPeerId!=id && _capture != null)
-        {
-            _capture.ReturnLocal();
-            _capture.Dispose();
-            _capture=null;
-        }
-        _captureInboundPeerId=0;
-        _captureUsesInbound = true;
-        if (!_receiver.SelectConnectedPeer(id)) return;
-        _incomingPeer = target.Peer; // deterministic: no async UI callback race
-        ArmSelectedInbound();
-        RefreshDisplays();
+        finally { _retargetingInput=false; }
     }
 
     private void ArmSelectedInbound()

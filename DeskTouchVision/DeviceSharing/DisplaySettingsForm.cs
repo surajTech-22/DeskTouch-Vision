@@ -494,6 +494,52 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         finally { _updatingTargetChoice = false; }
     }
 
+    private EnvironmentRouteOrder? ConnectedEnvironmentOrder()
+    {
+        if(_display.Remote==null)return null;
+        int baseId;
+        if(_host!=null)baseId=0;
+        else
+        {
+            var peers=_receiver?.ConnectedPeers ??
+                Array.Empty<(int Id,ConnectedPeer Peer)>();
+            var basePeer=peers.Where(p=>p.Peer.Platform=="Windows")
+                .OrderBy(p=>p.Id).FirstOrDefault();
+            if(basePeer.Peer==null)
+                basePeer=peers.OrderBy(p=>p.Id).FirstOrDefault();
+            if(basePeer.Peer==null)return null;
+            baseId=basePeer.Id;
+        }
+        return new EnvironmentRouteOrder(baseId,
+            _display.EnvironmentDevices,_preferredEdge);
+    }
+
+    private int CurrentInputTargetId() =>
+        _captureUsesInbound || _host==null
+            ? _receiver?.SelectedPeerId ?? EnvironmentRouteOrder.Local
+            : -_host.SelectedEnvironmentTargetId;
+
+    private bool NavigateEnvironmentFromCapture(MonitorEdge edge,double fraction)
+    {
+        var order=ConnectedEnvironmentOrder();
+        if(order==null || edge is not
+            (MonitorEdge.Left or MonitorEdge.Right))return false;
+        bool remote=_capture?.RemoteActive==true;
+        int starting=remote?CurrentInputTargetId():EnvironmentRouteOrder.Local;
+        int? destination=order.Neighbor(starting,edge);
+        if(destination==null || destination==EnvironmentRouteOrder.Local)
+            return false; // safe return to this computer
+        int target=destination.Value;
+        if(target!=CurrentInputTargetId())
+            SelectConnectedTarget(target);
+        // An actual edge-crossing gesture is user input authority consent;
+        // the next destination MUST still confirm its independent grant and
+        // applied cursor acknowledgement before we capture any keys.
+        if(_capture?.IsArmed!=true)return false;
+        _capture.BeginLinkedHandoff(edge,fraction);
+        return true;
+    }
+
     private void SelectConnectedTarget(int id)
     {
         // One authenticated environment session routes to all members.
@@ -521,6 +567,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 {
                     _capture = new SourceCapture(this, _host, Status,
                         _preferredEdge, preserveRawInput: true);
+                    _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
                     _capture.Arm();
                 }
                 catch (Exception ex)
@@ -575,6 +622,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
+            _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
             _capture.Arm();
             _captureInboundPeerId=_receiver.SelectedPeerId;
             Status("Windows controls " + _incomingPeer.Name +
@@ -968,6 +1016,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _captureUsesInbound = false;
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
             preserveRawInput: true);
+        _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;

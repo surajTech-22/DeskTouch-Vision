@@ -377,6 +377,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
                 LayoutIdentity(peer.Peer)));
+        // Migrate names written by v0.3.16's local-only UI into stable
+        // authenticated certificate identities whenever one is available.
+        lock(_layoutGate)
+        {
+            foreach(var peer in _sessions.Values)
+            {
+                string legacy=peer.Peer.Platform+"|"+peer.Peer.Name;
+                string stable=LayoutIdentity(peer.Peer);
+                if(legacy==stable ||
+                    !_environmentPositions.TryGetValue(legacy,out var old))continue;
+                if(!_environmentPositions.ContainsKey(stable))
+                    _environmentPositions[stable]=old with {Key=stable};
+                _environmentPositions.Remove(legacy);
+            }
+        }
         string payload = JsonSerializer.Serialize(members);
         if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
         {

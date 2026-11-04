@@ -11,7 +11,14 @@ adb shell settings get secure default_input_method | tr -d '\r' | grep -F 'DeskT
 adb shell dumpsys accessibility | grep -F 'DeskTouchAccessibilityService'
 
 : > android-input-emulator.txt
+failed=0
 for probe in status keyboard click drag scroll; do
+  # An actual Android tap establishes input focus; a programmatic request
+  # alone is not equivalent to a user focusing a text field.
+  if [[ "$probe" == keyboard ]]; then
+    adb shell input tap 240 110
+    sleep 1
+  fi
   label="$(echo "$probe" | tr '[:lower:]' '[:upper:]')"
   adb logcat -c
   adb shell am start -n com.desktouch.vision/.InputProbeActivity \
@@ -36,7 +43,11 @@ for probe in status keyboard click drag scroll; do
     echo "FAIL: Android $probe input behavior was not verified" | tee -a android-input-emulator.txt
     adb shell dumpsys accessibility | grep -E 'Enabled services|Bound services|DeskTouch' | head -30 || true
     adb logcat -d -s AndroidRuntime:E DeskTouchInputProbe:V | tail -80 || true
-    exit 1
+    failed=$((failed+1))
   fi
 done
+if [[ "$failed" -ne 0 ]]; then
+  echo "FAIL: $failed Android real-input probes did not pass"
+  exit 1
+fi
 echo "PASS: Android real editor input and click, drag, wheel events in emulator"

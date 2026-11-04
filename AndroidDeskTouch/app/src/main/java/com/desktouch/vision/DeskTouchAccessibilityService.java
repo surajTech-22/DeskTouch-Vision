@@ -10,6 +10,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.Choreographer;
+import android.graphics.Rect;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
@@ -35,8 +37,19 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private volatile Runnable pendingApplied;
     private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
         new java.util.concurrent.atomic.AtomicBoolean();
+    private final Choreographer.FrameCallback pointerFrame = ignored -> flushPointer();
+    private int lastOverlayX=Integer.MIN_VALUE,lastOverlayY=Integer.MIN_VALUE;
     private int downX,downY;
     private boolean held,shift,control,alt,remoteGesture;
+    private boolean gestureRunning;
+    private final ArrayDeque<GestureCommand> pendingGestures=new ArrayDeque<>();
+    private static final class GestureCommand {
+        final int sx,sy,ex,ey;
+        final long duration;
+        GestureCommand(int sx,int sy,int ex,int ey,long duration){
+            this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;this.duration=duration;
+        }
+    }
     private volatile boolean remoteActive;
 
     static boolean allowed(Context context){
@@ -103,18 +116,33 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 PixelFormat.TRANSLUCENT);
             p.gravity=Gravity.TOP|Gravity.LEFT;
             p.x=x-dp(10);p.y=y-dp(10);
-            try{windows.addView(dot,p);cursor=dot;cursorParams=p;}
-            catch(RuntimeException ex){return;}
+            try{
+                windows.addView(dot,p);
+                cursor=dot;cursorParams=p;
+                lastOverlayX=x;lastOverlayY=y;
+            }catch(RuntimeException ex){return;}
         }
-        if(cursor!=null && cursorParams!=null){
-            cursorParams.x=x-dp(10);
-            cursorParams.y=y-dp(10);
-            try{windows.updateViewLayout(cursor,cursorParams);}
-            catch(RuntimeException ex){removePointer();}
+        // One window-layout Binder transaction at most per VSync, and none
+        // when the cursor coordinate is unchanged. The old path updated an
+        // overlay for every TCP movement and overloaded the Android UI thread.
+        if(cursor!=null && cursorParams!=null &&
+            (x!=lastOverlayX || y!=lastOverlayY)){
+            cursorParams.x=x-dp(10);cursorParams.y=y-dp(10);
+            try{
+                windows.updateViewLayout(cursor,cursorParams);
+                lastOverlayX=x;lastOverlayY=y;
+            }catch(RuntimeException ex){removePointer();}
         }
     }
     private void removePointer(){
         held=false;
+        remoteActive=false;
+        pendingApplied=null;
+        Choreographer.getInstance().removeFrameCallback(pointerFrame);
+        moveScheduled.set(false);
+        lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+        pendingGestures.clear();
+        gestureRunning=false;
         if(cursor!=null&&windows!=null){
             try{windows.removeView(cursor);}catch(RuntimeException ignored){}
         }
@@ -130,7 +158,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.pendingY=py;
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true))
-            service.ui.post(service::flushPointer);
+            service.ui.post(()->Choreographer.getInstance()
+                .postFrameCallback(service.pointerFrame));
         return true;
     }
     private void flushPointer(){
@@ -142,7 +171,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(remoteActive&&cursor!=null&&ack!=null&&ready(this))ack.run();
         if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
             moveScheduled.compareAndSet(false,true))
-            ui.post(this::flushPointer);
+            Choreographer.getInstance().postFrameCallback(pointerFrame);
+    }
+    private void flushPointerBeforeAction(){
+        // A click or scroll must operate at the most recently received
+        // pointer position, never the previous animation frame.
+        if(remoteActive && (pendingX!=x || pendingY!=y || cursor==null))
+            showPointer(pendingX,pendingY);
+        Runnable ack=pendingApplied;
+        pendingApplied=null;
+        if(cursor!=null && ack!=null && remoteActive)ack.run();
     }
     static void endRemote(){
         DeskTouchAccessibilityService service=instance;
@@ -150,12 +188,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     static void mouseButton(int button,boolean pressed){
         DeskTouchAccessibilityService service=instance;
-        if(service==null||!ready(service) || button!=1)return;
+        if(service==null||!ready(service)||button!=1)return;
         service.ui.post(()->{
-            if(pressed){service.held=true;service.downX=service.x;service.downY=service.y;}
-            else if(service.held){
+            if(!service.remoteActive || !ready(service))return;
+            service.flushPointerBeforeAction();
+            if(pressed){
+                service.held=true;service.downX=service.x;service.downY=service.y;
+            }else if(service.held){
                 service.held=false;
-                service.dispatchStroke(service.downX,service.downY,service.x,service.y,90);
+                service.enqueueGesture(service.downX,service.downY,
+                    service.x,service.y,45);
             }
         });
     }
@@ -163,32 +205,79 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service)||amount==0)return;
         service.ui.post(()->{
-            int distance=Math.max(60,Math.min(240,Math.abs(amount)));
+            if(!service.remoteActive || !ready(service))return;
+            service.flushPointerBeforeAction();
+            // Native accessibility scroll actions are dispatched directly to
+            // the scrollable UI node under the cursor. This avoids an
+            // unnecessary 120ms gesture when the target exposes scrolling.
+            if(!horizontal && service.performNativeScroll(amount))return;
+            int distance=Math.max(55,Math.min(210,Math.abs(amount)));
             int sx=service.x,sy=service.y;
             int ex=horizontal?sx+(amount>0?-distance:distance):sx;
             int ey=horizontal?sy:sy+(amount>0?-distance:distance);
-            service.dispatchStroke(sx,sy,ex,ey,120);
+            service.enqueueGesture(sx,sy,ex,ey,85);
         });
     }
-    private void dispatchStroke(int sx,int sy,int ex,int ey,long duration){
-        if(!ready(this))return;
+
+    private boolean performNativeScroll(int amount){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root==null)return false;
+        // Bound traversal so a huge UI tree cannot stall the main thread.
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        AccessibilityNodeInfo target=null;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=96){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(x,y))continue;
+            if(node.isScrollable())target=node;
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        if(target==null)return false;
+        int action=amount>0?AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD:
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
+        return target.performAction(action);
+    }
+
+    private void enqueueGesture(int sx,int sy,int ex,int ey,long duration){
+        if(!remoteActive || !ready(this))return;
+        // dispatchGesture cancels an already running gesture. Serialize
+        // commands instead of repeatedly interrupting taps and swipes.
+        if(pendingGestures.size()>=6)pendingGestures.pollFirst();
+        pendingGestures.addLast(new GestureCommand(sx,sy,ex,ey,duration));
+        pumpGestures();
+    }
+    private void pumpGestures(){
+        if(gestureRunning || !remoteActive || !ready(this))return;
+        GestureCommand command=pendingGestures.pollFirst();
+        if(command==null){remoteGesture=false;return;}
         Path path=new Path();
-        path.moveTo(sx,sy);
-        if(sx!=ex||sy!=ey)path.lineTo(ex,ey);
+        path.moveTo(command.sx,command.sy);
+        if(command.sx!=command.ex||command.sy!=command.ey)
+            path.lineTo(command.ex,command.ey);
         GestureDescription.StrokeDescription stroke=
-            new GestureDescription.StrokeDescription(path,0,duration);
+            new GestureDescription.StrokeDescription(path,0,command.duration);
         GestureDescription gesture=new GestureDescription.Builder().addStroke(stroke).build();
-        remoteGesture=true;
-        boolean started=dispatchGesture(gesture,
-            new GestureResultCallback(){
-                @Override public void onCompleted(GestureDescription completed){
-                    remoteGesture=false;
-                }
-                @Override public void onCancelled(GestureDescription cancelled){
-                    remoteGesture=false;
-                }
-            },ui);
-        if(!started)remoteGesture=false;
+        remoteGesture=gestureRunning=true;
+        boolean started=dispatchGesture(gesture,new GestureResultCallback(){
+            @Override public void onCompleted(GestureDescription completed){
+                finishGesture();
+            }
+            @Override public void onCancelled(GestureDescription cancelled){
+                finishGesture();
+            }
+        },ui);
+        if(!started)finishGesture();
+    }
+    private void finishGesture(){
+        gestureRunning=false;
+        if(pendingGestures.isEmpty())remoteGesture=false;
+        pumpGestures();
     }
     static void text(String incoming){
         DeskTouchAccessibilityService service=instance;

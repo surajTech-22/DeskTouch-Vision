@@ -314,8 +314,10 @@ internal sealed class DisplayArrangementControl : Control
         {
             Alignment = StringAlignment.Center,
             LineAlignment = StringAlignment.Near,
-            Trimming = StringTrimming.EllipsisCharacter,
-            FormatFlags = StringFormatFlags.NoWrap
+            Trimming = platform=="Android"
+                ? StringTrimming.EllipsisWord : StringTrimming.EllipsisCharacter,
+            FormatFlags = platform=="Android"
+                ? 0 : StringFormatFlags.NoWrap
         };
         g.DrawString(deviceName, nameFont, Brushes.White, title, format);
         var numberTile = new RectangleF(rect.Left + 4,

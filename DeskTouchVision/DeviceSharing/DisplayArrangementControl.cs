@@ -116,6 +116,9 @@ internal sealed class DisplayArrangementControl : Control
                 _memberOffsets[pair.Key]=pair.Value;
         Invalidate();
     }
+    internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
+        _environmentHits.Select(x=>(x.TargetId,x.Hit)).ToArray();
+
     internal IReadOnlyList<int> ArrangedTargetOrder(int baseTargetId)
     {
         // A physical screen is at most one input destination; all its native

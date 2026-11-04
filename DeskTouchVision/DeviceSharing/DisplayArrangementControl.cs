@@ -119,11 +119,12 @@ internal sealed class DisplayArrangementControl : Control
     internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
         _environmentHits.Select(x=>(x.TargetId,x.Hit)).ToArray();
 
-    internal int? AdjacentTarget(int currentId,MonitorEdge direction,int baseTargetId)
+    internal int? AdjacentTarget(int currentId,MonitorEdge direction,
+        int baseTargetId,double fraction=0.5)
     {
-        // Route by the ACTUAL dragged screen geometry, not the order in which
-        // peers happened to connect. Each authenticated peer can occupy any
-        // of the four outside edges of another screen.
+        // Only the ACTUAL shared screen edge can grant a transition. A screen
+        // somewhere in a direction is not a neighbor. Treat the phone's drag
+        // rectangle and both Windows monitor groups in the same diagram.
         var regions=new List<(int Id,RectangleF Bounds)> {
             (EnvironmentRouteOrder.Local,_localHit),(baseTargetId,_remoteHit)
         };
@@ -131,36 +132,50 @@ internal sealed class DisplayArrangementControl : Control
             if(_environmentDevices.Any(d=>d.TargetId==item.TargetId &&
                 d.SupportsInput))
                 regions.Add((item.TargetId,item.Hit));
-        return SpatialNeighbor(regions,currentId,direction);
+        return SpatialNeighbor(regions,currentId,direction,fraction);
     }
 
     internal static int? SpatialNeighbor(
         IReadOnlyList<(int Id,RectangleF Bounds)> regions,
-        int currentId,MonitorEdge direction)
+        int currentId,MonitorEdge direction,double fraction=0.5)
     {
         var origin=regions.FirstOrDefault(r=>r.Id==currentId);
-        if(origin.Bounds.Width<=0 || origin.Bounds.Height<=0)return null;
-        float ox=origin.Bounds.Left+origin.Bounds.Width/2;
-        float oy=origin.Bounds.Top+origin.Bounds.Height/2;
+        if(origin.Bounds.Width<=0||origin.Bounds.Height<=0)return null;
+        var bounds=origin.Bounds;
+        fraction=Math.Clamp(double.IsFinite(fraction)?fraction:0.5,0,1);
+        bool horizontal=direction is MonitorEdge.Left or MonitorEdge.Right;
+        float cross=(float)(horizontal
+            ?bounds.Top+fraction*bounds.Height
+            :bounds.Left+fraction*bounds.Width);
         int? best=null;
-        double bestScore=double.PositiveInfinity;
+        double nearest=double.PositiveInfinity;
         foreach(var item in regions)
         {
             if(item.Id==currentId || item.Bounds.Width<=0 ||
                 item.Bounds.Height<=0)continue;
-            float cx=item.Bounds.Left+item.Bounds.Width/2;
-            float cy=item.Bounds.Top+item.Bounds.Height/2;
-            double forward=direction switch{
-                MonitorEdge.Right=>cx-ox,MonitorEdge.Left=>ox-cx,
-                MonitorEdge.Bottom=>cy-oy,MonitorEdge.Top=>oy-cy,_=>0
+            var target=item.Bounds;
+            // Positive gap is space BETWEEN the two edges; negative gap
+            // means overlapping screens. Neither a distant display nor
+            // an overlay dropped into the middle of another is a route.
+            double gap=direction switch {
+                MonitorEdge.Right=>target.Left-bounds.Right,
+                MonitorEdge.Left=>bounds.Left-target.Right,
+                MonitorEdge.Bottom=>target.Top-bounds.Bottom,
+                MonitorEdge.Top=>bounds.Top-target.Bottom,
+                _=>double.PositiveInfinity
             };
-            if(forward<=2)continue;
-            double perpendicular=direction is MonitorEdge.Left or MonitorEdge.Right
-                ? Math.Abs(cy-oy) : Math.Abs(cx-ox);
-            // Prefer the nearest aligned screen, while allowing deliberate
-            // vertically or horizontally staggered monitor arrangements.
-            double score=forward+perpendicular*1.65;
-            if(score<bestScore){bestScore=score;best=item.Id;}
+            double allowance=Math.Max(12,Math.Min(42,
+                Math.Min(horizontal?bounds.Width:bounds.Height,
+                    horizontal?target.Width:target.Height)*0.19));
+            if(gap < -4 || gap>allowance)continue;
+            float from=horizontal?target.Top:target.Left;
+            float to=horizontal?target.Bottom:target.Right;
+            // A pointer crossing the TOP part of one screen must not leap
+            // to a phone attached to the bottom part of another screen.
+            float tolerance=2f;
+            if(cross < from-tolerance || cross>to+tolerance)continue;
+            double distance=Math.Max(0,gap);
+            if(distance<nearest){nearest=distance;best=item.Id;}
         }
         return best;
     }

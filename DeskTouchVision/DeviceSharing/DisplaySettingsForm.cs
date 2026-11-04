@@ -683,6 +683,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // or mouse hooks. Arm input monitoring only after TLS pairing has
             // authenticated an active incoming peer.
             _nativeInput = new PhysicalInputMonitor(this);
+            _nativeInput.IsOutboundInputCaptured=() =>
+                _capture?.RemoteActive==true;
             _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync,
                 _trusted, ConfirmTrustAsync);
             _receiver.PeerConnected += OnIncomingPeerConnected;
@@ -1074,6 +1076,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture?.Dispose();
         _capture = null;
         _nativeInput ??= new PhysicalInputMonitor(this);
+        _nativeInput.IsOutboundInputCaptured=() =>
+            _capture?.RemoteActive==true;
         _nativeInput.Start();
         session.AttachReverseInput(_nativeInput.Priority,
             () => _capture == null ||

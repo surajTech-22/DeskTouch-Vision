@@ -20,7 +20,14 @@ internal sealed record PeerHello(string Name, string Layout,
 // Issued exclusively by the authenticated hub over an existing TLS session.
 // Id is a connection-scoped route identifier, not a device identity or trust proof.
 internal sealed record EnvironmentMember(int Id, string Name, string Platform,
-    string Layout, bool SupportsReverseInput);
+    string Layout, bool SupportsReverseInput, string? StableIdentity=null);
+internal sealed record EnvironmentPosition(string Key,float X,float Y)
+{
+    internal static bool Valid(EnvironmentPosition? p) =>
+        p!=null && !string.IsNullOrWhiteSpace(p.Key) && p.Key.Length<=150 &&
+        !p.Key.Any(char.IsControl) && float.IsFinite(p.X) && float.IsFinite(p.Y) &&
+        Math.Abs(p.X)<=80000 && Math.Abs(p.Y)<=80000;
+}
 
 /// <summary>
 /// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
@@ -71,6 +78,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
     private readonly object _authorityGate = new();
+    private readonly object _layoutGate=new();
+    private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
+        new(StringComparer.Ordinal);
+    internal event Action<IReadOnlyDictionary<string,System.Drawing.PointF>>?
+        EnvironmentLayoutChanged;
     // A single environment can have many authenticated peers but only one
     // controller per destination. Every routed input is pinned to BOTH TLS
     // sessions, not a name, IP address or broadcast group hint.
@@ -101,6 +113,60 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+    internal static string LayoutIdentity(ConnectedPeer peer) =>
+        string.IsNullOrWhiteSpace(peer.DeviceFingerprint) ?
+            peer.Platform+"|"+peer.Name : peer.DeviceFingerprint;
+
+    internal void InitializeEnvironmentLayout(
+        IReadOnlyDictionary<string,System.Drawing.PointF> saved)
+    {
+        lock(_layoutGate)
+        {
+            _environmentPositions.Clear();
+            foreach(var pair in saved)
+            {
+                var position=new EnvironmentPosition(pair.Key,pair.Value.X,pair.Value.Y);
+                if(EnvironmentPosition.Valid(position))
+                    _environmentPositions[position.Key]=position;
+            }
+        }
+    }
+    internal IReadOnlyDictionary<string,System.Drawing.PointF> EnvironmentPositions
+    {
+        get {lock(_layoutGate) return _environmentPositions.Values.ToDictionary(
+            p=>p.Key,p=>new System.Drawing.PointF(p.X,p.Y),StringComparer.Ordinal);}
+    }
+    private void ApplyEnvironmentPosition(EnvironmentPosition placement)
+    {
+        lock(_layoutGate)_environmentPositions[placement.Key]=placement;
+        EnvironmentLayoutChanged?.Invoke(EnvironmentPositions);
+        _=Task.Run(async()=>{
+            try{await PublishEnvironmentLayoutAsync(_cancel.Token);}
+            catch(OperationCanceledException){}
+            catch(Exception ex){_status("Environment placement synchronization failed: "+ex.Message);}
+        });
+    }
+    internal bool UpdateEnvironmentPlacement(string key,System.Drawing.PointF point)
+    {
+        var placement=new EnvironmentPosition(key,point.X,point.Y);
+        if(!EnvironmentPosition.Valid(placement))return false;
+        // Only a current, authenticated member can acquire a drag position.
+        if(!_sessions.Values.Any(x=>LayoutIdentity(x.Peer)==key))return false;
+        ApplyEnvironmentPosition(placement);
+        return true;
+    }
+    private async Task PublishEnvironmentLayoutAsync(CancellationToken token)
+    {
+        EnvironmentPosition[] snapshot;
+        lock(_layoutGate)snapshot=_environmentPositions.Values.ToArray();
+        string payload=JsonSerializer.Serialize(snapshot);
+        if(System.Text.Encoding.UTF8.GetByteCount(payload)>4096)return;
+        foreach(var recipient in _sessions.Values)
+            try{await SendToAsync(recipient,
+                new Packet("environment-layout",Text:payload),token);}
+            catch(Exception) { /* peer may disconnect while receiving layout */ }
+    }
+
 
     internal static bool AllowsAndroidCapability(ConnectedPeer source, Packet packet) =>
         source.Platform=="Android" && packet.Type=="android-capability" &&
@@ -242,11 +308,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // session IDs are ephemeral and may never authorize a new pairing.
         var members = new List<EnvironmentMember> {
             new(0, Environment.MachineName, "Windows",
-                MonitorTopology.Capture().ToWire(), true)
+                MonitorTopology.Capture().ToWire(), true,Fingerprint)
         };
         foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
-                peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput));
+                peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
+                LayoutIdentity(peer.Peer)));
         string payload = JsonSerializer.Serialize(members);
         if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
         {
@@ -257,6 +324,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             try { await SendToAsync(recipient,
                 new Packet("environment-roster", recipient.Id, Text: payload), token); }
             catch (Exception) { /* peer may have disconnected */ }
+        await PublishEnvironmentLayoutAsync(token);
     }
 
     private void NotifySelection(Session? previous, Session? next)
@@ -634,6 +702,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         : "Android Accessibility disabled; device stays connected in view-only mode.");
                     continue;
                 }
+                if(p.Type=="environment-placement-update")
+                {
+                    if(p.Text is not { Length: > 1 and <= 512 })continue;
+                    EnvironmentPosition? placement;
+                    try { placement=JsonSerializer.Deserialize<EnvironmentPosition>(p.Text); }
+                    catch(JsonException){continue;}
+                    if(!EnvironmentPosition.Valid(placement) ||
+                        !_sessions.Values.Any(other=>
+                            LayoutIdentity(other.Peer)==placement!.Key))continue;
+                    ApplyEnvironmentPosition(placement!);
+                    continue;
+                }
                 if(p.Type=="environment-select")
                 {
                     // The hub owns routing decisions. Clients may request
@@ -921,6 +1001,20 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal int SelectedEnvironmentTargetId => Volatile.Read(ref _environmentTargetId);
     internal int OwnEnvironmentMemberId => Volatile.Read(ref _environmentOwnId);
     internal event Action? EnvironmentRosterChanged;
+    internal event Action<IReadOnlyDictionary<string,System.Drawing.PointF>>?
+        EnvironmentLayoutChanged;
+    private IReadOnlyDictionary<string,System.Drawing.PointF> _sharedLayout =
+        new Dictionary<string,System.Drawing.PointF>(StringComparer.Ordinal);
+    internal IReadOnlyDictionary<string,System.Drawing.PointF> SharedLayout =>
+        Volatile.Read(ref _sharedLayout);
+    internal bool PublishEnvironmentPlacement(string key,
+        System.Drawing.PointF point)
+    {
+        var placement=new EnvironmentPosition(key,point.X,point.Y);
+        return EnvironmentPosition.Valid(placement) &&
+            TrySend(new Packet("environment-placement-update",
+                Text:JsonSerializer.Serialize(placement)));
+    }
     internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
@@ -1228,6 +1322,21 @@ internal sealed class HostSession : IInputSession, IDisposable
                         m.SupportsReverseInput))
                         SelectEnvironmentTarget(0);
                     EnvironmentRosterChanged?.Invoke();
+                }
+                else if (p.Type=="environment-layout" &&
+                    p.Text is { Length: > 1 and <= 4096 } layout)
+                {
+                    EnvironmentPosition[]? list;
+                    try {list=JsonSerializer.Deserialize<EnvironmentPosition[]>(layout);}
+                    catch(JsonException){continue;}
+                    if(list==null || list.Length>8 ||
+                        list.Any(x=>!EnvironmentPosition.Valid(x)) ||
+                        list.Select(x=>x.Key).Distinct(StringComparer.Ordinal).Count()!=list.Length)
+                        continue;
+                    var positions=list.ToDictionary(x=>x.Key,
+                        x=>new System.Drawing.PointF(x.X,x.Y),StringComparer.Ordinal);
+                    Volatile.Write(ref _sharedLayout,positions);
+                    EnvironmentLayoutChanged?.Invoke(positions);
                 }
                 else if (p.Type == "environment-unavailable")
                 {

@@ -1027,7 +1027,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
             }
             foreach(var route in disconnectedRoutes)
+            {
+                Interlocked.Exchange(ref route.LatestMove,null);
+                route.InputQueue.Writer.TryComplete();
                 await RevokeRelayAsync(route,route.Target.Id==id,token);
+            }
             await PublishEnvironmentAsync(token);
             PeerListChanged?.Invoke();
             Session? previous=null, next=null;

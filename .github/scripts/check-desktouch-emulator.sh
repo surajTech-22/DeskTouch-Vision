@@ -22,6 +22,10 @@ done
 if [[ "$ready" != 1 ]]; then
   echo "FAIL: Android app UI did not expose required controls after retries"
   adb shell dumpsys activity activities | grep -E 'ResumedActivity|mFocusedApp|com.desktouch.vision' | head -40 || true
+  echo "DEBUG: foreground app UI hierarchy (emulator only, no user data)"
+  adb shell cat /sdcard/desktouch-ui.xml 2>/dev/null | head -c 7000 || true
+  echo
+  adb shell dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp|Window' | head -25 || true
   adb logcat -d -s AndroidRuntime:E | tail -90 || true
   exit 1
 fi

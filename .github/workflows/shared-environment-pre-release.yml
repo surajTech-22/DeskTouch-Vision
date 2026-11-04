@@ -2,11 +2,13 @@ name: DeskTouch Shared Environment - pre-release verification (no publish)
 
 on:
   push:
-    branches: [fix/bluetooth-audit-stable-0318, feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313, fix/android-inline-display-native-input-v0314, fix/multidevice-authority-ime-updater-permissions-v0315, fix/unified-draggable-input-layout-v0316, fix/strict-screen-boundary-handoff-v0317]
+    branches: [feature/android-ime-input-bridge-0319, fix/bluetooth-audit-stable-0318, feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313, fix/android-inline-display-native-input-v0314, fix/multidevice-authority-ime-updater-permissions-v0315, fix/unified-draggable-input-layout-v0316, fix/strict-screen-boundary-handoff-v0317]
     paths:
       - 'DeskTouchVision/**'
       - 'AndroidDeskTouch/**'
       - '.github/workflows/shared-environment-pre-release.yml'
+      - '.github/workflows/android-desktouch.yml'
+      - '.github/workflows/desktouch-vision.yml'
       - '.github/scripts/**'
   workflow_dispatch:
 
@@ -119,7 +121,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK for emulator launch
+      - name: Build debug APK for real app-process input probes
         working-directory: AndroidDeskTouch
         shell: bash
         run: |
@@ -147,3 +149,11 @@ jobs:
             adb shell pm grant com.desktouch.vision android.permission.POST_NOTIFICATIONS
             adb shell am start -n com.desktouch.vision/.MainActivity
             bash .github/scripts/check-desktouch-emulator.sh
+            bash .github/scripts/test-desktouch-input-emulator.sh
+      - name: Preserve Android input acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouch-Android-Real-Input-Acceptance
+          path: android-input-emulator.txt
+          if-no-files-found: ignore

@@ -117,6 +117,17 @@ public final class MainActivity extends Activity {
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         addButton(page,"Open Android Accessibility settings",()->
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+        // A dedicated input method improves editor typing (including WebViews)
+        // without requiring root, developer mode or a Bluetooth pairing.
+        // Android always requires the user to enable/select a third-party IME.
+        addButton(page,"Enable DeskTouch remote keyboard",()->
+            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
+        addButton(page,"Select DeskTouch remote keyboard",()->{
+            android.view.inputmethod.InputMethodManager manager=
+                (android.view.inputmethod.InputMethodManager)
+                getSystemService(INPUT_METHOD_SERVICE);
+            if(manager!=null)manager.showInputMethodPicker();
+        });
         addButton(page,"Stop Windows control on this phone",()->{
             DeskTouchRuntime.remoteNativeTouch();
             status.setText("Windows input authority returned to Android.");
@@ -262,7 +273,9 @@ public final class MainActivity extends Activity {
             "Select an active destination and take keyboard/mouse authority. " +
             "The Android typing field sends text to the selected Windows PC. " +
             "Enable Accessibility to allow approved Windows devices to control " +
-            "supported editable Android fields.");
+            "supported editable Android fields. " +
+            "The optional DeskTouch keyboard provides a native Android " +
+            "input-method connection to non-password text editors.");
         note.setTextColor(Color.LTGRAY);
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
@@ -274,7 +287,12 @@ public final class MainActivity extends Activity {
     }
     private void refreshPermissionState(){
         if(permissionState==null)return;
-        permissionState.setText(PermissionContinuity.state(this));
+        permissionState.setText(PermissionContinuity.state(this) +
+            "\nDeskTouch keyboard: " +
+            (DeskTouchInputMethod.isSelected(this)
+                ? "selected for focused-field typing."
+                : "not selected (optional; use Enable and Select above).") +
+            "\nPhysical Bluetooth keyboard/mouse emulation is not active.");
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){

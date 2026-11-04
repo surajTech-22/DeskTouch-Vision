@@ -23,6 +23,17 @@
         </activity>
         <service android:name=".AutoConnectService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+        <!-- Optional system keyboard: user must enable and select it manually. -->
+        <service android:name=".DeskTouchInputMethod"
+            android:label="DeskTouch keyboard receiver"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im"
+                android:resource="@xml/desktouch_ime" />
+        </service>
         <!-- Explicit opt-in from Android Settings is always required. -->
         <service android:name=".DeskTouchAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"

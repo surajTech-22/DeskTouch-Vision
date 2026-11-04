@@ -585,6 +585,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             IInputSession? next=null;
             ConnectedPeer? selectedPeer=null;
+            bool wasControllingRemote=_capture?.RemoteActive==true;
             if(id<=0 && _host!=null)
             {
                 int chosen=id<0 ? -id : 0;
@@ -627,7 +628,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // discarded physical key/mouse events and caused intermittent
             // Windows/Android handoff failures.
             if(_capture!=null)
-                _capture.Retarget(next,edge);
+                _capture.Retarget(next,edge,
+                    requestHandoff&&wasControllingRemote);
             else
             {
                 _capture=new SourceCapture(this,next,Status,edge,
@@ -684,7 +686,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // authenticated an active incoming peer.
             _nativeInput = new PhysicalInputMonitor(this);
             _nativeInput.IsOutboundInputCaptured=() =>
-                _capture?.RemoteActive==true;
+                _capture?.OutboundInputReserved==true;
             _receiver = new ReceiverServer(Status, _nativeInput.Priority, ConfirmPeerAsync,
                 _trusted, ConfirmTrustAsync);
             _receiver.PeerConnected += OnIncomingPeerConnected;
@@ -1077,7 +1079,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture = null;
         _nativeInput ??= new PhysicalInputMonitor(this);
         _nativeInput.IsOutboundInputCaptured=() =>
-            _capture?.RemoteActive==true;
+            _capture?.OutboundInputReserved==true;
         _nativeInput.Start();
         session.AttachReverseInput(_nativeInput.Priority,
             () => _capture == null ||

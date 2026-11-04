@@ -317,7 +317,7 @@ internal sealed class DisplayArrangementControl : Control
             Trimming = platform=="Android"
                 ? StringTrimming.EllipsisWord : StringTrimming.EllipsisCharacter,
             FormatFlags = platform=="Android"
-                ? 0 : StringFormatFlags.NoWrap
+                ? (StringFormatFlags)0 : StringFormatFlags.NoWrap
         };
         g.DrawString(deviceName, nameFont, Brushes.White, title, format);
         var numberTile = new RectangleF(rect.Left + 4,

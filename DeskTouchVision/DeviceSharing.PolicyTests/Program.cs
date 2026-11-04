@@ -939,6 +939,16 @@ finally
     Check(inline.Where(item=>item.Device.IsAndroid)
         .All(item=>item.World.Height>item.World.Width),
         "Android members must be displayed as portrait screen tiles, not footer labels");
+    var liveRoute=new EnvironmentRouteOrder(
+        new[]{EnvironmentRouteOrder.Local,7,-2,-3});
+    Check(liveRoute.Neighbor(7,MonitorEdge.Right)==-2 &&
+        liveRoute.Neighbor(-2,MonitorEdge.Left)==7,
+        "Keyboard/mouse moves between neighboring PC and Android without separate pairing");
+    var reversedRoute=new EnvironmentRouteOrder(
+        new[]{-2,EnvironmentRouteOrder.Local,7});
+    Check(reversedRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Left)==-2 &&
+        reversedRoute.Neighbor(-2,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
+        "Dragging the phone to the other side reverses real cursor-edge routing");
     Console.WriteLine("PASS: multiple authenticated Android device tiles, view-only phones, and no duplicate Windows monitors.");
 }
 
@@ -999,6 +1009,53 @@ var uiThread = new Thread(() =>
             diagram.DrawToBitmap(rendered,
                 new System.Drawing.Rectangle(0, 0, diagram.Width, diagram.Height));
         }
+        // Simulate a physical mouse-down/move/up on the ACTUAL phone tile.
+        // Prior builds only clicked it to swap a single target; this must
+        // drag the phone while retaining independent mouse target selection.
+        using(var bitmap=new System.Drawing.Bitmap(diagram.Width,diagram.Height))
+            diagram.DrawToBitmap(bitmap,
+                new System.Drawing.Rectangle(0,0,diagram.Width,diagram.Height));
+        var phoneHit=diagram.OnlineHitRegions.First(x=>x.TargetId==-5).Hit;
+        var origin=new System.Drawing.Point((int)phoneHit.X+Math.Max(8,(int)phoneHit.Width/3),
+            (int)phoneHit.Y+Math.Max(8,(int)phoneHit.Height/3));
+        int selections=0,placements=0;
+        diagram.EnvironmentDeviceSelected+=_=>selections++;
+        diagram.EnvironmentArrangementChanged+=()=>placements++;
+        var down=typeof(DisplayArrangementControl).GetMethod("OnMouseDown",
+            System.Reflection.BindingFlags.Instance|
+            System.Reflection.BindingFlags.NonPublic)!;
+        var move=typeof(DisplayArrangementControl).GetMethod("OnMouseMove",
+            System.Reflection.BindingFlags.Instance|
+            System.Reflection.BindingFlags.NonPublic)!;
+        var up=typeof(DisplayArrangementControl).GetMethod("OnMouseUp",
+            System.Reflection.BindingFlags.Instance|
+            System.Reflection.BindingFlags.NonPublic)!;
+        down.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
+            System.Windows.Forms.MouseButtons.Left,1,origin.X,origin.Y,0)});
+        move.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
+            System.Windows.Forms.MouseButtons.Left,1,origin.X-42,origin.Y,0)});
+        up.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
+            System.Windows.Forms.MouseButtons.Left,1,origin.X-42,origin.Y,0)});
+        Check(placements==1&&selections==0 &&
+            diagram.StoredMemberOffsets.Values.Any(p=>Math.Abs(p.X)>1),
+            "Android tile must DRAG and persist its position, not switch to a one-to-one target");
+        // Press/release with no movement should select, not drag/reconnect.
+        using(var bitmap2=new System.Drawing.Bitmap(diagram.Width,diagram.Height))
+            diagram.DrawToBitmap(bitmap2,
+                new System.Drawing.Rectangle(0,0,diagram.Width,diagram.Height));
+        var movedHit=diagram.OnlineHitRegions.First(x=>x.TargetId==-5).Hit;
+        int tapX=(int)(movedHit.X+movedHit.Width/2);
+        int tapY=(int)(movedHit.Y+movedHit.Height/2);
+        down.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
+            System.Windows.Forms.MouseButtons.Left,1,tapX,tapY,0)});
+        up.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
+            System.Windows.Forms.MouseButtons.Left,1,tapX,tapY,0)});
+        Check(selections==1&&placements==1,
+            "Tapping a phone should select it; dragging should only move its screen tile");
+        Check(view.Controls.OfType<System.Windows.Forms.Control>()
+            .SelectMany(x=>x.Controls.OfType<System.Windows.Forms.ComboBox>())
+            .All(c=>c.Name!="ConnectedDeviceTarget"),
+            "The old two-item one-to-one target dropdown must not be presented");
         // A real WinForms UserClosing event must hide the existing HWND,
         // not dispose the receiver/input hooks or close the TLS pairing.
         // We create the HWND without showing the form, so Shown/StartListening

@@ -14,7 +14,17 @@ for attempt in $(seq 1 12); do
     ready=1
     break
   fi
-  if [[ "$attempt" == 5 || "$attempt" == 9 ]]; then
+  # GitHub's headless AOSP/Google emulator intermittently starts with an
+  # ANR from its SYSTEM launcher (Quickstep/Pixel Launcher), which obscures
+  # every app even while DeskTouch is the resumed foreground activity.
+  # Close only that explicitly identified non-DeskTouch system dialog.
+  # Never dismiss an ANR for DeskTouch itself or accept an empty hierarchy.
+  if [[ "$current" == *"Quickstep isn't responding"* ||
+        "$current" == *"Pixel Launcher isn't responding"* ]]; then
+    echo "Emulator launcher ANR detected; dismissing SYSTEM launcher only"
+    adb shell input tap 540 1200 || true
+    adb shell am start -n com.desktouch.vision/.MainActivity >/dev/null || true
+  elif [[ "$attempt" == 5 || "$attempt" == 9 ]]; then
     adb shell am start -n com.desktouch.vision/.MainActivity >/dev/null || true
   fi
   sleep 2

@@ -156,7 +156,7 @@ internal sealed class PhysicalInputMonitor : IDisposable
             if ((mouse.flags & 1) == 0 &&
                 (msg is Win.WM_MOUSEMOVE or Win.WM_LBUTTONDOWN or Win.WM_RBUTTONDOWN or
                        Win.WM_MBUTTONDOWN or Win.WM_MOUSEWHEEL or Win.WM_MOUSEHWHEEL))
-                Priority.RecordPhysicalActivity();
+                RecordPhysicalIfLocal();
         }
         return Win.CallNextHookEx(_mouseHook, code, wParam, lParam);
     }
@@ -178,7 +178,7 @@ internal sealed class PhysicalInputMonitor : IDisposable
             if (header.Device == IntPtr.Zero) return; // reject virtual/unidentified source
             if (header.Type == 1) // RIM_TYPEKEYBOARD; no scan codes stored
             {
-                Priority.RecordPhysicalActivity();
+                RecordPhysicalIfLocal();
             }
             else if (header.Type == 0 && size >= Marshal.SizeOf<Win.RAWINPUT>())
             {

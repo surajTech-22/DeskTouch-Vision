@@ -3,6 +3,9 @@ package com.desktouch.vision;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.accessibilityservice.InputMethod;
+import android.text.InputType;
+import android.view.inputmethod.EditorInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.os.Build;
 import android.content.Context;
 import android.graphics.Path;
@@ -310,24 +313,78 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(pendingGestures.isEmpty())remoteGesture=false;
         pumpGestures();
     }
+    static boolean safeEditorType(int inputType){
+        int kind=inputType & InputType.TYPE_MASK_CLASS;
+        int variant=inputType & InputType.TYPE_MASK_VARIATION;
+        if(kind==InputType.TYPE_CLASS_TEXT){
+            return variant!=InputType.TYPE_TEXT_VARIATION_PASSWORD &&
+                variant!=InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD &&
+                variant!=InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;
+        }
+        return kind!=InputType.TYPE_NULL &&
+            !(kind==InputType.TYPE_CLASS_NUMBER &&
+                variant==InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+    }
+
+    private AccessibilityNodeInfo focusedEditor(){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root!=null){
+            AccessibilityNodeInfo node=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if(node!=null)return node;
+        }
+        // WebView/editors may expose focused input under a separate
+        // interactive window, not under getRootInActiveWindow().
+        List<AccessibilityWindowInfo> windows=getWindows();
+        if(windows==null)return null;
+        for(AccessibilityWindowInfo window:windows){
+            if(window==null)continue;
+            AccessibilityNodeInfo tree=window.getRoot();
+            if(tree==null)continue;
+            AccessibilityNodeInfo node=tree.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if(node!=null)return node;
+        }
+        return null;
+    }
+
+    private InputMethod.AccessibilityInputConnection nativeEditor(
+        AccessibilityNodeInfo focusedField)
+    {
+        if(Build.VERSION.SDK_INT<33 || (focusedField!=null &&
+            (!focusedField.isEditable() || focusedField.isPassword())))
+            return null;
+        try {
+            InputMethod method=getInputMethod();
+            if(method==null || !method.getCurrentInputStarted())return null;
+            EditorInfo info=method.getCurrentInputEditorInfo();
+            if(info==null || !safeEditorType(info.inputType))return null;
+            // An active non-password Android InputConnection is itself an
+            // authoritative focused editor, including WebView, even when
+            // findFocus() cannot expose a standard AccessibilityNodeInfo.
+            return method.getCurrentInputConnection();
+        }catch(RuntimeException unavailable){return null;}
+    }
+
     private boolean commitNativeText(String incoming,
         AccessibilityNodeInfo focusedField)
     {
-        // API 33+ Accessibility IME is Android's own editable-field input
-        // channel. Never use it on non-editable or password UI components.
-        if(Build.VERSION.SDK_INT<33 || focusedField==null ||
-            !focusedField.isEditable() || focusedField.isPassword())return false;
-        try {
-            InputMethod.AccessibilityInputConnection editor=
-                getInputMethod().getCurrentInputConnection();
-            if(editor==null)return false;
+        InputMethod.AccessibilityInputConnection editor=nativeEditor(focusedField);
+        if(editor==null)return false;
+        try{
             editor.commitText(incoming,1,null);
             return true;
         }catch(RuntimeException unavailable){
-            // A custom editor may not supply an InputConnection; use the
-            // existing ACTION_SET_TEXT route instead of losing input.
-            return false;
+            return false; // fallback to ACTION_SET_TEXT where available
         }
+    }
+
+    private boolean nativeDelete(int vk,AccessibilityNodeInfo field){
+        if(vk!=8 && vk!=46)return false;
+        InputMethod.AccessibilityInputConnection editor=nativeEditor(field);
+        if(editor==null)return false;
+        try{
+            editor.deleteSurroundingText(vk==8?1:0,vk==46?1:0);
+            return true;
+        }catch(RuntimeException unavailable){return false;}
     }
 
     static void text(String incoming){
@@ -335,11 +392,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(service==null||!ready(service)||
             incoming==null||incoming.length()==0||incoming.length()>512)return;
         service.ui.post(()->{
-            AccessibilityNodeInfo root=service.getRootInActiveWindow();
-            if(root==null)return;
-            AccessibilityNodeInfo field=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-            if(field==null||!field.isEditable()||field.isPassword())return;
+            AccessibilityNodeInfo field=service.focusedEditor();
             if(service.commitNativeText(incoming,field))return;
+            if(field==null||!field.isEditable()||field.isPassword())return;
             CharSequence original=field.getText();
             String content=original==null?"":original.toString();
             int start=field.getTextSelectionStart();
@@ -376,12 +431,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(!pressed||control||alt)return;
         if(vk==27){performGlobalAction(GLOBAL_ACTION_BACK);return;}
         if(vk==0x24 && !isTextFieldFocused()){performGlobalAction(GLOBAL_ACTION_HOME);return;}
-        AccessibilityNodeInfo root=getRootInActiveWindow();
-        if(root==null)return;
-        AccessibilityNodeInfo field=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-        if(field==null || !field.isEditable() || field.isPassword())return;
+        AccessibilityNodeInfo field=focusedEditor();
         String printable=WindowsKeyText.printable(vk,shift);
         if(printable!=null && commitNativeText(printable,field))return;
+        if(nativeDelete(vk,field))return;
+        if(field==null || !field.isEditable() || field.isPassword())return;
         CharSequence text=field.getText();
         String original=text==null?"":text.toString();
         WindowsKeyText.Edit change=WindowsKeyText.apply(original,

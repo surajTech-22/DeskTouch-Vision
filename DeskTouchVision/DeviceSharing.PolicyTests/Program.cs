@@ -662,7 +662,7 @@ try
     multiServer.AllowForwardClaim=()=>false; // no Windows SendInput in CI.
     multiServer.Start();
     Check(multiServer.CanAcceptNewPeer,"Fresh hub must accept a peer");
-    using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(18));
+    using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(35));
     using var peer1=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
         multiServer.Fingerprint,_=>{},timeout.Token);
     using var peer2=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
@@ -673,6 +673,21 @@ try
         "Windows receiver must keep TWO authenticated TLS peers at once");
     Check(multiServer.CanAcceptNewPeer,
         "Windows must remain discoverable/ready with two connected devices");
+    // Drive the real authenticated hub->client->hub Bluetooth diagnostic flow.
+    // Hosted CI has no physical Bluetooth radio, so the result may be
+    // NoAdapter/Unknown: never assert that HID hardware is usable in CI.
+    Check(peer2.RequestBluetoothCheck(),
+        "A connected Windows client must request a shared Bluetooth scan");
+    for(int t=0;t<140 && (peer2.BluetoothReports.Count!=3 ||
+        peer2.BluetoothReports.Any(p=>p.Capability.State=="Checking"));t++)
+        await Task.Delay(100,timeout.Token);
+    Check(peer2.BluetoothReports.Count==3 &&
+        peer2.BluetoothReports.All(p=>p.Capability.State!="Checking") &&
+        peer2.BluetoothReports.Select(p=>p.Id).Distinct().Count()==3,
+        "Hub and two connected Windows clients must return one non-spoofed Bluetooth capability report each");
+    Check(!multiPriority.RemoteGranted,
+        "Bluetooth diagnostics must not claim keyboard or mouse authority");
+    Console.WriteLine("PASS: Bluetooth capability collected over existing TLS from hub and two Windows peers without input claims.");
     peer1.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);

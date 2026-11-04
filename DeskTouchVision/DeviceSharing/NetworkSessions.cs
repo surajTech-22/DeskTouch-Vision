@@ -125,6 +125,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static string LayoutIdentity(ConnectedPeer peer) =>
         string.IsNullOrWhiteSpace(peer.DeviceFingerprint) ?
             peer.Platform+"|"+peer.Name : peer.DeviceFingerprint;
+    internal static bool OwnsPlacement(ConnectedPeer peer,string key)=>
+        key==LayoutIdentity(peer) || key=="hub@"+LayoutIdentity(peer);
 
     internal void InitializeEnvironmentLayout(
         IReadOnlyDictionary<string,System.Drawing.PointF> saved)
@@ -147,7 +149,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     }
     private void ApplyEnvironmentPosition(EnvironmentPosition placement)
     {
-        lock(_layoutGate)_environmentPositions[placement.Key]=placement;
+        lock(_layoutGate)
+        {
+            // Replace a legacy local-offset value when a single hub-relative
+            // position arrives. Two competing conventions must not survive.
+            if(placement.Key.StartsWith("hub@",StringComparison.Ordinal))
+                _environmentPositions.Remove(placement.Key["hub@".Length..]);
+            _environmentPositions[placement.Key]=placement;
+        }
         EnvironmentLayoutChanged?.Invoke(EnvironmentPositions);
         _=Task.Run(async()=>{
             try{await PublishEnvironmentLayoutAsync(_cancel.Token);}
@@ -160,7 +169,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var placement=new EnvironmentPosition(key,point.X,point.Y);
         if(!EnvironmentPosition.Valid(placement))return false;
         // Only a current, authenticated member can acquire a drag position.
-        if(!_sessions.Values.Any(x=>LayoutIdentity(x.Peer)==key))return false;
+        if(!_sessions.Values.Any(x=>OwnsPlacement(x.Peer,key)))return false;
         ApplyEnvironmentPosition(placement);
         return true;
     }
@@ -806,7 +815,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     catch(JsonException){continue;}
                     if(!EnvironmentPosition.Valid(placement) ||
                         !_sessions.Values.Any(other=>
-                            LayoutIdentity(other.Peer)==placement!.Key))continue;
+                            OwnsPlacement(other.Peer,placement!.Key)))continue;
                     ApplyEnvironmentPosition(placement!);
                     continue;
                 }

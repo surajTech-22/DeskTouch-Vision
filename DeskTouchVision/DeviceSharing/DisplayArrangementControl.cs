@@ -103,6 +103,7 @@ internal sealed class DisplayArrangementControl : Control
     private RectangleF _draggingMemberHit;
     private float _layoutScale=1f;
     internal event Action? EnvironmentArrangementChanged;
+    internal event Action<string,PointF>? EnvironmentMemberMoved;
 
     internal IReadOnlyDictionary<string,PointF> StoredMemberOffsets =>
         new Dictionary<string,PointF>(_memberOffsets,StringComparer.Ordinal);
@@ -263,6 +264,49 @@ internal sealed class DisplayArrangementControl : Control
         return new Point(
             left <= right ? Math.Clamp(delta.X, left, right) : 0,
             top <= bottom ? Math.Clamp(delta.Y, top, bottom) : 0);
+    }
+
+    internal static RectangleF SnapToConnectedScreen(RectangleF proposed,
+        IReadOnlyList<RectangleF> otherScreens)
+    {
+        // A screen dropped inside another screen has no meaningful border.
+        // Snap to the nearest FREE exterior edge (all four directions).
+        // This also makes a dragged phone reachable by cursor movement.
+        RectangleF best=proposed;
+        double distance=double.PositiveInfinity;
+        foreach(var anchor in otherScreens)
+        {
+            if(anchor.Width<1 || anchor.Height<1)continue;
+            const float gap=8f;
+            foreach(var side in new[]{MonitorEdge.Left,MonitorEdge.Right,
+                MonitorEdge.Top,MonitorEdge.Bottom})
+            {
+                float x=proposed.X,y=proposed.Y;
+                float centerX=Math.Clamp(proposed.Left+proposed.Width/2,
+                    anchor.Left+3,anchor.Right-3);
+                float centerY=Math.Clamp(proposed.Top+proposed.Height/2,
+                    anchor.Top+3,anchor.Bottom-3);
+                switch(side)
+                {
+                    case MonitorEdge.Left: x=anchor.Left-proposed.Width-gap;
+                        y=centerY-proposed.Height/2;break;
+                    case MonitorEdge.Right: x=anchor.Right+gap;
+                        y=centerY-proposed.Height/2;break;
+                    case MonitorEdge.Top: y=anchor.Top-proposed.Height-gap;
+                        x=centerX-proposed.Width/2;break;
+                    case MonitorEdge.Bottom:y=anchor.Bottom+gap;
+                        x=centerX-proposed.Width/2;break;
+                }
+                var candidate=new RectangleF(x,y,proposed.Width,proposed.Height);
+                if(otherScreens.Any(other=>
+                    RectangleF.Intersect(candidate,other).Width>2 &&
+                    RectangleF.Intersect(candidate,other).Height>2))continue;
+                double dx=candidate.X-proposed.X,dy=candidate.Y-proposed.Y;
+                double cost=dx*dx+dy*dy;
+                if(cost<distance){distance=cost;best=candidate;}
+            }
+        }
+        return best;
     }
 
     private Point ClampedDragPoint(Point attempted)
@@ -577,10 +621,22 @@ internal sealed class DisplayArrangementControl : Control
                 {
                     string key=member.LayoutKey;
                     var old=_memberOffsets.GetValueOrDefault(key);
+                    var wanted=new RectangleF(_draggingMemberHit.X+memberDeltaX,
+                        _draggingMemberHit.Y+memberDeltaY,
+                        _draggingMemberHit.Width,_draggingMemberHit.Height);
+                    var occupied=new List<RectangleF>{_localHit};
+                    if(_remoteHit.Width>0)occupied.Add(_remoteHit);
+                    foreach(var other in _environmentHits)
+                        if(other.TargetId!=id)occupied.Add(other.Hit);
+                    var snapped=SnapToConnectedScreen(wanted,occupied);
+                    float scale=Math.Max(.001f,_layoutScale);
                     _memberOffsets[key]=new PointF(
-                        Math.Clamp(old.X+memberDeltaX/Math.Max(.001f,_layoutScale),-80000,80000),
-                        Math.Clamp(old.Y+memberDeltaY/Math.Max(.001f,_layoutScale),-80000,80000));
+                        Math.Clamp(old.X+(snapped.X-_draggingMemberHit.X)/scale,
+                            -80000,80000),
+                        Math.Clamp(old.Y+(snapped.Y-_draggingMemberHit.Y)/scale,
+                            -80000,80000));
                     EnvironmentArrangementChanged?.Invoke();
+                    EnvironmentMemberMoved?.Invoke(key,_memberOffsets[key]);
                 }
             }
             Invalidate();

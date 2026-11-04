@@ -31,6 +31,22 @@ Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Desktop",testDisplay,
 Check(ReceiverServer.AllowsForwardInput(new ConnectedPeer("Approved phone",testDisplay,
     SupportsReverseInput:true,Platform:"Android",SupportsForwardInput:true)),
     "Only an Android session explicitly enabled for forward control may request an input lease");
+Check(ReceiverServer.AllowsAndroidCapability(
+    new ConnectedPeer("Xiaomi",testDisplay,Platform:"Android"),
+    new Packet("android-capability",1)),
+    "An authenticated Android phone can advertise that Accessibility was restored");
+Check(ReceiverServer.AllowsAndroidCapability(
+    new ConnectedPeer("Xiaomi",testDisplay,Platform:"Android"),
+    new Packet("android-capability",0)),
+    "An Android phone can revoke Accessibility on an active TLS session");
+Check(!ReceiverServer.AllowsAndroidCapability(
+    new ConnectedPeer("Desktop",testDisplay,Platform:"Windows"),
+    new Packet("android-capability",1)),
+    "Windows peer cannot spoof Android Accessibility permission changes");
+Check(!ReceiverServer.AllowsAndroidCapability(
+    new ConnectedPeer("Xiaomi",testDisplay,Platform:"Android"),
+    new Packet("android-capability",3)),
+    "Unknown Android capability flags cannot grant keyboard authority");
 Console.WriteLine("PASS: Android input opt-in enforced; Windows PC duplex preserved.");
 
 // A LAN with two Windows PCs and one Android phone must not be collapsed to

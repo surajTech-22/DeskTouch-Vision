@@ -165,10 +165,12 @@ internal static class UpdateClient
     {
         if (window.IsDisposed) return;
         SetStatus(window, "checking GitHub releases");
+        Log("Manual release check requested; checking for active download and GitHub response.");
         try
         {
-            // Manual requests WAIT for the automatic startup check/download to
-            // finish; they never mistake an in-progress update for "no release".
+            // Manual checks wait for the active transaction only up to a
+            // bounded deadline. Never leave "checking GitHub releases" stuck
+            // indefinitely behind an automatic download on a second PC.
             var result = await CheckForUpdatesAsync(window, manual: true, CancellationToken.None);
             if (window.IsDisposed || result == CheckResult.InstallationStarted) return;
             string message = result switch
@@ -176,7 +178,7 @@ internal static class UpdateClient
                 CheckResult.NoReleases =>
                     "No published releases were returned by the official DeskTouch repository.",
                 CheckResult.InstallationBusy =>
-                    "Another verified DeskTouch installer is active. This check did not download another copy or close your Displays window. Check the updater log if the installer remains busy.",
+                    "Another update check, download or verified installer is in progress. This window will not stay on 'Checking GitHub releases'. For details run CHECK_DESKTOUCH.ps1 or inspect %LOCALAPPDATA%\\DeskTouchVision\\logs\\update-check.log.",
                 _ => $"This installation is already current (v{CurrentVersion.ToString(3)})."
             };
             SetStatus(window, "Displays");
@@ -201,16 +203,23 @@ internal static class UpdateClient
         // Automatic events never start a duplicate update in progress.
         if (!manual && !await UpdateGate.WaitAsync(0, cancellation))
             return CheckResult.UpToDate;
-        if (manual) await UpdateGate.WaitAsync(cancellation);
+        if (manual && !await UpdateGate.WaitAsync(TimeSpan.FromSeconds(12), cancellation))
+        {
+            Log("Manual check returned busy: an automatic check/download holds the update gate.");
+            return CheckResult.InstallationBusy;
+        }
         try
         {
             if (window.IsDisposed) return CheckResult.UpToDate;
+            using var metadataDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            metadataDeadline.CancelAfter(TimeSpan.FromSeconds(25));
             using var response = await Downloads.GetAsync(
-                $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest", cancellation);
+                $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest",
+                HttpCompletionOption.ResponseHeadersRead, metadataDeadline.Token);
             if (response.StatusCode == HttpStatusCode.NotFound)
                 return CheckResult.NoReleases;
             response.EnsureSuccessStatusCode();
-            using var release = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation));
+            using var release = JsonDocument.Parse(await response.Content.ReadAsStringAsync(metadataDeadline.Token));
             var root = release.RootElement;
             var tag = root.GetProperty("tag_name").GetString();
             if (!Version.TryParse(tag?.TrimStart('v', 'V'), out var latest))

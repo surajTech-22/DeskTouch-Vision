@@ -530,6 +530,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.ArrangedTargetOrder(baseId));
     }
 
+    private bool CurrentDestinationIsAndroid()
+    {
+        if(_captureUsesInbound || _host==null)
+        {
+            int id=_receiver?.SelectedPeerId??0;
+            return id>0 && _receiver?.ConnectedPeers
+                .Any(p=>p.Id==id && p.Peer.Platform=="Android")==true;
+        }
+        int target=_host.SelectedEnvironmentTargetId;
+        return target>0 && _host.EnvironmentMembers.Any(
+            m=>m.Id==target && m.Platform=="Android" &&
+                m.SupportsReverseInput);
+    }
+
     private int CurrentInputTargetId() =>
         _captureUsesInbound || _host==null
             ? _receiver?.SelectedPeerId ?? EnvironmentRouteOrder.Local
@@ -638,6 +652,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _capture=new SourceCapture(this,next,Status,edge,
                     preserveRawInput:true);
                 _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
+                _capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
                 _capture.Arm();
             }
             if(requestHandoff)
@@ -666,6 +681,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
             _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
+                _capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
             _capture.Arm();
             _captureInboundPeerId=_receiver.SelectedPeerId;
             Status("Windows controls " + _incomingPeer.Name +
@@ -1096,6 +1112,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
             preserveRawInput: true);
         _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
+                _capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
         session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;

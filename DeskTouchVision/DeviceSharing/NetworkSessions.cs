@@ -90,6 +90,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly object _layoutGate=new();
     private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
         new(StringComparer.Ordinal);
+    // Defaults may move when a Windows peer joins. User-dragged placements
+    // remain authoritative and must NEVER be reset by roster refreshes.
+    private readonly HashSet<string> _automaticPositionKeys=new(StringComparer.Ordinal);
     internal event Action<IReadOnlyDictionary<string,System.Drawing.PointF>>?
         EnvironmentLayoutChanged;
     // A single environment can have many authenticated peers but only one
@@ -134,6 +137,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         lock(_layoutGate)
         {
             _environmentPositions.Clear();
+            _automaticPositionKeys.Clear();
             foreach(var pair in saved)
             {
                 var position=new EnvironmentPosition(pair.Key,pair.Value.X,pair.Value.Y);
@@ -156,6 +160,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if(placement.Key.StartsWith("hub@",StringComparison.Ordinal))
                 _environmentPositions.Remove(placement.Key["hub@".Length..]);
             _environmentPositions[placement.Key]=placement;
+            _automaticPositionKeys.Remove(placement.Key);
         }
         EnvironmentLayoutChanged?.Invoke(EnvironmentPositions);
         _=Task.Run(async()=>{
@@ -373,6 +378,22 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
+    // One canonical placement for a phone on all PCs, including the period
+    // BEFORE anybody drags its tile. Derived solely from hub dimensions and
+    // authenticated Windows peer geometry, never the local preview origin.
+    internal static EnvironmentPosition DefaultAndroidPosition(string key,
+        System.Drawing.Rectangle hub,int windowsWidth,int windowsCount,int index)
+    {
+        int gap=Math.Max(90,hub.Height/12);
+        int phoneHeight=Math.Max(380,(int)(hub.Height*.88));
+        int phoneWidth=Math.Max(300,(int)(phoneHeight*.64));
+        int x=hub.Width+(windowsCount>0?110+windowsWidth+
+            Math.Max(0,windowsCount-1)*110:0)+gap+index*(phoneWidth+gap);
+        int y=(hub.Height-phoneHeight)/2;
+        return new EnvironmentPosition(key,Math.Clamp(x,-80000,80000),
+            Math.Clamp(y,-80000,80000));
+    }
+
     private async Task PublishEnvironmentAsync(CancellationToken token)
     {
         if (token.IsCancellationRequested) return;
@@ -386,8 +407,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
                 LayoutIdentity(peer.Peer)));
-        // Migrate names written by v0.3.16's local-only UI into stable
-        // authenticated certificate identities whenever one is available.
+        // Migrate local-only offsets and seed the same hub-relative phone
+        // placement for both Windows previews. Do not overwrite user drags.
+        bool layoutChanged=false;
         lock(_layoutGate)
         {
             foreach(var peer in _sessions.Values)
@@ -400,7 +422,39 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _environmentPositions[stable]=old with {Key=stable};
                 _environmentPositions.Remove(legacy);
             }
+            var snapshot=_sessions.Values.OrderBy(p=>p.Id).ToArray();
+            var windows=snapshot.Where(p=>p.Peer.Platform=="Windows").ToArray();
+            int windowsWidth=windows.Sum(p=>p.Peer.Monitors.Bounds.Width);
+            var hub=MonitorTopology.Capture().Bounds;
+            int phoneIndex=0;
+            foreach(var phone in snapshot.Where(p=>p.Peer.Platform=="Android"))
+            {
+                string identity=LayoutIdentity(phone.Peer);
+                string canonical="hub@"+identity;
+                var proposed=DefaultAndroidPosition(canonical,hub,
+                    windowsWidth,windows.Length,phoneIndex++);
+                if(!_environmentPositions.ContainsKey(canonical) &&
+                    _environmentPositions.TryGetValue(identity,out var legacy))
+                {
+                    // The older layout value was a displacement from the
+                    // local default. Convert it once on the hub, then share.
+                    _environmentPositions.Remove(identity);
+                    _environmentPositions[canonical]=proposed with {
+                        X=Math.Clamp(proposed.X+legacy.X,-80000,80000),
+                        Y=Math.Clamp(proposed.Y+legacy.Y,-80000,80000)};
+                    layoutChanged=true;
+                }
+                else if(!_environmentPositions.ContainsKey(canonical) ||
+                    _automaticPositionKeys.Contains(canonical))
+                {
+                    if(!_environmentPositions.TryGetValue(canonical,out var old) ||
+                        old!=proposed)layoutChanged=true;
+                    _environmentPositions[canonical]=proposed;
+                    _automaticPositionKeys.Add(canonical);
+                }
+            }
         }
+        if(layoutChanged)EnvironmentLayoutChanged?.Invoke(EnvironmentPositions);
         string payload = JsonSerializer.Serialize(members);
         if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
         {

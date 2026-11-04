@@ -468,9 +468,14 @@ internal sealed class SourceCapture : IDisposable
             {
                 // Some precision touchpads do not provide raw mouse packets.
                 // Fallback uses attempted pointer displacement from parked anchor.
-                if (Environment.TickCount64 - _lastRawMs > 650)
+                long now=Environment.TickCount64;
+                // Hybrid mice and precision touchpads alternate Raw Input and
+                // WM_MOUSEMOVE. The former 650 ms exclusion window dropped
+                // legitimate hook-only movement after a raw event, producing
+                // irregular Android cursor delays. Ignore only near-duplicates.
+                if (ShouldUseHookFallback(_lastRawMs,now))
                 {
-                    _lastFallbackMs=Environment.TickCount64;
+                    _lastFallbackMs=now;
                     MoveRemote(mouse.pt.X - _anchorX, mouse.pt.Y - _anchorY);
                 }
                 return (IntPtr)1;
@@ -629,6 +634,9 @@ internal sealed class SourceCapture : IDisposable
         }
         finally { Marshal.FreeHGlobal(memory); }
     }
+
+    internal static bool ShouldUseHookFallback(long lastRawMs,long now) =>
+        lastRawMs<=0 || (now>=lastRawMs && now-lastRawMs>40);
 
     internal static bool ShouldDropDuplicateRaw(long lastHookFallback,long now) =>
         lastHookFallback>0 && now>=lastHookFallback &&

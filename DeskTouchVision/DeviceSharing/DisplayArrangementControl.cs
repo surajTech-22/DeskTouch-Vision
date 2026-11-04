@@ -189,20 +189,7 @@ internal sealed class DisplayArrangementControl : Control
         // Their preview rectangles are visual placements only: Android is
         // never registered as a native Windows monitor or virtual driver.
         var core = Rectangle.Union(l, remotePos);
-        var extras = new List<(EnvironmentDisplayTile Device, Rectangle World)>();
-        int nextX = core.Right + Math.Max(90, core.Height / 12);
-        foreach (var device in _environmentDevices)
-        {
-            int count = Math.Clamp(device.ScreenCount, 1, 8);
-            int height = Math.Max(380, (int)(core.Height * (device.IsAndroid ? .88 : .79)));
-            int width = device.IsAndroid
-                ? Math.Max(220, (int)(height * .51)) // upright phone next to PCs
-                : Math.Max(420, (int)(height * .95 * count));
-            var location = new Rectangle(nextX,
-                core.Top + (core.Height - height) / 2, width, height);
-            extras.Add((device, location));
-            nextX = location.Right + Math.Max(90, core.Height / 12);
-        }
+        var extras = ComposeInlineDevices(core,_environmentDevices);
         var full = core;
         foreach(var additional in extras)
             full = Rectangle.Union(full,additional.World);
@@ -269,6 +256,28 @@ internal sealed class DisplayArrangementControl : Control
             }
             _environmentHits.Add((group,extra.Device.TargetId));
         }
+    }
+
+    internal static IReadOnlyList<(EnvironmentDisplayTile Device,Rectangle World)>
+        ComposeInlineDevices(Rectangle mainScreenArea,
+            IReadOnlyList<EnvironmentDisplayTile> members)
+    {
+        var result=new List<(EnvironmentDisplayTile Device,Rectangle World)>();
+        int nextX=mainScreenArea.Right+Math.Max(90,mainScreenArea.Height/12);
+        foreach(var device in members)
+        {
+            int count=Math.Clamp(device.ScreenCount,1,8);
+            int height=Math.Max(380,
+                (int)(mainScreenArea.Height*(device.IsAndroid?.88:.79)));
+            int width=device.IsAndroid
+                ? Math.Max(220,(int)(height*.51))
+                : Math.Max(420,(int)(height*.95*count));
+            var preview=new Rectangle(nextX,
+                mainScreenArea.Top+(mainScreenArea.Height-height)/2,width,height);
+            result.Add((device,preview));
+            nextX=preview.Right+Math.Max(90,mainScreenArea.Height/12);
+        }
+        return result;
     }
 
     private static void DrawPlaceholder(Graphics g, RectangleF r)

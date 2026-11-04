@@ -119,6 +119,52 @@ internal sealed class DisplayArrangementControl : Control
     internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
         _environmentHits.Select(x=>(x.TargetId,x.Hit)).ToArray();
 
+    internal int? AdjacentTarget(int currentId,MonitorEdge direction,int baseTargetId)
+    {
+        // Route by the ACTUAL dragged screen geometry, not the order in which
+        // peers happened to connect. Each authenticated peer can occupy any
+        // of the four outside edges of another screen.
+        var regions=new List<(int Id,RectangleF Bounds)> {
+            (EnvironmentRouteOrder.Local,_localHit),(baseTargetId,_remoteHit)
+        };
+        foreach(var item in _environmentHits)
+            if(_environmentDevices.Any(d=>d.TargetId==item.TargetId &&
+                d.SupportsInput))
+                regions.Add((item.TargetId,item.Hit));
+        return SpatialNeighbor(regions,currentId,direction);
+    }
+
+    internal static int? SpatialNeighbor(
+        IReadOnlyList<(int Id,RectangleF Bounds)> regions,
+        int currentId,MonitorEdge direction)
+    {
+        var origin=regions.FirstOrDefault(r=>r.Id==currentId);
+        if(origin.Bounds.Width<=0 || origin.Bounds.Height<=0)return null;
+        float ox=origin.Bounds.Left+origin.Bounds.Width/2;
+        float oy=origin.Bounds.Top+origin.Bounds.Height/2;
+        int? best=null;
+        double bestScore=double.PositiveInfinity;
+        foreach(var item in regions)
+        {
+            if(item.Id==currentId || item.Bounds.Width<=0 ||
+                item.Bounds.Height<=0)continue;
+            float cx=item.Bounds.Left+item.Bounds.Width/2;
+            float cy=item.Bounds.Top+item.Bounds.Height/2;
+            double forward=direction switch{
+                MonitorEdge.Right=>cx-ox,MonitorEdge.Left=>ox-cx,
+                MonitorEdge.Bottom=>cy-oy,MonitorEdge.Top=>oy-cy,_=>0
+            };
+            if(forward<=2)continue;
+            double perpendicular=direction is MonitorEdge.Left or MonitorEdge.Right
+                ? Math.Abs(cy-oy) : Math.Abs(cx-ox);
+            // Prefer the nearest aligned screen, while allowing deliberate
+            // vertically or horizontally staggered monitor arrangements.
+            double score=forward+perpendicular*1.65;
+            if(score<bestScore){bestScore=score;best=item.Id;}
+        }
+        return best;
+    }
+
     internal IReadOnlyList<int> ArrangedTargetOrder(int baseTargetId)
     {
         // A physical screen is at most one input destination; all its native

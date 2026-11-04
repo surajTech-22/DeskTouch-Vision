@@ -86,8 +86,9 @@ jobs:
             echo "DeskTouch Android unit run $pass / 2"
             gradle --no-daemon :app:testDebugUnitTest
           done
-          gradle --no-daemon :app:assembleDebug
+          gradle --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
           test -s app/build/outputs/apk/debug/app-debug.apk
+          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Record Android test summary without releasing APK
         shell: bash
         run: |
@@ -147,3 +148,11 @@ jobs:
             adb shell pm grant com.desktouch.vision android.permission.POST_NOTIFICATIONS
             adb shell am start -n com.desktouch.vision/.MainActivity
             bash .github/scripts/check-desktouch-emulator.sh
+            bash .github/scripts/test-desktouch-input-emulator.sh
+      - name: Preserve Android input acceptance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskTouch-Android-Real-Input-Acceptance
+          path: android-input-instrumentation.txt
+          if-no-files-found: ignore

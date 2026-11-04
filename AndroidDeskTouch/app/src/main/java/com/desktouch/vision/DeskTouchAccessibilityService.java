@@ -306,10 +306,15 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             }
         }
         if(editor!=null){
-            boolean clicked=editor.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-            boolean focused=editor.isFocused() ||
-                editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
-            if(clicked||focused)return true;
+            // ACTION_CLICK can report success on Xiaomi/WebView before any
+            // editor has actually gained input focus. Treat that as an
+            // unfinished tap: the caller sends the normal approved gesture
+            // instead of silently swallowing the click and all later text.
+            editor.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            if(editor.isFocused() ||
+                editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS))
+                return true;
+            return false;
         }
         if(target==null)return false;
         // Some WebView editors receive a click but do not start the input
@@ -393,23 +398,29 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
 
     private AccessibilityNodeInfo focusedEditor(){
+        AccessibilityNodeInfo fallback=null;
         AccessibilityNodeInfo root=getRootInActiveWindow();
         if(root!=null){
             AccessibilityNodeInfo node=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-            if(node!=null)return node;
+            if(node!=null){
+                if(node.isEditable())return node;
+                fallback=node;
+            }
         }
-        // WebView/editors may expose focused input under a separate
-        // interactive window, not under getRootInActiveWindow().
+        // Chrome/WebView may expose a focused non-editable container in the
+        // active window while the real editor is in another interactive
+        // window. Prefer an actual editable focused node across all windows.
         List<AccessibilityWindowInfo> windows=getWindows();
-        if(windows==null)return null;
-        for(AccessibilityWindowInfo window:windows){
+        if(windows!=null)for(AccessibilityWindowInfo window:windows){
             if(window==null)continue;
             AccessibilityNodeInfo tree=window.getRoot();
             if(tree==null)continue;
             AccessibilityNodeInfo node=tree.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-            if(node!=null)return node;
+            if(node==null)continue;
+            if(node.isEditable())return node;
+            if(fallback==null)fallback=node;
         }
-        return null;
+        return fallback;
     }
 
     private InputMethod.AccessibilityInputConnection nativeEditor(

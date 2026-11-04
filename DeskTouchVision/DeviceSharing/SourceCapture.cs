@@ -55,6 +55,28 @@ internal sealed class SourceCapture : IDisposable
     // Request a different already authenticated environment member when
     // crossing its actual screen boundary. Never connects another socket.
     internal Func<MonitorEdge,double,bool>? NavigateEnvironment { get; set; }
+    internal Func<bool>? DestinationIsAndroid { get; set; }
+
+    internal static string? AndroidPrintableKey(int vk,bool shift)
+    {
+        if(vk is >=0x41 and <=0x5A)
+            return ((char)(vk+(shift?0:32))).ToString();
+        if(vk is >=0x30 and <=0x39)
+            return shift ? ")!@#$%^&*("[vk-0x30].ToString()
+                : ((char)vk).ToString();
+        if(vk is >=0x60 and <=0x69)
+            return ((char)('0'+vk-0x60)).ToString();
+        if(vk==0x20)return " ";
+        return vk switch{
+            0xBA=>shift?":":";", 0xBB=>shift?"+":"=",
+            0xBC=>shift?"<":",", 0xBD=>shift?"_":"-",
+            0xBE=>shift?">":".", 0xBF=>shift?"?":"/",
+            0xC0=>shift?"~":"`", 0xDB=>shift?"{":"[",
+            0xDC=>shift?"|":"\\", 0xDD=>shift?"}":"]",
+            0xDE=>shift?"\"":"'", _=>null
+        };
+    }
+
     private System.Windows.Forms.Timer? _slowEdgeTimer;
     private bool _controlPressed, _altPressed, _shiftPressed;
 
@@ -526,9 +548,27 @@ internal sealed class SourceCapture : IDisposable
         }
         if (RemoteActive)
         {
+            // Android's Accessibility API is an editable-field/IME API, not
+            // raw hardware keyboard injection. Send printable characters
+            // through the authenticated reverse-text route so Chrome/WebView
+            // can commit them using the active Android InputConnection.
+            // Modifier and navigation keys continue using reverse-key.
+            if(DestinationIsAndroid?.Invoke()==true && !_controlPressed &&
+                !_altPressed)
+            {
+                var printable=AndroidPrintableKey((int)key.vkCode,_shiftPressed);
+                if(printable!=null)
+                {
+                    if(down && !_session.TrySend(new Packet("text",
+                        Text:printable)))
+                        Post(ReturnLocal);
+                    return (IntPtr)1;
+                }
+            }
             bool extended = (key.flags & 1) != 0;
-            _session.TrySend(new Packet("key", (int)key.scanCode, extended ? 1 : 0,
-                down ? 1 : 0, (int)key.vkCode));
+            if(!_session.TrySend(new Packet("key",(int)key.scanCode,
+                extended?1:0,down?1:0,(int)key.vkCode)))
+                Post(ReturnLocal);
             return (IntPtr)1;
         }
         return Win.CallNextHookEx(_keyHook, code, wParam, lParam);

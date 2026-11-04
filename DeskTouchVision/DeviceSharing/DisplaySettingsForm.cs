@@ -395,7 +395,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _disconnect.Enabled = _host != null ||
             _receiver?.ConnectedPeerCount > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
-        if (_host != null && !_captureUsesInbound)
+        if (_host != null)
         {
             int members=_host.EnvironmentMembers.Count;
             int android=_host.EnvironmentMembers.Count(m=>m.Platform=="Android");
@@ -885,12 +885,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
-            _incomingPeer = peer;
-            if ((_captureUsesInbound || _host == null) &&
-                _receiver?.SelectedPeerId == _captureInboundPeerId)
-                _capture?.RefreshRemoteGeometry(peer.Monitors);
+            // Ignore nonselected members when updating the active pointer
+            // geometry. A phone's layout update must not re-map the PC's
+            // mouse coordinates (or steal keyboard authority).
+            int selectedId=_receiver?.SelectedPeerId??0;
+            var selected=_receiver?.ConnectedPeers
+                .FirstOrDefault(p=>p.Id==selectedId).Peer;
+            if(selected!=null && selected.Equals(peer))
+            {
+                _incomingPeer=selected;
+                if((_captureUsesInbound||_host==null) &&
+                    selectedId==_captureInboundPeerId)
+                    _capture?.RefreshRemoteGeometry(peer.Monitors);
+            }
             RefreshDisplays();
-            Status("Display geometry synchronized for " + peer.Name + ".");
         });
     }
 

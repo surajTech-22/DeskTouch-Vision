@@ -113,6 +113,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         super.onServiceConnected();
         instance=this;
         windows=(WindowManager)getSystemService(WINDOW_SERVICE);
+        DeskTouchRuntime.accessibilityPermissionChanged();
     }
     @Override public void onAccessibilityEvent(AccessibilityEvent event){
         // Touch from the phone user takes priority over remote input.
@@ -129,6 +130,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     @Override public void onDestroy(){
         if(instance==this)instance=null;
+        DeskTouchRuntime.accessibilityPermissionChanged();
         DeskTouchRuntime.remoteNativeTouch();
         removePointer();
         super.onDestroy();

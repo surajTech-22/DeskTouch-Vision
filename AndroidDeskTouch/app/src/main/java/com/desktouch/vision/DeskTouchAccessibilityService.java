@@ -10,7 +10,8 @@ import android.os.Build;
 import android.content.Context;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.Canvas;
+import android.graphics.Paint;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -37,7 +38,6 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private final Handler ui=new Handler(Looper.getMainLooper());
     private WindowManager windows;
     private View cursor;
-    private WindowManager.LayoutParams cursorParams;
     private volatile int x,y;
     private volatile int pendingX,pendingY;
     private volatile Runnable pendingApplied;
@@ -56,6 +56,27 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;this.duration=duration;
         }
     }
+    private final class PointerSurface extends View {
+        private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ring=new Paint(Paint.ANTI_ALIAS_FLAG);
+        PointerSurface(Context context){
+            super(context);
+            setWillNotDraw(false);
+            fill.setColor(0xff37b6f6);
+            ring.setColor(0xffffffff);
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(dp(2));
+        }
+        @Override protected void onDraw(Canvas canvas){
+            super.onDraw(canvas);
+            int px=lastOverlayX,py=lastOverlayY;
+            if(px==Integer.MIN_VALUE||py==Integer.MIN_VALUE)return;
+            float radius=dp(9);
+            canvas.drawCircle(px,py,radius,fill);
+            canvas.drawCircle(px,py,radius,ring);
+        }
+    }
+
     private volatile boolean remoteActive;
 
     static boolean allowed(Context context){
@@ -112,36 +133,41 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         x=Math.max(0,Math.min(Math.max(1,dm.widthPixels)-1,requestedX));
         y=Math.max(0,Math.min(Math.max(1,dm.heightPixels)-1,requestedY));
         if(cursor==null){
-            View dot=new View(this);
-            GradientDrawable drawable=new GradientDrawable();
-            drawable.setShape(GradientDrawable.OVAL);
-            drawable.setColor(0xff37b6f6);
-            drawable.setStroke(dp(2),0xffffffff);
-            dot.setBackground(drawable);
-            WindowManager.LayoutParams p=new WindowManager.LayoutParams(
-                dp(20),dp(20),WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // A transparent, NON-TOUCHABLE accessibility surface is added
+            // only once. Its tiny dirty rectangle is redrawn at display
+            // VSync, avoiding a WindowManager Binder relayout on every
+            // network mouse movement (a major source of sporadic lag).
+            PointerSurface pointer=new PointerSurface(this);
+            WindowManager.LayoutParams params=new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
-            p.gravity=Gravity.TOP|Gravity.LEFT;
-            p.x=x-dp(10);p.y=y-dp(10);
+            params.gravity=Gravity.TOP|Gravity.LEFT;
+            params.x=0;params.y=0;
+            lastOverlayX=x;lastOverlayY=y;
             try{
-                windows.addView(dot,p);
-                cursor=dot;cursorParams=p;
-                lastOverlayX=x;lastOverlayY=y;
-            }catch(RuntimeException ex){return;}
+                windows.addView(pointer,params);
+                cursor=pointer;
+            }catch(RuntimeException blocked){
+                lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+                return;
+            }
         }
-        // One window-layout Binder transaction at most per VSync, and none
-        // when the cursor coordinate is unchanged. The old path updated an
-        // overlay for every TCP movement and overloaded the Android UI thread.
-        if(cursor!=null && cursorParams!=null &&
-            (x!=lastOverlayX || y!=lastOverlayY)){
-            cursorParams.x=x-dp(10);cursorParams.y=y-dp(10);
-            try{
-                windows.updateViewLayout(cursor,cursorParams);
-                lastOverlayX=x;lastOverlayY=y;
-            }catch(RuntimeException ex){removePointer();}
+        if(cursor!=null && (x!=lastOverlayX || y!=lastOverlayY)){
+            int oldX=lastOverlayX,oldY=lastOverlayY;
+            lastOverlayX=x;lastOverlayY=y;
+            int halo=dp(14);
+            int left=Math.max(0,Math.min(oldX,x)-halo);
+            int top=Math.max(0,Math.min(oldY,y)-halo);
+            int right=Math.min(cursor.getWidth(),Math.max(oldX,x)+halo);
+            int bottom=Math.min(cursor.getHeight(),Math.max(oldY,y)+halo);
+            if(right>left&&bottom>top)
+                cursor.invalidate(left,top,right,bottom);
+            else cursor.invalidate();
         }
     }
     private void removePointer(){
@@ -156,7 +182,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(cursor!=null&&windows!=null){
             try{windows.removeView(cursor);}catch(RuntimeException ignored){}
         }
-        cursor=null;cursorParams=null;
+        cursor=null;
     }
     static boolean pointer(int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;

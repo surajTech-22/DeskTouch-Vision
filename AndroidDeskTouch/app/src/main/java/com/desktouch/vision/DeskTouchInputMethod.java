@@ -93,6 +93,18 @@ public final class DeskTouchInputMethod extends InputMethodService {
         return service!=null && service.approvedEditor()!=null;
     }
 
+    /** Non-sensitive state for debug Android emulator probes; never reads text. */
+    static String stateForTesting(Context context) {
+        DeskTouchInputMethod method=current;
+        if(method==null)return "service=not-bound selected="+isSelected(context);
+        EditorInfo info=method.getCurrentInputEditorInfo();
+        return "service=bound started="+method.editorStarted+
+            " hasEditorInfo="+(info!=null)+
+            " hasInputConnection="+(method.getCurrentInputConnection()!=null)+
+            " selected="+isSelected(context)+
+            " approved="+DeskTouchAccessibilityService.ready(context);
+    }
+
     /** Called on the Android UI thread from the existing authorized input path. */
     static boolean commitRemoteText(String value) {
         DeskTouchInputMethod service=current;

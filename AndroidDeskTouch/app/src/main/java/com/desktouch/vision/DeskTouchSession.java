@@ -39,7 +39,7 @@ final class DeskTouchSession implements AutoCloseable {
     private final Events events;
     private final TrustedWindows trust;
     private final Context application;
-    private volatile int reverseLease,reverseApplied;
+    private volatile int reverseLease,reverseApplied,reportedMissingKeyboard;
     private final ExecutorService sender=Executors.newSingleThreadExecutor();
     private final Object writeLock=new Object();
     private final java.util.concurrent.atomic.AtomicReference<Packet> newestMove =
@@ -303,7 +303,7 @@ final class DeskTouchSession implements AutoCloseable {
                 send(new Packet("reverse-busy",p.a));
                 return;
             }
-            reverseLease=p.a;reverseApplied=0;
+            reverseLease=p.a;reverseApplied=0;reportedMissingKeyboard=0;
             send(new Packet("reverse-granted",p.a));
             status("Windows is allowed to control this Android screen.");
             return;
@@ -331,7 +331,14 @@ final class DeskTouchSession implements AutoCloseable {
         }else if("reverse-wheel".equals(p.type)){
             DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
         }else if("reverse-key".equals(p.type)){
-            DeskTouchAccessibilityService.key(p.d,p.c!=0);
+            final int activeLease=reverseLease;
+            DeskTouchAccessibilityService.key(p.d,p.c!=0,()->{
+                // No typed characters/scan codes are exposed to the hub.
+                if(reverseLease==activeLease && reportedMissingKeyboard!=activeLease){
+                    reportedMissingKeyboard=activeLease;
+                    send(new Packet("reverse-key-unavailable",activeLease));
+                }
+            });
         }else if("reverse-text".equals(p.type) && p.text!=null &&
             p.text.length()>0 && p.text.length()<=512){
             DeskTouchAccessibilityService.text(p.text);

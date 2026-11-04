@@ -831,6 +831,19 @@ finally
     Check(DisplayArrangementControl.ProjectEnvironment(devices,-2)
         .Any(v=>v.TargetId==0),
         "Hub must appear as another selectable member when Android is selected");
+    var mainScreens=new System.Drawing.Rectangle(0,0,3800,1080);
+    var inline=DisplayArrangementControl.ComposeInlineDevices(mainScreens,visible);
+    Check(inline.Count==3 && inline[0].World.Left>=mainScreens.Right,
+        "Android/Windows environment devices must render on the MAIN display row");
+    Check(inline.All(item=>item.World.Top<mainScreens.Bottom &&
+         item.World.Bottom>mainScreens.Top),
+        "No authenticated phone may be moved into a separate bottom display deck");
+    Check(inline.Zip(inline.Skip(1),(first,second)=>
+         second.World.Left>=first.World.Right).All(ok=>ok),
+        "Screens must have non-overlapping inline hit targets");
+    Check(inline.Where(item=>item.Device.IsAndroid)
+        .All(item=>item.World.Height>item.World.Width),
+        "Android members must be displayed as portrait screen tiles, not footer labels");
     Console.WriteLine("PASS: multiple authenticated Android device tiles, view-only phones, and no duplicate Windows monitors.");
 }
 

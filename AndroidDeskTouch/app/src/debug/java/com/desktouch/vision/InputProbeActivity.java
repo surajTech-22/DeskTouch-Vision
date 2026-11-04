@@ -103,7 +103,11 @@ public final class InputProbeActivity extends Activity {
     private void checkUntil(String name,BooleanSupplier condition,int attempts,
         Runnable success) {
         if(condition.getAsBoolean()){success.run();return;}
-        if(attempts==0){result(name,false,"Android UI did not reach expected state");return;}
+        if(attempts==0){
+            result(name,false,"Android UI did not reach expected state; testText="+
+                editor.getText().toString());
+            return;
+        }
         ui.postDelayed(()->checkUntil(name,condition,attempts-1,success),150);
     }
     private void dismissIme() {
@@ -139,15 +143,42 @@ public final class InputProbeActivity extends Activity {
             ui.postDelayed(()->Log.i(TAG,"KEYBOARD_AFTER_FOCUS "+
                 DeskTouchInputMethod.stateForTesting(this)),1900);
             checkUntil("KEYBOARD",DeskTouchInputMethod::hasActiveEditor,28,()->{
-                boolean accepted=DeskTouchInputMethod.commitRemoteText("hello") &&
-                    DeskTouchInputMethod.sendRemoteKey(8) &&
-                    DeskTouchInputMethod.commitRemoteText("o") &&
-                    DeskTouchInputMethod.sendRemoteKey(37) &&
-                    DeskTouchInputMethod.commitRemoteText("!");
-                if(!accepted){result("KEYBOARD",false,"IME rejected an input operation");return;}
-                checkUntil("KEYBOARD",()->"hell!o".equals(
-                    editor.getText().toString()),25,()->
-                    result("KEYBOARD",true,"text, deletion and caret movement applied"));
+                Log.i(TAG,"KEYBOARD_STAGE text");
+                if(!DeskTouchInputMethod.commitRemoteText("hello")){
+                    result("KEYBOARD",false,"text commit rejected");return;
+                }
+                checkUntil("KEYBOARD",()->"hello".equals(
+                    editor.getText().toString()),18,()->{
+                    Log.i(TAG,"KEYBOARD_STAGE backspace");
+                    if(!DeskTouchInputMethod.sendRemoteKey(8)){
+                        result("KEYBOARD",false,"backspace rejected");return;
+                    }
+                    checkUntil("KEYBOARD",()->"hell".equals(
+                        editor.getText().toString()),18,()->{
+                        Log.i(TAG,"KEYBOARD_STAGE retype");
+                        if(!DeskTouchInputMethod.commitRemoteText("o")){
+                            result("KEYBOARD",false,"retype rejected");return;
+                        }
+                        checkUntil("KEYBOARD",()->"hello".equals(
+                            editor.getText().toString()),18,()->{
+                            Log.i(TAG,"KEYBOARD_STAGE left-arrow");
+                            if(!DeskTouchInputMethod.sendRemoteKey(37)){
+                                result("KEYBOARD",false,"left arrow rejected");return;
+                            }
+                            ui.postDelayed(()->{
+                                Log.i(TAG,"KEYBOARD_STAGE insert-at-caret");
+                                if(!DeskTouchInputMethod.commitRemoteText("!")){
+                                    result("KEYBOARD",false,"caret insertion rejected");
+                                    return;
+                                }
+                                checkUntil("KEYBOARD",()->"hell!o".equals(
+                                    editor.getText().toString()),18,()->
+                                    result("KEYBOARD",true,
+                                        "text, Backspace and caret applied to Android editor"));
+                            },220);
+                        });
+                    });
+                });
             });
         } else if("click".equals(name)) {
             dismissIme();

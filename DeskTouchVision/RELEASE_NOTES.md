@@ -10,6 +10,7 @@
 - Windows-to-Android pointer movement now coalesces to one **VSync-driven** overlay update per frame, instead of a WindowManager layout transaction for every incoming network packet. Unchanged cursor coordinates trigger no relayout.
 - A click/scroll flushes the latest pointer coordinate first so input cannot target the previous visual frame.
 - Where Android's Accessibility tree exposes a clickable/scrollable UI target, use its native **ACTION_CLICK** or **ACTION_SCROLL_FORWARD/BACKWARD** immediately. An accessibility gesture is a fallback for controls that lack actions.
+- On Android 13+ (API 33), use the public Accessibility **InputMethod / InputConnection.commitText** path for ordinary text in approved non-password focused editors; older phones and custom editors retain the existing ACTION_SET_TEXT fallback. The Accessibility service XML declares the platform's official input-method flag.
 - Serialize fallback gestures so a new click/scroll does not cancel one already being processed. Tap/scroll gesture durations were reduced from 90/120ms to 45/85ms.
 - Original TLS identity, single logical environment, native Android touch priority, bounded text-entry permissions, and no-password-field policy remain in place.
 

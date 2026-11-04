@@ -234,6 +234,11 @@ internal sealed class DisplayArrangementControl : Control
         return online.Where(p=>p.TargetId!=selectedTargetId)
             .GroupBy(p=>p.TargetId).Select(g=>g.First())
             .OrderBy(p=>p.IsAndroid?1:0)
+            // Keep input-capable phone tiles adjacent to the linked Windows
+            // displays. A view-only Android device still appears in the
+            // diagram but must not stand between the PC and a controllable
+            // phone, making that phone's outer edge unreachable.
+            .ThenBy(p=>p.SupportsInput?0:1)
             .ThenBy(p=>p.Name,StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -489,7 +494,14 @@ internal sealed class DisplayArrangementControl : Control
             IReadOnlyList<EnvironmentDisplayTile> members)
     {
         var result=new List<(EnvironmentDisplayTile Device,Rectangle World)>();
-        int nextX=mainScreenArea.Right+Math.Max(90,mainScreenArea.Height/12);
+        // Connection tiles represent REACHABLE screen neighbors, not distant
+        // floating thumbnails. The previous 90+ world-pixel gap could exceed
+        // SpatialNeighbor's (scale-dependent) allowed crossing distance on
+        // wide Displays windows, especially for narrow portrait phones.
+        // Use a small stable world-space seam so every default connected
+        // screen can be reached without the user manually dragging it first.
+        int connectedGap=Math.Clamp(mainScreenArea.Height/140,8,24);
+        int nextX=mainScreenArea.Right+connectedGap;
         foreach(var device in members)
         {
             int count=Math.Clamp(device.ScreenCount,1,8);
@@ -501,7 +513,7 @@ internal sealed class DisplayArrangementControl : Control
             var preview=new Rectangle(nextX,
                 mainScreenArea.Top+(mainScreenArea.Height-height)/2,width,height);
             result.Add((device,preview));
-            nextX=preview.Right+Math.Max(90,mainScreenArea.Height/12);
+            nextX=preview.Right+connectedGap;
         }
         return result;
     }

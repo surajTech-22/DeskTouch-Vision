@@ -1060,6 +1060,42 @@ finally
     Check(inline.Where(item=>item.Device.IsAndroid)
         .All(item=>item.World.Height>item.World.Width),
         "Android members must be displayed as portrait screen tiles, not footer labels");
+    // Regression: the default Xiaomi portrait preview was separated from
+    // Windows by a decorative gap which became BIGGER than SpatialNeighbor's
+    // crossing allowance as the diagram/window was resized. The connected
+    // phone appeared in Displays but Windows would never hand the cursor off.
+    var phoneWorld=new System.Drawing.Rectangle(0,0,5000,900);
+    var phonePreview=DisplayArrangementControl.ComposeInlineDevices(phoneWorld,
+        new[]{new EnvironmentDisplayTile(93,"Xiaomi","Android",1,true)})[0].World;
+    foreach(float scale in new[]{.12f,.24f,.45f})
+    {
+        var phoneRegions=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+            (7,new System.Drawing.RectangleF(0,0,
+                phoneWorld.Width*scale,phoneWorld.Height*scale)),
+            (93,new System.Drawing.RectangleF(
+                phonePreview.X*scale,phonePreview.Y*scale,
+                phonePreview.Width*scale,phonePreview.Height*scale))
+        };
+        double crossingFraction=(phonePreview.Top+phonePreview.Height/2d)/
+            phoneWorld.Height;
+        Check(DisplayArrangementControl.SpatialNeighbor(phoneRegions,7,
+            MonitorEdge.Right,crossingFraction)==93,
+            "Connected Android portrait tile must accept Windows right-edge " +
+            "handoff at diagram scale "+scale);
+        Check(DisplayArrangementControl.SpatialNeighbor(phoneRegions,93,
+            MonitorEdge.Left,.5)==7,
+            "Android left-edge return must reach its original Windows peer");
+    }
+    var viewOnlyBeforePhone=DisplayArrangementControl.ProjectEnvironment(
+        new[]{
+            new EnvironmentDisplayTile(91,"A view-only Android","Android",1,false),
+            new EnvironmentDisplayTile(93,"Z controllable Xiaomi","Android",1,true)
+        },0);
+    Check(viewOnlyBeforePhone.First().TargetId==93 &&
+        viewOnlyBeforePhone.Last().TargetId==91,
+        "Non-input Android devices must not occupy the default adjacent " +
+        "slot and block Windows-to-phone cursor entry");
+    Console.WriteLine("PASS: Android default edge handoff independent of diagram zoom and view-only neighbors.");
     var spatial=new List<(int Id,System.Drawing.RectangleF Bounds)>{
         (EnvironmentRouteOrder.Local,new(0,0,300,220)),
         (7,new(330,0,300,220)),

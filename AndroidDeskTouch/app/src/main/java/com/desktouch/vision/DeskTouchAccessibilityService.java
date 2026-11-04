@@ -40,6 +40,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private final Handler ui=new Handler(Looper.getMainLooper());
     private WindowManager windows;
     private View cursor;
+    private WindowManager.LayoutParams compactPointerParams;
     private volatile int x,y;
     private volatile int pendingX,pendingY;
     private volatile long pendingArrivalNanos;
@@ -139,13 +140,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private void showPointer(int requestedX,int requestedY){
         if(!ready(this))return;
         android.util.DisplayMetrics dm=getResources().getDisplayMetrics();
-        x=Math.max(0,Math.min(Math.max(1,dm.widthPixels)-1,requestedX));
-        y=Math.max(0,Math.min(Math.max(1,dm.heightPixels)-1,requestedY));
+        int screenWidth=Math.max(1,dm.widthPixels),screenHeight=Math.max(1,dm.heightPixels);
+        x=Math.max(0,Math.min(screenWidth-1,requestedX));
+        y=Math.max(0,Math.min(screenHeight-1,requestedY));
         if(cursor==null){
-            // A transparent, NON-TOUCHABLE accessibility surface is added
-            // only once. Its tiny dirty rectangle is redrawn at display
-            // VSync, avoiding a WindowManager Binder relayout on every
-            // network mouse movement (a major source of sporadic lag).
+            // First use the existing single full-screen NON-TOUCHABLE
+            // accessibility overlay: no expensive relayout on each motion.
             PointerSurface pointer=new PointerSurface(this);
             WindowManager.LayoutParams params=new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -157,16 +157,74 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 PixelFormat.TRANSLUCENT);
             params.gravity=Gravity.TOP|Gravity.LEFT;
             params.x=0;params.y=0;
-            lastOverlayX=x;lastOverlayY=y;
             try{
                 windows.addView(pointer,params);
                 cursor=pointer;
-            }catch(RuntimeException blocked){
-                lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
-                return;
+                compactPointerParams=null;
+                lastOverlayX=x;lastOverlayY=y;
+            }catch(RuntimeException fullOverlayRejected){
+                // A Xiaomi/OEM window policy may reject a full-screen
+                // accessibility overlay even while the service is active.
+                // Retry with a compact, non-touchable native accessibility
+                // overlay inside THIS app; never request a separate app or
+                // silent SYSTEM_ALERT_WINDOW permission.
+                int width=Math.min(screenWidth,dp(52));
+                int height=Math.min(screenHeight,dp(52));
+                WindowManager.LayoutParams compact=new WindowManager.LayoutParams(
+                    width,height,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT);
+                compact.gravity=Gravity.TOP|Gravity.LEFT;
+                compact.x=PointerOverlayGeometry.origin(x,screenWidth,width);
+                compact.y=PointerOverlayGeometry.origin(y,screenHeight,height);
+                PointerSurface smaller=new PointerSurface(this);
+                try{
+                    windows.addView(smaller,compact);
+                    cursor=smaller;
+                    compactPointerParams=compact;
+                    lastOverlayX=x-compact.x;
+                    lastOverlayY=y-compact.y;
+                    Log.w("DeskTouchPointer","Full-screen pointer overlay unavailable; compact accessibility overlay active");
+                }catch(RuntimeException compactRejected){
+                    cursor=null;
+                    compactPointerParams=null;
+                    lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+                    // Do not leave Windows waiting for a fake cursor-applied
+                    // acknowledgement. Revoke the lease over the authenticated
+                    // session so its keyboard/mouse remain local.
+                    Log.e("DeskTouchPointer",
+                        "Android rejected both pointer overlays; remote control revoked");
+                    DeskTouchRuntime.pointerOverlayUnavailable();
+                    return;
+                }
             }
         }
-        if(cursor!=null && (x!=lastOverlayX || y!=lastOverlayY)){
+        if(cursor==null)return;
+        if(compactPointerParams!=null){
+            WindowManager.LayoutParams compact=compactPointerParams;
+            int left=PointerOverlayGeometry.origin(x,screenWidth,compact.width);
+            int top=PointerOverlayGeometry.origin(y,screenHeight,compact.height);
+            if(compact.x!=left || compact.y!=top){
+                compact.x=left;compact.y=top;
+                try{windows.updateViewLayout(cursor,compact);}
+                catch(RuntimeException revoked){
+                    Log.e("DeskTouchPointer",
+                        "Compact pointer overlay update rejected; remote control revoked");
+                    DeskTouchRuntime.pointerOverlayUnavailable();
+                    removePointer();
+                    return;
+                }
+            }
+            int localX=x-left,localY=y-top;
+            if(localX!=lastOverlayX||localY!=lastOverlayY){
+                lastOverlayX=localX;lastOverlayY=localY;
+                cursor.invalidate();
+            }
+            return;
+        }
+        if(x!=lastOverlayX || y!=lastOverlayY){
             int oldX=lastOverlayX,oldY=lastOverlayY;
             lastOverlayX=x;lastOverlayY=y;
             int halo=dp(14);
@@ -192,6 +250,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             try{windows.removeView(cursor);}catch(RuntimeException ignored){}
         }
         cursor=null;
+        compactPointerParams=null;
     }
     static boolean pointer(int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;

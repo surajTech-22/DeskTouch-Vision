@@ -45,6 +45,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
     private readonly Button _androidDownload = Button("Get Android app");
+    private readonly Button _bluetoothCheck = Button("Bluetooth check");
+    private BluetoothHidCheckForm? _bluetoothDialog;
     private readonly LinkLabel _checkUpdates = new()
     {
         Text = "Check for updates",
@@ -136,7 +138,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings, _androidDownload })
+        foreach (var b in new[] { _add, _bluetoothCheck, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -193,6 +195,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
         _androidDownload.Click += (_, _) => { using var view = new AndroidDownloadDialog(); view.ShowDialog(this); };
+        _bluetoothCheck.Click += (_, _) => OpenBluetoothCheck();
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
@@ -245,6 +248,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             ShowFromTray();
             ManageTrustedDevices();
+        });
+        _trayMenu.Items.Add("Bluetooth check (connected PCs)", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenBluetoothCheck();
         });
         _trayMenu.Items.Add("Get Android app", null, (_, _) =>
         {
@@ -345,7 +353,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         Text = name, Width = name switch {
             "Windows display settings" => 178, "Copy pairing code" => 155,
-            "Add devices" => 145, "Get Android app" => 150, _ => 100 },
+            "Add devices" => 145, "Get Android app" => 150,
+            "Bluetooth check" => 140, _ => 100 },
         FlatStyle = FlatStyle.Flat,
         FlatAppearance = { BorderColor = Color.FromArgb(85, 89, 100), BorderSize = 1 },
         ForeColor = Color.White,
@@ -379,6 +388,34 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         catch { /* Never block Windows input for diagnostic logging. */ }
         UpdateButtons();
     }
+
+    private void OpenBluetoothCheck()
+    {
+        if(_bluetoothDialog==null || _bluetoothDialog.IsDisposed)
+            _bluetoothDialog=new BluetoothHidCheckForm(GetBluetoothReports,
+                RequestBluetoothReports);
+        _bluetoothDialog.RefreshReports();
+        if(!_bluetoothDialog.Visible)_bluetoothDialog.Show(this);
+        _bluetoothDialog.BringToFront();
+        RequestBluetoothReports();
+    }
+
+    private IReadOnlyList<BluetoothHidDeviceStatus> GetBluetoothReports() =>
+        _host?.BluetoothReports ?? _receiver?.BluetoothReports ??
+        new[] { new BluetoothHidDeviceStatus(0,Environment.MachineName,
+            BluetoothHidCapability.Checking) };
+
+    private void RequestBluetoothReports()
+    {
+        if(_host!=null && _host.RequestBluetoothCheck())return;
+        _receiver?.RequestBluetoothCheck();
+    }
+
+    private void OnBluetoothReportsChanged() => PostToUi(() =>
+    {
+        if(_bluetoothDialog is {IsDisposed:false})
+            _bluetoothDialog.RefreshReports();
+    });
 
     private void UpdateButtons()
     {
@@ -711,6 +748,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerConnected += OnIncomingPeerConnected;
             _receiver.PeerDisconnected += OnIncomingPeerDisconnected;
             _receiver.PeerListChanged += OnPeerListChanged;
+            _receiver.BluetoothReportsChanged += OnBluetoothReportsChanged;
             _receiver.InitializeEnvironmentLayout(_display.StoredMemberOffsets);
             _receiver.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
@@ -773,6 +811,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerConnected -= OnIncomingPeerConnected;
             _receiver.PeerDisconnected -= OnIncomingPeerDisconnected;
             _receiver.PeerListChanged -= OnPeerListChanged;
+            _receiver.BluetoothReportsChanged -= OnBluetoothReportsChanged;
             _receiver.EnvironmentLayoutChanged -= HandleSharedEnvironmentLayout;
             _receiver.PeerTopologyChanged -= OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged -= OnIncomingPeerPlacementChanged;
@@ -1117,6 +1156,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;
+        session.BluetoothReportsChanged += OnBluetoothReportsChanged;
         session.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
         if(session.SharedLayout.Count>0)
             _display.RestoreMemberOffsets(session.SharedLayout);
@@ -1127,6 +1167,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         RefreshDisplays();
         _capture.Arm();
         session.PublishSourcePlacement(_preferredEdge);
+        session.RequestBluetoothCheck();
         UpdateButtons();
     }
 
@@ -1401,6 +1442,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;
             _host.EnvironmentRosterChanged -= HandleEnvironmentRoster;
+            _host.BluetoothReportsChanged -= OnBluetoothReportsChanged;
             _host.EnvironmentLayoutChanged -= HandleSharedEnvironmentLayout;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
         }
@@ -1546,6 +1588,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (disposing)
         {
             _closing.Cancel();
+            _bluetoothDialog?.Close();
+            _bluetoothDialog?.Dispose();
+            _bluetoothDialog=null;
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;
             if (_trayIcon != null)

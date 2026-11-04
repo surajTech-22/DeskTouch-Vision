@@ -31,6 +31,7 @@ internal sealed class SourceCapture : IDisposable
     private int _anchorX, _anchorY;
     private long _cooldownUntil;
     private long _lastRawMs;
+    private long _lastFallbackMs;
     private System.Drawing.Point _lastPhysicalPointer;
     private bool _hasLastPhysicalPointer;
     private readonly SlowEdgeApproach _slowEdge = new();
@@ -255,6 +256,7 @@ internal sealed class SourceCapture : IDisposable
         // Native Windows cursor only moves AFTER remote input was accepted.
         Win.SetCursorPos(_anchorX, _anchorY);
         _lastRawMs = 0;
+        _lastFallbackMs = 0;
         Interlocked.Exchange(ref _active, 1);
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
     }
@@ -375,7 +377,10 @@ internal sealed class SourceCapture : IDisposable
                 // Some precision touchpads do not provide raw mouse packets.
                 // Fallback uses attempted pointer displacement from parked anchor.
                 if (Environment.TickCount64 - _lastRawMs > 650)
+                {
+                    _lastFallbackMs=Environment.TickCount64;
                     MoveRemote(mouse.pt.X - _anchorX, mouse.pt.Y - _anchorY);
+                }
                 return (IntPtr)1;
             }
             int button = msg switch {
@@ -465,9 +470,15 @@ internal sealed class SourceCapture : IDisposable
             if (input.Header.Type != 0 || (input.Mouse.Flags & 1) != 0) return;
             if (RemoteActive)
             {
-                _lastRawMs = Environment.TickCount64;
-                MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
-                    ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
+                long now=Environment.TickCount64;
+                _lastRawMs = now;
+                // Mouse low-level hook and Raw Input can describe the SAME
+                // physical movement when a slow touchpad switches paths.
+                // Suppress only the immediately duplicated raw event;
+                // alternating input sources must not double movement speed.
+                if(!ShouldDropDuplicateRaw(_lastFallbackMs,now))
+                    MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
+                        ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
             }
             else
             {
@@ -488,6 +499,10 @@ internal sealed class SourceCapture : IDisposable
         }
         finally { Marshal.FreeHGlobal(memory); }
     }
+
+    internal static bool ShouldDropDuplicateRaw(long lastHookFallback,long now) =>
+        lastHookFallback>0 && now>=lastHookFallback &&
+        now-lastHookFallback<=24;
 
     internal static int ScaleRawDelta(int raw, int systemMouseSpeed)
     {

@@ -17,6 +17,9 @@ internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Pl
     // the peer advertises its stable ID (never IP based).
     internal string LayoutKey => !string.IsNullOrWhiteSpace(StableIdentity)
         ? StableIdentity : Platform+"|"+Name;
+    // v2 stores one ABSOLUTE screen position relative to the hub's monitor
+    // origin. Old saved local-view offsets remain readable until re-dragged.
+    internal string CanonicalLayoutKey => "hub@"+LayoutKey;
 }
 
 // Logical routing order follows the EXISTING inline screen arrangement.
@@ -102,6 +105,24 @@ internal sealed class DisplayArrangementControl : Control
     private int _draggingMemberId=int.MinValue;
     private RectangleF _draggingMemberHit;
     private float _layoutScale=1f;
+    private System.Drawing.Point _hubWorldOrigin;
+    private readonly Dictionary<int,Rectangle> _worldMemberRects=new();
+    internal bool LocalIsEnvironmentHub { get; set; } = true;
+    internal static Rectangle ResolveMemberWorld(Rectangle defaultWorld,
+        Rectangle hubBounds,PointF? canonical,PointF? legacy)
+    {
+        if(canonical is { } p)
+            return new Rectangle(
+                hubBounds.Left+(int)Math.Round(p.X),
+                hubBounds.Top+(int)Math.Round(p.Y),
+                defaultWorld.Width,defaultWorld.Height);
+        if(legacy is { } old)
+        {
+            defaultWorld.Offset((int)Math.Round(old.X),
+                (int)Math.Round(old.Y));
+        }
+        return defaultWorld;
+    }
     internal event Action? EnvironmentArrangementChanged;
     internal event Action<string,PointF>? EnvironmentMemberMoved;
 
@@ -354,6 +375,7 @@ internal sealed class DisplayArrangementControl : Control
         _localHit = RectangleF.Empty;
         _placeholderHit = RectangleF.Empty;
         _environmentHits.Clear();
+        _worldMemberRects.Clear();
 
         if (_local == null)
         {
@@ -373,11 +395,21 @@ internal sealed class DisplayArrangementControl : Control
         // Their preview rectangles are visual placements only: Android is
         // never registered as a native Windows monitor or virtual driver.
         var core = Rectangle.Union(l, remotePos);
-        var extras = ComposeInlineDevices(core,_environmentDevices)
-            .Select(extra => {
-                var offset=_memberOffsets.GetValueOrDefault(extra.Device.LayoutKey);
-                var moved=extra.World;
-                moved.Offset((int)Math.Round(offset.X),(int)Math.Round(offset.Y));
+        // Both Windows hosts use the SAME physical SURAJ hub screen origin.
+        // Local/remote Windows screen preview origins can otherwise differ
+        // even when every peer has received the identical drag offset.
+        var hubBounds=LocalIsEnvironmentHub ? l : remotePos;
+        _hubWorldOrigin=hubBounds.Location;
+        var extras=ComposeInlineDevices(core,_environmentDevices)
+            .Select(extra=>{
+                PointF? canonical=_memberOffsets.TryGetValue(
+                    extra.Device.CanonicalLayoutKey,out var position)
+                    ? position:null;
+                PointF? legacy=_memberOffsets.TryGetValue(
+                    extra.Device.LayoutKey,out var old) ? old:null;
+                var moved=ResolveMemberWorld(extra.World,hubBounds,
+                    canonical,legacy);
+                _worldMemberRects[extra.Device.TargetId]=moved;
                 return (extra.Device,World:moved);
             }).ToArray();
         var full = core;
@@ -619,8 +651,9 @@ internal sealed class DisplayArrangementControl : Control
                 var member=_environmentDevices.FirstOrDefault(d=>d.TargetId==id);
                 if(member!=null)
                 {
-                    string key=member.LayoutKey;
-                    var old=_memberOffsets.GetValueOrDefault(key);
+                    string key=member.CanonicalLayoutKey;
+                    if(!_worldMemberRects.TryGetValue(id,out var memberWorld))
+                        return;
                     var wanted=new RectangleF(_draggingMemberHit.X+memberDeltaX,
                         _draggingMemberHit.Y+memberDeltaY,
                         _draggingMemberHit.Width,_draggingMemberHit.Height);
@@ -630,11 +663,20 @@ internal sealed class DisplayArrangementControl : Control
                         if(other.TargetId!=id)occupied.Add(other.Hit);
                     var snapped=SnapToConnectedScreen(wanted,occupied);
                     float scale=Math.Max(.001f,_layoutScale);
-                    _memberOffsets[key]=new PointF(
-                        Math.Clamp(old.X+(snapped.X-_draggingMemberHit.X)/scale,
+                    // Convert the FINAL snapped viewport position back into
+                    // world units relative to the one hub reference. Never
+                    // publish a local view's change-from-default offset.
+                    var position=new PointF(
+                        Math.Clamp(memberWorld.Left-
+                            _hubWorldOrigin.X+
+                            (snapped.X-_draggingMemberHit.X)/scale,
                             -80000,80000),
-                        Math.Clamp(old.Y+(snapped.Y-_draggingMemberHit.Y)/scale,
+                        Math.Clamp(memberWorld.Top-
+                            _hubWorldOrigin.Y+
+                            (snapped.Y-_draggingMemberHit.Y)/scale,
                             -80000,80000));
+                    _memberOffsets.Remove(member.LayoutKey);
+                    _memberOffsets[key]=position;
                     EnvironmentArrangementChanged?.Invoke();
                     EnvironmentMemberMoved?.Invoke(key,_memberOffsets[key]);
                 }

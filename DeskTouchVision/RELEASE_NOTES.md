@@ -1,3 +1,24 @@
+# DeskTouch Vision v0.3.17 — consistent multi-PC Android position and keyboard handoff
+
+## Shared environment fixes
+- External screen edges use physical boundary contact plus the actual cursor crossing point. Moving to an unrelated outside edge of the second computer must NOT teleport the cursor back to SURAJ.
+- The Xiaomi phone remains draggable. Each completed phone drag is now stored as the screen's **hub-relative position** under the authenticated stable device identity, rather than an offset from the computer's local preview. Both Windows systems calculate the same position from the SURAJ hub's display origin, and the hub broadcasts updates to all connected members.
+- The position protocol accepts only a current approved member's stable identity. Canonical hub coordinates supersede legacy local offsets. Old local offsets remain readable until the phone is moved using this version. Device pairing, Tally/AAH apps, and Windows physical monitor configuration are not changed.
+- Edge handoff continues to use one existing authenticated environment with separate per-destination authority grants, not individual Android/Windows connections. A solid/unmatched edge retains current control.
+
+## Android keyboard and cursor
+- Windows printable keyboard keys use the existing authenticated `reverse-text` message for Android, allowing Android's supported Accessibility editor/IME input path (including WebView) to insert text. Nonprintable/navigation/modifier keys still use the `reverse-key` path.
+- Native Android Accessibility clicks first focus editable elements. If Android denies text insertion or no editable field is focused, the phone reports one keyboard-unavailable notice per authority lease without exposing the typed data. Password editor protections remain in place.
+- Existing VSync pointer coalescing, low-latency TLS, gesture serialization and privacy-safe `DeskTouchTiming` diagnostics are preserved; actual Xiaomi Wi-Fi delay must still be measured on the phone.
+
+## Test boundary
+- GitHub Windows tests cover canonical hub placement across different preview origins, independent synchronized TLS layout, strict contact-based edge routing and Android printable-key conversion.
+- GitHub Android tests/build validate the service and transport; emulator launch verifies the app starts, but cannot establish physical Xiaomi keyboard focus or true multi-PC network latency.
+- Windows and Android production packages must preserve the same signing identity, release-event updater and SHA-256 verification.
+- Keep the update unpromoted if final-commit pre-release tests fail.
+
+---
+
 # DeskTouch Vision v0.3.16 — one draggable environment, not a one-to-one selector
 
 - Removed the two-item Windows/Android target dropdown. Displays now identifies **one environment** with the actual **total device count**, including the local PC. Clicking a device tile chooses it as a keyboard/mouse destination; dragging moves its preview without changing active authority.

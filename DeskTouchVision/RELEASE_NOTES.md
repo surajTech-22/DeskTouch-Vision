@@ -1,17 +1,16 @@
-# DeskTouch Vision v0.3.20 — Android pointer handoff resilience
+# DeskTouch Vision v0.3.21 — Android smoother pointer, accurate taps and connection resilience
 
 ## Changes
-- Fix a Windows display-arrangement mismatch where the default gap between PC and portrait Android previews could exceed the actual edge-routing tolerance, making the phone visible but unreachable by cursor handoff. The linked phone now sits at a reachable seam across different Displays window sizes.
-- Keep Android devices with enabled input permission next to the Windows monitors; a view-only phone can no longer block the path to a controllable phone.
-- Add Windows regression tests for entering and leaving the Android screen at multiple diagram scales and for mixed view-only/controllable Android devices.
-- Preserve the existing Windows↔Windows and Windows→Android authenticated TLS handoff and exclusive authority leases.
-- Android normally renders its cursor through the existing single non-touchable full-screen Accessibility overlay at display refresh rate, without doing a window relayout on every mouse movement.
-- If an Android OEM/MIUI/Xiaomi system rejects that full-screen overlay, DeskTouch retries a compact non-touchable `TYPE_ACCESSIBILITY_OVERLAY` pointer inside the **same existing app**, without requiring root, fake Bluetooth, a separate installed app, or bypassing Android permissions.
-- If the Android operating system rejects both overlay types or blocks a subsequent overlay layout update, DeskTouch safely revokes the phone's remote input lease and gives Windows back its native keyboard and mouse instead of waiting on a pointer-applied acknowledgement that cannot arrive.
-- An actionable Android pointer overlay status and non-sensitive diagnostic log event explain what failed; no typed text, coordinates, device identity, or LAN details are logged.
-- Includes unit tests for position clamping and compact overlay boundary behavior. Existing Android input receiver / IME, Windows multi-peer authority and device placement are reused unchanged.
+- Fix phone touch-coordinate offsets by using the same full physical display size in the Android foreground pairing dialog, automatic background reconnect, pointer overlay, and Accessibility gesture coordinates; do not confuse content-area DisplayMetrics with full screen pixels.
+- Publish corrected Android display topology over the existing authenticated TLS session when the phone rotates; maintain the existing user-authorized connection and shared group routing.
+- Make the compact fallback pointer overlay follow an invisible viewport. It repositions the Android WindowManager surface only when the pointer nears its boundary, instead of making an expensive cross-process window relayout on virtually every mouse move.
+- Use an exact screen-coordinate Accessibility tap first; fall back to accessibility node-click if an OEM rejects gesture dispatch. Native Android touch still takes priority.
+- Keep CPU and low-latency Wi-Fi resources active only during an explicitly authorized Windows-to-Android control lease; release them on physical phone touch, return-local, disconnect or permission revocation.
+- Request Android keep-screen-on for the non-touchable pointer overlay while Windows owns the input lease; OEM Android power policy may still override it.
+- Enable TCP keepalives and increase Android socket read grace from 22 to 60 seconds and Windows per-peer idle heartbeat grace from 18 to 50 seconds to reduce false timeouts during screen/Wi-Fi scheduling transitions. Heartbeats and trusted reconnect remain enabled.
+- Keep the existing Android package name, permanent release signing identity, keyboard/IME, phone display placement and bidirectional Windows native device controls. No new app, Bluetooth spoofing or accessibility permission bypass.
 
-## Validation and limits
-- GitHub tests: Android JVM tests, Android emulator click/drag/scroll/IME and reverse text/key acceptance, Windows shared-environment TLS and installer/update safety.
-- A GitHub emulator cannot establish Xiaomi's actual OEM window-overlay policy or guarantee the user's real phone grants accessibility/display permissions. On the phone, leave the existing app installed; install the same-cert update, enable Windows control and the DeskTouch Accessibility service. Check the phone's overlay restrictions if control is revoked.
-- A native Bluetooth HID keyboard/mouse is not emulated by this update.
+## Validation
+- Android JVM overlay follow-window boundary/no-relayout regression tests, signed-APK production manifest checks and Android emulator gesture/keyboard acceptance.
+- Windows multi-device encrypted TLS/authority tests, heartbeat grace assertion, installer/tray/update tests, plus coordinated Windows and Android package CI.
+- Physical Xiaomi/Android testing is still required for actual Wi-Fi jitter, display overlay restrictions, touch accuracy in third-party apps and screen sleep behavior. Keeping the screen on consumes battery; the app releases low-latency resources when remote control ends.

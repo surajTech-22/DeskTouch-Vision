@@ -2,7 +2,7 @@ name: DeskTouch Shared Environment - pre-release verification (no publish)
 
 on:
   push:
-    branches: [feature/android-ime-input-bridge-0319, fix/bluetooth-audit-stable-0318, feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313, fix/android-inline-display-native-input-v0314, fix/multidevice-authority-ime-updater-permissions-v0315, fix/unified-draggable-input-layout-v0316, fix/strict-screen-boundary-handoff-v0317]
+    branches: [fix/android-pointer-handoff-v0320, feature/android-ime-input-bridge-0319, fix/bluetooth-audit-stable-0318, feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313, fix/android-inline-display-native-input-v0314, fix/multidevice-authority-ime-updater-permissions-v0315, fix/unified-draggable-input-layout-v0316, fix/strict-screen-boundary-handoff-v0317]
     paths:
       - 'DeskTouchVision/**'
       - 'AndroidDeskTouch/**'

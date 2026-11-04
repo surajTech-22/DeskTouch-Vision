@@ -137,8 +137,11 @@ Check(!InputClaimLifecyclePolicy.CanGrant(false, true, false),
     "A stale remote-active flag cannot bypass inactive physical monitoring.");
 Check(InputClaimLifecyclePolicy.CanGrant(true, false, false),
     "An authenticated monitored peer may request input authority.");
-Check(!InputClaimLifecyclePolicy.CanGrant(true, true, false),
-    "Forward remote claim must be refused during reverse input control.");
+Check(InputClaimLifecyclePolicy.CanGrant(true, true, false),
+    "Independent Android-to-hub and hub-to-PC input grants must coexist safely.");
+Check(!PhysicalInputMonitor.IsLocallyDirected(true) &&
+    PhysicalInputMonitor.IsLocallyDirected(false),
+    "Physical input forwarded to another device cannot revoke a separate hub controller");
 Check(!InputClaimLifecyclePolicy.CanGrant(true, false, true),
     "Forward remote claim must be refused during pending reverse handoff.");
 Console.WriteLine("PASS: discovery-only startup cannot grant input; global monitoring required for sharing.");

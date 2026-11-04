@@ -5,6 +5,39 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// Bluetooth HID eligibility is read-only. A candidate is NOT proof of an
+// Android HID connection, and adapter selection cannot change input leases.
+var candidate = new BluetoothHidCapability("Candidate", true, true,
+    "BLE peripheral role available.");
+var unsupported = new BluetoothHidCapability("Unsupported", true, false,
+    "BLE peripheral role unavailable.");
+Check(BluetoothHidCapability.Valid(candidate) &&
+    BluetoothHidCapability.Valid(unsupported),
+    "Valid adapter reports can travel over the authenticated environment");
+Check(!BluetoothHidCapability.Valid(
+    new BluetoothHidCapability("Candidate", true, false, "Impossible")),
+    "The hub must reject a falsely qualified peripheral candidate");
+Check(!BluetoothHidCapability.Valid(
+    new BluetoothHidCapability("Candidate", true, true, "Unsafe\nidentity")),
+    "The hub must reject multiline, untrusted adapter reports");
+var radios = new[] {
+    new BluetoothHidDeviceStatus(0, "Hub", unsupported),
+    new BluetoothHidDeviceStatus(1, "Peer-A", candidate),
+    new BluetoothHidDeviceStatus(2, "Peer-B", unsupported)
+};
+Check(BluetoothHidSelection.PreferredCandidate(radios)==1,
+    "Only eligible peer should be preferred even if the hub lacks Bluetooth");
+Check(BluetoothHidSelection.PreferredCandidate(
+    new[] { radios[0], radios[2] })==null,
+    "Never choose an unsupported Windows Bluetooth adapter");
+Check(BluetoothHidSelection.PreferredCandidate(
+    new[] { radios[1], new BluetoothHidDeviceStatus(3,"Peer-C",candidate) },3)==3,
+    "Keep the previously chosen eligible endpoint to avoid bouncing");
+Check(BluetoothHidSelection.IsMateriallyStronger(-76,-62) &&
+    !BluetoothHidSelection.IsMateriallyStronger(-76,-71),
+    "Only a measured, stable RSSI improvement could justify future roaming");
+Console.WriteLine("PASS: cross-PC Bluetooth report validation, safe candidate choice and RSSI hysteresis.");
+
 // Native Windows DISPLAYn identifiers must be stable PER computer. The
 // previous UI incorrectly numbered every PC and phone in one running sequence.
 Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
@@ -624,7 +657,7 @@ try
     multiServer.AllowForwardClaim=()=>false; // no Windows SendInput in CI.
     multiServer.Start();
     Check(multiServer.CanAcceptNewPeer,"Fresh hub must accept a peer");
-    using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(18));
+    using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(35));
     using var peer1=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
         multiServer.Fingerprint,_=>{},timeout.Token);
     using var peer2=await HostSession.ConnectWithApprovalAsync("127.0.0.1",
@@ -635,6 +668,21 @@ try
         "Windows receiver must keep TWO authenticated TLS peers at once");
     Check(multiServer.CanAcceptNewPeer,
         "Windows must remain discoverable/ready with two connected devices");
+    // Drive the real authenticated hub->client->hub Bluetooth diagnostic flow.
+    // Hosted CI has no physical Bluetooth radio, so the result may be
+    // NoAdapter/Unknown: never assert that HID hardware is usable in CI.
+    Check(peer2.RequestBluetoothCheck(),
+        "A connected Windows client must request a shared Bluetooth scan");
+    for(int t=0;t<140 && (peer2.BluetoothReports.Count!=3 ||
+        peer2.BluetoothReports.Any(p=>p.Capability.State=="Checking"));t++)
+        await Task.Delay(100,timeout.Token);
+    Check(peer2.BluetoothReports.Count==3 &&
+        peer2.BluetoothReports.All(p=>p.Capability.State!="Checking") &&
+        peer2.BluetoothReports.Select(p=>p.Id).Distinct().Count()==3,
+        "Hub and two connected Windows clients must return one non-spoofed Bluetooth capability report each");
+    Check(!multiPriority.RemoteGranted,
+        "Bluetooth diagnostics must not claim keyboard or mouse authority");
+    Console.WriteLine("PASS: Bluetooth capability collected over existing TLS from hub and two Windows peers without input claims.");
     peer1.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);

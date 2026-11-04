@@ -548,7 +548,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             return true;
         }
         if(destination.Value==CurrentInputTargetId())
+        {
+            // A user may have clicked the phone tile earlier without
+            // taking authority. Crossing the edge of THAT already-selected
+            // device must still request its first input grant.
+            if(!remote && _capture?.IsArmed==true)
+            {
+                _capture.BeginLinkedHandoff(edge,fraction);
+                return true;
+            }
             return false;
+        }
         // One authenticated hub, one keyboard/mouse hook pair: retarget the
         // SAME SourceCapture rather than disposing global hooks during the
         // cursor-edge transition. The destination still grants its own lease.

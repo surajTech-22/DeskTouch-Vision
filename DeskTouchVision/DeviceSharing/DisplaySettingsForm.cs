@@ -536,11 +536,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private bool NavigateEnvironmentFromCapture(MonitorEdge edge,double fraction)
     {
         var order=ConnectedEnvironmentOrder();
-        if(order==null || edge is not
-            (MonitorEdge.Left or MonitorEdge.Right))return false;
+        if(order==null)return false;
         bool remote=_capture?.RemoteActive==true;
         int starting=remote?CurrentInputTargetId():EnvironmentRouteOrder.Local;
-        int? destination=order.Neighbor(starting,edge);
+        int baseId=_host!=null ? 0 :
+            _receiver?.ConnectedPeers.Where(p=>p.Peer.Platform=="Windows")
+                .OrderBy(p=>p.Id).Select(p=>p.Id).FirstOrDefault()??0;
+        if(baseId==0 && _host==null)
+            baseId=_receiver?.ConnectedPeers.OrderBy(p=>p.Id)
+                .Select(p=>p.Id).FirstOrDefault()??0;
+        int? destination=_display.AdjacentTarget(starting,edge,baseId);
+        if(destination==null && edge is MonitorEdge.Left or MonitorEdge.Right)
+            destination=order.Neighbor(starting,edge);
         if(destination==null)return false;
         if(destination==EnvironmentRouteOrder.Local)
         {

@@ -166,6 +166,8 @@ jobs:
           } else {
             gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes-file "DeskTouchVision/RELEASE_NOTES.md"
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
-            Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2" -Body "desktouch-release:$tag" -ContentType "text/plain" | Out-Null
-            Write-Host "Release event sent: $tag"
+            # Do not announce an incomplete paired release. The Android
+            # workflow sends one release event after it attaches a permanently
+            # signed APK and verifies all four release assets.
+            Write-Host "Windows release staged for $tag; awaiting signed Android APK."
           }

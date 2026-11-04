@@ -1,3 +1,17 @@
+# DeskTouch Vision v0.3.16 — one draggable environment, not a one-to-one selector
+
+- Removed the two-item Windows/Android target dropdown. Displays now identifies **one environment** with the actual **total device count**, including the local PC. Clicking a device tile chooses it as a keyboard/mouse destination; dragging moves its preview without changing active authority.
+- Made EVERY authenticated Android/Windows environment member tile draggable in the SAME monitor diagram. A phone's dropped position persists in the existing per-user layout file (`device-sharing-layout.json`), keyed by stable identity where available, not by a temporary route ID or IP address.
+- Added full four-direction edge lookup using actual screen positions. Place Xiaomi to the right, left, above or below the PC and the corresponding outside-edge motion will choose the adjacent authenticated input destination.
+- Corrected the critical one-to-one behavior: a target change no longer destroys and recreates global keyboard/mouse hooks. A single SourceCapture retains its OS input hooks and retargets the existing authenticated TLS session, releasing the old destination's input lease before requesting a new per-target grant and cursor-applied acknowledgement.
+- Fixed a background phone topology update re-mapping the selected Windows PC's cursor, and preserved complete environment counts while another peer has selected authority.
+- The host/phone and PC/PC sessions continue concurrently. Input from one physical keyboard/mouse goes to **one selected destination at a time**; multiple users or devices can control different targets at the same time. A target may only grant one remote controller and local physical input takes precedence.
+- Device tiles are *control and screen-placement representations*, not new Windows video monitors. Android is not a native Extended Desktop display; screen streaming/virtual display drivers are outside this change.
+- New Windows integration tests exercise physical Android tile drag vs click, persisted layout offsets, layout-driven left/right/top/bottom target choices and same-hook source session retarget, in addition to existing three- and eight-client TLS lease tests. Android unit/APK and emulator launch remain part of non-publishing pre-release verification.
+- **Production release is gated** on final GitHub CI, then testing on the physical SURAJ, DESKTOP-IQ1KSJ9 and Xiaomi device arrangement.
+
+---
+
 # DeskTouch Vision v0.3.15 — simultaneous authority, Android keyboard and updater recovery
 
 ## One environment, all devices functional

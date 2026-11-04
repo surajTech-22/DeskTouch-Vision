@@ -18,7 +18,7 @@ Check(!BluetoothHidCapability.Valid(
     new BluetoothHidCapability("Candidate", true, false, "Impossible")),
     "The hub must reject a falsely qualified peripheral candidate");
 Check(!BluetoothHidCapability.Valid(
-    new BluetoothHidCapability("Candidate", true, true, "Unsafe\\nidentity")),
+    new BluetoothHidCapability("Candidate", true, true, "Unsafe\nidentity")),
     "The hub must reject multiline, untrusted adapter reports");
 var radios = new[] {
     new BluetoothHidDeviceStatus(0, "Hub", unsupported),

@@ -14,6 +14,40 @@ internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Pl
     internal bool IsAndroid => Platform=="Android";
 }
 
+// Logical routing order follows the EXISTING inline screen arrangement.
+// A local keyboard has one active destination at a time, while every other
+// authenticated environment member stays connected and independently usable.
+internal sealed class EnvironmentRouteOrder
+{
+    internal const int Local = int.MinValue;
+    private readonly IReadOnlyList<int> _order;
+    internal IReadOnlyList<int> Order => _order;
+    internal EnvironmentRouteOrder(int baseTargetId,
+        IReadOnlyList<EnvironmentDisplayTile> extraDevices, MonitorEdge baseEdge)
+    {
+        var list=new List<int>();
+        if(baseEdge==MonitorEdge.Left)list.Add(baseTargetId);
+        list.Add(Local);
+        if(baseEdge!=MonitorEdge.Left)list.Add(baseTargetId);
+        foreach(var member in extraDevices)
+            if(member.SupportsInput && member.TargetId!=baseTargetId &&
+                !list.Contains(member.TargetId))
+                list.Add(member.TargetId);
+        _order=list;
+    }
+    internal int? Neighbor(int currentTargetId, MonitorEdge toward)
+    {
+        if(toward is not (MonitorEdge.Left or MonitorEdge.Right))
+            return null;
+        int index=-1;
+        for(int i=0;i<_order.Count;i++)
+            if(_order[i]==currentTargetId){index=i;break;}
+        if(index<0)return null;
+        int next=index+(toward==MonitorEdge.Right?1:-1);
+        return next>=0&&next<_order.Count?_order[next]:null;
+    }
+}
+
 internal sealed class DisplayArrangementControl : Control
 {
     private MonitorTopology? _local, _remote;

@@ -139,30 +139,55 @@ jobs:
           if-no-files-found: error
 
       - name: Attach ONLY permanent-key-signed Android APK to matching official release
-        # Windows release must exist BEFORE Android attaches its APK.
-        # Main-branch push verifies Android signing/build but does not
-        # upload to a race-dependent release; workflow_run does that.
+        # Workflow-run is the normal path after Windows finishes. A main
+        # push/explicit dispatch may also attach if the official Windows ZIP
+        # and checksum already exist; that recovers from delayed Windows
+        # workflow finalization without weakening signing or release gates.
         if: >-
-          github.event_name == 'workflow_run' &&
-          github.event.workflow_run.head_branch == 'main'
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.head_branch == 'main') ||
+          ((github.event_name == 'push' ||
+            github.event_name == 'workflow_dispatch') &&
+           github.ref == 'refs/heads/main')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$(grep 'versionName' app/build.gradle | head -1 | sed -E "s/.*'([^']+)'.*/\1/")"
           tag="v${version}"
-          gh release view "$tag" --repo "${{ github.repository }}"
-          # Require both Windows assets before publishing the Android update.
+          event="${{ github.event_name }}"
+          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [[ "$event" == "workflow_run" ]]; then
+              echo "::error::Windows release missing after successful Windows workflow."
+              exit 1
+            fi
+            echo "Windows release not staged yet; workflow_run will attach the same permanently signed APK."
+            exit 0
+          fi
+          # Do not publish an Android update unless Windows passed its own
+          # package pipeline and attached both verified official artifacts.
           assets="$(gh release view "$tag" --json assets --jq '.assets[].name' --repo "${{ github.repository }}")"
-          echo "$assets" | grep -Fx 'DeskTouchVision-win-x64.zip'
-          echo "$assets" | grep -Fx 'DeskTouchVision-win-x64.zip.sha256'
+          if ! echo "$assets" | grep -Fxq 'DeskTouchVision-win-x64.zip' ||
+             ! echo "$assets" | grep -Fxq 'DeskTouchVision-win-x64.zip.sha256'; then
+            if [[ "$event" == "workflow_run" ]]; then
+              echo "::error::Official Windows ZIP/checksum missing."
+              exit 1
+            fi
+            echo "Windows files not complete; skip early main push, workflow_run will finish."
+            exit 0
+          fi
+          if echo "$assets" | grep -Fxq 'DeskTouchVision-android-preview.apk' &&
+             echo "$assets" | grep -Fxq 'DeskTouchVision-android-preview.apk.sha256'; then
+            echo "The paired, permanently signed Android release is already present; no duplicate update notification."
+            exit 0
+          fi
           gh release upload "$tag" DeskTouchVision-android-preview.apk DeskTouchVision-android-preview.apk.sha256 --clobber --repo "${{ github.repository }}"
           final="$(gh release view "$tag" --json assets --jq '.assets[].name' --repo "${{ github.repository }}")"
           for expected in DeskTouchVision-win-x64.zip DeskTouchVision-win-x64.zip.sha256 DeskTouchVision-android-preview.apk DeskTouchVision-android-preview.apk.sha256; do
             echo "$final" | grep -Fx "$expected"
           done
-          # Notify both Windows and Android only when the coordinated release
-          # exists with its paired hash-verified assets. Never announce early.
+          # Announce only after both matching signed Android and Windows
+          # artifacts exist on the same official release.
           curl -fsS --retry 3 -X POST -H 'Content-Type: text/plain' --data "desktouch-release:$tag" 'https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2'
           echo "Coordinated DeskTouch Windows + Android release announced: $tag"
 

@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.13 — connected Android devices visible in Displays
+
+- The existing Windows **Displays** diagram now includes a compact row of all additional authenticated Windows/Android environment members, not just the single selected remote computer. Android devices are identified by their actual mobile name and **Android • Display 1**.
+- Each phone already connected to the same hub appears automatically when the hub's live roster changes. A phone without Accessibility authorization still appears as connected, marked **View only • permission needed**, so visibility is separate from control authority.
+- Clicking a member tile selects that device using the **existing** authenticated environment connection; it does not create a new pairing, disconnect another device, or change Windows monitor configuration.
+- Native monitor names/numbering and the selected remote display's drag/edge behavior remain unchanged. The additional row shares the original diagram rather than replacing its design.
+- Windows summary now reports the total number of online environment members and Android devices. Offline and separately connected phones are never fabricated as online. On the Android app, **Join environment** must point to the same Windows hub (for example SURAJ) to appear on the other Windows member.
+- Regression tests verify two simultaneous Android tiles (including view-only), nonduplicated selected screens, target identities, and WinForms bitmap rendering at compact and standard window sizes.
+- Uses the previously verified v0.3.12 shared-environment TLS hub, exclusive input authority, keyboard routing, and permanent Android signing identity.
+
+---
 # DeskTouch Vision v0.3.12 — single shared environment (development, not released)
 
 ## Real multi-device environment

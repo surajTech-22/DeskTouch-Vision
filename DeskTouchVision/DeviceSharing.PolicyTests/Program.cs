@@ -704,6 +704,10 @@ try
     Check(await remoteGrant.Task.WaitAsync(timeout.Token)==3100 &&
         destinationInput.RemoteGranted,
         "Hub operator must control the selected PC independently");
+    // Use the REAL form's policy, not a hard-coded test grant. A previous
+    // release denied this exact case whenever a reverse capture was active.
+    multiServer.AllowForwardClaim=()=>InputClaimLifecyclePolicy.CanGrant(
+        true,destinationInput.RemoteGranted,false);
     Check(peer3.TrySend(new Packet("claim",3200)),
         "Another authenticated device must be able to claim the hub concurrently");
     Check(await hubGrant.Task.WaitAsync(timeout.Token)==3200,

@@ -86,9 +86,8 @@ jobs:
             echo "DeskTouch Android unit run $pass / 2"
             gradle --no-daemon :app:testDebugUnitTest
           done
-          gradle --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
+          gradle --no-daemon :app:assembleDebug
           test -s app/build/outputs/apk/debug/app-debug.apk
-          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Record Android test summary without releasing APK
         shell: bash
         run: |
@@ -120,13 +119,14 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK for emulator launch
+      - name: Build debug APK and on-device instrumentation test APK
         working-directory: AndroidDeskTouch
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon :app:assembleDebug
+          gradle --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
           test -s app/build/outputs/apk/debug/app-debug.apk
+          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Enable emulator hardware virtualization
         shell: bash
         run: |

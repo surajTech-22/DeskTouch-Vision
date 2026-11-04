@@ -82,6 +82,7 @@ internal sealed class BluetoothHidCheckForm : Form
                     "Candidate"=>"CANDIDATE (not paired)",
                     "Unsupported"=>"Not supported",
                     "NoAdapter"=>"No Bluetooth adapter",
+                    "RadioOff"=>"Bluetooth switched off",
                     "Checking"=>"Checking…",
                     _=>"Unable to verify"
                 });
@@ -97,7 +98,7 @@ internal sealed class BluetoothHidCheckForm : Form
         }
         var chosen=reports.FirstOrDefault(r=>r.Id==preferred);
         _message.Text=chosen==null
-            ? "No Windows PC has confirmed BLE peripheral eligibility. Check the adapter details and connectivity."
+            ? "No Windows PC currently has confirmed enabled BLE peripheral eligibility. Check adapter details or turn Bluetooth on."
             : "Preferred eligible adapter: "+chosen.Name+
               ". This is a hardware CAPABILITY check, not a live Bluetooth HID link. "+
               "Actual Android pairing, HID reports and RSSI are not tested yet.";

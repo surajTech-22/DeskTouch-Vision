@@ -408,43 +408,50 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _display.LocalDeviceName = Environment.MachineName;
             _display.Local = MonitorTopology.Capture();
-            bool inbound = (_captureUsesInbound || _host == null) &&
-                _incomingPeer != null;
-            _display.Remote = inbound ? _incomingPeer!.Monitors :
-                _host?.RemoteMonitors ?? _incomingPeer?.Monitors;
-            _display.RemoteDeviceName = inbound ? _incomingPeer!.Name :
-                _host != null ? (_host.RemoteSystemName ?? _remoteAddress) :
-                _incomingPeer?.Name ?? "Connected device";
-
-            // The diagram previously drew ONLY the selected remote monitor
-            // topology. List all other live authenticated members here too,
-            // including Android phones and their screen count, without changing
-            // Windows monitor numbering or opening another connection.
+            // Device placement is an ENVIRONMENT property, not a transient
+            // keyboard-authority selection. Selecting Android must never
+            // move the Windows PC from the left side to another tile.
             var tiles = new List<EnvironmentDisplayTile>();
-            int selectedTargetId;
-            if(_host != null && !inbound)
+            int baseTargetId=0;
+            if(_host!=null)
             {
-                selectedTargetId=-_host.SelectedEnvironmentTargetId;
+                // A leaf Windows PC is always arranged next to its hub.
+                var hub=_host.EnvironmentMembers.FirstOrDefault(m=>m.Id==0);
+                var baseTopology=hub==null ?
+                    _host.RemoteMonitors : MonitorTopology.FromWire(hub.Layout);
+                _display.Remote=baseTopology;
+                _display.RemoteDeviceName=hub?.Name ?? _remoteAddress;
                 foreach(var member in _host.EnvironmentMembers)
                 {
-                    if(member.Id==_host.OwnEnvironmentMemberId)continue;
-                    int id=member.Id==0?0:-member.Id;
-                    int screens=MonitorTopology.FromWire(member.Layout).Monitors.Count;
-                    tiles.Add(new EnvironmentDisplayTile(id,member.Name,
-                        member.Platform,screens,member.SupportsReverseInput));
+                    if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId)continue;
+                    tiles.Add(new EnvironmentDisplayTile(-member.Id,member.Name,
+                        member.Platform,MonitorTopology.FromWire(member.Layout).Monitors.Count,
+                        member.SupportsReverseInput));
                 }
             }
             else
             {
-                selectedTargetId=_receiver?.SelectedPeerId ?? 0;
-                foreach(var (id,peer) in _receiver?.ConnectedPeers ??
-                    Array.Empty<(int Id,ConnectedPeer Peer)>())
+                var connected=_receiver?.ConnectedPeers ??
+                    Array.Empty<(int Id,ConnectedPeer Peer)>();
+                // First connected Windows PC is a permanent layout anchor.
+                // A selected Android phone remains beside it, not in its slot.
+                var main=connected.Where(p=>p.Peer.Platform=="Windows")
+                    .OrderBy(p=>p.Id).FirstOrDefault();
+                if(main.Peer==null)
+                    main=connected.OrderBy(p=>p.Id).FirstOrDefault();
+                baseTargetId=main.Id;
+                _display.Remote=main.Peer?.Monitors;
+                _display.RemoteDeviceName=main.Peer?.Name ?? "Connected device";
+                foreach(var (id,peer) in connected)
+                {
+                    if(id==baseTargetId)continue;
                     tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
                         peer.Platform,peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput));
+                }
             }
             _display.EnvironmentDevices =
-                DisplayArrangementControl.ProjectEnvironment(tiles,selectedTargetId);
+                DisplayArrangementControl.ProjectEnvironment(tiles,baseTargetId);
             UpdateTargetChoice();
             UpdateButtons();
         }

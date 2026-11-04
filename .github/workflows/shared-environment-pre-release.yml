@@ -119,14 +119,13 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK and on-device instrumentation test APK
+      - name: Build debug APK for real app-process input probes
         working-directory: AndroidDeskTouch
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon :app:assembleDebug :app:assembleDebugAndroidTest
+          gradle --no-daemon :app:assembleDebug
           test -s app/build/outputs/apk/debug/app-debug.apk
-          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
       - name: Enable emulator hardware virtualization
         shell: bash
         run: |
@@ -154,5 +153,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DeskTouch-Android-Real-Input-Acceptance
-          path: android-input-instrumentation.txt
+          path: android-input-emulator.txt
           if-no-files-found: ignore

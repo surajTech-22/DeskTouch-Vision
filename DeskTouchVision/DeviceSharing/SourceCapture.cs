@@ -11,7 +11,7 @@ namespace DeskTouch.DeviceShare;
 internal sealed class SourceCapture : IDisposable
 {
     private readonly Control _owner;
-    private readonly IInputSession _session;
+    private IInputSession _session;
     private readonly bool _preserveRawInput;
     private readonly int _mouseSpeed;
     private readonly AuthorityRequestTracker _claims = new();
@@ -104,6 +104,42 @@ internal sealed class SourceCapture : IDisposable
         MonitorEdge.Bottom => MonitorEdge.Top,
         _ => MonitorEdge.Left
     };
+
+    // One physical keyboard/mouse hook set for the WHOLE environment. A
+    // destination change must release the previous session while still
+    // bound to it, and then attach the next already-authenticated stream
+    // WITHOUT disposing/reattaching global Windows hooks or Raw Input.
+    internal void Retarget(IInputSession next, MonitorEdge entryEdge)
+    {
+        ReturnLocal();
+        _session=next;
+        _remoteMonitors=next.RemoteMonitors;
+        _edge=entryEdge;
+        _slowEdge.Reset();
+        _alternateSlowEdge.Reset();
+        Interlocked.Exchange(ref _pending,0);
+        Interlocked.Exchange(ref _switchPending,0);
+        _cooldownUntil=0;
+    }
+
+    internal bool SameInputSession(IInputSession session) =>
+        ReferenceEquals(_session,session);
+
+    internal MonitorTopology ActiveRemoteMonitors => _remoteMonitors;
+
+    internal void RefreshRemoteGeometry(MonitorTopology newGeometry)
+    {
+        // A roster/selection metadata event must never silently revoke a
+        // fresh input lease after the mouse has already crossed screens.
+        // Real monitor geometry changes still clamp the current pointer.
+        _remoteMonitors=newGeometry;
+        if(RemoteActive)
+        {
+            var point=_remoteMonitors.ClampToRealMonitor(
+                new System.Drawing.Point(_remoteX,_remoteY));
+            _remoteX=point.X;_remoteY=point.Y;
+        }
+    }
 
     internal void BeginLinkedHandoff(MonitorEdge approach,double fraction)
     {

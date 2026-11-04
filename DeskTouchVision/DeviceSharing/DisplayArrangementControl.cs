@@ -9,9 +9,14 @@ namespace DeskTouch.DeviceShare;
 /// only; only the placement of an AUTHENTICATED remote computer is draggable.
 /// </summary>
 internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
-    int ScreenCount,bool SupportsInput)
+    int ScreenCount,bool SupportsInput,string? StableIdentity=null)
 {
     internal bool IsAndroid => Platform=="Android";
+    // Prefer a persistent authenticated device identity. The hub roster only
+    // exposes a connection-scoped route ID, so names are a UI fallback until
+    // the peer advertises its stable ID (never IP based).
+    internal string LayoutKey => !string.IsNullOrWhiteSpace(StableIdentity)
+        ? StableIdentity : Platform+"|"+Name;
 }
 
 // Logical routing order follows the EXISTING inline screen arrangement.
@@ -22,6 +27,10 @@ internal sealed class EnvironmentRouteOrder
     internal const int Local = int.MinValue;
     private readonly IReadOnlyList<int> _order;
     internal IReadOnlyList<int> Order => _order;
+    internal EnvironmentRouteOrder(IReadOnlyList<int> arranged)
+    {
+        _order=arranged.Distinct().ToArray();
+    }
     internal EnvironmentRouteOrder(int baseTargetId,
         IReadOnlyList<EnvironmentDisplayTile> extraDevices, MonitorEdge baseEdge)
     {
@@ -88,6 +97,39 @@ internal sealed class DisplayArrangementControl : Control
     private IReadOnlyList<EnvironmentDisplayTile> _environmentDevices =
         Array.Empty<EnvironmentDisplayTile>();
     private readonly List<(RectangleF Hit,int TargetId)> _environmentHits = new();
+    private readonly Dictionary<string,PointF> _memberOffsets =
+        new(StringComparer.Ordinal);
+    private int _draggingMemberId=int.MinValue;
+    private RectangleF _draggingMemberHit;
+    private float _layoutScale=1f;
+    internal event Action? EnvironmentArrangementChanged;
+
+    internal IReadOnlyDictionary<string,PointF> StoredMemberOffsets =>
+        new Dictionary<string,PointF>(_memberOffsets,StringComparer.Ordinal);
+    internal void RestoreMemberOffsets(IReadOnlyDictionary<string,PointF> offsets)
+    {
+        _memberOffsets.Clear();
+        foreach(var pair in offsets)
+            if(pair.Key.Length is > 0 and < 150 &&
+                float.IsFinite(pair.Value.X) && float.IsFinite(pair.Value.Y) &&
+                Math.Abs(pair.Value.X)<90000 && Math.Abs(pair.Value.Y)<90000)
+                _memberOffsets[pair.Key]=pair.Value;
+        Invalidate();
+    }
+    internal IReadOnlyList<int> ArrangedTargetOrder(int baseTargetId)
+    {
+        // A physical screen is at most one input destination; all its native
+        // monitors remain inside the same peer and aren't separate pairings.
+        var arranged=new List<(int Id,float Center)> {
+            (EnvironmentRouteOrder.Local,_localHit.Left+_localHit.Width/2),
+            (baseTargetId,_remoteHit.Left+_remoteHit.Width/2)
+        };
+        foreach(var (hit,id) in _environmentHits)
+            if(_environmentDevices.Any(d=>d.TargetId==id && d.SupportsInput))
+                arranged.Add((id,hit.Left+hit.Width/2));
+        return arranged.OrderBy(item=>item.Center).Select(item=>item.Id)
+            .Distinct().ToArray();
+    }
 
     // This is an authenticated, online-only snapshot of the same environment.
     // A phone is never fabricated from LAN discovery or merely remembered trust.
@@ -223,7 +265,13 @@ internal sealed class DisplayArrangementControl : Control
         // Their preview rectangles are visual placements only: Android is
         // never registered as a native Windows monitor or virtual driver.
         var core = Rectangle.Union(l, remotePos);
-        var extras = ComposeInlineDevices(core,_environmentDevices);
+        var extras = ComposeInlineDevices(core,_environmentDevices)
+            .Select(extra => {
+                var offset=_memberOffsets.GetValueOrDefault(extra.Device.LayoutKey);
+                var moved=extra.World;
+                moved.Offset((int)Math.Round(offset.X),(int)Math.Round(offset.Y));
+                return (extra.Device,World:moved);
+            }).ToArray();
         var full = core;
         foreach(var additional in extras)
             full = Rectangle.Union(full,additional.World);
@@ -232,6 +280,7 @@ internal sealed class DisplayArrangementControl : Control
         float scale = Math.Min(Math.Max(70, Width - pad * 2) / Math.Max(1, full.Width),
             Math.Max(60, Height - pad * 2) / Math.Max(1, full.Height));
         scale = Math.Max(.001f,scale);
+        _layoutScale=scale;
         float offsetX = (Width - full.Width * scale) / 2f;
         float offsetY = (Height - full.Height * scale) / 2f;
 
@@ -278,6 +327,9 @@ internal sealed class DisplayArrangementControl : Control
         foreach(var extra in extras)
         {
             var group = Fit(extra.World,full,scale,offsetX,offsetY);
+            if(extra.Device.TargetId==_draggingMemberId)
+                group.Offset(_dragCurrent.X-_dragOrigin.X,
+                    _dragCurrent.Y-_dragOrigin.Y);
             int count=Math.Clamp(extra.Device.ScreenCount,1,8);
             float gap=Math.Min(7,group.Width / Math.Max(3,count*8));
             float screenWidth=(group.Width-gap*(count-1))/count;
@@ -394,7 +446,14 @@ internal sealed class DisplayArrangementControl : Control
         {
             if(item.Hit.Contains(e.Location))
             {
-                EnvironmentDeviceSelected?.Invoke(item.TargetId);
+                // Treat a press as the START of a native-monitor-style drag.
+                // A tap on release still selects the member; dragging never
+                // tears down an input session or requires another pairing.
+                _draggingMemberId=item.TargetId;
+                _draggingMemberHit=item.Hit;
+                _dragOrigin=_dragCurrent=e.Location;
+                Capture=true;
+                Cursor=Cursors.SizeAll;
                 return;
             }
         }
@@ -412,13 +471,20 @@ internal sealed class DisplayArrangementControl : Control
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        if (_draggingRemote)
+        if (_draggingMemberId!=int.MinValue)
+        {
+            var delta=ConstrainDrag(_draggingMemberHit,ClientSize,
+                new Point(e.X-_dragOrigin.X,e.Y-_dragOrigin.Y));
+            _dragCurrent=new Point(_dragOrigin.X+delta.X,_dragOrigin.Y+delta.Y);
+            Invalidate();
+        }
+        else if (_draggingRemote)
         {
             _dragCurrent = ClampedDragPoint(e.Location);
             Invalidate();
         }
         else Cursor = _environmentHits.Any(item=>item.Hit.Contains(e.Location))
-            ? Cursors.Hand
+            ? Cursors.SizeAll
             : _remote != null && _remoteHit.Contains(e.Location)
                 ? Cursors.SizeAll
                 : _remote == null && _placeholderHit.Contains(e.Location)
@@ -428,6 +494,32 @@ internal sealed class DisplayArrangementControl : Control
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if(_draggingMemberId!=int.MinValue)
+        {
+            int id=_draggingMemberId;
+            int dx=_dragCurrent.X-_dragOrigin.X;
+            int dy=_dragCurrent.Y-_dragOrigin.Y;
+            _draggingMemberId=int.MinValue;
+            Capture=false;
+            Cursor=Cursors.Default;
+            if(Math.Max(Math.Abs(dx),Math.Abs(dy)) < 8)
+                EnvironmentDeviceSelected?.Invoke(id);
+            else
+            {
+                var member=_environmentDevices.FirstOrDefault(d=>d.TargetId==id);
+                if(member!=null)
+                {
+                    string key=member.LayoutKey;
+                    var old=_memberOffsets.GetValueOrDefault(key);
+                    _memberOffsets[key]=new PointF(
+                        Math.Clamp(old.X+dx/Math.Max(.001f,_layoutScale),-80000,80000),
+                        Math.Clamp(old.Y+dy/Math.Max(.001f,_layoutScale),-80000,80000));
+                    EnvironmentArrangementChanged?.Invoke();
+                }
+            }
+            Invalidate();
+            return;
+        }
         if (!_draggingRemote) return;
         _dragCurrent = ClampedDragPoint(e.Location);
         _draggingRemote = false;
@@ -459,6 +551,12 @@ internal sealed class DisplayArrangementControl : Control
     protected override void OnMouseCaptureChanged(EventArgs e)
     {
         base.OnMouseCaptureChanged(e);
+        if(_draggingMemberId!=int.MinValue && !Capture)
+        {
+            _draggingMemberId=int.MinValue;
+            Cursor=Cursors.Default;
+            Invalidate();
+        }
         if (_draggingRemote && !Capture)
         {
             _draggingRemote = false;
@@ -469,6 +567,11 @@ internal sealed class DisplayArrangementControl : Control
 
     protected override void OnResize(EventArgs e)
     {
+        if(_draggingMemberId!=int.MinValue)
+        {
+            _draggingMemberId=int.MinValue;
+            Capture=false;
+        }
         if (_draggingRemote)
         {
             _draggingRemote = false;

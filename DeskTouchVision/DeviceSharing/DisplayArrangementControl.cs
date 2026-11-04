@@ -356,7 +356,7 @@ internal sealed class DisplayArrangementControl : Control
             int height=Math.Max(380,
                 (int)(mainScreenArea.Height * (device.IsAndroid ? 0.88 : 0.79)));
             int width=device.IsAndroid
-                ? Math.Max(220,(int)(height*.51))
+                ? Math.Max(300,(int)(height*.64))
                 : Math.Max(420,(int)(height*.95*count));
             var preview=new Rectangle(nextX,
                 mainScreenArea.Top+(mainScreenArea.Height-height)/2,width,height);
@@ -390,7 +390,9 @@ internal sealed class DisplayArrangementControl : Control
         g.FillPath(fill, path);
         g.DrawPath(outline, path);
         if (rect.Width < 38 || rect.Height < 28) return;
-        float labelHeight = Math.Min(27, Math.Max(13, rect.Height * .23f));
+        float labelHeight = platform=="Android"
+            ? Math.Min(52,Math.Max(26,rect.Height*.36f))
+            : Math.Min(27, Math.Max(13, rect.Height * .23f));
         var title = new RectangleF(rect.Left + 4, rect.Top + 3,
             Math.Max(1, rect.Width - 8), labelHeight);
         using var nameFont = new Font("Segoe UI Semibold",
@@ -412,7 +414,7 @@ internal sealed class DisplayArrangementControl : Control
             Math.Min(15, Math.Max(1, rect.Height - labelHeight - 7)));
         if (numberTile.Height >= 9)
             DrawCenter(g, platform == "Android"
-                ? $"Android · Display {displayNumber}" : $"Display {displayNumber}",
+                ? $"Android · {displayNumber}" : $"Display {displayNumber}",
                 numberTile, Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
     }
 

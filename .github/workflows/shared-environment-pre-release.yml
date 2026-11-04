@@ -7,6 +7,8 @@ on:
       - 'DeskTouchVision/**'
       - 'AndroidDeskTouch/**'
       - '.github/workflows/shared-environment-pre-release.yml'
+      - '.github/workflows/android-desktouch.yml'
+      - '.github/workflows/desktouch-vision.yml'
       - '.github/scripts/**'
   workflow_dispatch:
 

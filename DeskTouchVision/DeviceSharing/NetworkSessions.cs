@@ -86,6 +86,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly Func<string,CancellationToken,Task<bool>>? _requestTrustApproval;
     private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
+    private readonly ConcurrentDictionary<int,BluetoothHidCapability> _bluetoothReports = new();
+    private BluetoothHidCapability _localBluetoothReport = BluetoothHidCapability.Checking;
     private readonly object _authorityGate = new();
     private readonly object _layoutGate=new();
     private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
@@ -114,6 +116,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
     internal event Action? PeerListChanged;
+    internal event Action? BluetoothReportsChanged;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
@@ -125,6 +128,58 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+
+    internal IReadOnlyList<BluetoothHidDeviceStatus> BluetoothReports
+    {
+        get
+        {
+            var reports = new List<BluetoothHidDeviceStatus> {
+                new(0,Environment.MachineName,Volatile.Read(ref _localBluetoothReport))
+            };
+            foreach(var session in _sessions.Values.Where(s=>s.Peer.Platform=="Windows")
+                .OrderBy(s=>s.Id))
+                reports.Add(new(session.Id,session.Peer.Name,
+                    _bluetoothReports.TryGetValue(session.Id,out var status)
+                        ? status : BluetoothHidCapability.Checking));
+            return reports;
+        }
+    }
+
+    // A request from EITHER Windows app checks the entire paired environment.
+    // This carries only adapter capabilities, never keyboard events or
+    // Bluetooth device addresses, through the existing authenticated TLS link.
+    internal void RequestBluetoothCheck()
+    {
+        if(_disposed || _cancel.IsCancellationRequested)return;
+        _=RefreshBluetoothReportsAsync(_cancel.Token);
+    }
+
+    private async Task RefreshBluetoothReportsAsync(CancellationToken token)
+    {
+        foreach(var peer in _sessions.Values.Where(s=>s.Peer.Platform=="Windows"))
+        {
+            try{await SendToAsync(peer,new Packet("bluetooth-check-request"),token);}
+            catch(Exception){} // peer disconnected mid-check
+        }
+        var status=await BluetoothHidDiagnostics.CheckAsync();
+        if(token.IsCancellationRequested)return;
+        Volatile.Write(ref _localBluetoothReport,status);
+        await PublishBluetoothReportsAsync(token);
+    }
+
+    private async Task PublishBluetoothReportsAsync(CancellationToken token)
+    {
+        if(token.IsCancellationRequested)return;
+        var reports=BluetoothReports;
+        var payload=JsonSerializer.Serialize(reports);
+        if(System.Text.Encoding.UTF8.GetByteCount(payload)>7800)return;
+        BluetoothReportsChanged?.Invoke();
+        foreach(var peer in _sessions.Values.Where(s=>s.Peer.Platform=="Windows"))
+        {
+            try{await SendToAsync(peer,new Packet("bluetooth-snapshot",Text:payload),token);}
+            catch(Exception){} // disconnected peer
+        }
+    }
     internal static string LayoutIdentity(ConnectedPeer peer) =>
         string.IsNullOrWhiteSpace(peer.DeviceFingerprint) ?
             peer.Platform+"|"+peer.Name : peer.DeviceFingerprint;
@@ -740,12 +795,31 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
             await PublishEnvironmentAsync(token);
+            if(peer.Platform=="Windows")RequestBluetoothCheck();
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
                 deadline.CancelAfter(TimeSpan.FromSeconds(18));
                 var p=await Wire.ReadAsync(ssl,deadline.Token);
                 if(p.Type=="goodbye") break;
+                if(p.Type=="bluetooth-check-request" && peer.Platform=="Windows")
+                {
+                    RequestBluetoothCheck();
+                    continue;
+                }
+                if(p.Type=="bluetooth-report" && peer.Platform=="Windows")
+                {
+                    if(p.Text is not {Length:>1 and <=1024})continue;
+                    BluetoothHidCapability? report;
+                    try{report=JsonSerializer.Deserialize<BluetoothHidCapability>(p.Text);}
+                    catch(JsonException){continue;}
+                    if(!BluetoothHidCapability.Valid(report))continue;
+                    // Trust the authenticated session ID and peer name, not
+                    // identity claims embedded in client-supplied diagnostics.
+                    _bluetoothReports[session.Id]=report!;
+                    await PublishBluetoothReportsAsync(token);
+                    continue;
+                }
                 if(p.Type=="trust-request")
                 {
                     bool allowed=false;
@@ -1074,6 +1148,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
+            _bluetoothReports.TryRemove(id,out _);
+            await PublishBluetoothReportsAsync(token);
             lock(_authorityGate) _hubClaims.Remove(id);
             var disconnectedRoutes=new List<RelayLease>();
             lock(_authorityGate)
@@ -1156,6 +1232,12 @@ internal sealed class HostSession : IInputSession, IDisposable
     private string? _environmentHubName;
     private readonly MonitorTopology _environmentHubMonitors;
     private EnvironmentMember[] _environmentMembers = [];
+    private BluetoothHidDeviceStatus[] _bluetoothReports = [];
+    internal IReadOnlyList<BluetoothHidDeviceStatus> BluetoothReports =>
+        Volatile.Read(ref _bluetoothReports);
+    internal event Action? BluetoothReportsChanged;
+    internal bool RequestBluetoothCheck() =>
+        TrySend(new Packet("bluetooth-check-request"));
     private int _environmentOwnId;
     private int _environmentTargetId;
     internal IReadOnlyList<EnvironmentMember> EnvironmentMembers =>
@@ -1484,6 +1566,32 @@ internal sealed class HostSession : IInputSession, IDisposable
                         m.SupportsReverseInput))
                         SelectEnvironmentTarget(0);
                     EnvironmentRosterChanged?.Invoke();
+                }
+                else if(p.Type=="bluetooth-check-request")
+                {
+                    // Probe off the receive loop: input and heartbeat packets
+                    // must continue even if the Windows adapter is sluggish.
+                    _=Task.Run(async () =>
+                    {
+                        var report=await BluetoothHidDiagnostics.CheckAsync();
+                        TrySend(new Packet("bluetooth-report",
+                            Text:JsonSerializer.Serialize(report)));
+                    });
+                }
+                else if(p.Type=="bluetooth-snapshot" &&
+                    p.Text is { Length:>1 and <=7800 } bluetoothPayload)
+                {
+                    BluetoothHidDeviceStatus[]? reports;
+                    try{reports=JsonSerializer.Deserialize<BluetoothHidDeviceStatus[]>(
+                        bluetoothPayload);}
+                    catch(JsonException){continue;}
+                    if(reports==null || reports.Length is <1 or >9 ||
+                        reports.Select(r=>r.Id).Distinct().Count()!=reports.Length ||
+                        reports.Any(r=>r.Id<0 || r.Name is not {Length:>0 and <=100} ||
+                            r.Name.Any(char.IsControl) ||
+                            !BluetoothHidCapability.Valid(r.Capability)))continue;
+                    Volatile.Write(ref _bluetoothReports,reports);
+                    BluetoothReportsChanged?.Invoke();
                 }
                 else if (p.Type=="environment-layout" &&
                     p.Text is { Length: > 1 and <= 4096 } serializedPositions)

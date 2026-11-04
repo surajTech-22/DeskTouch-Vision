@@ -71,7 +71,7 @@ internal sealed class DisplayArrangementControl : Control
     {
         return online.Where(p=>p.TargetId!=selectedTargetId)
             .GroupBy(p=>p.TargetId).Select(g=>g.First())
-            .OrderBy(p=>p.IsAndroid?0:1)
+            .OrderBy(p=>p.IsAndroid?1:0)
             .ThenBy(p=>p.Name,StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -179,33 +179,42 @@ internal sealed class DisplayArrangementControl : Control
         }
 
         var l = _local.Bounds;
-        // Leave a compact lane for the other online environment members.
-        // Local monitor positions and selected remote monitor positions are
-        // still rendered by the original Windows layout calculation.
-        int memberLane = _environmentDevices.Count>0 ? Math.Min(120,
-            Math.Max(74, Height/3)) : 0;
         var r = _remote?.Bounds;
         var remotePos = r is null
             ? Placement(l, new Rectangle(0, 0, Math.Max(900, l.Width * 2 / 3),
                 Math.Max(540, l.Height * 2 / 3)), _remoteEdge)
             : Placement(l, r.Value, _remoteEdge);
 
-        // Local monitors are fixed by Windows. Only remote computer is placed
-        // next to those displays. This does not call Windows ChangeDisplaySettings.
-        var full = Rectangle.Union(l, remotePos);
-        const float pad = 38;
-        float availableX = Math.Max(90, Width - pad * 2);
-        float availableY = Math.Max(70, Height - memberLane - pad * 2);
-        float scale = Math.Min(availableX / Math.Max(1, full.Width),
-            availableY / Math.Max(1, full.Height));
-        scale = Math.Max(.001f, scale);
-        float offsetX = (Width - full.Width * scale) / 2f;
-        float offsetY = (Height - memberLane - full.Height * scale) / 2f;
+        // All authenticated screens belong in the SAME display arrangement.
+        // Their preview rectangles are visual placements only: Android is
+        // never registered as a native Windows monitor or virtual driver.
+        var core = Rectangle.Union(l, remotePos);
+        var extras = new List<(EnvironmentDisplayTile Device, Rectangle World)>();
+        int nextX = core.Right + Math.Max(90, core.Height / 12);
+        foreach (var device in _environmentDevices)
+        {
+            int count = Math.Clamp(device.ScreenCount, 1, 8);
+            int height = Math.Max(380, (int)(core.Height * (device.IsAndroid ? .88 : .79)));
+            int width = device.IsAndroid
+                ? Math.Max(220, (int)(height * .51)) // upright phone next to PCs
+                : Math.Max(420, (int)(height * .95 * count));
+            var location = new Rectangle(nextX,
+                core.Top + (core.Height - height) / 2, width, height);
+            extras.Add((device, location));
+            nextX = location.Right + Math.Max(90, core.Height / 12);
+        }
+        var full = core;
+        foreach(var additional in extras)
+            full = Rectangle.Union(full,additional.World);
 
-        _localHit = new RectangleF(
-            offsetX + (l.Left - full.Left) * scale,
-            offsetY + (l.Top - full.Top) * scale,
-            l.Width * scale, l.Height * scale);
+        const float pad = 36;
+        float scale = Math.Min(Math.Max(70, Width - pad * 2) / Math.Max(1, full.Width),
+            Math.Max(60, Height - pad * 2) / Math.Max(1, full.Height));
+        scale = Math.Max(.001f,scale);
+        float offsetX = (Width - full.Width * scale) / 2f;
+        float offsetY = (Height - full.Height * scale) / 2f;
+
+        _localHit = Fit(l,full,scale,offsetX,offsetY);
         int localOrdinal = 0;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
         {
@@ -216,9 +225,7 @@ internal sealed class DisplayArrangementControl : Control
 
         if (_remote is { } remote)
         {
-            var group = new RectangleF(offsetX + (remotePos.Left - full.Left) * scale,
-                offsetY + (remotePos.Top - full.Top) * scale,
-                remotePos.Width * scale, remotePos.Height * scale);
+            var group = Fit(remotePos, full, scale, offsetX, offsetY);
             _remoteBaseHit = group;
             if (_draggingRemote)
             {
@@ -238,65 +245,29 @@ internal sealed class DisplayArrangementControl : Control
                 DrawScreen(g, tile, RemoteDeviceName,
                     DisplayNumber(m, ++remoteOrdinal), m.Primary, false);
             }
-            // Each screen now carries the device name; no generic
-            // "Connected PC" title appears below the remote group.
         }
-        else
+        else if(extras.Count == 0)
         {
-            _placeholderHit = new RectangleF(
-                offsetX + (remotePos.Left - full.Left) * scale,
-                offsetY + (remotePos.Top - full.Top) * scale,
-                remotePos.Width * scale, remotePos.Height * scale);
+            _placeholderHit = Fit(remotePos, full, scale, offsetX, offsetY);
             DrawPlaceholder(g, _placeholderHit);
         }
-        // The remaining authenticated environment devices are part of the
-        // SAME screen diagram. Draw them without implying Windows has changed
-        // its own monitor configuration or that every device is the active target.
-        DrawEnvironmentMembers(g,memberLane);
-    }
 
-    private void DrawEnvironmentMembers(Graphics g,int lane)
-    {
-        if(lane<=0 || _environmentDevices.Count==0)return;
-        float top=Height-lane+5;
-        using var headingFont=new Font("Segoe UI Semibold",9.5f);
-        g.DrawString("Other connected devices in this environment",
-            headingFont,Brushes.Gainsboro,12,top);
-        float cardY=top+23;
-        float cardHeight=Math.Max(30,lane-33);
-        float left=12,spacing=9;
-        float available=Math.Max(1,Width-24);
-        int count=_environmentDevices.Count;
-        float cardWidth=Math.Max(48,Math.Min(158,
-            (available-spacing*Math.Max(0,count-1))/Math.Max(1,count)));
-        using var nameFont=new Font("Segoe UI Semibold",9f);
-        using var smallFont=new Font("Segoe UI",8f);
-        using var format=new StringFormat { Alignment=StringAlignment.Center,
-            Trimming=StringTrimming.EllipsisCharacter,
-            FormatFlags=StringFormatFlags.NoWrap };
-        foreach(var device in _environmentDevices)
+        // Extra Windows PCs and Android phones use the exact same screen
+        // tiles/labels as native and selected displays, never a footer/deck.
+        foreach(var extra in extras)
         {
-            var card=new RectangleF(left,cardY,cardWidth,cardHeight);
-            if(card.Right>Width-4)break;
-            using var path=Rounded(card,7);
-            using var bg=new SolidBrush(device.IsAndroid
-                ? Color.FromArgb(51,85,119)
-                : Color.FromArgb(51,100,92));
-            using var border=new Pen(Color.FromArgb(151,185,207),1.2f);
-            g.FillPath(bg,path);g.DrawPath(border,path);
-            g.DrawString(CleanDeviceName(device.Name,"Connected device"),
-                nameFont,Brushes.White,
-                new RectangleF(card.X+4,card.Y+6,card.Width-8,17),format);
-            string secondary=device.IsAndroid ? "Android • Display 1" :
-                $"Windows • {device.ScreenCount} display(s)";
-            g.DrawString(secondary,smallFont,Brushes.Gainsboro,
-                new RectangleF(card.X+4,card.Y+26,card.Width-8,16),format);
-            if(!device.SupportsInput)
-                g.DrawString("View only • permission needed",smallFont,
-                    Brushes.Gainsboro,new RectangleF(card.X+4,
-                        card.Bottom-16,card.Width-8,14),format);
-            _environmentHits.Add((card,device.TargetId));
-            left+=cardWidth+spacing;
+            var group = Fit(extra.World,full,scale,offsetX,offsetY);
+            int count=Math.Clamp(extra.Device.ScreenCount,1,8);
+            float gap=Math.Min(7,group.Width / Math.Max(3,count*8));
+            float screenWidth=(group.Width-gap*(count-1))/count;
+            for(int index=0;index<count;index++)
+            {
+                var screen=new RectangleF(group.Left+(screenWidth+gap)*index,
+                    group.Top,screenWidth,group.Height);
+                DrawScreen(g,screen,extra.Device.Name,index+1,false,false,
+                    extra.Device.IsAndroid?"Android":null);
+            }
+            _environmentHits.Add((group,extra.Device.TargetId));
         }
     }
 
@@ -312,7 +283,7 @@ internal sealed class DisplayArrangementControl : Control
     }
 
     private static void DrawScreen(Graphics g, RectangleF rect, string deviceName,
-        int displayNumber, bool primary, bool local)
+        int displayNumber, bool primary, bool local, string? platform = null)
     {
         if (rect.Width < 5 || rect.Height < 5) return;
         using var path = Rounded(rect, 9);
@@ -343,8 +314,9 @@ internal sealed class DisplayArrangementControl : Control
             Math.Max(1, rect.Width - 8),
             Math.Min(15, Math.Max(1, rect.Height - labelHeight - 7)));
         if (numberTile.Height >= 9)
-            DrawCenter(g, $"Display {displayNumber}", numberTile,
-                Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
+            DrawCenter(g, platform == "Android"
+                ? $"Android · Display {displayNumber}" : $"Display {displayNumber}",
+                numberTile, Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
     }
 
     private static GraphicsPath Rounded(RectangleF rect, float radius)

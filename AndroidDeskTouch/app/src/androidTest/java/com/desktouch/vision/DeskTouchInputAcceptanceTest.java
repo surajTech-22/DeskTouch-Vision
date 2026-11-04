@@ -125,6 +125,8 @@ public final class DeskTouchInputAcceptanceTest {
         int ex=sx+activity.dragTarget.getWidth()/3;
         assertTrue(DeskTouchAccessibilityService.pointer(sx,sy,null));
         DeskTouchAccessibilityService.mouseButton(1,true);
+        // Let the UI thread capture the initial press before moving.
+        instrumentation.waitForIdleSync();
         assertTrue(DeskTouchAccessibilityService.pointer(ex,sy,null));
         DeskTouchAccessibilityService.mouseButton(1,false);
         assertTrue("Drag gesture did not reach the Android View",

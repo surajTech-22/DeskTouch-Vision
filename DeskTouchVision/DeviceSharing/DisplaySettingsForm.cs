@@ -733,8 +733,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnPeerListChanged() => PostToUi(() =>
     {
-        // Receiver roster updates and topology changes must redraw the
-        // diagram, not just the target drop-down.
+        // An Android permission may be restored or disabled on the SAME TLS
+        // session, without dropping the entire environment. Keep diagram,
+        // keyboard-target availability and active input grant consistent.
+        if(_captureUsesInbound && _receiver!=null)
+        {
+            int id=_receiver.SelectedPeerId;
+            var active=_receiver.ConnectedPeers.FirstOrDefault(p=>p.Id==id);
+            if(active.Peer!=null)
+            {
+                _incomingPeer=active.Peer;
+                if(!active.Peer.SupportsReverseInput &&
+                    _captureInboundPeerId==id && _capture!=null)
+                {
+                    _capture.ReturnLocal();
+                    _capture.Dispose();_capture=null;
+                    _captureInboundPeerId=0;
+                }
+                if(active.Peer.SupportsReverseInput && _capture==null &&
+                    _nativeInput?.IsRunning==true)
+                    ArmSelectedInbound();
+            }
+        }
         RefreshDisplays();
     });
 

@@ -268,7 +268,7 @@ internal sealed class DisplayArrangementControl : Control
         {
             int count=Math.Clamp(device.ScreenCount,1,8);
             int height=Math.Max(380,
-                (int)(mainScreenArea.Height*(device.IsAndroid?.88:.79)));
+                (int)(mainScreenArea.Height * (device.IsAndroid ? 0.88 : 0.79)));
             int width=device.IsAndroid
                 ? Math.Max(220,(int)(height*.51))
                 : Math.Max(420,(int)(height*.95*count));

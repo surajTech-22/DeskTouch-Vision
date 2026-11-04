@@ -8,6 +8,12 @@ namespace DeskTouch.DeviceShare;
 /// Windows Display Settings-style overview. Native Windows monitors are read
 /// only; only the placement of an AUTHENTICATED remote computer is draggable.
 /// </summary>
+internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
+    int ScreenCount,bool SupportsInput)
+{
+    internal bool IsAndroid => Platform=="Android";
+}
+
 internal sealed class DisplayArrangementControl : Control
 {
     private MonitorTopology? _local, _remote;
@@ -45,6 +51,29 @@ internal sealed class DisplayArrangementControl : Control
     private bool _draggingRemote;
     private Point _dragOrigin;
     private Point _dragCurrent;
+    private IReadOnlyList<EnvironmentDisplayTile> _environmentDevices =
+        Array.Empty<EnvironmentDisplayTile>();
+    private readonly List<(RectangleF Hit,int TargetId)> _environmentHits = new();
+
+    // This is an authenticated, online-only snapshot of the same environment.
+    // A phone is never fabricated from LAN discovery or merely remembered trust.
+    internal IReadOnlyList<EnvironmentDisplayTile> EnvironmentDevices
+    {
+        get => _environmentDevices;
+        set {
+            _environmentDevices=value?.ToArray() ?? Array.Empty<EnvironmentDisplayTile>();
+            Invalidate();
+        }
+    }
+    internal event Action<int>? EnvironmentDeviceSelected;
+    internal static IReadOnlyList<EnvironmentDisplayTile> ProjectEnvironment(
+        IEnumerable<EnvironmentDisplayTile> online,int selectedTargetId)
+    {
+        return online.Where(p=>p.TargetId!=selectedTargetId)
+            .GroupBy(p=>p.TargetId).Select(g=>g.First())
+            .OrderBy(p=>p.IsAndroid?0:1)
+            .ThenBy(p=>p.Name,StringComparer.OrdinalIgnoreCase).ToArray();
+    }
 
     internal event Action? AddComputerRequested;
     internal event Action<MonitorEdge>? RemoteEdgeChanged;
@@ -140,6 +169,7 @@ internal sealed class DisplayArrangementControl : Control
         _remoteBaseHit = RectangleF.Empty;
         _localHit = RectangleF.Empty;
         _placeholderHit = RectangleF.Empty;
+        _environmentHits.Clear();
 
         if (_local == null)
         {
@@ -149,6 +179,11 @@ internal sealed class DisplayArrangementControl : Control
         }
 
         var l = _local.Bounds;
+        // Leave a compact lane for the other online environment members.
+        // Local monitor positions and selected remote monitor positions are
+        // still rendered by the original Windows layout calculation.
+        int memberLane = _environmentDevices.Count>0 ? Math.Min(120,
+            Math.Max(74, Height/3)) : 0;
         var r = _remote?.Bounds;
         var remotePos = r is null
             ? Placement(l, new Rectangle(0, 0, Math.Max(900, l.Width * 2 / 3),
@@ -160,12 +195,12 @@ internal sealed class DisplayArrangementControl : Control
         var full = Rectangle.Union(l, remotePos);
         const float pad = 38;
         float availableX = Math.Max(90, Width - pad * 2);
-        float availableY = Math.Max(70, Height - pad * 2);
+        float availableY = Math.Max(70, Height - memberLane - pad * 2);
         float scale = Math.Min(availableX / Math.Max(1, full.Width),
             availableY / Math.Max(1, full.Height));
         scale = Math.Max(.001f, scale);
         float offsetX = (Width - full.Width * scale) / 2f;
-        float offsetY = (Height - full.Height * scale) / 2f;
+        float offsetY = (Height - memberLane - full.Height * scale) / 2f;
 
         _localHit = new RectangleF(
             offsetX + (l.Left - full.Left) * scale,
@@ -214,7 +249,55 @@ internal sealed class DisplayArrangementControl : Control
                 remotePos.Width * scale, remotePos.Height * scale);
             DrawPlaceholder(g, _placeholderHit);
         }
-        // Each native or Android display carries its own system label.
+        // The remaining authenticated environment devices are part of the
+        // SAME screen diagram. Draw them without implying Windows has changed
+        // its own monitor configuration or that every device is the active target.
+        DrawEnvironmentMembers(g,memberLane);
+    }
+
+    private void DrawEnvironmentMembers(Graphics g,int lane)
+    {
+        if(lane<=0 || _environmentDevices.Count==0)return;
+        float top=Height-lane+5;
+        using var headingFont=new Font("Segoe UI Semibold",9.5f);
+        g.DrawString("Other connected devices in this environment",
+            headingFont,Brushes.Gainsboro,12,top);
+        float cardY=top+23;
+        float cardHeight=Math.Max(30,lane-33);
+        float left=12,spacing=9;
+        float available=Math.Max(1,Width-24);
+        int count=_environmentDevices.Count;
+        float cardWidth=Math.Max(48,Math.Min(158,
+            (available-spacing*Math.Max(0,count-1))/Math.Max(1,count)));
+        using var nameFont=new Font("Segoe UI Semibold",9f);
+        using var smallFont=new Font("Segoe UI",8f);
+        using var format=new StringFormat { Alignment=StringAlignment.Center,
+            Trimming=StringTrimming.EllipsisCharacter,
+            FormatFlags=StringFormatFlags.NoWrap };
+        foreach(var device in _environmentDevices)
+        {
+            var card=new RectangleF(left,cardY,cardWidth,cardHeight);
+            if(card.Right>Width-4)break;
+            using var path=Rounded(card,7);
+            using var bg=new SolidBrush(device.IsAndroid
+                ? Color.FromArgb(51,85,119)
+                : Color.FromArgb(51,100,92));
+            using var border=new Pen(Color.FromArgb(151,185,207),1.2f);
+            g.FillPath(bg,path);g.DrawPath(border,path);
+            g.DrawString(CleanDeviceName(device.Name,"Connected device"),
+                nameFont,Brushes.White,
+                new RectangleF(card.X+4,card.Y+6,card.Width-8,17),format);
+            string secondary=device.IsAndroid ? "Android • Display 1" :
+                $"Windows • {device.ScreenCount} display(s)";
+            g.DrawString(secondary,smallFont,Brushes.Gainsboro,
+                new RectangleF(card.X+4,card.Y+26,card.Width-8,16),format);
+            if(!device.SupportsInput)
+                g.DrawString("View only • permission needed",smallFont,
+                    Brushes.Gainsboro,new RectangleF(card.X+4,
+                        card.Bottom-16,card.Width-8,14),format);
+            _environmentHits.Add((card,device.TargetId));
+            left+=cardWidth+spacing;
+        }
     }
 
     private static void DrawPlaceholder(Graphics g, RectangleF r)
@@ -290,6 +373,14 @@ internal sealed class DisplayArrangementControl : Control
     {
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
+        foreach(var item in _environmentHits)
+        {
+            if(item.Hit.Contains(e.Location))
+            {
+                EnvironmentDeviceSelected?.Invoke(item.TargetId);
+                return;
+            }
+        }
         if (_remote != null && _remoteHit.Contains(e.Location))
         {
             _draggingRemote = true;
@@ -309,10 +400,12 @@ internal sealed class DisplayArrangementControl : Control
             _dragCurrent = ClampedDragPoint(e.Location);
             Invalidate();
         }
-        else Cursor = _remote != null && _remoteHit.Contains(e.Location)
-            ? Cursors.SizeAll
-            : _remote == null && _placeholderHit.Contains(e.Location)
-                ? Cursors.Hand : Cursors.Default;
+        else Cursor = _environmentHits.Any(item=>item.Hit.Contains(e.Location))
+            ? Cursors.Hand
+            : _remote != null && _remoteHit.Contains(e.Location)
+                ? Cursors.SizeAll
+                : _remote == null && _placeholderHit.Contains(e.Location)
+                    ? Cursors.Hand : Cursors.Default;
     }
 
     protected override void OnMouseUp(MouseEventArgs e)

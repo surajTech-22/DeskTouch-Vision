@@ -59,8 +59,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             .getBoolean(ALLOWED,false);
     }
     static void setAllowed(Context context,boolean allowed){
-        context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
-            .putBoolean(ALLOWED,allowed).apply();
+        // Persist the user's app-level approval synchronously BEFORE the
+        // package installer can kill this process. In-place signed upgrades
+        // retain these preferences; an uninstall/data-clear cannot.
+        if(!context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+            .putBoolean(ALLOWED,allowed).commit())
+            throw new IllegalStateException("Cannot save Android control preference");
         if(!allowed){
             DeskTouchAccessibilityService service=instance;
             if(service!=null){

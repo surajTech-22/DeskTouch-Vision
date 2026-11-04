@@ -14,7 +14,13 @@ public final class BootReceiver extends BroadcastReceiver {
         // disables the service after an in-place update, notify the user
         // rather than silently pretending permission has survived.
         if(Intent.ACTION_MY_PACKAGE_REPLACED.equals(action))
-            PermissionContinuity.onPackageReplaced(context);
+            try{PermissionContinuity.onPackageReplaced(context);}
+            catch(RuntimeException restricted){
+                // User may have denied notification permission or Xiaomi may
+                // block this background notification. Never break trust
+                // continuity/reconnection because a reminder was blocked.
+                Log.w("DeskTouch","Post-update permission reminder restricted",restricted);
+            }
         if(!AutoConnectService.enabled(context))return;
         try{AutoConnectService.start(context);}
         catch(RuntimeException e){

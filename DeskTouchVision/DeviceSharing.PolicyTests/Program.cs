@@ -776,6 +776,35 @@ finally
         "One hub must advertise itself and ALL three simultaneous members");
     var routed=mobileSource.EnvironmentMembers
         .Where(m=>m.Id>0).OrderBy(m=>m.Id).Skip(1).First();
+    Check(!string.IsNullOrWhiteSpace(routed.StableIdentity),
+        "Every connected member must have a stable layout identity");
+    var sharedKey=routed.StableIdentity!;
+    Check(mobileSource.PublishEnvironmentPlacement(sharedKey,
+        new System.Drawing.PointF(620,-155)),
+        "One member must be able to publish a dragged screen to the authenticated hub");
+    for(int i=0;i<100 &&
+        (!otherPhone.SharedLayout.TryGetValue(sharedKey,out var position) ||
+        position.X!=620 || position.Y!=-155);i++)
+        await Task.Delay(40,deadline.Token);
+    Check(otherPhone.SharedLayout.TryGetValue(sharedKey,out var firstPosition) &&
+        firstPosition.X==620 && firstPosition.Y==-155,
+        "Other Windows PC must receive the SAME placement without manual copying");
+    Check(environment.EnvironmentPositions.ContainsKey(sharedKey),
+        "Windows hub must store the authoritative layout");
+    Check(otherPhone.PublishEnvironmentPlacement(sharedKey,
+        new System.Drawing.PointF(-180,235)),
+        "Drag on another Windows PC must update the same shared environment");
+    for(int i=0;i<100 &&
+        (!mobileSource.SharedLayout.TryGetValue(sharedKey,out var position) ||
+        position.X!=-180 || position.Y!=235);i++)
+        await Task.Delay(40,deadline.Token);
+    Check(mobileSource.SharedLayout.TryGetValue(sharedKey,out var secondPosition) &&
+        secondPosition.X==-180 && secondPosition.Y==235,
+        "Drag on second PC must synchronize back to first PC through hub");
+    Check(environment.ConnectedPeerCount==3,
+        "Layout broadcast must not reconnect or drop any client session");
+    Console.WriteLine("PASS: bidirectional shared screen layout replication across three TLS clients.");
+
     Check(mobileSource.SelectEnvironmentTarget(routed.Id),
         "Android-style controller must route across the original hub connection");
     Check(mobileSource.SelectedEnvironmentTargetId==routed.Id,
@@ -963,6 +992,39 @@ finally
     Check(DisplayArrangementControl.SpatialNeighbor(spatial,7,
         MonitorEdge.Left)==EnvironmentRouteOrder.Local,
         "PC must remain reachable when Android is visible below another PC");
+    var farScreens=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+        (1,new(0,0,300,220)),(2,new(900,0,220,220))
+    };
+    Check(DisplayArrangementControl.SpatialNeighbor(farScreens,1,
+        MonitorEdge.Right)==null,
+        "Distant screen on same side must never capture second PC's right edge");
+    var wrongBand=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+        (1,new(0,0,300,220)),(2,new(310,175,170,220))
+    };
+    Check(DisplayArrangementControl.SpatialNeighbor(wrongBand,1,
+        MonitorEdge.Right,0.1)==null &&
+        DisplayArrangementControl.SpatialNeighbor(wrongBand,1,
+            MonitorEdge.Right,0.95)==2,
+        "Only the touching vertical part of a screen edge can route to Android");
+    var overlap=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+        (1,new(0,0,300,220)),(2,new(150,40,100,160))
+    };
+    Check(DisplayArrangementControl.SpatialNeighbor(overlap,1,
+        MonitorEdge.Right)==null,
+        "Overlapping Android preview is not a valid outside screen boundary");
+    var attached=DisplayArrangementControl.SnapToConnectedScreen(
+        new System.Drawing.RectangleF(155,60,90,150),
+        new[]{new System.Drawing.RectangleF(0,0,300,220)});
+    Check(System.Drawing.RectangleF.Intersect(attached,
+        new System.Drawing.RectangleF(0,0,300,220)).IsEmpty,
+        "Dragged phone dropped inside Windows must snap OUTSIDE the screen");
+    var snappedScreens=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+        (1,new(0,0,300,220)),(2,attached)
+    };
+    Check(new[]{MonitorEdge.Left,MonitorEdge.Right,MonitorEdge.Top,MonitorEdge.Bottom}
+        .Any(side=>DisplayArrangementControl.SpatialNeighbor(snappedScreens,
+            1,side)==2),
+        "Snapped Xiaomi must be reachable by crossing an actual adjacent edge");
     var liveRoute=new EnvironmentRouteOrder(
         new[]{EnvironmentRouteOrder.Local,7,-2,-3});
     Check(liveRoute.Neighbor(7,MonitorEdge.Right)==-2 &&

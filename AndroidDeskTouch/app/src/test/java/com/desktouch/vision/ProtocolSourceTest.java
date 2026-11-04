@@ -137,6 +137,33 @@ public final class ProtocolSourceTest {
         assertTrue(member.supportsInput);
         assertEquals("Windows • DESKTOP-SECOND",member.toString());
     }
+    @Test public void remoteAndroidTextNeverTargetsPasswordEditors(){
+        assertTrue(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_TEXT));
+        assertTrue(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_TEXT |
+                android.text.InputType.TYPE_TEXT_VARIATION_WEB_EDIT_TEXT));
+        assertFalse(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_TEXT |
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD));
+        assertFalse(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_TEXT |
+                android.text.InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD));
+        assertFalse(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_TEXT |
+                android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD));
+        assertFalse(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_CLASS_NUMBER |
+                android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD));
+        assertFalse(DeskTouchAccessibilityService.safeEditorType(
+            android.text.InputType.TYPE_NULL));
+    }
+    @Test public void appApprovalSurvivesUpdateWithoutGrantingOsAccessibility(){
+        assertTrue(PermissionContinuity.needsUserReapproval(true,false));
+        assertFalse(PermissionContinuity.needsUserReapproval(true,true));
+        assertFalse(PermissionContinuity.needsUserReapproval(false,false));
+        assertFalse(PermissionContinuity.needsUserReapproval(false,true));
+    }
     @Test public void unavailableGatewayDoesNotBecomeTrusted() {
         DesktopDiscovery.Device busy=DesktopDiscovery.parse(
             "DT1-BUSY|Busy|"+"D".repeat(64),"192.168.1.4");

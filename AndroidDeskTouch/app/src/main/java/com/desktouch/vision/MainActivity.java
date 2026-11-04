@@ -15,6 +15,7 @@ public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList,environmentList;
     private TextView connectionSummary;
+    private TextView permissionState;
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY;
@@ -97,6 +98,7 @@ public final class MainActivity extends Activity {
         allowWindows.setChecked(DeskTouchAccessibilityService.allowed(this));
         allowWindows.setOnCheckedChangeListener((v,enabled)->{
             DeskTouchAccessibilityService.setAllowed(this,enabled);
+            refreshPermissionState();
             if(enabled && !DeskTouchAccessibilityService.ready(this)){
                 status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings, then reconnect.");
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
@@ -105,6 +107,13 @@ public final class MainActivity extends Activity {
                 : "Windows control disabled. Android touch has priority.");
         });
         page.addView(allowWindows);
+        permissionState=new TextView(this);
+        permissionState.setTextColor(Color.rgb(243,208,145));
+        permissionState.setPadding(0,dp(5),0,dp(8));
+        page.addView(permissionState);
+        refreshPermissionState();
+        addButton(page,"Restore Android Accessibility permission",()->
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         addButton(page,"Open Android Accessibility settings",()->
             startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         addButton(page,"Stop Windows control on this phone",()->{
@@ -257,6 +266,14 @@ public final class MainActivity extends Activity {
         note.setPadding(0,dp(14),0,0);
         page.addView(note);
 
+    }
+    @Override protected void onResume(){
+        super.onResume();
+        refreshPermissionState();
+    }
+    private void refreshPermissionState(){
+        if(permissionState==null)return;
+        permissionState.setText(PermissionContinuity.state(this));
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addButton(LinearLayout parent,String label,Runnable action){

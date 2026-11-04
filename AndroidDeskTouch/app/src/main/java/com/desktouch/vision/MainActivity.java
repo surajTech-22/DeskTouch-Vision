@@ -281,6 +281,10 @@ public final class MainActivity extends Activity {
         page.addView(note);
 
     }
+    @Override public void onConfigurationChanged(android.content.res.Configuration config){
+        super.onConfigurationChanged(config);
+        DeskTouchRuntime.publishPhoneGeometry();
+    }
     @Override protected void onResume(){
         super.onResume();
         refreshPermissionState();
@@ -390,8 +394,7 @@ public final class MainActivity extends Activity {
                                     "pair separately with every member.")
                                 .setNegativeButton("Cancel",null)
                                 .setPositiveButton("Join environment",(dialog,which)->{
-                                    android.graphics.Point size=new android.graphics.Point();
-                                    getWindowManager().getDefaultDisplay().getRealSize(size);
+                                    android.graphics.Point size=PhoneScreenGeometry.read(this);
                                     AutoConnectService.setReconnect(this,true);
                                     AutoConnectService.resumePeer(this,gateway.fingerprint);
                                     session=DeskTouchRuntime.select(this,gateway.fingerprint);

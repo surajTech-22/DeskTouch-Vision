@@ -801,6 +801,43 @@ finally
     Check(mobileSource.SharedLayout.TryGetValue(sharedKey,out var secondPosition) &&
         secondPosition.X==-180 && secondPosition.Y==235,
         "Drag on second PC must synchronize back to first PC through hub");
+    // v0.3.17 canonical coordinates use the SURAJ hub as the SAME
+    // reference on either PC, even when the local preview has another
+    // world-coordinate origin. The old per-PC offset produced a different
+    // arrangement after exactly the same drag broadcast.
+    string canonicalKey="hub@"+sharedKey;
+    var hubPeer=new ConnectedPeer("Second PC",
+        MonitorTopology.Capture(),DeviceFingerprint:sharedKey);
+    Check(ReceiverServer.OwnsPlacement(hubPeer,canonicalKey) &&
+        !ReceiverServer.OwnsPlacement(hubPeer,"hub@IMPOSTOR"),
+        "Canonical layout writes must be tied to authenticated stable identity");
+    var phoneDefaultOnHub=new System.Drawing.Rectangle(5200,400,440,800);
+    var phoneDefaultOnLeaf=new System.Drawing.Rectangle(3100,400,440,800);
+    var canonicalOffset=new System.Drawing.PointF(2700,260);
+    var hubWorld=DisplayArrangementControl.ResolveMemberWorld(
+        phoneDefaultOnHub,new System.Drawing.Rectangle(200,50,1700,1000),
+        canonicalOffset,null);
+    var leafWorld=DisplayArrangementControl.ResolveMemberWorld(
+        phoneDefaultOnLeaf,new System.Drawing.Rectangle(-1900,50,1700,1000),
+        canonicalOffset,null);
+    Check(hubWorld.Left-200==leafWorld.Left+1900 &&
+        hubWorld.Top-50==leafWorld.Top-50,
+        "Hub and second PC must render the exact SAME canonical Android placement");
+    Check(mobileSource.PublishEnvironmentPlacement(canonicalKey,canonicalOffset),
+        "Hub must accept canonical Android position based on stable device identity");
+    for(int i=0;i<100 &&
+        !otherPhone.SharedLayout.ContainsKey(canonicalKey);i++)
+        await Task.Delay(40,deadline.Token);
+    Check(otherPhone.SharedLayout.TryGetValue(canonicalKey,out var synced) &&
+        synced==canonicalOffset &&
+        !environment.EnvironmentPositions.ContainsKey(sharedKey),
+        "Shared canonical layout must replace old local offset on all participants");
+    Check(SourceCapture.AndroidPrintableKey(0x41,false)=="a" &&
+        SourceCapture.AndroidPrintableKey(0x41,true)=="A" &&
+        SourceCapture.AndroidPrintableKey(0x31,true)=="!" &&
+        SourceCapture.AndroidPrintableKey(0x20,false)==" " &&
+        SourceCapture.AndroidPrintableKey(0x70,false)==null,
+        "Android text route must handle letters, shifted digits and preserve function keys");
     Check(environment.ConnectedPeerCount==3,
         "Layout broadcast must not reconnect or drop any client session");
     Console.WriteLine("PASS: bidirectional shared screen layout replication across three TLS clients.");

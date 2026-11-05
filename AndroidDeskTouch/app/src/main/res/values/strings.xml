@@ -1,4 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-  <string name="accessibility_description">Optional remote control for explicitly trusted Windows PCs. When enabled, DeskTouch can move an on-screen pointer, perform taps and swipes, and enter text in editable fields. Use DeskTouch to turn off remote control at any time. It does not capture or send Android screen contents, and does not edit password fields.</string>
-</resources>

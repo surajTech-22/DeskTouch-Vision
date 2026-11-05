@@ -120,17 +120,22 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
                 if (peripheral == null) break;
                 if (p.Type == "release") {
                     _keys.Clear(); _mouseButtons = 0; _positionKnown = false;
+                    Interlocked.Exchange(ref _moveQueued, 0);
                     await peripheral.ReleaseKeysAsync();
                     await peripheral.SendMouseAsync(BleHid.Core.MouseButtons.None, 0, 0, 0);
                     continue;
                 }
-                if (!Ready || _lease <= 0) continue;
                 if (p.Type == "move-flush") {
+                    // Always consume the coalescing signal, even after a BLE
+                    // link loss, so a later paired handoff can send its first
+                    // cursor report instead of waiting for a stale signal.
                     Interlocked.Exchange(ref _moveQueued, 0);
                     var latest = Interlocked.Exchange(ref _latestMove, null);
-                    if (latest != null) await ApplyMoveAsync(peripheral, latest);
+                    if (latest != null && Ready && _lease > 0)
+                        await ApplyMoveAsync(peripheral, latest);
                     continue;
                 }
+                if (!Ready || _lease <= 0) continue;
                 // Preserve keyboard/button ordering with the latest cursor position.
                 var before = Interlocked.Exchange(ref _latestMove, null);
                 if (before != null) await ApplyMoveAsync(peripheral, before);

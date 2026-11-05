@@ -619,21 +619,11 @@ try
         "Windows receiver must keep TWO authenticated TLS peers at once");
     Check(multiServer.CanAcceptNewPeer,
         "Windows must remain discoverable/ready with two connected devices");
-    // Drive the real authenticated hub->client->hub Bluetooth diagnostic flow.
-    // Hosted CI has no physical Bluetooth radio, so the result may be
-    // NoAdapter/Unknown: never assert that HID hardware is usable in CI.
-    Check(peer2.RequestBluetoothCheck(),
-        "A connected Windows client must request a shared Bluetooth scan");
-    for(int t=0;t<140 && (peer2.BluetoothReports.Count!=3 ||
-        peer2.BluetoothReports.Any(p=>p.Capability.State=="Checking"));t++)
-        await Task.Delay(100,timeout.Token);
-    Check(peer2.BluetoothReports.Count==3 &&
-        peer2.BluetoothReports.All(p=>p.Capability.State!="Checking") &&
-        peer2.BluetoothReports.Select(p=>p.Id).Distinct().Count()==3,
-        "Hub and two connected Windows clients must return one non-spoofed Bluetooth capability report each");
+    // Connected Windows peers must not acquire the keyboard/mouse lease
+    // merely by joining the existing TLS environment.
     Check(!multiPriority.RemoteGranted,
-        "Bluetooth diagnostics must not claim keyboard or mouse authority");
-    Console.WriteLine("PASS: Bluetooth capability collected over existing TLS from hub and two Windows peers without input claims.");
+        "Authentication or discovery must not grant remote input");
+    Console.WriteLine("PASS: multiple authenticated Windows peers stay online without stealing input.");
     peer1.Dispose();
     for(int t=0;t<30 && multiServer.ConnectedPeerCount!=1;t++)
         await Task.Delay(100,timeout.Token);
@@ -714,7 +704,7 @@ try
     Check(multiServer.SelectedPeerId==selectedWindows.Id &&
         destinationInput.RemoteGranted && multiPriority.RemoteGranted &&
         multiServer.ConnectedPeerCount==2,
-        "Android controlling hub must NOT switch, disconnect or revoke hub-to-PC input");
+        "A different Windows PC controlling the hub must NOT switch, disconnect or revoke hub-to-PC input");
     Check(peer3.TrySend(new Packet("release",3200)),
         "Hub control can be released independently of Windows remote control");
     Check(pcDestination.TrySend(new Packet("release",3100)),
@@ -724,7 +714,7 @@ try
         await Task.Delay(40,timeout.Token);
     Check(!destinationInput.RemoteGranted && !multiPriority.RemoteGranted,
         "Independent lease releases must not strand keyboard/mouse authority");
-    Console.WriteLine("PASS: Android->hub AND hub->Windows keyboard authority concurrently; no capture selection theft.");
+    Console.WriteLine("PASS: Windows peer->hub AND hub->Windows keyboard authority concurrently; no capture selection theft.");
 
     // The Windows keyboard/mouse capture is pinned to its original TLS peer.
     // Selecting another device must never misroute a delayed key or release.

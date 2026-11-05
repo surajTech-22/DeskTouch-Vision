@@ -166,7 +166,11 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
         if (_lease <= 0 || !Ready) return;
         if (!_positionKnown) {
             _previousX = p.A; _previousY = p.B; _positionKnown = true;
-            Authority?.Invoke(new Packet("active", _lease));
+            // Send a neutral native report through the actual GATT notifier
+            // before marking the handoff active; subscriber existence alone
+            // is not proof that HID output can be delivered.
+            await peripheral.SendMouseAsync((BleHid.Core.MouseButtons)_mouseButtons, 0, 0, 0);
+            if (_lease > 0 && Ready) Authority?.Invoke(new Packet("active", _lease));
             return;
         }
         int dx = p.A - _previousX, dy = p.B - _previousY;

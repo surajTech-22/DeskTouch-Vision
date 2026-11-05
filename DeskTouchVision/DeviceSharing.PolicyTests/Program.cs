@@ -1091,6 +1091,11 @@ var uiThread = new Thread(() =>
             .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
         Check(!actionRow.WrapContents && actionRow.AutoScroll,
             "High-DPI action buttons must not collapse into an invisible second row");
+        Check(actionRow.Controls.OfType<System.Windows.Forms.Button>()
+            .All(b=>!b.Text.Contains("Android",StringComparison.OrdinalIgnoreCase) &&
+                    !b.Text.Contains("HID",StringComparison.OrdinalIgnoreCase) &&
+                    !b.Text.Contains("Bluetooth",StringComparison.OrdinalIgnoreCase)),
+            "Windows-only UI must not show legacy mobile or HID actions");
         var trustButton = view.Controls.Find("TrustedDevicesButton", true)
             .OfType<System.Windows.Forms.Button>().Single();
         trustButton.Parent?.PerformLayout();
@@ -1108,13 +1113,13 @@ var uiThread = new Thread(() =>
         diagram.Remote = nonrectangular;
         diagram.EnvironmentDevices =
             DisplayArrangementControl.ProjectEnvironment(new[] {
-                new EnvironmentDisplayTile(-5,"Android Phone A","Android",1,true),
-                new EnvironmentDisplayTile(-6,"Android Phone B","Android",1,false),
+                new EnvironmentDisplayTile(-5,"WORKSTATION B","Windows",1,true),
+                new EnvironmentDisplayTile(-6,"WORKSTATION C","Windows",1,false),
                 new EnvironmentDisplayTile(-7,"Windows peer","Windows",2,true)
             },0);
         Check(diagram.EnvironmentDevices.Count==3 &&
-            diagram.EnvironmentDevices.Count(t=>t.IsAndroid)==2,
-            "Display diagram must retain every connected phone alongside native screens");
+            diagram.EnvironmentDevices.All(t=>t.Platform=="Windows"),
+            "Display diagram must retain every connected Windows computer");
 
         foreach (var windowSize in new[] {
             new System.Drawing.Size(780, 600),
@@ -1133,15 +1138,15 @@ var uiThread = new Thread(() =>
             diagram.DrawToBitmap(rendered,
                 new System.Drawing.Rectangle(0, 0, diagram.Width, diagram.Height));
         }
-        // Simulate a physical mouse-down/move/up on the ACTUAL phone tile.
+        // Simulate physical mouse dragging on the actual Windows peer tile.
         // Prior builds only clicked it to swap a single target; this must
-        // drag the phone while retaining independent mouse target selection.
+        // drag the Windows monitor while preserving input selection.
         using(var bitmap=new System.Drawing.Bitmap(diagram.Width,diagram.Height))
             diagram.DrawToBitmap(bitmap,
                 new System.Drawing.Rectangle(0,0,diagram.Width,diagram.Height));
-        var phoneHit=diagram.OnlineHitRegions.First(x=>x.TargetId==-5).Hit;
-        var origin=new System.Drawing.Point((int)phoneHit.X+Math.Max(8,(int)phoneHit.Width/3),
-            (int)phoneHit.Y+Math.Max(8,(int)phoneHit.Height/3));
+        var peerHit=diagram.OnlineHitRegions.First(x=>x.TargetId==-5).Hit;
+        var origin=new System.Drawing.Point((int)peerHit.X+Math.Max(8,(int)peerHit.Width/3),
+            (int)peerHit.Y+Math.Max(8,(int)peerHit.Height/3));
         int selections=0,placements=0;
         diagram.EnvironmentDeviceSelected+=_=>selections++;
         diagram.EnvironmentArrangementChanged+=()=>placements++;
@@ -1162,7 +1167,7 @@ var uiThread = new Thread(() =>
             System.Windows.Forms.MouseButtons.Left,1,origin.X-42,origin.Y,0)});
         Check(placements==1&&selections==0 &&
             diagram.StoredMemberOffsets.Values.Any(p=>Math.Abs(p.X)>1),
-            "Android tile must DRAG and persist its position, not switch to a one-to-one target");
+            "Windows tile must drag and persist without creating another connection");
         // Press/release with no movement should select, not drag/reconnect.
         using(var bitmap2=new System.Drawing.Bitmap(diagram.Width,diagram.Height))
             diagram.DrawToBitmap(bitmap2,
@@ -1175,7 +1180,7 @@ var uiThread = new Thread(() =>
         up.Invoke(diagram,new object[]{new System.Windows.Forms.MouseEventArgs(
             System.Windows.Forms.MouseButtons.Left,1,tapX,tapY,0)});
         Check(selections==1&&placements==1,
-            "Tapping a phone should select it; dragging should only move its screen tile");
+            "Clicking a Windows peer selects it; dragging moves its screen tile");
         Check(view.Controls.OfType<System.Windows.Forms.Control>()
             .SelectMany(x=>x.Controls.OfType<System.Windows.Forms.ComboBox>())
             .All(c=>c.Name!="ConnectedDeviceTarget"),
@@ -1186,7 +1191,7 @@ var uiThread = new Thread(() =>
         var monitorA=new MonitorTopology(new[]{
             new MonitorRect("PC_A",0,0,1920,1080,true)});
         var monitorB=new MonitorTopology(new[]{
-            new MonitorRect("ANDROID",0,0,1080,2400,true)});
+            new MonitorRect("PC_B",0,0,1280,1024,true)});
         var recorderA=new RecordingInputSession(monitorA);
         var recorderB=new RecordingInputSession(monitorB);
         using(var capture=new SourceCapture(diagram,recorderA,_=>{},
@@ -1208,11 +1213,11 @@ var uiThread = new Thread(() =>
                 !recorderB.Packets.Any(p=>p.Type=="release") &&
                 capture.SameInputSession(recorderB) &&
                 capture.ActiveRemoteMonitors.Bounds==monitorB.Bounds,
-                "Old Windows PC must receive release before Android replaces the destination");
+                "Previous Windows PC must receive release before switching destination");
             capture.BeginLinkedHandoff(MonitorEdge.Right,0.4);
             Check(recorderB.Packets.Any(p=>p.Type=="claim") &&
                 !recorderA.Packets.Skip(2).Any(p=>p.Type=="claim"),
-                "Android receives the next claim over the existing capture, without new hook installation");
+                "Next Windows PC receives claim over existing capture without new hooks");
             capture.ReturnLocal();
             capture.Retarget(recorderA,MonitorEdge.Right,
                 continuingRemoteHandoff:true);

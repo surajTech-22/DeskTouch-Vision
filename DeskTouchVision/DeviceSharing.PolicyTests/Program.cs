@@ -13,10 +13,10 @@ static void Check(bool test, string message)
 
 // ADB UHID is real Android kernel virtual HID (not BLE and not Accessibility).
 // Never capture Windows input when the phone is missing or unauthorized.
-var devices = UhidInputSession.AuthorizedDevices(
+var authorizedUhidDevices = UhidInputSession.AuthorizedDevices(
     "List of devices attached\n192.168.1.4:37101\tdevice product:phone model:Phone\n" +
     "192.168.1.5:5555\tunauthorized\n192.168.1.6:5555\toffline\n");
-Check(devices.Count == 1 && devices[0]=="192.168.1.4:37101",
+Check(authorizedUhidDevices.Count == 1 && authorizedUhidDevices[0]=="192.168.1.4:37101",
     "Native Wi-Fi UHID must select only explicitly ADB-authorized phones");
 Check(UhidInputSession.AuthorizedDevices("List of devices attached\n").Count==0,
     "Unpaired phones must not capture Windows keyboard or mouse");

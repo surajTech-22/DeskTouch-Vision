@@ -45,7 +45,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
     private readonly Button _androidDownload = Button("Get Android app");
-    private readonly Button _bluetoothCheck = Button("Bluetooth check");
+    private readonly Button _bluetoothCheck = Button("Native Android HID");
+    private NativeHidInputSession? _hid;
+    private SourceCapture? _hidCapture;
+    private System.Windows.Forms.Timer? _hidMonitorTimer;
+    private bool _hidStarting;
+    private readonly string _nativeHidOptInPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DeskTouchVision", "native-hid-enabled");
     private BluetoothHidCheckForm? _bluetoothDialog;
     private readonly LinkLabel _checkUpdates = new()
     {
@@ -195,7 +202,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
         _androidDownload.Click += (_, _) => { using var view = new AndroidDownloadDialog(); view.ShowDialog(this); };
-        _bluetoothCheck.Click += (_, _) => OpenBluetoothCheck();
+        _bluetoothCheck.Click += async (_, _) => await ToggleNativeHidAsync();
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
@@ -223,6 +230,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
             if (_startInTray) HideToTray(showBalloon: false);
+            _hidMonitorTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            _hidMonitorTimer.Tick += (_, _) => MaintainNativeHid();
+            _hidMonitorTimer.Start();
+            if (File.Exists(_nativeHidOptInPath)) _ = StartNativeHidAsync();
         };
         InitializeTray();
         FormClosing += OnDeskTouchFormClosing;
@@ -331,6 +342,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             return;
         }
         _closing.Cancel();
+        _hidMonitorTimer?.Stop();
+        _hidCapture?.Dispose(); _hidCapture = null;
+        if (_hid != null) {
+            Task.Run(async () => await _hid.DisposeAsync()).GetAwaiter().GetResult();
+            _hid = null;
+        }
         _trustedScanTimer?.Stop();
         // Revoke remote control and close the TLS peer before destroying
         // Windows input hooks or receiver listening state.
@@ -387,6 +404,117 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         catch { /* Never block Windows input for diagnostic logging. */ }
         UpdateButtons();
+    }
+
+    private async Task ToggleNativeHidAsync()
+    {
+        if (_hidStarting) return;
+        if (_hid?.IsStarted == true) await StopNativeHidAsync();
+        else await StartNativeHidAsync();
+    }
+
+    private async Task StartNativeHidAsync()
+    {
+        if (_hidStarting || _hid?.IsStarted == true || _closing.IsCancellationRequested)
+            return;
+        _hidStarting = true;
+        _bluetoothCheck.Enabled = false;
+        _bluetoothCheck.Text = "Starting HID…";
+        try
+        {
+            _hid ??= new NativeHidInputSession();
+            _hid.Status += NativeHidStatus;
+            _hid.Authority += NativeHidAuthority;
+            await _hid.StartAsync();
+            Directory.CreateDirectory(Path.GetDirectoryName(_nativeHidOptInPath)!);
+            File.WriteAllText(_nativeHidOptInPath, "User enabled native Bluetooth HID.");
+            _bluetoothCheck.Text = "Stop native HID";
+            Status("Native Bluetooth HID advertising. Pair this PC in Android Settings > Bluetooth. " +
+                   "Edge handoff arms automatically after Android subscribes.");
+            MaintainNativeHid();
+        }
+        catch (Exception ex)
+        {
+            Status("Native Bluetooth HID unavailable: " + ex.Message);
+            _bluetoothCheck.Text = "Native Android HID";
+        }
+        finally { _hidStarting = false; _bluetoothCheck.Enabled = true; }
+    }
+
+    private async Task StopNativeHidAsync()
+    {
+        if (_hidStarting) return;
+        _hidStarting = true;
+        try
+        {
+            _hidCapture?.ReturnLocal(); _hidCapture?.Dispose(); _hidCapture = null;
+            _hidMonitorTimer?.Stop();
+            if (_hid != null)
+            {
+                _hid.Status -= NativeHidStatus;
+                _hid.Authority -= NativeHidAuthority;
+                await _hid.DisposeAsync();
+                _hid = null;
+            }
+            if (File.Exists(_nativeHidOptInPath)) File.Delete(_nativeHidOptInPath);
+            _bluetoothCheck.Text = "Native Android HID";
+            _capture?.Arm();
+            Status("Native HID stopped. Windows and network sharing remain available.");
+        }
+        catch (Exception ex) { Status("Stopping native HID: " + ex.Message); }
+        finally { _hidStarting = false; _hidMonitorTimer?.Start(); }
+    }
+
+    private void NativeHidStatus(string message) => PostToUi(() => Status(message));
+
+    private void NativeHidAuthority(Packet packet) => PostToUi(() =>
+    {
+        if (_hidCapture == null) return;
+        switch (packet.Type)
+        {
+            case "granted": _hidCapture.GrantRemote(packet.A); break;
+            case "active": _hidCapture.ConfirmRemoteAuthority(packet.A); break;
+            case "local-active": _hidCapture.ReturnLocal(); break;
+        }
+    });
+
+    private void MaintainNativeHid()
+    {
+        if (_closing.IsCancellationRequested || _hid == null || !_hid.IsStarted) return;
+        if (!_hid.Ready)
+        {
+            if (_hidCapture != null)
+            {
+                _hidCapture.ReturnLocal();
+                _hidCapture.Dispose();
+                _hidCapture = null;
+                try { _capture?.Arm(); } catch (Exception ex) { Status(ex.Message); }
+                Status("Native HID disconnected; local Windows input restored.");
+            }
+            return;
+        }
+        if (_hidCapture != null || _capture?.RemoteActive == true ||
+            _capture?.IsClaimPending == true) return;
+        // Optional actual screen geometry from a connected Android app.
+        // The Bluetooth HID path works without the Android app being opened.
+        var phone = _receiver?.ConnectedPeers
+            .FirstOrDefault(p => p.Peer.Platform == "Android").Peer;
+        if (phone != null) _hid.SetPhoneGeometry(phone.Monitors);
+        try
+        {
+            _capture?.Disarm(); // never install two global mouse/keyboard hook sets
+            _hidCapture = new SourceCapture(this, _hid, Status, _preferredEdge,
+                preserveRawInput: true);
+            _hidCapture.Arm();
+            Status("Android HID paired. Move to the configured edge to hand off. " +
+                   "DeskTouch continues while hidden in the tray.");
+        }
+        catch (Exception ex)
+        {
+            _hidCapture?.Dispose(); _hidCapture = null;
+            try { _capture?.Arm(); } catch { }
+            Status("Native HID capture unavailable: " + ex.Message);
+        }
     }
 
     private void OpenBluetoothCheck()
@@ -634,6 +762,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         double fraction,bool requestHandoff)
     {
         if(_retargetingInput)return false;
+        if (_hidCapture != null) {
+            _hidCapture.ReturnLocal(); _hidCapture.Dispose(); _hidCapture=null;
+        }
         _retargetingInput=true;
         try
         {
@@ -712,7 +843,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (_receiver == null || _incomingPeer?.SupportsReverseInput != true ||
             !_captureUsesInbound && _host != null) return;
-        if (_capture != null) return;
+        if (_capture != null || _hidCapture != null) return;
         try
         {
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
@@ -866,6 +997,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         PostToUi(() =>
         {
             if (_receiver == null) return;
+            if (_hidCapture != null) { RefreshDisplays(); return; }
             try
             {
                 _nativeInput?.Start();
@@ -910,6 +1042,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         PostToUi(() =>
         {
+            if (_hidCapture != null) { RefreshDisplays(); return; }
             int selectedId=_receiver?.SelectedPeerId ?? 0;
             // A selection change raises "previous disconnected" even when
             // its TLS session is still online. Never dispose a just-armed
@@ -975,6 +1108,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.RemoteEdge = _preferredEdge;
             SavePreferredEdge();
             _capture?.SetEdge(_preferredEdge);
+            _hidCapture?.SetEdge(_preferredEdge);
             Status("Both computers' outside-edge handoff positions synchronized.");
         });
     }
@@ -1165,7 +1299,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _remoteAddress);
         session.RemotePlacementChanged += HandleRemotePlacement;
         RefreshDisplays();
-        _capture.Arm();
+        if (_hidCapture == null) _capture.Arm();
         session.PublishSourcePlacement(_preferredEdge);
         session.RequestBluetoothCheck();
         UpdateButtons();
@@ -1424,6 +1558,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _preferredEdge = edge;
         SavePreferredEdge();
         _capture?.SetEdge(edge);
+        _hidCapture?.SetEdge(edge);
         if (!_captureUsesInbound) _host?.PublishSourcePlacement(edge);
         if (_captureUsesInbound || _host == null)
             _receiver?.PublishPlacement(Opposite(edge));
@@ -1573,7 +1708,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // capture must see the same real raw event on either computer.
             // Previously receiving mode discarded it before SourceCapture.
             _nativeInput?.HandleRawInput(message.LParam);
-            _capture?.OnRawInput(message.LParam);
+            if (_hidCapture != null) _hidCapture.OnRawInput(message.LParam);
+            else _capture?.OnRawInput(message.LParam);
         }
         if (message.Msg == 0x007E && IsHandleCreated && !Disposing)
         {

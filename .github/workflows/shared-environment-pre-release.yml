@@ -149,6 +149,7 @@ jobs:
             adb shell pm grant com.desktouch.vision android.permission.POST_NOTIFICATIONS
             adb shell am start -n com.desktouch.vision/.MainActivity
             bash .github/scripts/check-desktouch-emulator.sh
+            bash .github/scripts/test-desktouch-uhid-emulator.sh
             bash .github/scripts/test-desktouch-input-emulator.sh
       - name: Preserve Android input acceptance results
         if: always()

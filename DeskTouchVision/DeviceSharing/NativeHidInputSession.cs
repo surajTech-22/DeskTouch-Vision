@@ -84,7 +84,15 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
 
     public bool TrySend(Packet p)
     {
-        if (_closed || !Ready) return false;
+        if (_closed) return false;
+        // Release must remain possible after Bluetooth disconnect. Otherwise
+        // a lost HID subscriber strands the old lease and prevents re-handoff.
+        if (p.Type is "release" or "reset") {
+            if (p.Type == "reset" || p.A == _lease) _lease = 0;
+            Interlocked.Exchange(ref _latestMove, null);
+            return _events.Writer.TryWrite(new Packet("release"));
+        }
+        if (!Ready) return false;
         if (p.Type == "claim") {
             if (p.A <= 0 || _lease != 0) return false;
             var hosts = _peripheral!.Hosts();
@@ -93,11 +101,6 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
             _positionKnown = false;
             Authority?.Invoke(new Packet("granted", p.A));
             return true;
-        }
-        if (p.Type is "release" or "reset") {
-            if (p.Type == "reset" || p.A == _lease) _lease = 0;
-            Interlocked.Exchange(ref _latestMove, null);
-            return _events.Writer.TryWrite(new Packet("release"));
         }
         if (_lease <= 0) return false;
         if (p.Type == "move") {

@@ -9,11 +9,11 @@ namespace DeskTouch.DeviceShare;
 /// <summary>Discovery-only information. The advertised fingerprint is never
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
-    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false);
+    bool CanReceive = true, bool IsHub = false);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
-/// Android phones remain visible in Add devices. A full-capacity PC is clearly marked
+/// All Windows computers remain visible in Add devices. A full-capacity PC is marked
 /// rather than silently disappearing. No IP address is remembered as identity.
 /// </summary>
 internal sealed class NearbyComputerDiscovery : IDisposable
@@ -22,7 +22,6 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private const string Probe = "DT1-DISCOVER";
     private const string ReadyPrefix = "DT1-READY|";
     private const string BusyPrefix = "DT1-BUSY|";
-    private const string MobilePrefix = "DT1-MOBILE|";
     private readonly CancellationTokenSource _stop = new();
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
@@ -81,8 +80,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
                 await _listener.SendAsync(reply,msg.RemoteEndPoint,_stop.Token);
                 // A member with an outgoing hub connection is a LEAF, even if
-                // it keeps its own incoming listener. Android should prefer a
-                // real environment hub instead of creating a split network.
+                // it keeps its own incoming listener. New Windows members join
+                // the real environment hub instead of splitting the network.
                 if (_isEnvironmentHub())
                 {
                     byte[] hubHint=Encoding.ASCII.GetBytes("DT1-HUB|"+_fingerprint);
@@ -114,28 +113,22 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     internal static NearbyComputer? ParseReply(string response, IPAddress address)
     {
         if (!IsPrivateLan(address) || response.Length is < 75 or > 260) return null;
-        bool isMobile = response.StartsWith(MobilePrefix, StringComparison.Ordinal);
         bool busy = response.StartsWith(BusyPrefix, StringComparison.Ordinal);
-        if (!isMobile && !busy &&
-            !response.StartsWith(ReadyPrefix, StringComparison.Ordinal)) return null;
-        string prefix = isMobile ? MobilePrefix : busy ? BusyPrefix : ReadyPrefix;
+        if (!busy && !response.StartsWith(ReadyPrefix, StringComparison.Ordinal)) return null;
+        string prefix = busy ? BusyPrefix : ReadyPrefix;
         var parts = response[prefix.Length..].Split('|');
         if (parts.Length != 2 || parts[0].Length is < 1 or > 100 ||
             parts[0].Any(char.IsControl) ||
             parts[1].Length != 64 || !parts[1].All(Uri.IsHexDigit)) return null;
-        // Android currently initiates outgoing TLS toward Windows. It must
-        // never be presented as a Windows TCP receiver on port 37377.
         return new NearbyComputer(parts[0], address.ToString(),
-            parts[1].ToUpperInvariant(), isMobile, !busy && !isMobile);
+            parts[1].ToUpperInvariant(), !busy);
     }
 
     internal static IReadOnlyList<NearbyComputer> DistinctDevices(IEnumerable<NearbyComputer> peers) =>
-        peers.GroupBy(p => (p.IsAndroid, p.Fingerprint), 
-                EqualityComparer<(bool, string)>.Default)
+        peers.GroupBy(p => p.Fingerprint, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.OrderByDescending(p => p.CanReceive)
                 .ThenByDescending(p=>p.IsHub).First())
-            .OrderBy(p => p.IsAndroid)
-            .ThenByDescending(p=>p.IsHub)
+            .OrderByDescending(p=>p.IsHub)
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(p => p.Address, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -168,8 +161,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             }
         }
         byte[] probe = Encoding.ASCII.GetBytes(Probe);
-        // Retry two cycles, not just one shot. Both Wi-Fi broadcast filtering
-        // and waking Android phones can discard the first datagram.
+        // Retry broadcast a few times: Wi-Fi roaming and firewalls can discard
+        // the first discovery packet without implying a disconnected Windows PC.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel);
         deadline.CancelAfter(TimeSpan.FromMilliseconds(3700));
         var sendAt = DateTime.UtcNow;
@@ -203,15 +196,14 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 }
                 var peer = ParseReply(response, packet.RemoteEndPoint.Address);
                 if (peer is not null)
-                    found[(peer.IsAndroid ? "android:" : "windows:") + peer.Fingerprint] = peer;
+                    found[peer.Fingerprint] = peer;
             }
             catch (OperationCanceledException) when (!deadline.IsCancellationRequested) { }
             catch (OperationCanceledException) { break; }
             catch (SocketException) { break; }
         }
         return DistinctDevices(found.Values.Select(p =>
-            p with { IsHub = !p.IsAndroid &&
-                advertisedHubs.TryGetValue(p.Fingerprint,out var claimedAddress) &&
+            p with { IsHub = advertisedHubs.TryGetValue(p.Fingerprint,out var claimedAddress) &&
                 string.Equals(claimedAddress,p.Address,StringComparison.OrdinalIgnoreCase) }));
     }
 

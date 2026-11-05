@@ -88,6 +88,7 @@ public final class UhidShellBridge {
 
             DataInputStream in = new DataInputStream(System.in);
             byte[] keyReport = new byte[8], mouseReport = new byte[5];
+            boolean firstMouseApplied = false;
             for (;;) {
                 int operation = in.read();
                 if (operation < 0 || operation == CLOSE) break;
@@ -97,6 +98,11 @@ public final class UhidShellBridge {
                 in.readFully(report);
                 byte[] request = inputRequest(report);
                 Os.write(operation == KEYBOARD ? keyboard : mouse, request, 0, request.length);
+                if (operation == MOUSE && !firstMouseApplied) {
+                    firstMouseApplied = true;
+                    System.out.write("ACTIVE\n".getBytes(StandardCharsets.US_ASCII));
+                    System.out.flush();
+                }
             }
         } catch (Exception ex) {
             System.err.println("DeskTouch UHID: " + ex.getClass().getSimpleName() +

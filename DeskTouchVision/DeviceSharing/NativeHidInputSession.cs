@@ -118,7 +118,7 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
                 if (p.Type == "release") {
                     _keys.Clear(); _mouseButtons = 0; _positionKnown = false;
                     await peripheral.ReleaseKeysAsync();
-                    await peripheral.SendMouseAsync(MouseButtons.None, 0, 0, 0);
+                    await peripheral.SendMouseAsync(BleHid.Core.MouseButtons.None, 0, 0, 0);
                     continue;
                 }
                 if (!Ready || _lease <= 0) continue;
@@ -135,11 +135,11 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
                     int flag = p.A switch { 1 => 1, 2 => 2, 3 => 4, _ => 0 };
                     if (p.B != 0) _mouseButtons |= flag;
                     else _mouseButtons &= ~flag;
-                    await peripheral.SendMouseAsync((MouseButtons)_mouseButtons, 0, 0, 0);
+                    await peripheral.SendMouseAsync((BleHid.Core.MouseButtons)_mouseButtons, 0, 0, 0);
                 }
                 else if (p.Type == "wheel") {
                     if (p.B == 0)
-                        await peripheral.SendMouseAsync((MouseButtons)_mouseButtons, 0, 0,
+                        await peripheral.SendMouseAsync((BleHid.Core.MouseButtons)_mouseButtons, 0, 0,
                             Math.Clamp(p.A / 120, -127, 127));
                 }
                 else if (p.Type == "key") {
@@ -173,7 +173,7 @@ internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
         _previousX = p.A; _previousY = p.B;
         if (dx == 0 && dy == 0) return;
         // Native relative X/Y HID reports: Android owns cursor acceleration.
-        await peripheral.SendMouseAsync((MouseButtons)_mouseButtons,
+        await peripheral.SendMouseAsync((BleHid.Core.MouseButtons)_mouseButtons,
             Math.Clamp(dx, -32767, 32767), Math.Clamp(dy, -32767, 32767), 0);
     }
 

@@ -11,9 +11,8 @@ internal sealed class PairComputerDialog : Form
     private sealed record NearbyItem(NearbyComputer Peer)
     {
         public override string ToString() =>
-            $"{(Peer.IsAndroid ? "Android" : Peer.IsHub ? "Environment hub" : "Windows member")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
-            (Peer.IsAndroid ? "Join from phone" :
-             Peer.CanReceive ? "Accepting members" : "At capacity");
+            $"{(Peer.IsHub ? "Environment hub" : "Windows member")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
+            (Peer.CanReceive ? "Accepting members" : "At capacity");
     }
 
     private readonly ListBox _nearby = new() { Dock = DockStyle.Fill,
@@ -131,11 +130,10 @@ internal sealed class PairComputerDialog : Form
                 if (_nearby.Items.Count > 0) _nearby.SelectedIndex = 0;
             }
             finally { _nearby.EndUpdate(); }
-            int mobileCount = _nearby.Items.Cast<NearbyItem>().Count(x => x.Peer.IsAndroid);
-            int windowsCount = _nearby.Items.Count - mobileCount;
-            _discoveryStatus.Text = _nearby.Items.Count == 0
-                ? "No devices found. Keep DeskTouch running on each PC/phone; check LAN firewall."
-                : $"{windowsCount} Windows PC(s), {mobileCount} Android phone(s). Busy PCs stay visible.";
+            int windowsCount = _nearby.Items.Count;
+            _discoveryStatus.Text = windowsCount == 0
+                ? "No Windows PCs found. Keep DeskTouch running on each PC; check LAN firewall."
+                : $"{windowsCount} Windows computer(s) found. Busy PCs remain visible.";
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!IsDisposed) _discoveryStatus.Text = "Network scan unavailable: " + ex.Message; }
@@ -168,11 +166,6 @@ internal sealed class PairComputerDialog : Form
         }
         else if (_nearby.SelectedItem is NearbyItem selected)
         {
-            if (selected.Peer.IsAndroid)
-            {
-                _error.Text = "On that Android device, select this Windows PC to connect.";
-                return;
-            }
             if (!selected.Peer.CanReceive)
             {
                 _error.Text = "That Windows endpoint is at capacity. The existing environment stays connected.";

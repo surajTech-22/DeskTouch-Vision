@@ -1,13 +1,11 @@
-name: DeskTouch Shared Environment - pre-release verification (no publish)
+name: DeskTouch Windows-only shared environment - pre-release verification
 
 on:
   push:
-    branches: [fix/native-uhid-wifi-no-bluetooth-v0323, feature/native-bluetooth-hogp-v0322, fix/android-latency-coordinate-timeouts-v0321, fix/android-pointer-handoff-v0320, feature/android-ime-input-bridge-0319, fix/bluetooth-audit-stable-0318, feature/shared-environment-relay-v0312, fix/android-devices-visible-in-displays-v0313, fix/android-inline-display-native-input-v0314, fix/multidevice-authority-ime-updater-permissions-v0315, fix/unified-draggable-input-layout-v0316, fix/strict-screen-boundary-handoff-v0317]
+    branches: [feature/windows-only-stability-v0324]
     paths:
       - 'DeskTouchVision/**'
-      - 'AndroidDeskTouch/**'
       - '.github/workflows/shared-environment-pre-release.yml'
-      - '.github/workflows/android-desktouch.yml'
       - '.github/workflows/desktouch-vision.yml'
       - '.github/scripts/**'
   workflow_dispatch:
@@ -17,7 +15,7 @@ permissions:
 
 jobs:
   windows-environment:
-    name: Windows - multi-device TLS and packaging
+    name: Windows - persistent TLS, native authority and package
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
@@ -50,6 +48,14 @@ jobs:
               !(Test-Path preview/DeviceSharing/DeskTouch.DeviceShare.exe)) {
             throw "Missing required Windows preview executables"
           }
+      - name: Assert Windows-only source and remove stale mobile artifacts
+        shell: pwsh
+        run: |
+          if (Test-Path AndroidDeskTouch) { throw "Android project must be absent" }
+          if (Test-Path preview/DeskTouchVision-android-preview.apk) { throw "Android APK in Windows-only package" }
+          if (Test-Path preview/DeviceSharing/AndroidDeskTouch) { throw "Android binaries must not be bundled" }
+          $form=Get-Content DeskTouchVision/DeviceSharing/DisplaySettingsForm.cs -Raw
+          if ($form -match 'Get Android app|Android HID|Bluetooth check') { throw "Obsolete Android controls present" }
       - name: Record Windows test summary
         shell: pwsh
         run: |
@@ -65,96 +71,3 @@ jobs:
           path: windows-verify.txt
           if-no-files-found: error
 
-  android-environment:
-    name: Android - unit tests and APK compile
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v4
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-      - name: Android protocol and discovery regression tests twice
-        working-directory: AndroidDeskTouch
-        shell: bash
-        run: |
-          set -euo pipefail
-          for pass in 1 2; do
-            echo "DeskTouch Android unit run $pass / 2"
-            gradle --no-daemon :app:testDebugUnitTest
-          done
-          gradle --no-daemon :app:assembleDebug
-          test -s app/build/outputs/apk/debug/app-debug.apk
-      - name: Record Android test summary without releasing APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "source_sha=${{ github.sha }}"
-            echo "android_unit_passes=2"
-            echo "production_signed=false"
-            echo "release_published=false"
-            echo "debug_apk_sha256=$(sha256sum AndroidDeskTouch/app/build/outputs/apk/debug/app-debug.apk | cut -d' ' -f1)"
-          } > android-verify.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: DeskTouch-Android-PreRelease-Verification
-          path: android-verify.txt
-          if-no-files-found: error
-
-  android-emulator-smoke:
-    name: Android emulator - launch shared-environment UI
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v4
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-      - name: Build debug APK for real app-process input probes
-        working-directory: AndroidDeskTouch
-        shell: bash
-        run: |
-          set -euo pipefail
-          gradle --no-daemon :app:assembleDebug
-          test -s app/build/outputs/apk/debug/app-debug.apk
-      - name: Enable emulator hardware virtualization
-        shell: bash
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-      - name: Launch Android app and verify core controls
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          arch: x86_64
-          profile: pixel_6
-          target: default
-          ram-size: 3072M
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          disable-animations: true
-          script: |
-            adb install AndroidDeskTouch/app/build/outputs/apk/debug/app-debug.apk
-            adb shell pm grant com.desktouch.vision android.permission.POST_NOTIFICATIONS
-            adb shell am start -n com.desktouch.vision/.MainActivity
-            bash .github/scripts/check-desktouch-emulator.sh
-            bash .github/scripts/test-desktouch-uhid-emulator.sh
-            bash .github/scripts/test-desktouch-input-emulator.sh
-      - name: Preserve Android input acceptance results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: DeskTouch-Android-Real-Input-Acceptance
-          path: android-input-emulator.txt
-          if-no-files-found: ignore

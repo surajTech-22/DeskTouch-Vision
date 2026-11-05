@@ -30,7 +30,7 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
 }
 
 /// <summary>
-/// A small authenticated LAN hub. Up to eight PCs/phones can remain connected
+/// A small authenticated LAN hub. Up to eight Windows PCs can remain connected
 /// through the same existing TLS protocol. Only one peer holds the input lease.
 /// The currently selected peer is the target for Windows-to-peer reverse input;
 /// switching to another peer is explicit when that peer requests authority.
@@ -38,8 +38,8 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
 internal sealed class ReceiverServer : IInputSession, IDisposable
 {
     private const int MaxPeers = 8;
-    // Allow Android CPU/Wi-Fi rescheduling during screen transitions without
-    // disconnecting a still-authenticated peer on an 18-second idle gap.
+    // Allow Wi-Fi roaming and transient Windows scheduling pauses without
+    // retaining a permanently abandoned connection. Input leases revoke on disconnect.
     internal const int PeerIdleGraceSeconds = 50;
     private sealed class Session
     {
@@ -70,7 +70,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal bool Granted;
         // Routed pointer packets are coalesced while key and button events
         // preserve their order. Never block the hub's TCP receive loop on
-        // every intermediate Android cursor coordinate.
+        // every intermediate remote cursor coordinate.
         internal readonly Channel<Packet> InputQueue=Channel.CreateBounded<Packet>(
             new BoundedChannelOptions(512) {
                 SingleReader=true,SingleWriter=false,
@@ -89,8 +89,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly Func<string,CancellationToken,Task<bool>>? _requestTrustApproval;
     private readonly ConcurrentDictionary<int,TcpClient> _clients = new();
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
-    private readonly ConcurrentDictionary<int,BluetoothHidCapability> _bluetoothReports = new();
-    private BluetoothHidCapability _localBluetoothReport = BluetoothHidCapability.Checking;
     private readonly object _authorityGate = new();
     private readonly object _layoutGate=new();
     private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
@@ -116,7 +114,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<Packet>? ReverseControlMessage;
     internal event Action<ConnectedPeer>? PeerConnected;
     internal event Action? PeerListChanged;
-    internal event Action? BluetoothReportsChanged;
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
@@ -124,62 +121,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
     internal static bool AllowsForwardInput(ConnectedPeer peer) =>
-        peer.Platform != "Android" || peer.SupportsForwardInput;
+        peer.Platform == "Windows";
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
 
-    internal IReadOnlyList<BluetoothHidDeviceStatus> BluetoothReports
-    {
-        get
-        {
-            var reports = new List<BluetoothHidDeviceStatus> {
-                new(0,Environment.MachineName,Volatile.Read(ref _localBluetoothReport))
-            };
-            foreach(var session in _sessions.Values.Where(s=>s.Peer.Platform=="Windows")
-                .OrderBy(s=>s.Id))
-                reports.Add(new(session.Id,session.Peer.Name,
-                    _bluetoothReports.TryGetValue(session.Id,out var status)
-                        ? status : BluetoothHidCapability.Checking));
-            return reports;
-        }
-    }
-
-    // A request from EITHER Windows app checks the entire paired environment.
-    // This carries only adapter capabilities, never keyboard events or
-    // Bluetooth device addresses, through the existing authenticated TLS link.
-    internal void RequestBluetoothCheck()
-    {
-        if(_disposed || _cancel.IsCancellationRequested)return;
-        _=RefreshBluetoothReportsAsync(_cancel.Token);
-    }
-
-    private async Task RefreshBluetoothReportsAsync(CancellationToken token)
-    {
-        foreach(var peer in _sessions.Values.Where(s=>s.Peer.Platform=="Windows"))
-        {
-            try{await SendToAsync(peer,new Packet("bluetooth-check-request"),token);}
-            catch(Exception){} // peer disconnected mid-check
-        }
-        var status=await BluetoothHidDiagnostics.CheckAsync();
-        if(token.IsCancellationRequested)return;
-        Volatile.Write(ref _localBluetoothReport,status);
-        await PublishBluetoothReportsAsync(token);
-    }
-
-    private async Task PublishBluetoothReportsAsync(CancellationToken token)
-    {
-        if(token.IsCancellationRequested)return;
-        var reports=BluetoothReports;
-        var payload=JsonSerializer.Serialize(reports);
-        if(System.Text.Encoding.UTF8.GetByteCount(payload)>7800)return;
-        BluetoothReportsChanged?.Invoke();
-        foreach(var peer in _sessions.Values.Where(s=>s.Peer.Platform=="Windows"))
-        {
-            try{await SendToAsync(peer,new Packet("bluetooth-snapshot",Text:payload),token);}
-            catch(Exception){} // disconnected peer
-        }
-    }
     internal static string LayoutIdentity(ConnectedPeer peer) =>
         string.IsNullOrWhiteSpace(peer.DeviceFingerprint) ?
             peer.Platform+"|"+peer.Name : peer.DeviceFingerprint;
@@ -243,10 +189,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             catch(Exception) { /* peer may disconnect while receiving layout */ }
     }
 
-
-    internal static bool AllowsAndroidCapability(ConnectedPeer source, Packet packet) =>
-        source.Platform=="Android" && packet.Type=="android-capability" &&
-        packet.A is 0 or 1;
 
     internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
         bool differentPeers, int claim) =>
@@ -664,7 +606,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
-    private static ConnectedPeer ReadHello(string? value)
+    internal static ConnectedPeer ReadHello(string? value)
     {
         if (string.IsNullOrWhiteSpace(value) || value.Length > 6000)
             throw new InvalidDataException("Missing peer monitor layout.");
@@ -677,11 +619,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // it to authenticate the source or grant remote keyboard authority.
         string? hint = hello.Fingerprint is { Length:64 } id &&
             id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
-        string platform = string.Equals(hello.Platform, "Android",
-            StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
+        // Only Windows desktop peers may enter a DeskTouch environment.
+        // Reject previous Android clients BEFORE registering any input lease.
+        if (!string.IsNullOrWhiteSpace(hello.Platform) &&
+            !string.Equals(hello.Platform, "Windows", StringComparison.Ordinal))
+            throw new InvalidDataException("Only Windows computers are supported.");
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true, hint, platform,
-            platform != "Android" || hello.ForwardInputSupported == true);
+            hello.ReverseInputSupported ?? true, hint, "Windows", true);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -726,7 +670,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var hello=await Wire.ReadAsync(ssl,helloTimeout.Token);
         if(hello.Type!="hello") throw new InvalidDataException("Missing authenticated hello.");
         var peer=ReadHello(hello.Text);
-        // The authenticated hello carries the current computer/phone name.
+        // The authenticated hello carries the current Windows computer name.
         // A saved trusted-device alias may be stale after the PC was renamed;
         // keep the actual announced system name in the display diagram.
         var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
@@ -740,39 +684,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             bool first;
             lock(_authorityGate) first=_selected==null;
             if(first) Select(session);
-            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
+            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" Windows computers).");
             // The server advertises its CURRENT system name after successful
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
             await PublishEnvironmentAsync(token);
-            // The Windows UI requests the first Bluetooth check after pairing
-            // and on the diagnostic button. Do not repeatedly query every
-            // adapter as peers join: it can delay live input-lease traffic.
             while(!token.IsCancellationRequested)
             {
                 using var deadline=CancellationTokenSource.CreateLinkedTokenSource(token);
                 deadline.CancelAfter(TimeSpan.FromSeconds(PeerIdleGraceSeconds));
                 var p=await Wire.ReadAsync(ssl,deadline.Token);
                 if(p.Type=="goodbye") break;
-                if(p.Type=="bluetooth-check-request" && peer.Platform=="Windows")
-                {
-                    RequestBluetoothCheck();
-                    continue;
-                }
-                if(p.Type=="bluetooth-report" && peer.Platform=="Windows")
-                {
-                    if(p.Text is not {Length:>1 and <=1024})continue;
-                    BluetoothHidCapability? report;
-                    try{report=JsonSerializer.Deserialize<BluetoothHidCapability>(p.Text);}
-                    catch(JsonException){continue;}
-                    if(!BluetoothHidCapability.Valid(report))continue;
-                    // Trust the authenticated session ID and peer name, not
-                    // identity claims embedded in client-supplied diagnostics.
-                    _bluetoothReports[session.Id]=report!;
-                    await PublishBluetoothReportsAsync(token);
-                    continue;
-                }
                 if(p.Type=="trust-request")
                 {
                     bool allowed=false;
@@ -810,24 +733,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         PeerPlacementChanged?.Invoke(edge);
                     continue;
                 }
-                if(p.Type=="reverse-key-unavailable")
-                {
-                    RelayLease? relay;
-                    lock(_authorityGate)
-                    {
-                        _relayByTarget.TryGetValue(session.Id,out relay);
-                        if(relay!=null && relay.Claim!=p.A)relay=null;
-                    }
-                    if(relay!=null)
-                    {
-                        try { await SendToAsync(relay.Source,
-                            new Packet("android-keyboard-unavailable"),token); }
-                        catch(Exception){}
-                    }
-                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
-                        _status("Android keyboard input unavailable: tap an editable field on the phone and verify DeskTouch Accessibility is enabled.");
-                    continue;
-                }
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
@@ -857,35 +762,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             lock(_authorityGate) _hubClaims.Remove(session.Id);
                         ReverseControlMessage?.Invoke(p);
                     }
-                    continue;
-                }
-                if(p.Type=="android-capability")
-                {
-                    if(!AllowsAndroidCapability(session.Peer,p))continue;
-                    bool canReceive=p.A==1;
-                    if(session.Peer.SupportsReverseInput==canReceive)continue;
-                    session.Peer=session.Peer with {SupportsReverseInput=canReceive};
-                    if(!canReceive)
-                    {
-                        // Revoking Android Accessibility must immediately
-                        // stop any hub-local or routed keyboard/mouse lease.
-                        // Never silently keep a stale remote controller.
-                        TrySendReverseTo(session.Id,new Packet("reset"));
-                        RelayLease? relay;
-                        lock(_authorityGate)
-                            _relayByTarget.TryGetValue(session.Id,out relay);
-                        if(relay!=null)
-                        {
-                            var removed=RemoveRelayFromSource(relay.Source.Id);
-                            if(removed!=null)
-                                await RevokeRelayAsync(removed,true,token);
-                        }
-                    }
-                    await PublishEnvironmentAsync(token);
-                    PeerListChanged?.Invoke();
-                    _status(canReceive
-                        ? "Android Accessibility restored on an existing secure connection."
-                        : "Android Accessibility disabled; device stays connected in view-only mode.");
                     continue;
                 }
                 if(p.Type=="environment-placement-update")
@@ -973,9 +849,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     bool granted=false;
                     lock(_authorityGate)
                     {
-                        // One-way Android mode: never accept Android->Windows
-                        // keyboard/mouse claims. Android remains paired for
-                        // Windows->Android control via reverse-* packets.
+                        // Only an authenticated Windows input controller can claim authority.
                         if(p.A>0 && AllowsForwardInput(session.Peer) &&
                            (_owner==null || ReferenceEquals(_owner,session)) &&
                            (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
@@ -986,11 +860,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             granted=true;
                         }
                     }
-                    // A forward Android/Windows INPUT CLAIM controls the
+                    // A forward Windows INPUT CLAIM controls the
                     // local hub only. It is NOT a request to change which
                     // remote destination the hub operator is controlling.
                     // Selecting the claimant here revoked the selected PC's
-                    // reverse keyboard lease whenever a phone touched its UI.
+                    // reverse keyboard lease whenever the Windows peer used native input.
                     // Forward owner (_owner) and reverse target (_selected)
                     // must remain independent while all peers stay connected.
                     if(granted && !_sessions.ContainsKey(session.Id))
@@ -1033,9 +907,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="ping")
                 {
-                    // The Android client expects a server response within 22s.
-                    // Older Windows releases ignored all mobile heartbeats,
-                    // causing a healthy connection to time out after 22s.
+                    // Answer authenticated heartbeats so Windows Wi-Fi roaming
+                    // does not leave the input lease in an ambiguous state.
                     await SendToAsync(session,new Packet("pong"),token);
                     continue;
                 }
@@ -1101,8 +974,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             linked.Cancel();
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
-            _bluetoothReports.TryRemove(id,out _);
-            await PublishBluetoothReportsAsync(token);
             lock(_authorityGate) _hubClaims.Remove(id);
             var disconnectedRoutes=new List<RelayLease>();
             lock(_authorityGate)
@@ -1185,12 +1056,6 @@ internal sealed class HostSession : IInputSession, IDisposable
     private string? _environmentHubName;
     private readonly MonitorTopology _environmentHubMonitors;
     private EnvironmentMember[] _environmentMembers = [];
-    private BluetoothHidDeviceStatus[] _bluetoothReports = [];
-    internal IReadOnlyList<BluetoothHidDeviceStatus> BluetoothReports =>
-        Volatile.Read(ref _bluetoothReports);
-    internal event Action? BluetoothReportsChanged;
-    internal bool RequestBluetoothCheck() =>
-        TrySend(new Packet("bluetooth-check-request"));
     private int _environmentOwnId;
     private int _environmentTargetId;
     internal IReadOnlyList<EnvironmentMember> EnvironmentMembers =>
@@ -1510,7 +1375,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                         members.Select(m=>m.Id).Distinct().Count()!=members.Length ||
                         members.Any(m=>m.Id<0 || m.Name.Length is < 1 or > 100 ||
                             m.Name.Any(char.IsControl) ||
-                            m.Platform is not ("Windows" or "Android")))
+                            m.Platform != "Windows"))
                         throw new InvalidDataException("Invalid authenticated environment roster.");
                     Volatile.Write(ref _environmentMembers,members);
                     Volatile.Write(ref _environmentOwnId,p.A);
@@ -1519,32 +1384,6 @@ internal sealed class HostSession : IInputSession, IDisposable
                         m.SupportsReverseInput))
                         SelectEnvironmentTarget(0);
                     EnvironmentRosterChanged?.Invoke();
-                }
-                else if(p.Type=="bluetooth-check-request")
-                {
-                    // Probe off the receive loop: input and heartbeat packets
-                    // must continue even if the Windows adapter is sluggish.
-                    _=Task.Run(async () =>
-                    {
-                        var report=await BluetoothHidDiagnostics.CheckAsync();
-                        TrySend(new Packet("bluetooth-report",
-                            Text:JsonSerializer.Serialize(report)));
-                    });
-                }
-                else if(p.Type=="bluetooth-snapshot" &&
-                    p.Text is { Length:>1 and <=7800 } bluetoothPayload)
-                {
-                    BluetoothHidDeviceStatus[]? reports;
-                    try{reports=JsonSerializer.Deserialize<BluetoothHidDeviceStatus[]>(
-                        bluetoothPayload);}
-                    catch(JsonException){continue;}
-                    if(reports==null || reports.Length is <1 or >9 ||
-                        reports.Select(r=>r.Id).Distinct().Count()!=reports.Length ||
-                        reports.Any(r=>r.Id<0 || r.Name is not {Length:>0 and <=100} ||
-                            r.Name.Any(char.IsControl) ||
-                            !BluetoothHidCapability.Valid(r.Capability)))continue;
-                    Volatile.Write(ref _bluetoothReports,reports);
-                    BluetoothReportsChanged?.Invoke();
                 }
                 else if (p.Type=="environment-layout" &&
                     p.Text is { Length: > 1 and <= 4096 } serializedPositions)
@@ -1594,9 +1433,6 @@ internal sealed class HostSession : IInputSession, IDisposable
                     HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
-                else if (p.Type == "android-keyboard-unavailable")
-                    InputDeliveryWarning?.Invoke(
-                        "Android has no supported focused text field. Click an editable field on the phone, then type. Check Android Accessibility settings if needed.");
                 else if (p.Type == "keyboard-unavailable")
                     InputDeliveryWarning?.Invoke("The receiving Windows PC rejected keyboard " +
                         "input. Click a normal text field on that PC and check whether " +

@@ -11,6 +11,35 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// Native HID must send real GATT mouse/keyboard reports, not Android text/gesture
+// packets. Exercise report maps, modifier encoding, and the unpaired gate without
+// requiring a physical Bluetooth radio on the CI runner.
+Check(BleHid.Core.HidDescriptors.HidService ==
+    BleHid.Core.HidDescriptors.Uuid16(0x1812),
+    "The advertised service must be standard Bluetooth HID (0x1812)");
+Check(BleHid.Core.HidReports.Mouse(BleHid.Core.MouseButtons.Left, 27, -11, 1)
+    .SequenceEqual(new byte[] { 1, 27, 0, 245, 255, 1 }),
+    "Relative native HID mouse report must contain buttons and signed deltas");
+Check(BleHid.Core.HidReports.Keyboard(
+    BleHid.Core.KeyModifiers.LeftShift, 0x04)
+    .SequenceEqual(new byte[] { 2, 0, 4, 0, 0, 0, 0, 0 }),
+    "Native HID keyboard must use standard usage IDs and modifiers");
+Check(NativeHidKeyMap.Usage(0x41) == 4 &&
+      NativeHidKeyMap.Usage(0x0D) == 0x28 &&
+      NativeHidKeyMap.Usage(0x27) == 0x4F &&
+      NativeHidKeyMap.Usage(0xBA) == 0x33,
+    "Windows letter, Enter, arrow, and OEM key codes must map to HID usages");
+Check(NativeHidKeyMap.Modifiers(new HashSet<int> { 0x11, 0xA1 })
+    == (BleHid.Core.KeyModifiers.LeftControl |
+        BleHid.Core.KeyModifiers.RightShift),
+    "Physical Windows modifier keys must survive native HID capture");
+var unpairedHid = new NativeHidInputSession();
+Check(!unpairedHid.TrySend(new Packet("claim", 1)) &&
+      !unpairedHid.Ready,
+    "No BLE HID subscriber means no mouse/keyboard authority or capture");
+unpairedHid.DisposeAsync().AsTask().GetAwaiter().GetResult();
+Console.WriteLine("PASS: real Bluetooth HOGP descriptors/reports and no unpaired input capture.");
+
 // Bluetooth HID eligibility is read-only. A candidate is NOT proof of an
 // Android HID connection, and adapter selection cannot change input leases.
 var candidate = new BluetoothHidCapability("Candidate", true, true,

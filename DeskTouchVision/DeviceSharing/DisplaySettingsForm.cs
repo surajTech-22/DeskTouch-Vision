@@ -122,7 +122,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (!_updatingTargetChoice && _targetChoice.SelectedItem is TargetOption target)
                 SelectConnectedTarget(target.Id);
         };
-        // Every connected phone/PC is selected by clicking its SCREEN tile.
+        // Every connected Windows computer is selected by clicking its screen tile.
         // The previous two-option dropdown falsely implied two independent
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
@@ -548,7 +548,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         if(destination.Value==CurrentInputTargetId())
         {
-            // A user may have clicked the phone tile earlier without
+            // A user may have clicked the computer tile earlier without
             // taking authority. Crossing the edge of THAT already-selected
             // device must still request its first input grant.
             if(!remote && _capture?.IsArmed==true)
@@ -586,7 +586,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     return false;
                 // A release MUST go over the PREVIOUS authenticated route;
                 // changing the hub destination first would release the wrong
-                // phone/PC and leave keyboard authority stranded.
+                // Windows computer and leave keyboard authority stranded.
                 _capture?.ReturnLocal();
                 if(!_host.SelectEnvironmentTarget(chosen))
                 {
@@ -627,8 +627,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _capture=new SourceCapture(this,next,Status,edge,
                     preserveRawInput:true);
                 _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                _capture.DestinationIsAndroid=false;
-                _capture.Arm();
+                    _capture.Arm();
             }
             if(requestHandoff)
                 _capture.BeginLinkedHandoff(edge,fraction);
@@ -656,8 +655,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
             _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                _capture.DestinationIsAndroid=false;
-            _capture.Arm();
+                _capture.Arm();
             _captureInboundPeerId=_receiver.SelectedPeerId;
             Status("Windows controls " + _incomingPeer.Name +
                 " across the existing authenticated connection.");
@@ -772,7 +770,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnPeerListChanged() => PostToUi(() =>
     {
-        // An Android permission may be restored or disabled on the SAME TLS
+        // A Windows peer's controls may be updated on the SAME TLS
         // session, without dropping the entire environment. Keep diagram,
         // keyboard-target availability and active input grant consistent.
         if(_captureUsesInbound && _receiver!=null)
@@ -1082,8 +1080,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
             preserveRawInput: true);
         _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                _capture.DestinationIsAndroid=false;
-        session.AuthorityControlPacket += HandleRemoteState;
+            session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;

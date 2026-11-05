@@ -31,8 +31,8 @@ internal sealed class UhidInputSession : INativeHidSession
     private bool _positionKnown, _closed;
     private string _device = "";
 
-    internal event Action<Packet>? Authority;
-    internal event Action<string>? Status;
+    public event Action<Packet>? Authority;
+    public event Action<string>? Status;
 
     public bool IsStarted => _started;
     public bool Ready {

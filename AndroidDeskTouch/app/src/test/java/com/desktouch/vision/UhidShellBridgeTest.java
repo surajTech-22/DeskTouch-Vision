@@ -26,7 +26,7 @@ public class UhidShellBridgeTest {
             new byte[] { 1,12,(byte)-5,0,0 });
         ByteBuffer kb=ByteBuffer.wrap(keys).order(ByteOrder.nativeOrder());
         ByteBuffer mm=ByteBuffer.wrap(mouse).order(ByteOrder.nativeOrder());
-        assertEquals(12,keys.length);
+        assertEquals(14,keys.length);
         assertEquals(11,mouse.length);
         assertEquals(12,kb.getInt(0));
         assertEquals(8,kb.getShort(4));

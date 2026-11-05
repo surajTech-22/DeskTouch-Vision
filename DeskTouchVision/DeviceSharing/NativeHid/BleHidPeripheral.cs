@@ -435,13 +435,12 @@ public sealed class BleHidPeripheral : IAsyncDisposable
                     if (!string.IsNullOrWhiteSpace(device.Name))
                         _hostNames[host.DeviceId] = device.Name;
                     device.ConnectionStatusChanged += OnConnectionStatusChanged;
-                    if (CanReadConnectionParameters)
-                        device.ConnectionParametersChanged += OnConnectionParametersChanged;
+                    // Bluetooth connection-interval introspection is Windows 11-only;
+                    // not required for native HID pairing and sending.
                     _hostDevices[host.DeviceId] = device;
                 }
 
-                if (CanReadConnectionParameters)
-                    UpdateConnectionInterval(device);
+                // Use configured report pacing; keep Windows 10 compatibility.
             }
         }
         catch (Exception ex)
@@ -468,24 +467,6 @@ public sealed class BleHidPeripheral : IAsyncDisposable
                 .Where(pair => pair.Value.ConnectionStatus == BluetoothConnectionStatus.Connected)
                 .Select(pair => pair.Key),
             _selectedHostId is null ? "all hosts disconnected" : "selected host disconnected");
-    }
-
-    [SupportedOSPlatform("windows10.0.22000.0")]
-    private void OnConnectionParametersChanged(BluetoothLEDevice sender, object args) =>
-        UpdateConnectionInterval(sender);
-
-    [SupportedOSPlatform("windows10.0.22000.0")]
-    private void UpdateConnectionInterval(BluetoothLEDevice device)
-    {
-        var parameters = device.GetConnectionParameters();
-        if (parameters.ConnectionInterval == 0) return;
-
-        var intervalMs = (int)Math.Ceiling(parameters.ConnectionInterval * 1.25);
-        if (_connectionIntervalsMs.TryGetValue(device.DeviceId, out var previous) && previous == intervalMs)
-            return;
-
-        _connectionIntervalsMs[device.DeviceId] = intervalMs;
-        Log?.Invoke($"[link] connection interval -> {intervalMs} ms");
     }
 
     public Task SendKeyboardAsync(KeyModifiers modifiers, params byte[] usages)
@@ -783,8 +764,7 @@ public sealed class BleHidPeripheral : IAsyncDisposable
         foreach (var device in _hostDevices.Values)
         {
             device.ConnectionStatusChanged -= OnConnectionStatusChanged;
-            if (CanReadConnectionParameters)
-                device.ConnectionParametersChanged -= OnConnectionParametersChanged;
+            // No Windows 11-only connection-parameters event registration.
             device.Dispose();
         }
         _hostDevices.Clear();

@@ -11,7 +11,7 @@ namespace DeskTouch.DeviceShare;
 /// injection is involved in this transport. Physical input remains subject
 /// to the existing SourceCapture authority and emergency-return controls.
 /// </summary>
-internal sealed class NativeHidInputSession : IInputSession, IAsyncDisposable
+internal sealed class NativeHidInputSession : INativeHidSession
 {
     private readonly Channel<Packet> _events = Channel.CreateUnbounded<Packet>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });

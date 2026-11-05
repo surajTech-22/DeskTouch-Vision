@@ -11,6 +11,21 @@ static void Check(bool test, string message)
     if (!test) throw new Exception("Input priority regression: " + message);
 }
 
+// ADB UHID is real Android kernel virtual HID (not BLE and not Accessibility).
+// Never capture Windows input when the phone is missing or unauthorized.
+var authorizedUhidDevices = UhidInputSession.AuthorizedDevices(
+    "List of devices attached\n192.168.1.4:37101\tdevice product:phone model:Phone\n" +
+    "192.168.1.5:5555\tunauthorized\n192.168.1.6:5555\toffline\n");
+Check(authorizedUhidDevices.Count == 1 && authorizedUhidDevices[0]=="192.168.1.4:37101",
+    "Native Wi-Fi UHID must select only explicitly ADB-authorized phones");
+Check(UhidInputSession.AuthorizedDevices("List of devices attached\n").Count==0,
+    "Unpaired phones must not capture Windows keyboard or mouse");
+var localUhid = new UhidInputSession();
+Check(!localUhid.TrySend(new Packet("claim",9)) && !localUhid.Ready,
+    "Android UHID source cannot claim input before the Android kernel acknowledges creation");
+localUhid.DisposeAsync().AsTask().GetAwaiter().GetResult();
+Console.WriteLine("PASS: native Wi-Fi UHID authorized ADB discovery and no-unpaired-capture.");
+
 // Native HID must send real GATT mouse/keyboard reports, not Android text/gesture
 // packets. Exercise report maps, modifier encoding, and the unpaired gate without
 // requiring a physical Bluetooth radio on the CI runner.

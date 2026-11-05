@@ -45,8 +45,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
     private readonly Button _androidDownload = Button("Get Android app");
-    private readonly Button _bluetoothCheck = Button("Native Android HID");
-    private NativeHidInputSession? _hid;
+    private readonly Button _bluetoothCheck = Button("Android HID");
+    private INativeHidSession? _hid;
+    private DateTime _hidRetryAfter = DateTime.MinValue;
     private SourceCapture? _hidCapture;
     private System.Windows.Forms.Timer? _hidMonitorTimer;
     private bool _hidStarting;
@@ -409,34 +410,49 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private async Task ToggleNativeHidAsync()
     {
         if (_hidStarting) return;
-        if (_hid?.IsStarted == true) await StopNativeHidAsync();
-        else await StartNativeHidAsync();
+        // Explicit user opt-in, retained through tray/startup without leaving
+        // Android application UI open. Press again to revoke authorization.
+        if (File.Exists(_nativeHidOptInPath))
+        {
+            await StopNativeHidAsync();
+            return;
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(_nativeHidOptInPath)!);
+        File.WriteAllText(_nativeHidOptInPath,
+            "User enabled native Android UHID via authorized Wi-Fi debugging.");
+        await StartNativeHidAsync();
     }
 
     private async Task StartNativeHidAsync()
     {
-        if (_hidStarting || _hid?.IsStarted == true || _closing.IsCancellationRequested)
+        if (_hidStarting || _closing.IsCancellationRequested ||
+            !File.Exists(_nativeHidOptInPath) || _hid?.Ready == true)
             return;
         _hidStarting = true;
+        _hidRetryAfter = DateTime.UtcNow.AddSeconds(15);
         _bluetoothCheck.Enabled = false;
-        _bluetoothCheck.Text = "Starting HID…";
+        _bluetoothCheck.Text = "Connecting…";
         try
         {
-            _hid ??= new NativeHidInputSession();
+            if (_hid != null) {
+                _hid.Status -= NativeHidStatus;
+                _hid.Authority -= NativeHidAuthority;
+                await _hid.DisposeAsync();
+                _hid=null;
+            }
+            _hid = new UhidInputSession();
             _hid.Status += NativeHidStatus;
             _hid.Authority += NativeHidAuthority;
             await _hid.StartAsync();
-            Directory.CreateDirectory(Path.GetDirectoryName(_nativeHidOptInPath)!);
-            File.WriteAllText(_nativeHidOptInPath, "User enabled native Bluetooth HID.");
-            _bluetoothCheck.Text = "Stop native HID";
-            Status("Native Bluetooth HID advertising. Pair this PC in Android Settings > Bluetooth. " +
-                   "Edge handoff arms automatically after Android subscribes.");
+            _bluetoothCheck.Text = "Stop HID";
+            Status("Android native keyboard and mouse ready over authorized Wi-Fi UHID. " +
+                   "Move to the screen edge. Android app can stay closed.");
             MaintainNativeHid();
         }
         catch (Exception ex)
         {
-            Status("Native Bluetooth HID unavailable: " + ex.Message);
-            _bluetoothCheck.Text = "Native Android HID";
+            Status("Native Android UHID not connected: " + ex.Message);
+            _bluetoothCheck.Text = "Stop HID";
         }
         finally { _hidStarting = false; _bluetoothCheck.Enabled = true; }
     }
@@ -447,22 +463,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _hidStarting = true;
         try
         {
-            _hidCapture?.ReturnLocal(); _hidCapture?.Dispose(); _hidCapture = null;
-            _hidMonitorTimer?.Stop();
-            if (_hid != null)
-            {
+            if (File.Exists(_nativeHidOptInPath)) File.Delete(_nativeHidOptInPath);
+            _hidCapture?.ReturnLocal(); _hidCapture?.Dispose(); _hidCapture=null;
+            if (_hid != null) {
                 _hid.Status -= NativeHidStatus;
                 _hid.Authority -= NativeHidAuthority;
                 await _hid.DisposeAsync();
-                _hid = null;
+                _hid=null;
             }
-            if (File.Exists(_nativeHidOptInPath)) File.Delete(_nativeHidOptInPath);
-            _bluetoothCheck.Text = "Native Android HID";
-            _capture?.Arm();
-            Status("Native HID stopped. Windows and network sharing remain available.");
+            _bluetoothCheck.Text = "Android HID";
+            try { _capture?.Arm(); } catch (Exception ex) { Status(ex.Message); }
+            Status("Android native UHID stopped; Windows keyboard and mouse restored.");
         }
-        catch (Exception ex) { Status("Stopping native HID: " + ex.Message); }
-        finally { _hidStarting = false; _hidMonitorTimer?.Start(); }
+        catch (Exception ex) { Status("Stopping native UHID: " + ex.Message); }
+        finally { _hidStarting = false; }
     }
 
     private void NativeHidStatus(string message) => PostToUi(() => Status(message));
@@ -480,40 +494,39 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void MaintainNativeHid()
     {
-        if (_closing.IsCancellationRequested || _hid == null || !_hid.IsStarted) return;
-        if (!_hid.Ready)
-        {
-            if (_hidCapture != null)
-            {
+        if (_closing.IsCancellationRequested || _hidStarting) return;
+        if (_hid == null || !_hid.Ready) {
+            if (_hidCapture != null) {
                 _hidCapture.ReturnLocal();
                 _hidCapture.Dispose();
-                _hidCapture = null;
+                _hidCapture=null;
                 try { _capture?.Arm(); } catch (Exception ex) { Status(ex.Message); }
-                Status("Native HID disconnected; local Windows input restored.");
+                Status("Android UHID disconnected; Windows input restored.");
             }
+            if (File.Exists(_nativeHidOptInPath) &&
+                DateTime.UtcNow >= _hidRetryAfter)
+                _ = StartNativeHidAsync(); // autonomous tray reconnect
             return;
         }
         if (_hidCapture != null || _capture?.RemoteActive == true ||
             _capture?.IsClaimPending == true) return;
-        // Optional actual screen geometry from a connected Android app.
-        // The Bluetooth HID path works without the Android app being opened.
+        // Optional real geometry is available from Android TLS, but the
+        // physical UHID keyboard/mouse only uses relative native input.
         var phone = _receiver?.ConnectedPeers
             .FirstOrDefault(p => p.Peer.Platform == "Android").Peer;
         if (phone != null) _hid.SetPhoneGeometry(phone.Monitors);
-        try
-        {
-            _capture?.Disarm(); // never install two global mouse/keyboard hook sets
-            _hidCapture = new SourceCapture(this, _hid, Status, _preferredEdge,
-                preserveRawInput: true);
+        try {
+            _capture?.Disarm(); // only one Windows global input-hook owner
+            _hidCapture = new SourceCapture(this,_hid,Status,_preferredEdge,
+                preserveRawInput:true);
             _hidCapture.Arm();
-            Status("Android HID paired. Move to the configured edge to hand off. " +
-                   "DeskTouch continues while hidden in the tray.");
+            Status("Android UHID connected; move to configured edge for native keyboard/mouse. " +
+                   "Works with DeskTouch hidden in the tray.");
         }
-        catch (Exception ex)
-        {
-            _hidCapture?.Dispose(); _hidCapture = null;
+        catch(Exception ex) {
+            _hidCapture?.Dispose();_hidCapture=null;
             try { _capture?.Arm(); } catch { }
-            Status("Native HID capture unavailable: " + ex.Message);
+            Status("UHID handoff unavailable: "+ex.Message);
         }
     }
 

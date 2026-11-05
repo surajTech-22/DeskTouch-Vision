@@ -606,7 +606,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
-    private static ConnectedPeer ReadHello(string? value)
+    internal static ConnectedPeer ReadHello(string? value)
     {
         if (string.IsNullOrWhiteSpace(value) || value.Length > 6000)
             throw new InvalidDataException("Missing peer monitor layout.");
@@ -864,7 +864,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // local hub only. It is NOT a request to change which
                     // remote destination the hub operator is controlling.
                     // Selecting the claimant here revoked the selected PC's
-                    // reverse keyboard lease whenever a phone touched its UI.
+                    // reverse keyboard lease whenever the Windows peer used native input.
                     // Forward owner (_owner) and reverse target (_selected)
                     // must remain independent while all peers stay connected.
                     if(granted && !_sessions.ContainsKey(session.Id))

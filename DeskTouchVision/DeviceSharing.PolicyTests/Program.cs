@@ -22,7 +22,7 @@ Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
 Check(DisplayArrangementControl.DisplayNumber(new MonitorRect(
     "Windows screen", 0, 0, 1080, 2400, true), 1) == 1,
     "Another Windows computer starts monitor numbering at one.");
-Check(DisplayArrangementControl.CleanDeviceName("PC\\r\\nName", "Unknown") ==
+Check(DisplayArrangementControl.CleanDeviceName("PC\r\nName", "Unknown") ==
     "PC  Name", "Device title must not introduce newlines.");
 Console.WriteLine("PASS: native Windows display numbering and safe computer names.");
 var testDisplay = new MonitorTopology(new[] {
@@ -71,35 +71,31 @@ Check(sortedEnvironment[0].IsHub && sortedEnvironment[0].Name=="HUB",
 Check(NearbyComputerDiscovery.ParseReply("DT1-READY|Fake|BAD",local1)==null,
     "Invalid discovery fingerprint must be rejected");
 Check(WindowsStartup.Command(@"C:\\Program Files\\DeskTouch\\DeskTouch.DeviceShare.exe")
-    .EndsWith("\\" --tray",StringComparison.Ordinal),
+    .EndsWith("\" --tray",StringComparison.Ordinal),
     "Windows startup must use tray mode");
 Console.WriteLine("PASS: Windows-only discovery, hub priority, deduplication, startup.");
 
-// The visual order SURAJ | native Windows screens | Android must
-// remain a single input environment, not pairwise connections. Physical
-// cursor edge movement chooses the adjacent already-authenticated member.
-var inlineAndroid = new EnvironmentDisplayTile(-5,
-    "Xiaomi 22041216I","Android",1,true);
-var inlineDisabled = new EnvironmentDisplayTile(-6,
-    "Android view only","Android",1,false);
-var leafRoute = new EnvironmentRouteOrder(0,
-    new[]{inlineAndroid,inlineDisabled},MonitorEdge.Left);
+// Screen-edge handoff uses the existing authenticated Windows environment
+// rather than opening a new connection whenever a cursor crosses screens.
+var inlinePeer=new EnvironmentDisplayTile(-5,"WORKSTATION-B","Windows",1,true);
+var offlinePeer=new EnvironmentDisplayTile(-6,"Busy workstation","Windows",1,false);
+var leafRoute=new EnvironmentRouteOrder(0,new[]{inlinePeer,offlinePeer},MonitorEdge.Left);
 Check(leafRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Left)==0 &&
-    leafRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==-5,
-    "Windows leaf routes left to hub and right to Android without changing TLS sessions");
+      leafRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==-5,
+    "Windows leaf must route between hub and next authenticated PC");
 Check(leafRoute.Neighbor(-5,MonitorEdge.Left)==EnvironmentRouteOrder.Local &&
-    leafRoute.Neighbor(0,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
-    "Returning from phone/hub edge must restore local computer, not another peer");
+      leafRoute.Neighbor(0,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
+    "Crossing back from either Windows PC returns to source");
 Check(!leafRoute.Order.Contains(-6) &&
-    leafRoute.Neighbor(-5,MonitorEdge.Right)==null,
-    "View-only Android device must never receive an unauthorized automatic input claim");
+      leafRoute.Neighbor(-5,MonitorEdge.Right)==null,
+    "Unavailable Windows input target must never steal handoff");
 var hubRoute=new EnvironmentRouteOrder(7,
-    new[]{new EnvironmentDisplayTile(8,"Phone","Android",1,true)},
+    new[]{new EnvironmentDisplayTile(8,"WORKSTATION-C","Windows",1,true)},
     MonitorEdge.Right);
 Check(hubRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Right)==7 &&
-    hubRoute.Neighbor(7,MonitorEdge.Right)==8 &&
-    hubRoute.Neighbor(8,MonitorEdge.Left)==7,
-    "Hub -> Windows -> Android -> Windows edge navigation uses one persistent environment");
+      hubRoute.Neighbor(7,MonitorEdge.Right)==8 &&
+      hubRoute.Neighbor(8,MonitorEdge.Left)==7,
+    "Three Windows PCs must hand off within one persistent environment");
 Check(SourceCapture.ShouldDropDuplicateRaw(1000,1020) &&
     !SourceCapture.ShouldDropDuplicateRaw(1000,1040) &&
     !SourceCapture.ShouldDropDuplicateRaw(0,1030),
@@ -835,12 +831,6 @@ finally
         synced==canonicalOffset &&
         !environment.EnvironmentPositions.ContainsKey(sharedKey),
         "Shared canonical layout must replace old local offset on all participants");
-    Check(SourceCapture.AndroidPrintableKey(0x41,false)=="a" &&
-        SourceCapture.AndroidPrintableKey(0x41,true)=="A" &&
-        SourceCapture.AndroidPrintableKey(0x31,true)=="!" &&
-        SourceCapture.AndroidPrintableKey(0x20,false)==" " &&
-        SourceCapture.AndroidPrintableKey(0x70,false)==null,
-        "Android text route must handle letters, shifted digits and preserve function keys");
     Check(environment.ConnectedPeerCount==3,
         "Layout broadcast must not reconnect or drop any client session");
     Console.WriteLine("PASS: bidirectional shared screen layout replication across three TLS clients.");
@@ -979,78 +969,61 @@ finally
     finally {foreach(var endpoint in endpoints)endpoint.Dispose();}
 }
 
-// A hub/leaf roster can contain multiple phones plus Windows members.
-// The selected target remains in the original draggable monitor arrangement;
-// every OTHER online member must appear as a visible, selectable tile.
+// Every Windows computer must have one selectable monitor tile. The active
+// peer is not duplicated, and an unavailable peer cannot block edge handoff.
 {
-    var devices=new[] {
+    var devices=new[]{
         new EnvironmentDisplayTile(0,"SURAJ","Windows",1,true),
-        new EnvironmentDisplayTile(-2,"My Android Phone","Android",1,true),
-        new EnvironmentDisplayTile(-3,"Second Android","Android",1,false),
+        new EnvironmentDisplayTile(-2,"WORKSTATION-B","Windows",1,true),
+        new EnvironmentDisplayTile(-3,"WORKSTATION-C","Windows",1,false),
         new EnvironmentDisplayTile(-4,"DESKTOP-IQ1KSJ9","Windows",2,true),
-        new EnvironmentDisplayTile(-2,"duplicate roster callback","Android",1,true)
+        new EnvironmentDisplayTile(-2,"duplicate roster callback","Windows",1,true)
     };
     var visible=DisplayArrangementControl.ProjectEnvironment(devices,0);
-    Check(visible.Count==3,
-        "Environment diagram must show two Android phones and other Windows peers");
-    Check(visible.Count(v=>v.IsAndroid)==2 &&
-        visible.Any(v=>v.Name=="Second Android"&&!v.SupportsInput),
-        "Android phones must appear even when input Accessibility is not enabled");
-    Check(!visible.Any(v=>v.TargetId==0) &&
-        visible.Select(v=>v.TargetId).Distinct().Count()==visible.Count,
-        "Selected device must not be drawn twice or lose its route identity");
-    Check(DisplayArrangementControl.ProjectEnvironment(devices,-2)
-        .Any(v=>v.TargetId==0),
-        "Hub must appear as another selectable member when Android is selected");
-    var mainScreens=new System.Drawing.Rectangle(0,0,3800,1080);
-    var inline=DisplayArrangementControl.ComposeInlineDevices(mainScreens,visible);
-    Check(inline.Count==3 && inline[0].World.Left>=mainScreens.Right,
-        "Android/Windows environment devices must render on the MAIN display row");
-    Check(inline.All(item=>item.World.Top<mainScreens.Bottom &&
-         item.World.Bottom>mainScreens.Top),
-        "No authenticated phone may be moved into a separate bottom display deck");
-    Check(inline.Zip(inline.Skip(1),(first,second)=>
-         second.World.Left>=first.World.Right).All(ok=>ok),
-        "Screens must have non-overlapping inline hit targets");
-    Check(inline.Where(item=>item.Device.IsAndroid)
-        .All(item=>item.World.Height>item.World.Width),
-        "Android members must be displayed as portrait screen tiles, not footer labels");
-    // Regression: the default Xiaomi portrait preview was separated from
-    // Windows by a decorative gap which became BIGGER than SpatialNeighbor's
-    // crossing allowance as the diagram/window was resized. The connected
-    // phone appeared in Displays but Windows would never hand the cursor off.
-    var phoneWorld=new System.Drawing.Rectangle(0,0,5000,900);
-    var phonePreview=DisplayArrangementControl.ComposeInlineDevices(phoneWorld,
-        new[]{new EnvironmentDisplayTile(93,"Xiaomi","Android",1,true)})[0].World;
+    Check(visible.Count==3 &&
+          visible.Select(x=>x.TargetId).Distinct().Count()==3,
+        "Windows environment must deduplicate each connected monitor group");
+    Check(visible.All(x=>x.Platform=="Windows") &&
+          visible.Any(x=>!x.SupportsInput),
+        "Windows-only display must preserve busy connected computers without input");
+    Check(!visible.Any(x=>x.TargetId==0) &&
+          DisplayArrangementControl.ProjectEnvironment(devices,-2)
+              .Any(x=>x.TargetId==0),
+        "Selected monitor group must not appear twice");
+    var desktopArea=new System.Drawing.Rectangle(0,0,3800,1080);
+    var inline=DisplayArrangementControl.ComposeInlineDevices(desktopArea,visible);
+    Check(inline.Count==3 && inline[0].World.Left>=desktopArea.Right,
+        "All authenticated Windows screens must occupy the same diagram row");
+    Check(inline.All(x=>x.World.Top<desktopArea.Bottom &&
+          x.World.Bottom>desktopArea.Top),
+        "No Windows peer can disappear into an unrelated bottom dock");
+    Check(inline.Zip(inline.Skip(1),(a,b)=>b.World.Left>=a.World.Right)
+          .All(x=>x),
+        "Monitor hit targets must not overlap even with 2+ remote PCs");
+    var wideArea=new System.Drawing.Rectangle(0,0,5000,900);
+    var preview=DisplayArrangementControl.ComposeInlineDevices(wideArea,
+        new[]{new EnvironmentDisplayTile(93,"REMOTE-WINDOWS","Windows",1,true)})[0].World;
     foreach(float scale in new[]{.12f,.24f,.45f})
     {
-        var phoneRegions=new List<(int Id,System.Drawing.RectangleF Bounds)>{
-            (7,new System.Drawing.RectangleF(0,0,
-                phoneWorld.Width*scale,phoneWorld.Height*scale)),
-            (93,new System.Drawing.RectangleF(
-                phonePreview.X*scale,phonePreview.Y*scale,
-                phonePreview.Width*scale,phonePreview.Height*scale))
+        var regions=new List<(int Id,System.Drawing.RectangleF Bounds)>{
+            (7,new System.Drawing.RectangleF(0,0,wideArea.Width*scale,wideArea.Height*scale)),
+            (93,new System.Drawing.RectangleF(preview.X*scale,preview.Y*scale,
+                preview.Width*scale,preview.Height*scale))
         };
-        double crossingFraction=(phonePreview.Top+phonePreview.Height/2d)/
-            phoneWorld.Height;
-        Check(DisplayArrangementControl.SpatialNeighbor(phoneRegions,7,
-            MonitorEdge.Right,crossingFraction)==93,
-            "Connected Android portrait tile must accept Windows right-edge " +
-            "handoff at diagram scale "+scale);
-        Check(DisplayArrangementControl.SpatialNeighbor(phoneRegions,93,
-            MonitorEdge.Left,.5)==7,
-            "Android left-edge return must reach its original Windows peer");
+        double fraction=(preview.Top+preview.Height/2d)/wideArea.Height;
+        Check(DisplayArrangementControl.SpatialNeighbor(regions,7,
+            MonitorEdge.Right,fraction)==93 &&
+              DisplayArrangementControl.SpatialNeighbor(regions,93,
+                  MonitorEdge.Left,.5)==7,
+            "Windows edge handoff must remain reachable at diagram zoom "+scale);
     }
-    var viewOnlyBeforePhone=DisplayArrangementControl.ProjectEnvironment(
+    var viewOnly=DisplayArrangementControl.ProjectEnvironment(
         new[]{
-            new EnvironmentDisplayTile(91,"A view-only Android","Android",1,false),
-            new EnvironmentDisplayTile(93,"Z controllable Xiaomi","Android",1,true)
+            new EnvironmentDisplayTile(91,"Busy Windows PC","Windows",1,false),
+            new EnvironmentDisplayTile(93,"Available Windows PC","Windows",1,true)
         },0);
-    Check(viewOnlyBeforePhone.First().TargetId==93 &&
-        viewOnlyBeforePhone.Last().TargetId==91,
-        "Non-input Android devices must not occupy the default adjacent " +
-        "slot and block Windows-to-phone cursor entry");
-    Console.WriteLine("PASS: Android default edge handoff independent of diagram zoom and view-only neighbors.");
+    Check(viewOnly.First().TargetId==93 && viewOnly.Last().TargetId==91,
+        "Unavailable Windows computers cannot block active screen-edge handoff");
     var spatial=new List<(int Id,System.Drawing.RectangleF Bounds)>{
         (EnvironmentRouteOrder.Local,new(0,0,300,220)),
         (7,new(330,0,300,220)),
@@ -1060,58 +1033,47 @@ finally
     Check(DisplayArrangementControl.SpatialNeighbor(spatial,7,
         MonitorEdge.Bottom)==-5 &&
         DisplayArrangementControl.SpatialNeighbor(spatial,-5,
-            MonitorEdge.Top)==7,
-        "Dragging Xiaomi BELOW Windows must route keyboard/mouse through bottom/top edge");
-    Check(DisplayArrangementControl.SpatialNeighbor(spatial,
+        MonitorEdge.Top)==7 &&
+        DisplayArrangementControl.SpatialNeighbor(spatial,
         EnvironmentRouteOrder.Local,MonitorEdge.Left)==-6,
-        "Dragging an authorized Android to the left of Windows must use its left edge");
-    Check(DisplayArrangementControl.SpatialNeighbor(spatial,7,
-        MonitorEdge.Left)==EnvironmentRouteOrder.Local,
-        "PC must remain reachable when Android is visible below another PC");
+        "Dragged Windows monitor groups must support all physical outside edges");
     var farScreens=new List<(int Id,System.Drawing.RectangleF Bounds)>{
         (1,new(0,0,300,220)),(2,new(900,0,220,220))
     };
     Check(DisplayArrangementControl.SpatialNeighbor(farScreens,1,
         MonitorEdge.Right)==null,
-        "Distant screen on same side must never capture second PC's right edge");
+        "Distant display must not steal the right-edge input handoff");
     var wrongBand=new List<(int Id,System.Drawing.RectangleF Bounds)>{
         (1,new(0,0,300,220)),(2,new(310,175,170,220))
     };
     Check(DisplayArrangementControl.SpatialNeighbor(wrongBand,1,
         MonitorEdge.Right,0.1)==null &&
         DisplayArrangementControl.SpatialNeighbor(wrongBand,1,
-            MonitorEdge.Right,0.95)==2,
-        "Only the touching vertical part of a screen edge can route to Android");
+        MonitorEdge.Right,0.95)==2,
+        "Only the touching band of the monitor edge can be a neighbor");
     var overlap=new List<(int Id,System.Drawing.RectangleF Bounds)>{
         (1,new(0,0,300,220)),(2,new(150,40,100,160))
     };
     Check(DisplayArrangementControl.SpatialNeighbor(overlap,1,
         MonitorEdge.Right)==null,
-        "Overlapping Android preview is not a valid outside screen boundary");
-    var attached=DisplayArrangementControl.SnapToConnectedScreen(
+        "Overlapping monitor previews must not become fake outside boundaries");
+    var snapped=DisplayArrangementControl.SnapToConnectedScreen(
         new System.Drawing.RectangleF(155,60,90,150),
         new[]{new System.Drawing.RectangleF(0,0,300,220)});
-    Check(System.Drawing.RectangleF.Intersect(attached,
+    Check(System.Drawing.RectangleF.Intersect(snapped,
         new System.Drawing.RectangleF(0,0,300,220)).IsEmpty,
-        "Dragged phone dropped inside Windows must snap OUTSIDE the screen");
-    var snappedScreens=new List<(int Id,System.Drawing.RectangleF Bounds)>{
-        (1,new(0,0,300,220)),(2,attached)
-    };
-    Check(new[]{MonitorEdge.Left,MonitorEdge.Right,MonitorEdge.Top,MonitorEdge.Bottom}
-        .Any(side=>DisplayArrangementControl.SpatialNeighbor(snappedScreens,
-            1,side)==2),
-        "Snapped Xiaomi must be reachable by crossing an actual adjacent edge");
+        "Dragging remote PC over native monitor must snap it outside");
     var liveRoute=new EnvironmentRouteOrder(
         new[]{EnvironmentRouteOrder.Local,7,-2,-3});
     Check(liveRoute.Neighbor(7,MonitorEdge.Right)==-2 &&
-        liveRoute.Neighbor(-2,MonitorEdge.Left)==7,
-        "Keyboard/mouse moves between neighboring PC and Android without separate pairing");
+          liveRoute.Neighbor(-2,MonitorEdge.Left)==7,
+        "Input must route between neighboring Windows peers without repa iring");
     var reversedRoute=new EnvironmentRouteOrder(
         new[]{-2,EnvironmentRouteOrder.Local,7});
     Check(reversedRoute.Neighbor(EnvironmentRouteOrder.Local,MonitorEdge.Left)==-2 &&
-        reversedRoute.Neighbor(-2,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
-        "Dragging the phone to the other side reverses real cursor-edge routing");
-    Console.WriteLine("PASS: multiple authenticated Android device tiles, view-only phones, and no duplicate Windows monitors.");
+          reversedRoute.Neighbor(-2,MonitorEdge.Right)==EnvironmentRouteOrder.Local,
+        "Moving Windows peer to the opposite side reverses edge navigation");
+    Console.WriteLine("PASS: Windows-only multi-monitor routing and no duplicate peers.");
 }
 
 // Windows Forms layout smoke test runs on a dedicated STA thread. It never

@@ -1513,9 +1513,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (disposing)
         {
             _closing.Cancel();
-            _bluetoothDialog?.Close();
-            _bluetoothDialog?.Dispose();
-            _bluetoothDialog=null;
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;
             if (_trayIcon != null)

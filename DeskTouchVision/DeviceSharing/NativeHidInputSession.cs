@@ -28,10 +28,10 @@ internal sealed class NativeHidInputSession : INativeHidSession
     private bool _started;
     private bool _closed;
 
-    internal event Action<Packet>? Authority;
-    internal event Action<string>? Status;
-    internal bool IsStarted => _started;
-    internal bool Ready {
+    public event Action<Packet>? Authority;
+    public event Action<string>? Status;
+    public bool IsStarted => _started;
+    public bool Ready {
         get {
             var peripheral = _peripheral;
             return _started && peripheral != null &&
@@ -41,18 +41,18 @@ internal sealed class NativeHidInputSession : INativeHidSession
                 peripheral.Hosts().Count == 1;
         }
     }
-    internal string CurrentState => !_started ? "Bluetooth HID is off" :
+    public string CurrentState => !_started ? "Bluetooth HID is off" :
         Ready ? "Native HID paired; keyboard and mouse ready" :
         "Advertising. Pair DeskTouch with Android in Bluetooth settings.";
 
     public MonitorTopology RemoteMonitors { get; private set; } =
         new([new MonitorRect("Android Bluetooth HID", 0, 0, 1080, 2400, true)]);
 
-    internal void SetPhoneGeometry(MonitorTopology monitors) {
+    public void SetPhoneGeometry(MonitorTopology monitors) {
         if (_lease == 0) RemoteMonitors = monitors;
     }
 
-    internal async Task StartAsync()
+    public async Task StartAsync()
     {
         if (_started || _closed) return;
         var check = await BluetoothHidDiagnostics.CheckAsync();

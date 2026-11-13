@@ -1,4 +1,4 @@
-# DeskTouch Vision v0.3.25 — Bidirectional Windows & Android keyboard and mouse sharing
+# DeskTouch Vision v0.3.26 — Low-latency Wi-Fi input, smooth edge handoff & Play Protect compatibility
 
 DeskTouch Vision now reconnects **Windows PCs and Android phones** for wireless **keyboard and mouse sharing** over your private Wi-Fi network without Developer Options, cables, or Bluetooth dongles.
 

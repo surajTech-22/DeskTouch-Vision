@@ -240,6 +240,8 @@ final class DeskTouchSession implements AutoCloseable {
                 fingerprint=pinned;
                 announcedPhoneWidth=width;announcedPhoneHeight=height;
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
+                if(!DeskTouchAccessibilityService.isPausedForBanking(application))
+                    RemoteInputPower.begin(application);
                 // Allow for transient Android CPU/Wi-Fi scheduling pauses.
                 // Heartbeats and the foreground auto-reconnect still detect real loss.
                 ssl.setSoTimeout(60000);
@@ -366,7 +368,7 @@ final class DeskTouchSession implements AutoCloseable {
     private void clearReverseControl(boolean notifyWindows){
         int lease=reverseLease;reverseLease=0;reverseApplied=0;
         DeskTouchRuntime.releaseAndroidControl(this);
-        if(lease>0)RemoteInputPower.end();
+        if(!running && lease>0)RemoteInputPower.end();
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
@@ -530,6 +532,7 @@ final class DeskTouchSession implements AutoCloseable {
     }
     private synchronized void closeConnection(){
         clearReverseControl(false);
+        RemoteInputPower.end();
         running=false;active=false;claim=0;pendingTrust=null;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;

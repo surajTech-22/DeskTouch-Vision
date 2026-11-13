@@ -169,8 +169,8 @@ public final class ProtocolSourceTest {
                 android.text.InputType.TYPE_NUMBER_VARIATION_PASSWORD));
     }
     @Test public void gesturesAndShortcutsScaleSafely(){
-        assertEquals(45L,DeskTouchAccessibilityService.gestureDurationMs(0,0));
-        assertEquals(45L,DeskTouchAccessibilityService.gestureDurationMs(4,3));
+        assertEquals(25L,DeskTouchAccessibilityService.gestureDurationMs(0,0));
+        assertEquals(25L,DeskTouchAccessibilityService.gestureDurationMs(4,3));
         assertTrue(DeskTouchAccessibilityService.gestureDurationMs(300,0)>=90L);
         assertEquals(420L,DeskTouchAccessibilityService.gestureDurationMs(2000,0));
         assertTrue(DeskTouchAccessibilityService.isSupportedShortcutKey(0x41,true,false,false));

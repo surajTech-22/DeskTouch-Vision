@@ -14,10 +14,10 @@ internal static class Wire
     {
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(data);
         if (bytes.Length is < 2 or > MaxFrame) throw new InvalidDataException("Invalid message size");
-        byte[] header = new byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(header, bytes.Length);
-        await stream.WriteAsync(header, token);
-        await stream.WriteAsync(bytes, token);
+        byte[] frame = new byte[4 + bytes.Length];
+        BinaryPrimitives.WriteInt32BigEndian(frame, bytes.Length);
+        Buffer.BlockCopy(bytes, 0, frame, 4, bytes.Length);
+        await stream.WriteAsync(frame, token);
         await stream.FlushAsync(token);
     }
 

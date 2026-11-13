@@ -30,6 +30,7 @@ internal sealed class SourceCapture : IDisposable
     private int _remoteX, _remoteY;
     private int _anchorX, _anchorY;
     private long _cooldownUntil;
+    private long _enteredRemoteAt;
     private long _lastRawMs;
     private long _lastFallbackMs;
     private bool _continuingAcrossDevices;
@@ -268,7 +269,7 @@ internal sealed class SourceCapture : IDisposable
         int priorLease = Interlocked.Exchange(ref _activeClaim, 0);
         if (priorLease > 0)
             _session.TrySend(new Packet("release", priorLease));
-        _cooldownUntil = Environment.TickCount64 + 1000;
+        _cooldownUntil = Environment.TickCount64 + 180;
         _remoteModifierDownMask = 0;
         // Return to the real Windows screen the cursor left, not an empty
         // rectangle or another physical monitor. When entered via Ctrl+Alt+M,
@@ -331,10 +332,37 @@ internal sealed class SourceCapture : IDisposable
             _session.TrySend(new Packet("release", request));
             return;
         }
-        var entry = _remoteMonitors.EntryPoint(Opposite(_edge),
+        var entryEdge = Opposite(_edge);
+        var entry = _remoteMonitors.EntryPoint(entryEdge,
             _localMonitors.EdgeFraction(_pendingPoint, _edge));
-        _remoteX = entry.X;
-        _remoteY = entry.Y;
+        var targetMon = _remoteMonitors.MonitorAt(entry);
+        if (_directShortcutEntry && targetMon != null)
+        {
+            _remoteX = targetMon.X + targetMon.Width / 2;
+            _remoteY = targetMon.Y + targetMon.Height / 2;
+        }
+        else if (targetMon != null)
+        {
+            int insetX = Math.Min(36, Math.Max(4, targetMon.Width / 8));
+            int insetY = Math.Min(36, Math.Max(4, targetMon.Height / 8));
+            _remoteX = entryEdge switch
+            {
+                MonitorEdge.Left => Math.Min(targetMon.X + targetMon.Width - 1, entry.X + insetX),
+                MonitorEdge.Right => Math.Max(targetMon.X, entry.X - insetX),
+                _ => entry.X
+            };
+            _remoteY = entryEdge switch
+            {
+                MonitorEdge.Top => Math.Min(targetMon.Y + targetMon.Height - 1, entry.Y + insetY),
+                MonitorEdge.Bottom => Math.Max(targetMon.Y, entry.Y - insetY),
+                _ => entry.Y
+            };
+        }
+        else
+        {
+            _remoteX = entry.X;
+            _remoteY = entry.Y;
+        }
         Volatile.Write(ref _awaitingAppliedClaim, request);
         // Two-phase handoff: the receiving machine must actually APPLY the
         // first cursor packet and acknowledge before the source parks its
@@ -357,7 +385,9 @@ internal sealed class SourceCapture : IDisposable
         Volatile.Write(ref _activeClaim, request);
         // Native Windows cursor only moves AFTER remote input was accepted.
         Win.SetCursorPos(_anchorX, _anchorY);
-        _lastRawMs = 0;
+        long now = Environment.TickCount64;
+        _enteredRemoteAt = now;
+        _lastRawMs = now;
         _lastFallbackMs = 0;
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
@@ -374,7 +404,7 @@ internal sealed class SourceCapture : IDisposable
         _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
         ReturnLocal();
-        _cooldownUntil = Environment.TickCount64 + 1500;
+        _cooldownUntil = Environment.TickCount64 + 450;
         _status("Receiver physical keyboard/mouse detected. Automatically restored LOCAL control.");
     }
 
@@ -384,7 +414,7 @@ internal sealed class SourceCapture : IDisposable
         _claims.Cancel();
         Interlocked.Exchange(ref _pending, 0);
         ReturnLocal();
-        _cooldownUntil = Environment.TickCount64 + 1500;
+        _cooldownUntil = Environment.TickCount64 + 450;
         _status("Remote PC is currently being used locally. Native input has priority.");
     }
 
@@ -712,6 +742,7 @@ internal sealed class SourceCapture : IDisposable
         int nextY = _remoteY + dy;
         var monitor = _remoteMonitors.MonitorAt(new System.Drawing.Point(_remoteX, _remoteY));
         var returnEdge = Opposite(_edge);
+        bool withinEntryGrace = Environment.TickCount64 - _enteredRemoteAt < 180;
         if(monitor!=null && NavigateEnvironment!=null)
         {
             // The inline diagram may have another authenticated screen on
@@ -720,6 +751,7 @@ internal sealed class SourceCapture : IDisposable
             foreach(var side in new[]{
                 MonitorEdge.Left,MonitorEdge.Right,MonitorEdge.Top,MonitorEdge.Bottom})
             {
+                if (withinEntryGrace && side == returnEdge) continue;
                 bool outside=side switch{
                     MonitorEdge.Left=>dx<0 && nextX<monitor.X,
                     MonitorEdge.Right=>dx>0 && nextX>=monitor.X+monitor.Width,
@@ -757,7 +789,7 @@ internal sealed class SourceCapture : IDisposable
                 return;
             }
         }
-        if (monitor != null)
+        if (monitor != null && !withinEntryGrace)
         {
             bool leaving = returnEdge switch
             {

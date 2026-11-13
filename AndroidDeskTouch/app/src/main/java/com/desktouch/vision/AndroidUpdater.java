@@ -233,72 +233,21 @@ final class AndroidUpdater {
                         .setPositiveButton("OK",null).show());
                     return;
                 }
-                File apk=downloadVerified(activity,release);
-                if(!signingMatches(activity,apk)){
-                    activity.runOnUiThread(()->new AlertDialog.Builder(activity)
-                        .setTitle("APK signature differs")
-                        .setMessage("This preview APK is signed with a different key than the installed app. "+
-                            "Android correctly refuses an in-place update. Do not bypass this security check. "+
-                            "A stable publisher signing key is required for future updates; manually replacing "+
-                            "the old preview would lose local trusted-device data.")
-                        .setPositiveButton("OK",null).show());
-                    return;
-                }
-                // A legitimate update keeps the same app ID, signing
-                // identity and Android private storage. Snapshot only the
-                // user's permission state; never uninstall or clear data.
+                // Snapshot the user's permission state and open the official
+                // HTTPS release download in the system browser so the app
+                // does not require REQUEST_INSTALL_PACKAGES (which triggers
+                // Google Play Protect blocks when combined with Accessibility).
                 PermissionContinuity.checkpointBeforeInstaller(activity);
-                activity.runOnUiThread(()->openInstaller(activity,apk));
+                activity.runOnUiThread(()->{
+                    Intent intent=new Intent(Intent.ACTION_VIEW,Uri.parse(release.apk));
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    activity.startActivity(intent);
+                });
             }catch(Exception e){
                 activity.runOnUiThread(()->new AlertDialog.Builder(activity)
                     .setTitle("Update not installed").setMessage(e.getMessage())
                     .setPositiveButton("OK",null).show());
             }
         });
-    }
-
-    private static boolean signingMatches(Context context,File apk) throws Exception {
-        PackageManager pm=context.getPackageManager();
-        if(Build.VERSION.SDK_INT>=28){
-            PackageInfo current=pm.getPackageInfo(context.getPackageName(),
-                PackageManager.GET_SIGNING_CERTIFICATES);
-            PackageInfo incoming=pm.getPackageArchiveInfo(apk.getAbsolutePath(),
-                PackageManager.GET_SIGNING_CERTIFICATES);
-            if(incoming==null||incoming.signingInfo==null||current.signingInfo==null)
-                throw new SecurityException("APK signing details unavailable");
-            if(!context.getPackageName().equals(incoming.packageName))
-                throw new SecurityException("APK package name differs");
-            android.content.pm.Signature[] a=current.signingInfo.getApkContentsSigners();
-            android.content.pm.Signature[] b=incoming.signingInfo.getApkContentsSigners();
-            return Arrays.equals(a,b);
-        }
-        PackageInfo current=pm.getPackageInfo(context.getPackageName(),PackageManager.GET_SIGNATURES);
-        PackageInfo incoming=pm.getPackageArchiveInfo(apk.getAbsolutePath(),PackageManager.GET_SIGNATURES);
-        if(incoming==null||!context.getPackageName().equals(incoming.packageName))
-            throw new SecurityException("APK package identity differs");
-        return Arrays.equals(current.signatures,incoming.signatures);
-    }
-
-    private static void openInstaller(Activity activity,File apk){
-        if(Build.VERSION.SDK_INT>=26 &&
-            !activity.getPackageManager().canRequestPackageInstalls()){
-            new AlertDialog.Builder(activity)
-                .setTitle("Allow Android package installation")
-                .setMessage("Android requires permission for DeskTouch to request APK updates. "+
-                    "Allow it in Android Settings, then tap 'Update existing application' again.")
-                .setNegativeButton("Cancel",null)
-                .setPositiveButton("Android settings",(d,w)->activity.startActivity(
-                    new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        Uri.parse("package:"+activity.getPackageName()))))
-                .show();
-            return;
-        }
-        Uri uri=FileProvider.getUriForFile(activity,
-            activity.getPackageName()+".fileprovider",apk);
-        Intent intent=new Intent(Intent.ACTION_VIEW);
-        intent.setDataAndType(uri,"application/vnd.android.package-archive");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(intent); // Android OS shows its own install confirmation.
     }
 }

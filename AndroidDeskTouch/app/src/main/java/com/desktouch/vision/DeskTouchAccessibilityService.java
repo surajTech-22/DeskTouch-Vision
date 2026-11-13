@@ -126,6 +126,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             .putBoolean(PAUSED_FOR_BANKING,true)
             .commit())
             throw new IllegalStateException("Cannot save banking pause preference");
+        RemoteInputPower.end();
         DeskTouchAccessibilityService service=instance;
         if(service!=null){
             service.remoteActive=false;
@@ -294,7 +295,6 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         held=false;
         remoteActive=false;
         pendingApplied=null;
-        Choreographer.getInstance().removeFrameCallback(pointerFrame);
         moveScheduled.set(false);
         lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
         pendingGestures.clear();
@@ -316,8 +316,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true))
-            service.ui.post(()->Choreographer.getInstance()
-                .postFrameCallback(service.pointerFrame));
+            service.ui.post(service::flushPointer);
         else service.coalescedMoves.incrementAndGet();
         return true;
     }
@@ -346,7 +345,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(remoteActive&&cursor!=null&&ack!=null&&ready(this))ack.run();
         if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
             moveScheduled.compareAndSet(false,true))
-            Choreographer.getInstance().postFrameCallback(pointerFrame);
+            ui.post(this::flushPointer);
     }
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
@@ -363,7 +362,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     static long gestureDurationMs(int dx,int dy){
         long distance=Math.round(Math.hypot(dx,dy));
-        if(distance<=12)return 45L;
+        if(distance<=12)return 25L;
         return Math.min(420L,Math.max(90L,distance/2L));
     }
     static void mouseButton(int button,boolean pressed){
@@ -385,9 +384,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 service.held=true;service.downX=service.x;service.downY=service.y;
             }else if(service.held){
                 service.held=false;
+                int dx=service.x-service.downX,dy=service.y-service.downY;
+                if(Math.hypot(dx,dy)<=12)
+                    service.focusEditableAtPoint(service.x,service.y);
                 // Use exact coordinates for taps and distance-scaled durations
                 // for swipes/drags so short drags never teleport across lists.
-                long duration=gestureDurationMs(service.x-service.downX,service.y-service.downY);
+                long duration=gestureDurationMs(dx,dy);
                 service.enqueueGesture(service.downX,service.downY,
                     service.x,service.y,duration);
             }
@@ -539,6 +541,50 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             (vk==0x41 || vk==0x43 || vk==0x56 || vk==0x58);
     }
 
+    private AccessibilityNodeInfo focusEditableAtPoint(int px,int py){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        AccessibilityNodeInfo match=findEditableAtPoint(root,px,py);
+        if(match==null){
+            List<AccessibilityWindowInfo> list=getWindows();
+            if(list!=null){
+                for(AccessibilityWindowInfo w:list){
+                    if(w==null)continue;
+                    match=findEditableAtPoint(w.getRoot(),px,py);
+                    if(match!=null)break;
+                }
+            }
+        }
+        if(match!=null && !match.isPassword()){
+            match.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            if(!match.isFocused())
+                match.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            return match;
+        }
+        return null;
+    }
+
+    private static AccessibilityNodeInfo findEditableAtPoint(
+        AccessibilityNodeInfo root,int px,int py)
+    {
+        if(root==null)return null;
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        AccessibilityNodeInfo editor=null;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=96){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(px,py))continue;
+            if(node.isEditable() && node.isEnabled())editor=node;
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        return editor;
+    }
+
     private AccessibilityNodeInfo focusedEditor(){
         AccessibilityNodeInfo root=getRootInActiveWindow();
         if(root!=null){
@@ -664,6 +710,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 return;
             }
             AccessibilityNodeInfo field=service.focusedEditor();
+            if(field==null || !field.isEditable())
+                field=service.focusEditableAtPoint(service.x,service.y);
             if(service.commitNativeText(incoming,field) ||
                 DeskTouchInputMethod.commitRemoteText(incoming))return;
             if(field==null||!field.isEditable()||field.isPassword()){
@@ -713,6 +761,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(vk==18||vk==164||vk==165){alt=pressed;return true;}
         if(!pressed)return true;
         AccessibilityNodeInfo field=focusedEditor();
+        if(field==null || !field.isEditable())
+            field=focusEditableAtPoint(x,y);
         if(control||alt){
             return performShortcutAction(vk,field);
         }

@@ -431,6 +431,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         UpdateButtons();
     }
 
+    private void LogDiagnostic(string message)
+    {
+        if (IsDisposed || Disposing) return;
+        if (Interlocked.CompareExchange(ref _logWriterStarted, 1, 0) == 0)
+            _ = Task.Run(WriteLogsAsync);
+        _logChannel.Writer.TryWrite(
+            DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
+    }
+
     private void UpdateButtons()
     {
         if (IsDisposed) return;
@@ -868,6 +877,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
             _receiver.ReverseControlMessage += HandleReverseState;
+            _receiver.DiagnosticLog += LogDiagnostic;
             _receiver.AllowForwardClaim = () =>
                 InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
                     _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
@@ -930,6 +940,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.PeerTopologyChanged -= OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged -= OnIncomingPeerPlacementChanged;
             _receiver.ReverseControlMessage -= HandleReverseState;
+            _receiver.DiagnosticLog -= LogDiagnostic;
             _receiver.Dispose();
         }
         _receiver = null;
@@ -1261,6 +1272,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             () => _capture == null ||
                 (!_capture.RemoteActive && !_capture.IsClaimPending));
         session.AuthorityDiagnostic += Status;
+        session.DiagnosticLog += LogDiagnostic;
         session.InputDeliveryWarning += Status;
         _captureUsesInbound = false;
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
@@ -1555,6 +1567,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _host.AuthorityControlPacket -= HandleRemoteState;
             _host.AuthorityDiagnostic -= Status;
+            _host.DiagnosticLog -= LogDiagnostic;
             _host.InputDeliveryWarning -= Status;
             _host.RemoteTopologyChanged -= HandleRemoteTopology;
             _host.RemoteNameChanged -= HandleRemoteName;

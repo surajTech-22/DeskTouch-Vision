@@ -380,6 +380,7 @@ internal sealed class FastUdpClient : IDisposable
 
     internal int LocalPort { get; }
     internal event Action<FastUdpMessage>? MessageReceived;
+    internal event Action? ConfirmedChanged;
 
     internal FastUdpClient(IPAddress serverAddress, int serverPort, int peerId, byte[] key)
     {
@@ -399,6 +400,12 @@ internal sealed class FastUdpClient : IDisposable
         _recvThread.Start();
         Send(FastUdpOp.Probe, LocalPort, 0, 0);
         Send(FastUdpOp.Probe, LocalPort, 0, 0);
+    }
+
+    internal void SendProbe()
+    {
+        if (!_disposed)
+            Send(FastUdpOp.Probe, LocalPort, 0, 0);
     }
 
     internal bool Send(FastUdpOp op, int a, int b, int lease)
@@ -435,11 +442,18 @@ internal sealed class FastUdpClient : IDisposable
                 if (msg.Op == FastUdpOp.Probe)
                 {
                     Send(FastUdpOp.ProbeAck, LocalPort, 0, 0);
+                    // Also send our own Probe once the hub's stateful pinhole is open
+                    // so Client -> Server -> Client is confirmed promptly with ProbeAck.
+                    if (!Confirmed)
+                        Send(FastUdpOp.Probe, LocalPort, 0, 0);
                     MessageReceived?.Invoke(msg);
                 }
                 else if (msg.Op == FastUdpOp.ProbeAck)
                 {
+                    bool newlyConfirmed = !Confirmed;
                     Confirmed = true;
+                    if (newlyConfirmed)
+                        ConfirmedChanged?.Invoke();
                     MessageReceived?.Invoke(msg);
                 }
                 else
@@ -520,10 +534,11 @@ internal sealed class FastMovePacer : IDisposable
             if (_disposed) return false;
             long now = Stopwatch.GetTimestamp();
             _lastMoveTicks = now;
+            double minInterval = ActiveMinIntervalMsLocked();
             double elapsedMs = _lastMoveUdpTicks == 0
                 ? double.MaxValue
                 : (now - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
-            if (elapsedMs >= MinUdpIntervalMs)
+            if (elapsedMs >= minInterval)
             {
                 _throttledUdp = null;
                 _pendingTcpSync = move;
@@ -538,9 +553,29 @@ internal sealed class FastMovePacer : IDisposable
             UpdateTimerLocked();
         }
         if (sendNow)
-            _sendUdp(move);
+        {
+            if (_sendUdp(move))
+                Interlocked.Increment(ref _udpDirectCount);
+        }
         return true;
     }
+
+    private double _effectiveMinIntervalMs = -1;
+    private long _udpDirectCount, _udpFlushedCount, _trailingTcpSyncCount;
+
+    internal void SetMinIntervalMs(double ms)
+    {
+        lock (_gate)
+            _effectiveMinIntervalMs = ms > 0 ? ms : -1;
+    }
+
+    internal (long UdpDirect, long UdpPacedFlush, long TrailingTcpSync) TakeStats() => (
+        Interlocked.Exchange(ref _udpDirectCount, 0),
+        Interlocked.Exchange(ref _udpFlushedCount, 0),
+        Interlocked.Exchange(ref _trailingTcpSyncCount, 0));
+
+    private double ActiveMinIntervalMsLocked() =>
+        _effectiveMinIntervalMs > 0 ? _effectiveMinIntervalMs : MinUdpIntervalMs;
 
     internal Packet? TakePendingReliableSync(bool skipIfUdpDelivered = false)
     {
@@ -591,10 +626,11 @@ internal sealed class FastMovePacer : IDisposable
             {
                 if (_canSendUdp())
                 {
+                    double minInterval = ActiveMinIntervalMsLocked();
                     double udpElapsed = _lastMoveUdpTicks == 0
                         ? double.MaxValue
                         : (now - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
-                    if (udpElapsed >= MinUdpIntervalMs - 0.5)
+                    if (udpElapsed >= minInterval - 0.5)
                     {
                         udpMove = _throttledUdp;
                         _throttledUdp = null;
@@ -634,21 +670,37 @@ internal sealed class FastMovePacer : IDisposable
             UpdateTimerLocked();
         }
 
-        if (udpMove != null) _sendUdp(udpMove);
-        if (tcpSync != null) _queueReliableTcp(tcpSync);
+        if (udpMove != null && _sendUdp(udpMove))
+            Interlocked.Increment(ref _udpFlushedCount);
+        if (tcpSync != null)
+        {
+            _queueReliableTcp(tcpSync);
+            Interlocked.Increment(ref _trailingTcpSyncCount);
+        }
         if (sendWarm) _sendWarm!();
     }
 
     private void UpdateTimerLocked()
     {
         if (_disposed) return;
-        int dueMs = _throttledUdp != null
-            ? ThrottleFlushDelayMs
-            : _pendingTcpSync != null
+        int dueMs;
+        if (_throttledUdp != null)
+        {
+            double minInterval = ActiveMinIntervalMsLocked();
+            double elapsedMs = _lastMoveUdpTicks == 0
+                ? minInterval
+                : (Stopwatch.GetTimestamp() - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
+            int remainingMs = (int)Math.Ceiling(Math.Max(1.0, minInterval - elapsedMs));
+            dueMs = Math.Min(ThrottleFlushDelayMs, remainingMs);
+        }
+        else
+        {
+            dueMs = _pendingTcpSync != null
                 ? TrailingTcpSyncDelayMs
                 : _warmActive && _sendWarm != null
                     ? WarmKeepaliveIntervalMs
                     : Timeout.Infinite;
+        }
         try { _timer.Change(dueMs, Timeout.Infinite); }
         catch (ObjectDisposedException) { }
     }

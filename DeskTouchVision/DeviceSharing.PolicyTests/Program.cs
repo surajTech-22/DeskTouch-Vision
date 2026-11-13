@@ -185,8 +185,40 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         "Pre-click flush must extract the newest coordinate reliably for TCP before button press");
     Check(pacer.TakePendingReliableSync() == null,
         "Reliable sync must drain cleanly once flushed");
+
+    pacer.SetMinIntervalMs(2.0);
+    System.Threading.Thread.Sleep(5);
+    Check(pacer.TryHandleMove(new Packet("move", 80, 90)),
+        "Adjusted interval move must go out via FastUdp");
+    var stats = pacer.TakeStats();
+    Check(stats.UdpDirect >= 2,
+        "FastMovePacer telemetry stats must count direct FastUdp dispatches");
+
+    using var hub = new FastUdpHub();
+    var tempPeer = hub.AddPeer(99, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0))!;
+    byte[] peerKey = Convert.FromBase64String(tempPeer.Base64Key);
+    // Simulate Windows Firewall dropping the client's initial t=0 probes by removing/adding the peer after construction.
+    hub.RemovePeer(tempPeer);
+    using var udpClient = new FastUdpClient(System.Net.IPAddress.Loopback, hub.Port, 2, peerKey);
+    System.Threading.Thread.Sleep(40);
+    Check(!udpClient.Confirmed,
+        "Initial dropped probes must not self-confirm");
+    var hubPeer = hub.AddPeer(2, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0))!;
+    // Re-key client to match the real hub peer once the hub opens its firewall pinhole.
+    using var udpClient2 = new FastUdpClient(
+        System.Net.IPAddress.Loopback, hub.Port, 2, Convert.FromBase64String(hubPeer.Base64Key));
+    hub.ConfigurePeerPort(hubPeer, udpClient2.LocalPort);
+    var deadline = DateTime.UtcNow.AddMilliseconds(1500);
+    while (DateTime.UtcNow < deadline && !(udpClient2.Confirmed && hubPeer.Confirmed))
+    {
+        if (!udpClient2.Confirmed)
+            udpClient2.SendProbe();
+        System.Threading.Thread.Sleep(20);
+    }
+    Check(udpClient2.Confirmed && hubPeer.Confirmed,
+        "FastUdpClient must confirm bidirectional fast path even after pre-firewall probes drop");
 }
-Console.WriteLine("PASS: FastUdp AES-256-GCM replay protection and move pacing verified.");
+Console.WriteLine("PASS: FastUdp AES-256-GCM replay protection, delayed firewall handshake, and move pacing verified.");
 
 // An idle, discoverable DeskTouch listener must never install global input
 // hooks or grant remote authority. Only a connected, monitored peer can claim.

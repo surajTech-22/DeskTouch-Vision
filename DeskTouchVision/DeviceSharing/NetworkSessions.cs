@@ -81,6 +81,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ReverseMoveSignaled;
         internal FastUdpHub.Peer? UdpPeer;
         internal FastMovePacer? MovePacer;
+        internal long TcpFallbackMoves;
+        internal readonly IDisposable HighResTimer = Win.EnterHighResolutionTimer();
         internal int ActiveReverseLease;
         internal int Lease;
         internal int AppliedLease;
@@ -133,12 +135,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private Task? _serverTask;
     private int _nextClientId;
     private int _pendingAndActive;
+    private long _lastWarmBroadcastTicks;
     private Session? _selected;
     private Session? _owner;
     private bool _disposed;
 
     internal Func<bool>? AllowForwardClaim;
     internal event Action<Packet>? ReverseControlMessage;
+    internal event Action<string>? DiagnosticLog;
     internal event Action<ConnectedPeer>? PeerConnected;
     internal event Action? PeerListChanged;
     internal event Action? PeerDisconnected;
@@ -281,6 +285,49 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
         _listener.Start(MaxPeers);
         _serverTask = Task.Run(LoopAsync);
+        _ = Task.Run(() => ReportTelemetryLoopAsync(_cancel.Token));
+    }
+
+    private void BroadcastWarmToConfirmedTargets(int excludingSessionId)
+    {
+        var hub = _udpHub;
+        if (hub == null) return;
+        long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+        long prevTicks = Interlocked.Read(ref _lastWarmBroadcastTicks);
+        double elapsedMs = prevTicks == 0 ? double.MaxValue
+            : (nowTicks - prevTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        if (elapsedMs < 120) return;
+        if (Interlocked.CompareExchange(ref _lastWarmBroadcastTicks, nowTicks, prevTicks) != prevTicks)
+            return;
+        foreach (var peer in _sessions.Values)
+        {
+            if (peer.Id == excludingSessionId) continue;
+            if (peer.UdpPeer is { Confirmed: true } udpPeer)
+                hub.Send(udpPeer, FastUdpOp.Warm, 0, 0, 0);
+        }
+    }
+
+    private async Task ReportTelemetryLoopAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                await Task.Delay(3000, token);
+                foreach (var session in _sessions.Values)
+                {
+                    var pacer = session.MovePacer;
+                    if (pacer == null) continue;
+                    var s = pacer.TakeStats();
+                    long fallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
+                    if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && fallback == 0)
+                        continue;
+                    DiagnosticLog?.Invoke(
+                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} fast_confirmed={session.UdpPeer?.Confirmed == true} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback}");
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     private async Task LoopAsync()
@@ -427,6 +474,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
         CancellationToken token)
     {
+        relay.Target.MovePacer?.SetMinIntervalMs(4.5);
         if (_sessions.ContainsKey(relay.Target.Id))
         {
             try { await SendToAsync(relay.Target,
@@ -680,7 +728,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
                     var move = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (move != null)
+                    {
+                        Interlocked.Increment(ref session.TcpFallbackMoves);
                         await SendToAsync(session, ReverseInputProtocol.Encode(move), token);
+                    }
                     continue;
                 }
                 if (p.Type is "release" or "reset")
@@ -828,6 +879,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if(!_sessions.TryAdd(id,session))
         {
             session.MovePacer?.Dispose();
+            session.HighResTimer.Dispose();
             _udpHub?.RemovePeer(session.UdpPeer);
             throw new InvalidOperationException("Duplicate peer session ID");
         }
@@ -863,6 +915,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if (_udpHub != null && session.UdpPeer != null && p.A is > 0 and <= 65535)
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
+                        session.MovePacer?.SetMinIntervalMs(4.5);
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1072,6 +1125,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         session.EnvironmentTargetId=p.A;
                     }
                     if(localOwner)lock(session.InputLock)session.Injector.ReleaseAll();
+                    if(target?.UdpPeer is { Confirmed: true } targetUdp)
+                        _udpHub?.Send(targetUdp, FastUdpOp.Warm, 0, 0, 0);
                     await SendToAsync(session,new Packet("environment-selected",p.A),token);
                     continue;
                 }
@@ -1102,6 +1157,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         await SendToAsync(session,new Packet("busy",p.A),token);
                     else
                     {
+                        // Relayed moves are already paced by the source PC; keep a short
+                        // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
+                        relay.Target.MovePacer?.SetMinIntervalMs(2.0);
+                        if (relay.Target.UdpPeer is { Confirmed: true } relayUdp)
+                            _udpHub?.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
                         try { await SendToAsync(relay.Target,
                             new Packet("reverse-claim",p.A),token); }
                         catch(Exception)
@@ -1180,6 +1240,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     await SendToAsync(session,new Packet("pong"),token);
                     continue;
                 }
+                if(p.Type=="warm")
+                {
+                    BroadcastWarmToConfirmedTargets(session.Id);
+                    continue;
+                }
                 RelayLease? forward=null;
                 lock(_authorityGate)
                     _relayBySource.TryGetValue(session.Id,out forward);
@@ -1248,6 +1313,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Volatile.Write(ref session.ActiveReverseLease, 0);
             }
             session.MovePacer?.Dispose();
+            session.HighResTimer.Dispose();
             _udpHub?.RemovePeer(session.UdpPeer);
             var disconnectedRoutes=new List<RelayLease>();
             lock(_authorityGate)
@@ -1423,8 +1489,16 @@ internal sealed class HostSession : IInputSession, IDisposable
     private int _reverseAppliedLease;
     internal event Action<Packet>? AuthorityControlPacket;
     internal event Action<string>? AuthorityDiagnostic;
+    internal event Action<string>? DiagnosticLog;
     internal event Action? HeartbeatAcknowledged;
     internal event Action<string>? InputDeliveryWarning;
+    private IDisposable? _highResTimer;
+    private long _tcpFallbackMoves;
+    private long _lastPingSentTicks;
+    private double _lastRttMs;
+    private int _udpConfirmedLogged;
+    private long _lastTcpWarmTicks;
+    private string _lastLoggedVersions = "";
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -1688,6 +1762,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private void QueueTcpMove(Packet p)
     {
         if (Volatile.Read(ref _closed) != 0) return;
+        Interlocked.Increment(ref _tcpFallbackMoves);
         Interlocked.Exchange(ref _latestMove, p);
         if (Interlocked.CompareExchange(ref _moveSignaled, 1, 0) == 0 &&
             !_queue.Writer.TryWrite(new Packet("move-flush")))
@@ -1699,7 +1774,21 @@ internal sealed class HostSession : IInputSession, IDisposable
         if (Volatile.Read(ref _closed) != 0) return false;
         if (p.Type == "warm")
         {
-            _udpClient?.Send(FastUdpOp.Warm, 0, 0, 0);
+            var udp = Volatile.Read(ref _udpClient);
+            if (udp is { Confirmed: true })
+                udp.Send(FastUdpOp.Warm, 0, 0, 0);
+            // Also wake relayed Android targets through the hub at most once per 250ms
+            // while approaching an edge so the phone radio is awake before handoff.
+            long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            long prevTicks = Interlocked.Read(ref _lastTcpWarmTicks);
+            double sinceMs = prevTicks == 0 ? double.MaxValue
+                : (nowTicks - prevTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            if (sinceMs >= 250 &&
+                EnvironmentMembers.Any(m => m.Platform == "Android" && m.SupportsReverseInput) &&
+                Interlocked.CompareExchange(ref _lastTcpWarmTicks, nowTicks, prevTicks) == prevTicks)
+            {
+                _queue.Writer.TryWrite(new Packet("warm"));
+            }
             return true;
         }
         if (p.Type == "claim")
@@ -1759,6 +1848,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                     if (current!=0 && !members.Any(m=>m.Id==current &&
                         m.SupportsReverseInput))
                         SelectEnvironmentTarget(0);
+                    EmitEnvironmentVersionsDiagnostic();
                     EnvironmentRosterChanged?.Invoke();
                 }
                 else if (p.Type=="environment-layout" &&
@@ -1806,7 +1896,16 @@ internal sealed class HostSession : IInputSession, IDisposable
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
                     RemotePlacementChanged?.Invoke(changedEdge);
                 else if (p.Type == "pong")
+                {
+                    long sent = Interlocked.Exchange(ref _lastPingSentTicks, 0);
+                    if (sent > 0)
+                    {
+                        double rtt = (System.Diagnostics.Stopwatch.GetTimestamp() - sent) * 1000.0
+                            / System.Diagnostics.Stopwatch.Frequency;
+                        Volatile.Write(ref _lastRttMs, rtt);
+                    }
                     HeartbeatAcknowledged?.Invoke();
+                }
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
                 else if (p.Type == "android-keyboard-unavailable")
@@ -1846,14 +1945,62 @@ internal sealed class HostSession : IInputSession, IDisposable
         }
     }
 
+    private void EmitEnvironmentVersionsDiagnostic()
+    {
+        var members = Volatile.Read(ref _environmentMembers);
+        string hubVer = _environmentHubMonitors.Monitors.FirstOrDefault()?.AppVersion ?? "?";
+        string summary;
+        if (members.Length > 0)
+        {
+            summary = "hub=" + hubVer + "; " + string.Join(", ", members.Select(m =>
+            {
+                string? ver = null;
+                try { ver = MonitorTopology.FromWire(m.Layout).Monitors.FirstOrDefault()?.AppVersion; }
+                catch { }
+                return $"{m.Name}={ver ?? "?"}";
+            }));
+        }
+        else
+        {
+            summary = $"{_remoteSystemName ?? "remote"}={hubVer}";
+        }
+        if (summary == _lastLoggedVersions) return;
+        _lastLoggedVersions = summary;
+        DiagnosticLog?.Invoke("Peer versions: " + summary);
+    }
+
+    private void EmitTelemetryIfActive()
+    {
+        var pacer = _movePacer;
+        var s = pacer?.TakeStats() ?? (UdpDirect: 0L, UdpPacedFlush: 0L, TrailingTcpSync: 0L);
+        long tcpFallback = Interlocked.Exchange(ref _tcpFallbackMoves, 0);
+        if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && tcpFallback == 0)
+            return;
+        bool udpConfirmed = Volatile.Read(ref _udpClient)?.Confirmed == true;
+        double rtt = Volatile.Read(ref _lastRttMs);
+        DiagnosticLog?.Invoke(
+            $"Telemetry [out->{_remoteSystemName ?? "hub"}]: fast_confirmed={udpConfirmed} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={tcpFallback} rtt_ms={rtt:F1}");
+    }
+
     private async Task HeartbeatAsync()
     {
         try
         {
+            int beat = 0;
+            bool loggedInitial = false;
             while (!_cancel.IsCancellationRequested)
             {
                 await Task.Delay(1500, _cancel.Token);
+                if (!loggedInitial)
+                {
+                    loggedInitial = true;
+                    EmitEnvironmentVersionsDiagnostic();
+                }
+                if (Interlocked.Read(ref _lastPingSentTicks) == 0)
+                    Volatile.Write(ref _lastPingSentTicks, System.Diagnostics.Stopwatch.GetTimestamp());
                 if (!TrySend(new Packet("ping"))) break;
+                if ((++beat & 1) == 0)
+                    EmitTelemetryIfActive();
             }
         }
         catch (OperationCanceledException) { }
@@ -1900,6 +2047,11 @@ internal sealed class HostSession : IInputSession, IDisposable
             byte[] key = Convert.FromBase64String(encodedKey);
             if (key.Length != FastUdpCodec.KeySize) return;
             var client = new FastUdpClient(_serverAddress, serverPort, peerId, key);
+            client.ConfirmedChanged += () =>
+            {
+                if (Interlocked.CompareExchange(ref _udpConfirmedLogged, 1, 0) == 0)
+                    DiagnosticLog?.Invoke($"Low-latency direct input confirmed ({_serverAddress}:{serverPort}).");
+            };
             client.MessageReceived += msg =>
             {
                 if (Volatile.Read(ref _closed) != 0) return;
@@ -1915,8 +2067,29 @@ internal sealed class HostSession : IInputSession, IDisposable
                         ProcessReverseInput(new Packet("reverse-move", msg.A, msg.B));
                 }
             };
+            Interlocked.Exchange(ref _highResTimer, Win.EnterHighResolutionTimer())?.Dispose();
+            _movePacer?.SetMinIntervalMs(5.0);
             Interlocked.Exchange(ref _udpClient, client)?.Dispose();
             TrySend(new Packet("udp-ready", client.LocalPort));
+            var probeCancel = _cancel.Token;
+            _ = Task.Run(async () =>
+            {
+                // Wait briefly so TCP "udp-ready" lets the hub open its firewall pinhole
+                // before our probes arrive, then retry until bidirectional ProbeAck confirms.
+                for (int i = 0; i < 20 && !probeCancel.IsCancellationRequested && !client.Confirmed; i++)
+                {
+                    try { await Task.Delay(i == 0 ? 15 : 120, probeCancel); }
+                    catch (OperationCanceledException) { return; }
+                    if (!client.Confirmed && ReferenceEquals(Volatile.Read(ref _udpClient), client))
+                        client.SendProbe();
+                }
+                if (!probeCancel.IsCancellationRequested && !client.Confirmed &&
+                    ReferenceEquals(Volatile.Read(ref _udpClient), client))
+                {
+                    DiagnosticLog?.Invoke(
+                        $"Low-latency direct channel to {_serverAddress}:{serverPort} did not confirm; using reliable TCP fallback.");
+                }
+            }, probeCancel);
         }
         catch (Exception)
         {
@@ -1931,6 +2104,7 @@ internal sealed class HostSession : IInputSession, IDisposable
         _queue.Writer.TryComplete();
         _movePacer?.Dispose();
         Interlocked.Exchange(ref _udpClient, null)?.Dispose();
+        Interlocked.Exchange(ref _highResTimer, null)?.Dispose();
         if (_reversePriority != null)
             _reversePriority.PhysicalOverride -= OnReverseNativeActivity;
         ReleaseReverseAuthority();

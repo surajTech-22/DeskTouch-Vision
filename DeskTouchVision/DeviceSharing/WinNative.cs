@@ -92,6 +92,47 @@ internal static class Win
 
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern uint SendInput(uint count, [In] INPUT[] input, int size);
+
+    [DllImport("winmm.dll")]
+    private static extern uint timeBeginPeriod(uint periodMs);
+
+    [DllImport("winmm.dll")]
+    private static extern uint timeEndPeriod(uint periodMs);
+
+    private static readonly object HighResTimerGate = new();
+    private static int _highResTimerRefs;
+
+    /// <summary>
+    /// Lowers the Windows timer tick from 15.6 ms to 1 ms while an active sharing
+    /// session is connected so move pacing and keepalives avoid multi-millisecond stalls.
+    /// </summary>
+    internal static IDisposable EnterHighResolutionTimer()
+    {
+        lock (HighResTimerGate)
+        {
+            if (++_highResTimerRefs == 1)
+            {
+                try { _ = timeBeginPeriod(1); } catch { }
+            }
+        }
+        return new HighResolutionTimerScope();
+    }
+
+    private sealed class HighResolutionTimerScope : IDisposable
+    {
+        private int _disposed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            lock (HighResTimerGate)
+            {
+                if (_highResTimerRefs > 0 && --_highResTimerRefs == 0)
+                {
+                    try { _ = timeEndPeriod(1); } catch { }
+                }
+            }
+        }
+    }
 }
 
 internal sealed class InputInjector

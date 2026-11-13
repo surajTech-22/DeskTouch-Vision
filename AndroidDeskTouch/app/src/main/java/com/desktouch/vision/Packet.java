@@ -38,8 +38,15 @@ final class Packet {
     void write(DataOutputStream out) throws IOException,JSONException {
         byte[] data=json().getBytes(StandardCharsets.UTF_8);
         if(data.length<2 || data.length>8192) throw new IOException("Invalid packet size");
-        out.writeInt(data.length);
-        out.write(data);
+        // Write header + payload in one call so SSLSocket emits one TLS record
+        // instead of separate 4-byte and payload records on every packet.
+        byte[] frame=new byte[4+data.length];
+        frame[0]=(byte)(data.length>>>24);
+        frame[1]=(byte)(data.length>>>16);
+        frame[2]=(byte)(data.length>>>8);
+        frame[3]=(byte)data.length;
+        System.arraycopy(data,0,frame,4,data.length);
+        out.write(frame);
         out.flush();
     }
 }

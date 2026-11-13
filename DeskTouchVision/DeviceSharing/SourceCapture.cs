@@ -18,6 +18,7 @@ internal sealed class SourceCapture : IDisposable
     private int _activeClaim;
     private int _awaitingAppliedClaim;
     private long _claimStarted;
+    private long _claimGrantedAtMs;
     private readonly Win.HookProc _keyboardDelegate;
     private readonly Win.HookProc _mouseDelegate;
     private readonly Action<string> _status;
@@ -390,12 +391,15 @@ internal sealed class SourceCapture : IDisposable
             _remoteY = entry.Y;
         }
         Volatile.Write(ref _awaitingAppliedClaim, request);
+        long grantedAt = Environment.TickCount64;
+        Volatile.Write(ref _claimGrantedAtMs, grantedAt);
+        long grantMs = Math.Max(0, grantedAt - Volatile.Read(ref _claimStarted));
         // Two-phase handoff: the receiving machine must actually APPLY the
         // first cursor packet and acknowledge before the source parks its
         // physical cursor and suppresses keyboard/mouse input.
         if (!_session.TrySend(new Packet("move", _remoteX, _remoteY)))
             ReturnLocal();
-        else _status($"Destination granted request #{request}; waiting for cursor/authority application acknowledgement.");
+        else _status($"Destination granted request #{request} ({grantMs}ms); waiting for cursor/authority application acknowledgement.");
     }
 
     internal void ConfirmRemoteAuthority(int request)
@@ -421,7 +425,9 @@ internal sealed class SourceCapture : IDisposable
         _androidReturnPushPx = 0;
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
-        _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
+        long totalMs = Math.Max(0, now - Volatile.Read(ref _claimStarted));
+        long applyMs = Math.Max(0, now - Volatile.Read(ref _claimGrantedAtMs));
+        _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active ({totalMs}ms total, {applyMs}ms apply).");
     }
 
     internal void ReceiverNativePriority(int lease)
@@ -749,7 +755,8 @@ internal sealed class SourceCapture : IDisposable
                 int dy = (int)Math.Truncate(_remoteFracY);
                 _remoteFracX -= dx;
                 _remoteFracY -= dy;
-                MoveRemote(dx, dy);
+                if (dx != 0 || dy != 0)
+                    MoveRemote(dx, dy);
             }
         }
         else

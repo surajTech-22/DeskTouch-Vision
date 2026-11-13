@@ -226,7 +226,7 @@ public final class AutoConnectService extends Service {
         pool.schedule(()->{
             retryScheduled=false;
             autoConnect();
-        },3500,TimeUnit.MILLISECONDS);
+        },900,TimeUnit.MILLISECONDS);
     }
 
     private void autoConnect() {
@@ -260,7 +260,10 @@ public final class AutoConnectService extends Service {
                     return;
                 }
                 DeskTouchSession selected=DeskTouchRuntime.select(this,gateway.fingerprint);
-                selected.connect(gateway,display.x,display.y);
+                selected.connect(gateway,display.x,display.y,false,()->{
+                    if(reconnectEnabled(this) && enabled(this))
+                        scheduleInteractiveFollowUp();
+                });
                 connectedNow=true;
                 return; // never auto-open pairwise connections to group members
             }

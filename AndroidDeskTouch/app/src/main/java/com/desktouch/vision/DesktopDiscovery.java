@@ -131,8 +131,8 @@ final class DesktopDiscovery {
                 for(InterfaceAddress addr:nic.getInterfaceAddresses())
                     if(addr.getBroadcast()!=null) destinations.add(addr.getBroadcast());
             }
-            long deadline=System.nanoTime()+(fastMode ? 1_800_000_000L : 3_800_000_000L);
-            long retryNs=fastMode ? 450_000_000L : 900_000_000L;
+            long deadline=System.nanoTime()+(fastMode ? 1_400_000_000L : 2_200_000_000L);
+            long retryNs=fastMode ? 250_000_000L : 350_000_000L;
             int maxSends=3;
             int sends=0;
             long nextSend=0;
@@ -179,11 +179,12 @@ final class DesktopDiscovery {
                 Device old=devices.get(key);
                 if(old==null||(!old.ready&&device.ready))devices.put(key,device);
                 if(!device.android)sourceIpByFingerprint.put(device.fingerprint,ip);
-                if(fastMode && !matchedTarget && !device.android && device.ready &&
-                    quickTargetFingerprints.contains(device.fingerprint)) {
+                if(!matchedTarget && !device.android && device.ready &&
+                    (!fastMode || quickTargetFingerprints.contains(device.fingerprint))) {
                     matchedTarget=true;
                     // Collect any trailing DT1-HUB/DT1-LINK burst before returning quickly.
-                    deadline=Math.min(deadline,System.nanoTime()+120_000_000L);
+                    long tailNs=fastMode ? 120_000_000L : 300_000_000L;
+                    deadline=Math.min(deadline,System.nanoTime()+tailNs);
                 }
             }
         }

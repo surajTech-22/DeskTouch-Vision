@@ -1429,6 +1429,9 @@ var uiThread = new Thread(() =>
         double winStep = SourceCapture.ScaleRawDeltaPrecise(20, 10, false);
         Check(androidStep > 0 && androidStep < winStep,
             "Android mouse delta must be normalized rather than amplified with desktop 1.45x factor");
+        Check(Math.Abs(SourceCapture.ScaleRawDeltaPrecise(20, 10, true, 440, 2.0) - androidStep * 2.0) < 0.01 &&
+            Math.Abs(SourceCapture.ScaleRawDeltaPrecise(20, 10, false, null, 0.5) - winStep * 0.5) < 0.01,
+            "Pointer sensitivity multiplier must scale both Android and Windows raw deltas cleanly");
         Check(SourceCapture.ModifiersForMask(1 | 2 | 4).SequenceEqual(new[] { 0x11, 0x12, 0x10 }),
             "ModifiersForMask must extract held Ctrl, Alt, and Shift virtual keys");
 
@@ -1459,6 +1462,21 @@ var uiThread = new Thread(() =>
             pacer.TryHandleMove(new Packet("move", 420, 910));
             Check(pacer.TakePendingReliableSync(skipIfUdpDelivered: false)?.A == 420,
                 "Reliable settle sync still returns latest move when requested");
+        }
+
+        using (var trailingEvent = new ManualResetEventSlim())
+        {
+            int fallbackCount = 0, trailingCount = 0;
+            using var syncPacer = new FastMovePacer(
+                canSendUdp: () => true,
+                sendUdp: _ => true,
+                queueReliableTcp: _ => Interlocked.Increment(ref fallbackCount),
+                queueTrailingSync: _ => { Interlocked.Increment(ref trailingCount); trailingEvent.Set(); });
+            syncPacer.TryHandleMove(new Packet("move", 300, 500));
+            Check(trailingEvent.Wait(TimeSpan.FromSeconds(2)) &&
+                fallbackCount == 0 && trailingCount == 1 &&
+                syncPacer.TakeStats().TrailingTcpSync == 1,
+                "Normal end-of-stroke trailing settle sync must route separately without inflating tcp_fallback");
         }
 
         var onlinePeer = NearbyComputerDiscovery.ParseReply(

@@ -83,6 +83,31 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private ConnectedPeer? _incomingPeer;
     private SourceCapture? _capture;
     private MonitorEdge _preferredEdge = MonitorEdge.Right;
+    private double _pointerSensitivity = 1.0;
+    private readonly TrackBar _sensitivityBar = new()
+    {
+        Name = "PointerSensitivitySlider",
+        Minimum = 25,
+        Maximum = 250,
+        Value = 100,
+        SmallChange = 5,
+        LargeChange = 25,
+        TickFrequency = 25,
+        AutoSize = false,
+        Height = 32,
+        Dock = DockStyle.Fill,
+        BackColor = Color.FromArgb(31, 32, 36)
+    };
+    private readonly Label _sensitivityValue = new()
+    {
+        Name = "PointerSensitivityValue",
+        Text = "100%",
+        Dock = DockStyle.Right,
+        Width = 62,
+        TextAlign = ContentAlignment.MiddleRight,
+        ForeColor = Color.FromArgb(191, 215, 238)
+    };
+    private bool _updatingSensitivityUi;
     private bool _connecting;
     private string _remoteAddress = "";
 
@@ -132,7 +157,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 208,
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 248,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52,
             Name = "ConnectionActions",
@@ -146,6 +171,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             b.Margin = new Padding(0, 2, 10, 5);
             actions.Controls.Add(b);
         }
+        var sensitivityRow = new Panel { Dock = DockStyle.Top, Height = 40,
+            Padding = new Padding(0, 2, 0, 4), BackColor = BackColor };
+        var sensitivityLabel = new Label
+        {
+            Text = "Mouse sensitivity",
+            Dock = DockStyle.Left,
+            Width = 156,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Color.FromArgb(204, 210, 220)
+        };
+        _sensitivityBar.ValueChanged += (_, _) =>
+        {
+            if (_updatingSensitivityUi) return;
+            _pointerSensitivity = _sensitivityBar.Value / 100.0;
+            _sensitivityValue.Text = _sensitivityBar.Value + "%";
+            _capture?.SetPointerSensitivity(_pointerSensitivity);
+        };
+        _sensitivityBar.MouseUp += (_, _) => SavePreferredEdge();
+        _sensitivityBar.KeyUp += (_, _) => SavePreferredEdge();
+        sensitivityRow.Controls.Add(_sensitivityBar);
+        sensitivityRow.Controls.Add(_sensitivityValue);
+        sensitivityRow.Controls.Add(sensitivityLabel);
         var deviceInfo = new Panel { Dock = DockStyle.Fill,
             BackColor = Color.FromArgb(41, 43, 49),
             Padding = new Padding(14, 10, 12, 7) };
@@ -170,6 +217,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _status.AutoEllipsis = true;
 
         bottom.Controls.Add(deviceInfo);
+        bottom.Controls.Add(sensitivityRow);
         bottom.Controls.Add(actions);
         bottom.Controls.Add(_status);
 
@@ -627,6 +675,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void AttachCaptureHandlers(SourceCapture capture)
     {
+        capture.SetPointerSensitivity(_pointerSensitivity);
         capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
         capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
         capture.ToggleMobileRequested+=JumpToMobileOrReturn;
@@ -1312,7 +1361,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     return;
                 }
                 if (!Visible) ShowFromTray();
+                bool prevTopMost = TopMost;
+                TopMost = true;
                 Activate();
+                BringToFront();
+                TopMost = prevTopMost;
                 string safeName = name.Replace("\r", " ").Replace("\n", " ");
                 var result = MessageBox.Show(this,
                     $"Trust {safeName} for automatic reconnection?\n\n" +
@@ -1634,6 +1687,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 }
                 _display.RestoreMemberOffsets(offsets);
             }
+            if (doc.RootElement.TryGetProperty("PointerSensitivity", out var sens) &&
+                sens.TryGetDouble(out var mult) && !double.IsNaN(mult) && !double.IsInfinity(mult))
+            {
+                int pct = Math.Clamp((int)Math.Round(mult * 100.0),
+                    _sensitivityBar.Minimum, _sensitivityBar.Maximum);
+                _pointerSensitivity = pct / 100.0;
+                _updatingSensitivityUi = true;
+                try
+                {
+                    _sensitivityBar.Value = pct;
+                    _sensitivityValue.Text = pct + "%";
+                }
+                finally { _updatingSensitivityUi = false; }
+                _capture?.SetPointerSensitivity(_pointerSensitivity);
+            }
         }
         catch { /* invalid layout is ignored; Windows topology is unchanged */ }
     }
@@ -1645,6 +1713,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Directory.CreateDirectory(Path.GetDirectoryName(_layoutPath)!);
             File.WriteAllText(_layoutPath, JsonSerializer.Serialize(new {
                 RemoteEdge = _preferredEdge.ToString(),
+                PointerSensitivity = Math.Round(_pointerSensitivity, 2),
                 MemberPositions = _display.StoredMemberOffsets.ToDictionary(
                     p=>p.Key,p=>new { X=p.Value.X,Y=p.Value.Y })
             }));

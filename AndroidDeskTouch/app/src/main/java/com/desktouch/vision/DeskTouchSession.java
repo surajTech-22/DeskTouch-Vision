@@ -5,6 +5,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -84,6 +85,7 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile int announcedPhoneWidth,announcedPhoneHeight,announcedPhoneRotation;
     private volatile long lastUdpReverseMoveAtMs;
     private ScheduledFuture<?> udpProbeRetryFuture;
+    private ScheduledFuture<?> udpKeepAliveFuture;
     private DisplayManager.DisplayListener displayListener;
     private volatile java.util.List<EnvironmentTarget> environmentTargets =
         java.util.Collections.emptyList();
@@ -109,6 +111,7 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
     boolean hasClaim(){return claim>0||active;}
+    String connectedFingerprint(){return running ? fingerprint : null;}
     java.util.List<EnvironmentTarget> environmentTargets(){
         return environmentTargets;
     }
@@ -193,6 +196,10 @@ final class DeskTouchSession implements AutoCloseable {
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
+        connect(device,androidWidth,androidHeight,false,null);
+    }
+    void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
+            boolean interactiveUser,Runnable onFailure) {
         sender.execute(()->{
             if(running || connecting) {status("Already connected or connecting");return;}
             connecting=true;
@@ -217,19 +224,38 @@ final class DeskTouchSession implements AutoCloseable {
                 };
                 SSLContext context=SSLContext.getInstance("TLS");
                 context.init(null,new TrustManager[]{manager},new SecureRandom());
-                SSLSocket ssl=(SSLSocket)context.getSocketFactory().createSocket();
-                ssl.connect(new java.net.InetSocketAddress(device.address,37377),12000);
-                ssl.setTcpNoDelay(true);
-                ssl.setKeepAlive(true);
-                try { ssl.setTrafficClass(0x10); } catch (Exception ignored) {}
-                ssl.setSoTimeout(50000);
-                ssl.startHandshake();
-                DataInputStream in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
-                DataOutputStream out=new DataOutputStream(new BufferedOutputStream(ssl.getOutputStream()));
-                new Packet(saved==null?"auth-request":"auth-trusted",0,0,0,0,
-                    saved==null?PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL):saved).write(out);
-                Packet ready=Packet.read(in);
-                if(!"ready".equals(ready.type)) throw new SecurityException("Windows did not approve pairing");
+                SSLSocket ssl=null;
+                DataInputStream in=null;
+                DataOutputStream out=null;
+                Packet ready=null;
+                for(int attempt=0;attempt<2;attempt++){
+                    boolean tryTrusted=attempt==0 && saved!=null;
+                    ssl=(SSLSocket)context.getSocketFactory().createSocket();
+                    ssl.connect(new java.net.InetSocketAddress(device.address,37377),5000);
+                    ssl.setTcpNoDelay(true);
+                    ssl.setKeepAlive(true);
+                    try { ssl.setTrafficClass(0x10); } catch (Exception ignored) {}
+                    ssl.setSoTimeout(50000);
+                    ssl.startHandshake();
+                    in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
+                    out=new DataOutputStream(new BufferedOutputStream(ssl.getOutputStream()));
+                    new Packet(tryTrusted?"auth-trusted":"auth-request",0,0,0,0,
+                        tryTrusted?saved:PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL)).write(out);
+                    ready=Packet.read(in);
+                    if("ready".equals(ready.type)) break;
+                    try { ssl.close(); } catch (Exception ignored) {}
+                    ssl=null;
+                    if(tryTrusted){
+                        trust.forget(pinned);
+                        if(interactiveUser){
+                            status("Saved Windows trust expired; requesting fresh Windows approval...");
+                            continue;
+                        }
+                    }
+                    throw new SecurityException("Windows did not approve pairing");
+                }
+                if(ssl==null || in==null || out==null || ready==null || !"ready".equals(ready.type))
+                    throw new SecurityException("Windows did not approve pairing");
                 ArrayList<int[]> parsed=new ArrayList<>();
                 JSONArray layout=new JSONArray(ready.text);
                 if(layout.length()<1||layout.length()>20)throw new IOException("Invalid Windows display geometry");
@@ -293,6 +319,7 @@ final class DeskTouchSession implements AutoCloseable {
             } catch(Exception e) {
                 status("Connection failed: "+e.getMessage());
                 closeConnection();
+                if(onFailure!=null)onFailure.run();
             } finally {connecting=false;}
         });
     }
@@ -332,6 +359,9 @@ final class DeskTouchSession implements AutoCloseable {
                     String token=pendingTrust;pendingTrust=null;
                     if(token!=null){
                         trust.save(fingerprint,token);
+                        AutoConnectService.resumePeer(application,fingerprint);
+                        AutoConnectService.setEnabled(application,true);
+                        AutoConnectService.setReconnect(application,true);
                         status("Trusted Windows PC saved securely, without storing its IP address");
                     }
                 } else if("trust-denied".equals(p.type)){
@@ -406,9 +436,9 @@ final class DeskTouchSession implements AutoCloseable {
             }
             reverseLease=p.a;reverseApplied=0;reportedMissingKeyboard=0;
             lastUdpReverseMoveAtMs=0;
+            send(new Packet("reverse-granted",p.a));
             warmOrProbeUdp();
             RemoteInputPower.begin(application);
-            send(new Packet("reverse-granted",p.a));
             status("Windows is allowed to control this Android screen.");
             return;
         }
@@ -652,11 +682,22 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                     ch.sendProbe();
                 },180,180,TimeUnit.MILLISECONDS);
+                udpKeepAliveFuture=udpPacer.scheduleWithFixedDelay(()->{
+                    if(!running || udpChannel!=ch)return;
+                    if(!ch.confirmed || claim>0 || !DeskTouchAccessibilityService.ready(application))return;
+                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<140)return;
+                    PowerManager pm=(PowerManager)application.getSystemService(Context.POWER_SERVICE);
+                    if(pm!=null && !pm.isInteractive())return;
+                    ch.sendWarm();
+                },180,180,TimeUnit.MILLISECONDS);
             }
         } catch(Exception ignored) {
         }
     }
     private void closeUdpChannel(){
+        ScheduledFuture<?> keepAlive=udpKeepAliveFuture;
+        udpKeepAliveFuture=null;
+        if(keepAlive!=null) keepAlive.cancel(false);
         ScheduledFuture<?> retry=udpProbeRetryFuture;
         udpProbeRetryFuture=null;
         if(retry!=null) retry.cancel(false);

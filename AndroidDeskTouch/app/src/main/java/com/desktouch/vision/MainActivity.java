@@ -16,10 +16,14 @@ import java.util.List;
 
 /** DeskTouch Vision Android: hardware keyboard/mouse settings belong to Android itself. */
 public final class MainActivity extends Activity {
+    private static final String PREFS="desktouch_prefs";
+    private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
     private TextView status,devices;
     private LinearLayout deviceList,environmentList;
     private TextView connectionSummary;
     private TextView permissionState;
+    private TextView trustSummary;
+    private CheckBox autoStartCheck;
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
@@ -31,11 +35,16 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
+        int savedProgress=getSharedPreferences(PREFS,MODE_PRIVATE)
+            .getInt(PREF_POINTER_PROGRESS,180);
+        savedProgress=Math.max(0,Math.min(400,savedProgress));
+        pointerSpeed=1f+savedProgress/100f;
         session=DeskTouchRuntime.session(this);
         DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{
                 if(status!=null)status.setText(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
+                refreshTrustSummary();
                 updateVisibleScreenAwake();
             }));
         // Android 13+ requires permission to show the persistent connection
@@ -152,40 +161,67 @@ public final class MainActivity extends Activity {
                 status.setText("Paused for banking. Wi-Fi connection stays ready; tap Resume later.");
             }
         });
-        addButton(page,"Trust connected PC (auto reconnect identity)",()->session.requestTrust());
+        addButton(page,"Trust connected PC (auto reconnect identity)",()->{
+            DeskTouchSession current=DeskTouchRuntime.session(this);
+            session=current;
+            current.requestTrust();
+        });
         addButton(page,"Leave shared environment",()->{
+            DeskTouchSession current=DeskTouchRuntime.session(this);
+            session=current;
             AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
-            session.releaseControl();
-            session.disconnect();
+            current.releaseControl();
+            current.disconnect();
+            refreshTrustSummary();
             status.setText("Selected device disconnected. Other peers stay connected; "+
                 "auto reconnect paused only for this device.");
         });
-        android.widget.CheckBox autoStart=new android.widget.CheckBox(this);
-        autoStart.setText("Launch on Android startup and reconnect trusted devices");
-        autoStart.setTextColor(Color.WHITE);
-        autoStart.setChecked(AutoConnectService.enabled(this));
-        autoStart.setOnCheckedChangeListener((button,checked)->{
+        trustSummary=new TextView(this);
+        trustSummary.setTextColor(Color.rgb(185,225,195));
+        trustSummary.setPadding(0,dp(4),0,dp(4));
+        page.addView(trustSummary);
+        addButton(page,"Forget trusted computers",()->{
+            new TrustedWindows(this).clearAll();
+            refreshTrustSummary();
+            status.setText("Cleared saved trusted computers on this phone.");
+        });
+        autoStartCheck=new android.widget.CheckBox(this);
+        autoStartCheck.setText("Launch on Android startup and reconnect trusted devices");
+        autoStartCheck.setTextColor(Color.WHITE);
+        autoStartCheck.setChecked(AutoConnectService.enabled(this));
+        autoStartCheck.setOnClickListener(button->{
+            boolean checked=autoStartCheck.isChecked();
             AutoConnectService.setEnabled(this,checked);
             AutoConnectService.setReconnect(this,checked);
             status.setText(checked
                 ? "Android startup enabled; trusted PCs reconnect automatically when reachable."
                 : "Android startup and background reconnect disabled.");
         });
-        page.addView(autoStart);
+        page.addView(autoStartCheck);
+        refreshTrustSummary();
         addButton(page,"Get updates",()->AndroidUpdater.checkForUpdates(this,true));
         addButton(page,"Update existing application",()->AndroidUpdater.installAvailableUpdate(this));
         // Only checks official GitHub metadata; never downloads or silently
         // installs an executable without explicit user action.
         AndroidUpdater.checkForUpdates(this,false);
+        int initialSensitivityProgress=Math.max(0,Math.min(400,
+            Math.round((pointerSpeed-1f)*100f)));
         TextView padLabel=new TextView(this);
-        padLabel.setText("Mobile touchpad / connected mouse");
+        padLabel.setText("Mouse pointer sensitivity: "+
+            Math.round(pointerSpeed*100f/2.8f)+"%");
         padLabel.setTextColor(Color.WHITE);padLabel.setTextSize(16);
         padLabel.setPadding(0,dp(12),0,dp(6));page.addView(padLabel);
         SeekBar pointerSensitivity=new SeekBar(this);
-        pointerSensitivity.setMax(400);pointerSensitivity.setProgress(180);
+        pointerSensitivity.setMax(400);pointerSensitivity.setProgress(initialSensitivityProgress);
         pointerSensitivity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
             public void onProgressChanged(SeekBar b,int progress,boolean fromUser){
                 pointerSpeed=1f+progress/100f;
+                padLabel.setText("Mouse pointer sensitivity: "+
+                    Math.round(pointerSpeed*100f/2.8f)+"%");
+                if(fromUser){
+                    getSharedPreferences(PREFS,MODE_PRIVATE).edit()
+                        .putInt(PREF_POINTER_PROGRESS,progress).apply();
+                }
             }
             public void onStartTrackingTouch(SeekBar b){}
             public void onStopTrackingTouch(SeekBar b){}
@@ -401,7 +437,25 @@ public final class MainActivity extends Activity {
         super.onResume();
         updateVisibleScreenAwake();
         refreshPermissionState();
+        refreshTrustSummary();
+        if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+    }
+    private void refreshTrustSummary(){
+        if(trustSummary==null)return;
+        int count=new TrustedWindows(this).fingerprints().size();
+        String connectedFp=DeskTouchRuntime.session(this).connectedFingerprint();
+        boolean currentTrusted=connectedFp!=null &&
+            new TrustedWindows(this).get(connectedFp)!=null;
+        String base=count==0
+            ?"Trusted computers saved: 0 (auto-reconnect disabled until approved)"
+            :"Trusted computers saved: "+count;
+        if(connectedFp!=null)
+            base+=currentTrusted
+                ?" • Current computer is trusted"
+                :" • Current computer not trusted yet";
+        trustSummary.setText(base);
+        if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
     }
     private static void sendRemoteTextWithNewlines(DeskTouchSession target,String added){
         int start=0;
@@ -533,7 +587,7 @@ public final class MainActivity extends Activity {
                                     AutoConnectService.setReconnect(this,true);
                                     AutoConnectService.resumePeer(this,gateway.fingerprint);
                                     session=DeskTouchRuntime.select(this,gateway.fingerprint);
-                                    session.connect(gateway,size.x,size.y);
+                                    session.connect(gateway,size.x,size.y,true,null);
                                     status.setText("Connecting to shared environment through "+
                                         gateway.name+". Approve pairing on that Windows PC.");
                                 }).show();

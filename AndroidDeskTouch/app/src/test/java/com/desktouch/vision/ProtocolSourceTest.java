@@ -283,4 +283,21 @@ public final class ProtocolSourceTest {
         assertNull(DesktopDiscovery.parseOnline("DT1-READY|BAD|"+"E".repeat(64),"192.168.1.55"));
         assertNull(DesktopDiscovery.parseOnline("DT1-ONLINE|BAD|short","192.168.1.55"));
     }
+    @Test public void scrollWheelDirectionStaysInsideSafeScreenMargins(){
+        DeskTouchAccessibilityService.WheelStroke up=
+            DeskTouchAccessibilityService.computeWheelStroke(540,2100,120,false,1080,2400);
+        assertTrue(up.ey>up.sy);
+        assertEquals(110L,up.durationMs);
+        assertTrue(up.sy>=Math.round(2400*0.14f) && up.ey<=Math.round(2400*0.80f));
+
+        DeskTouchAccessibilityService.WheelStroke down=
+            DeskTouchAccessibilityService.computeWheelStroke(540,120,-120,false,1080,2400);
+        assertTrue(down.ey<down.sy);
+        assertTrue(down.ey>=Math.round(2400*0.14f) && down.sy<=Math.round(2400*0.80f));
+
+        DeskTouchAccessibilityService.WheelStroke right=
+            DeskTouchAccessibilityService.computeWheelStroke(1060,1200,120,true,1080,2400);
+        assertTrue(right.ex<right.sx);
+        assertTrue(right.ex>=Math.round(1080*0.10f) && right.sx<=Math.round(1080*0.90f));
+    }
 }

@@ -296,7 +296,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         long prevTicks = Interlocked.Read(ref _lastWarmBroadcastTicks);
         double elapsedMs = prevTicks == 0 ? double.MaxValue
             : (nowTicks - prevTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        if (elapsedMs < 120) return;
+        if (elapsedMs < 60) return;
         if (Interlocked.CompareExchange(ref _lastWarmBroadcastTicks, nowTicks, prevTicks) != prevTicks)
             return;
         foreach (var peer in _sessions.Values)
@@ -430,8 +430,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
-    private static bool QueueTcpRelayMove(RelayLease relay, Packet packet)
+    private static bool QueueTcpRelayMove(RelayLease relay, Packet packet,
+        bool countAsFallback = true)
     {
+        if (countAsFallback)
+            Interlocked.Increment(ref relay.Target.TcpFallbackMoves);
         Interlocked.Exchange(ref relay.LatestMove,packet);
         if(Interlocked.CompareExchange(ref relay.MoveSignaled,1,0)==0 &&
             !relay.InputQueue.Writer.TryWrite(new Packet("move-flush")))
@@ -451,7 +454,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Interlocked.Exchange(ref relay.LatestMove, null);
                 return true;
             }
-            return QueueTcpRelayMove(relay, packet);
+            return QueueTcpRelayMove(relay, packet, countAsFallback: true);
         }
         return relay.InputQueue.Writer.TryWrite(packet);
     }
@@ -615,8 +618,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return selected != null && TrySendReverseTo(selected.Id, packet);
     }
 
-    private static bool QueueTcpReverseMove(Session selected, Packet packet)
+    private static bool QueueTcpReverseMove(Session selected, Packet packet,
+        bool countAsFallback = true)
     {
+        if (countAsFallback)
+            Interlocked.Increment(ref selected.TcpFallbackMoves);
         Interlocked.Exchange(ref selected.LatestReverseMove, packet);
         if (Interlocked.CompareExchange(ref selected.ReverseMoveSignaled, 1, 0) == 0 &&
             !selected.ReverseQueue.Writer.TryWrite(new Packet("move-flush")))
@@ -627,7 +633,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return true;
     }
 
-    private void QueueReliableReverseMoveForSession(Session session, Packet move)
+    private void QueueReliableReverseMoveForSession(Session session, Packet move,
+        bool countAsFallback = true)
     {
         RelayLease? relay = null;
         bool hubOwned = false;
@@ -642,9 +649,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             else return;
         }
         if (hubOwned)
-            QueueTcpReverseMove(session, move);
+            QueueTcpReverseMove(session, move, countAsFallback);
         else if (relay != null)
-            QueueTcpRelayMove(relay, move);
+            QueueTcpRelayMove(relay, move, countAsFallback);
     }
 
     private bool TrySendReverseTo(int id, Packet packet)
@@ -695,7 +702,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Interlocked.Exchange(ref selected.LatestReverseMove, null);
                 return true;
             }
-            return QueueTcpReverseMove(selected, packet);
+            return QueueTcpReverseMove(selected, packet, countAsFallback: true);
         }
         if (selected.ReverseQueue.Writer.TryWrite(packet)) return true;
         _status("Peer input queue stalled. Disconnecting that peer safely.");
@@ -728,10 +735,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
                     var move = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (move != null)
-                    {
-                        Interlocked.Increment(ref session.TcpFallbackMoves);
                         await SendToAsync(session, ReverseInputProtocol.Encode(move), token);
-                    }
                     continue;
                 }
                 if (p.Type is "release" or "reset")
@@ -868,14 +872,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 return _udpHub != null && peerUdp != null && peerUdp.Confirmed && lease > 0 &&
                     _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease);
             },
-            queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move),
+            queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
             sendWarm: () =>
             {
                 var peerUdp = session.UdpPeer;
                 if (_udpHub != null && peerUdp is { HasEndpoint: true } &&
                     Volatile.Read(ref session.ActiveReverseLease) > 0)
                     _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
-            });
+            },
+            queueTrailingSync: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: false));
         if(!_sessions.TryAdd(id,session))
         {
             session.MovePacer?.Dispose();
@@ -1385,6 +1390,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             QueueRoutedInput(forward, new Packet("move", msg.A, msg.B));
             return;
         }
+        if (msg.Op == FastUdpOp.Warm)
+        {
+            if (session.Peer.Platform == "Windows")
+                BroadcastWarmToConfirmedTargets(session.Id);
+            return;
+        }
         if (msg.Op != FastUdpOp.Move) return;
         if (session.EnvironmentTargetId != 0) return;
 
@@ -1618,13 +1629,14 @@ internal sealed class HostSession : IInputSession, IDisposable
                 return udp != null && udp.Confirmed && lease > 0 &&
                     udp.Send(FastUdpOp.Move, move.A, move.B, lease);
             },
-            queueReliableTcp: move => QueueTcpMove(move),
+            queueReliableTcp: move => QueueTcpMove(move, countAsFallback: true),
             sendWarm: () =>
             {
                 var udp = _udpClient;
                 if (udp is { Confirmed: true } && Volatile.Read(ref _forwardClaimLease) > 0)
                     udp.Send(FastUdpOp.Warm, 0, 0, 0);
-            });
+            },
+            queueTrailingSync: move => QueueTcpMove(move, countAsFallback: false));
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
@@ -1759,10 +1771,11 @@ internal sealed class HostSession : IInputSession, IDisposable
         }
     }
 
-    private void QueueTcpMove(Packet p)
+    private void QueueTcpMove(Packet p, bool countAsFallback = true)
     {
         if (Volatile.Read(ref _closed) != 0) return;
-        Interlocked.Increment(ref _tcpFallbackMoves);
+        if (countAsFallback)
+            Interlocked.Increment(ref _tcpFallbackMoves);
         Interlocked.Exchange(ref _latestMove, p);
         if (Interlocked.CompareExchange(ref _moveSignaled, 1, 0) == 0 &&
             !_queue.Writer.TryWrite(new Packet("move-flush")))
@@ -1777,13 +1790,13 @@ internal sealed class HostSession : IInputSession, IDisposable
             var udp = Volatile.Read(ref _udpClient);
             if (udp is { Confirmed: true })
                 udp.Send(FastUdpOp.Warm, 0, 0, 0);
-            // Also wake relayed Android targets through the hub at most once per 250ms
+            // Also wake relayed Android targets through the hub at most once per 100ms
             // while approaching an edge so the phone radio is awake before handoff.
             long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             long prevTicks = Interlocked.Read(ref _lastTcpWarmTicks);
             double sinceMs = prevTicks == 0 ? double.MaxValue
                 : (nowTicks - prevTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-            if (sinceMs >= 250 &&
+            if (sinceMs >= 100 &&
                 EnvironmentMembers.Any(m => m.Platform == "Android" && m.SupportsReverseInput) &&
                 Interlocked.CompareExchange(ref _lastTcpWarmTicks, nowTicks, prevTicks) == prevTicks)
             {
@@ -1809,7 +1822,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                 Interlocked.Exchange(ref _latestMove, null);
                 return true;
             }
-            QueueTcpMove(p);
+            QueueTcpMove(p, countAsFallback: true);
             return true;
         }
         if (_queue.Writer.TryWrite(p)) return true;

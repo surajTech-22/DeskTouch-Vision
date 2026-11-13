@@ -36,6 +36,9 @@ final class TrustedWindows {
         return gen.generateKey();
     }
     synchronized void save(String fingerprint,String token) throws Exception {
+        if(fingerprint==null || token==null)
+            throw new SecurityException("Invalid trusted device identity");
+        fingerprint=fingerprint.toUpperCase(Locale.ROOT);
         if(!fingerprint.matches("[A-Fa-f0-9]{64}") || !token.matches("[A-Fa-f0-9]{64}"))
             throw new SecurityException("Invalid trusted device identity");
         byte[] iv=new byte[12];
@@ -50,17 +53,25 @@ final class TrustedWindows {
         if(!prefs.edit().putString(fingerprint,Base64.encodeToString(combined,Base64.NO_WRAP)).commit())
             throw new IllegalStateException("Could not persist device trust");
     }
-    synchronized String get(String fingerprint) throws Exception {
-        String encoded=prefs.getString(fingerprint,null);
+    synchronized String get(String fingerprint) {
+        if(fingerprint==null) return null;
+        String normalized=fingerprint.toUpperCase(Locale.ROOT);
+        String encoded=prefs.getString(normalized,null);
+        if(encoded==null) encoded=prefs.getString(fingerprint,null);
         if(encoded==null) return null;
-        byte[] combined=Base64.decode(encoded,Base64.NO_WRAP);
-        if(combined.length<29) throw new SecurityException("Corrupt trusted device record");
-        byte[] iv=new byte[12];
-        System.arraycopy(combined,0,iv,0,12);
-        Cipher aes=Cipher.getInstance("AES/GCM/NoPadding");
-        aes.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,iv));
-        aes.updateAAD(fingerprint.getBytes(StandardCharsets.US_ASCII));
-        return new String(aes.doFinal(combined,12,combined.length-12),StandardCharsets.US_ASCII);
+        try{
+            byte[] combined=Base64.decode(encoded,Base64.NO_WRAP);
+            if(combined.length<29) throw new SecurityException("Corrupt trusted device record");
+            byte[] iv=new byte[12];
+            System.arraycopy(combined,0,iv,0,12);
+            Cipher aes=Cipher.getInstance("AES/GCM/NoPadding");
+            aes.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,iv));
+            aes.updateAAD(normalized.getBytes(StandardCharsets.US_ASCII));
+            return new String(aes.doFinal(combined,12,combined.length-12),StandardCharsets.US_ASCII);
+        }catch(Exception ignored){
+            forget(fingerprint);
+            return null;
+        }
     }
     synchronized Set<String> fingerprints() {
         Set<String> identities=new HashSet<>();
@@ -70,6 +81,11 @@ final class TrustedWindows {
         return identities;
     }
     synchronized void forget(String fingerprint) {
-        prefs.edit().remove(fingerprint).apply();
+        if(fingerprint==null) return;
+        String normalized=fingerprint.toUpperCase(Locale.ROOT);
+        prefs.edit().remove(normalized).remove(fingerprint).commit();
+    }
+    synchronized void clearAll() {
+        prefs.edit().clear().commit();
     }
 }

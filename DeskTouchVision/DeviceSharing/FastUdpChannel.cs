@@ -502,6 +502,7 @@ internal sealed class FastMovePacer : IDisposable
     private readonly Func<bool> _canSendUdp;
     private readonly Func<Packet, bool> _sendUdp;
     private readonly Action<Packet> _queueReliableTcp;
+    private readonly Action<Packet> _queueTrailingSync;
     private readonly Action? _sendWarm;
     private readonly System.Threading.Timer _timer;
     private Packet? _throttledUdp;
@@ -516,11 +517,13 @@ internal sealed class FastMovePacer : IDisposable
         Func<bool> canSendUdp,
         Func<Packet, bool> sendUdp,
         Action<Packet> queueReliableTcp,
-        Action? sendWarm = null)
+        Action? sendWarm = null,
+        Action<Packet>? queueTrailingSync = null)
     {
         _canSendUdp = canSendUdp;
         _sendUdp = sendUdp;
         _queueReliableTcp = queueReliableTcp;
+        _queueTrailingSync = queueTrailingSync ?? queueReliableTcp;
         _sendWarm = sendWarm;
         _timer = new System.Threading.Timer(OnTimer, null, Timeout.Infinite, Timeout.Infinite);
     }
@@ -615,6 +618,7 @@ internal sealed class FastMovePacer : IDisposable
     {
         Packet? udpMove = null;
         Packet? tcpSync = null;
+        bool isTrailingSync = false;
         bool sendWarm = false;
 
         lock (_gate)
@@ -651,6 +655,7 @@ internal sealed class FastMovePacer : IDisposable
                 {
                     tcpSync = _pendingTcpSync;
                     _pendingTcpSync = null;
+                    isTrailingSync = true;
                 }
             }
 
@@ -674,8 +679,15 @@ internal sealed class FastMovePacer : IDisposable
             Interlocked.Increment(ref _udpFlushedCount);
         if (tcpSync != null)
         {
-            _queueReliableTcp(tcpSync);
-            Interlocked.Increment(ref _trailingTcpSyncCount);
+            if (isTrailingSync)
+            {
+                _queueTrailingSync(tcpSync);
+                Interlocked.Increment(ref _trailingTcpSyncCount);
+            }
+            else
+            {
+                _queueReliableTcp(tcpSync);
+            }
         }
         if (sendWarm) _sendWarm!();
     }

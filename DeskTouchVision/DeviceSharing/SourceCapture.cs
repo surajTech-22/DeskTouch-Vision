@@ -94,7 +94,11 @@ internal sealed class SourceCapture : IDisposable
     private bool _suppressMobileShortcutUp;
     private bool _directShortcutEntry;
     private double _remoteFracX, _remoteFracY;
+    private double _pointerSensitivity = 1.0;
     private int _androidReturnPushPx;
+
+    internal void SetPointerSensitivity(double multiplier) =>
+        Volatile.Write(ref _pointerSensitivity, Math.Clamp(multiplier, 0.25, 2.50));
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
     internal bool IsClaimPending =>
@@ -507,8 +511,8 @@ internal sealed class SourceCapture : IDisposable
         if (IsArmed && !RemoteActive)
         {
             long now = Environment.TickCount64;
-            const int warmEdgeRadiusPx = 140;
-            if (now - _lastWarmHintMs >= 45 &&
+            const int warmEdgeRadiusPx = 260;
+            if (now - _lastWarmHintMs >= 35 &&
                 (_localMonitors.IsExternalEdge(cursor, _edge, warmEdgeRadiusPx) ||
                  (NavigateEnvironment != null &&
                   (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), warmEdgeRadiusPx) ||
@@ -591,7 +595,15 @@ internal sealed class SourceCapture : IDisposable
                     if (now - _lastRawMs > 60 && missingRaw >= 3)
                     {
                         _lastFallbackMs = now;
-                        MoveRemote(dx, dy);
+                        double sens = Volatile.Read(ref _pointerSensitivity);
+                        _remoteFracX += dx * sens;
+                        _remoteFracY += dy * sens;
+                        int sdx = (int)Math.Truncate(_remoteFracX);
+                        int sdy = (int)Math.Truncate(_remoteFracY);
+                        _remoteFracX -= sdx;
+                        _remoteFracY -= sdy;
+                        if (sdx != 0 || sdy != 0)
+                            MoveRemote(sdx, sdy);
                     }
                 }
                 return (IntPtr)1;
@@ -747,8 +759,9 @@ internal sealed class SourceCapture : IDisposable
             {
                 bool targetAndroid = DestinationIsAndroid?.Invoke() == true;
                 int? dpi = _remoteMonitors.Monitors.FirstOrDefault()?.DensityDpi;
-                double sx = ScaleRawDeltaPrecise(input.Mouse.LastX, _mouseSpeed, targetAndroid, dpi);
-                double sy = ScaleRawDeltaPrecise(input.Mouse.LastY, _mouseSpeed, targetAndroid, dpi);
+                double sens = Volatile.Read(ref _pointerSensitivity);
+                double sx = ScaleRawDeltaPrecise(input.Mouse.LastX, _mouseSpeed, targetAndroid, dpi, sens);
+                double sy = ScaleRawDeltaPrecise(input.Mouse.LastY, _mouseSpeed, targetAndroid, dpi, sens);
                 _remoteFracX += sx;
                 _remoteFracY += sy;
                 int dx = (int)Math.Truncate(_remoteFracX);
@@ -803,17 +816,19 @@ internal sealed class SourceCapture : IDisposable
     }
 
     internal static double ScaleRawDeltaPrecise(
-        int raw, int systemMouseSpeed, bool isAndroid, int? remoteDensityDpi = null)
+        int raw, int systemMouseSpeed, bool isAndroid, int? remoteDensityDpi = null,
+        double sensitivity = 1.0)
     {
         if (raw == 0) return 0;
         int bounded = Math.Clamp(raw, isAndroid ? -450 : -800, isAndroid ? 450 : 800);
         double speedFactor = Math.Clamp(systemMouseSpeed, 1, 20) / 10.0;
+        double sensFactor = Math.Clamp(sensitivity, 0.25, 2.50);
         if (!isAndroid)
-            return bounded * speedFactor * 1.45;
+            return bounded * speedFactor * 1.45 * sensFactor;
         double dpiFactor = remoteDensityDpi is > 0
             ? Math.Clamp(remoteDensityDpi.Value / 440.0, 0.70, 1.35)
             : 1.0;
-        return bounded * speedFactor * 0.95 * dpiFactor;
+        return bounded * speedFactor * 0.95 * dpiFactor * sensFactor;
     }
 
     private static int EdgeOvershoot(MonitorRect monitor, int nextX, int nextY, MonitorEdge edge) =>

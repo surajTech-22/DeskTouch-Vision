@@ -184,7 +184,7 @@ final class FastUdpChannel implements Closeable {
         this.codec = new Codec(key, peerId, false);
         this.socket = new DatagramSocket(0);
         try {
-            this.socket.setTrafficClass(0xB8);
+            this.socket.setTrafficClass(0x10);
         } catch (Exception ignored) {
         }
         try {

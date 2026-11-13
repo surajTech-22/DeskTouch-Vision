@@ -477,7 +477,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
         CancellationToken token)
     {
-        relay.Target.MovePacer?.SetMinIntervalMs(4.5);
+        relay.Target.MovePacer?.SetMinIntervalMs(relay.Target.Peer.Platform == "Android" ? 7.5 : 4.5);
         if (_sessions.ContainsKey(relay.Target.Id))
         {
             try { await SendToAsync(relay.Target,
@@ -876,8 +876,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             sendWarm: () =>
             {
                 var peerUdp = session.UdpPeer;
-                if (_udpHub != null && peerUdp is { HasEndpoint: true } &&
-                    Volatile.Read(ref session.ActiveReverseLease) > 0)
+                if (_udpHub != null && peerUdp is { Confirmed: true } && _sessions.ContainsKey(id))
                     _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
             },
             queueTrailingSync: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: false));
@@ -920,7 +919,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if (_udpHub != null && session.UdpPeer != null && p.A is > 0 and <= 65535)
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
-                        session.MovePacer?.SetMinIntervalMs(4.5);
+                        session.MovePacer?.SetMinIntervalMs(
+                            session.Peer.Platform == "Android" ? 7.5 : 2.5);
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1164,7 +1164,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         // Relayed moves are already paced by the source PC; keep a short
                         // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
-                        relay.Target.MovePacer?.SetMinIntervalMs(2.0);
+                        relay.Target.MovePacer?.SetMinIntervalMs(
+                            relay.Target.Peer.Platform == "Android" ? 7.5 : 2.0);
                         if (relay.Target.UdpPeer is { Confirmed: true } relayUdp)
                             _udpHub?.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
                         try { await SendToAsync(relay.Target,
@@ -1633,7 +1634,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             sendWarm: () =>
             {
                 var udp = _udpClient;
-                if (udp is { Confirmed: true } && Volatile.Read(ref _forwardClaimLease) > 0)
+                if (udp is { Confirmed: true } && Volatile.Read(ref _closed) == 0)
                     udp.Send(FastUdpOp.Warm, 0, 0, 0);
             },
             queueTrailingSync: move => QueueTcpMove(move, countAsFallback: false));
@@ -2081,7 +2082,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                 }
             };
             Interlocked.Exchange(ref _highResTimer, Win.EnterHighResolutionTimer())?.Dispose();
-            _movePacer?.SetMinIntervalMs(5.0);
+            _movePacer?.SetMinIntervalMs(2.5);
             Interlocked.Exchange(ref _udpClient, client)?.Dispose();
             TrySend(new Packet("udp-ready", client.LocalPort));
             var probeCancel = _cancel.Token;

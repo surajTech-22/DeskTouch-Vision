@@ -176,7 +176,7 @@ internal static class FastUdpSocketOptions
         catch (Exception) { }
         try { socket.SendBufferSize = 262144; } catch (Exception) { }
         try { socket.ReceiveBufferSize = 262144; } catch (Exception) { }
-        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8); }
+        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10); }
         catch (Exception) { }
     }
 
@@ -495,8 +495,9 @@ internal sealed class FastMovePacer : IDisposable
 {
     private const double MinUdpIntervalMs = 1.5;
     private const int ThrottleFlushDelayMs = 2;
-    private const int TrailingTcpSyncDelayMs = 45;
-    private const int WarmKeepaliveIntervalMs = 12;
+    private const int TrailingTcpSyncDelayMs = 130;
+    private const int WarmKeepaliveIntervalMs = 35;
+    private const int WarmCooldownSeconds = 15;
 
     private readonly object _gate = new();
     private readonly Func<bool> _canSendUdp;
@@ -510,6 +511,7 @@ internal sealed class FastMovePacer : IDisposable
     private long _lastMoveUdpTicks;
     private long _lastMoveTicks;
     private long _lastWarmTicks;
+    private long _warmCooldownUntilTicks;
     private bool _warmActive;
     private bool _disposed;
 
@@ -608,10 +610,23 @@ internal sealed class FastMovePacer : IDisposable
     {
         lock (_gate)
         {
-            if (_disposed || _warmActive == active) return;
+            if (_disposed) return;
+            if (active) _warmCooldownUntilTicks = 0;
+            else if (_warmActive)
+                _warmCooldownUntilTicks = Stopwatch.GetTimestamp() + WarmCooldownSeconds * Stopwatch.Frequency;
+            if (_warmActive == active && !active) { UpdateTimerLocked(); return; }
             _warmActive = active;
             UpdateTimerLocked();
         }
+    }
+
+    private bool IsWarmWindowOpenLocked(long now)
+    {
+        if (_warmActive) return true;
+        if (_warmCooldownUntilTicks <= 0) return false;
+        if (now < _warmCooldownUntilTicks) return true;
+        _warmCooldownUntilTicks = 0;
+        return false;
     }
 
     private void OnTimer(object? state)
@@ -659,7 +674,7 @@ internal sealed class FastMovePacer : IDisposable
                 }
             }
 
-            if (_warmActive && udpMove == null && tcpSync == null && _sendWarm != null)
+            if (IsWarmWindowOpenLocked(now) && udpMove == null && tcpSync == null && _sendWarm != null)
             {
                 long lastActivityTicks = Math.Max(_lastMoveUdpTicks, _lastWarmTicks);
                 double idleWarmMs = lastActivityTicks == 0
@@ -707,9 +722,10 @@ internal sealed class FastMovePacer : IDisposable
         }
         else
         {
+            long now = Stopwatch.GetTimestamp();
             dueMs = _pendingTcpSync != null
                 ? TrailingTcpSyncDelayMs
-                : _warmActive && _sendWarm != null
+                : IsWarmWindowOpenLocked(now) && _sendWarm != null
                     ? WarmKeepaliveIntervalMs
                     : Timeout.Infinite;
         }
@@ -726,6 +742,7 @@ internal sealed class FastMovePacer : IDisposable
             _throttledUdp = null;
             _pendingTcpSync = null;
             _warmActive = false;
+            _warmCooldownUntilTicks = 0;
         }
         _timer.Dispose();
     }

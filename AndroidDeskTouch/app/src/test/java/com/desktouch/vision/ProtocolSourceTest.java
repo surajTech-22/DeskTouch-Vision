@@ -286,18 +286,37 @@ public final class ProtocolSourceTest {
     @Test public void scrollWheelDirectionStaysInsideSafeScreenMargins(){
         DeskTouchAccessibilityService.WheelStroke up=
             DeskTouchAccessibilityService.computeWheelStroke(540,2100,120,false,1080,2400);
-        assertTrue(up.ey>up.sy);
-        assertEquals(110L,up.durationMs);
-        assertTrue(up.sy>=Math.round(2400*0.14f) && up.ey<=Math.round(2400*0.80f));
+        assertTrue(up.ey<up.sy);
+        assertEquals(45L,up.durationMs);
+        assertTrue(up.ey>=Math.round(2400*0.14f) && up.sy<=Math.round(2400*0.80f));
 
         DeskTouchAccessibilityService.WheelStroke down=
             DeskTouchAccessibilityService.computeWheelStroke(540,120,-120,false,1080,2400);
-        assertTrue(down.ey<down.sy);
-        assertTrue(down.ey>=Math.round(2400*0.14f) && down.sy<=Math.round(2400*0.80f));
+        assertTrue(down.ey>down.sy);
+        assertTrue(down.sy>=Math.round(2400*0.14f) && down.ey<=Math.round(2400*0.80f));
 
         DeskTouchAccessibilityService.WheelStroke right=
             DeskTouchAccessibilityService.computeWheelStroke(1060,1200,120,true,1080,2400);
         assertTrue(right.ex<right.sx);
         assertTrue(right.ex>=Math.round(1080*0.10f) && right.sx<=Math.round(1080*0.90f));
+
+        // Scrolling directly on top of a tall app icon must escape well past the icon
+        // bounds before lifting so Android does not fire performClick() and open the app.
+        DeskTouchAccessibilityService.WheelStroke iconScrollUp=
+            DeskTouchAccessibilityService.computeWheelStroke(
+                220,1440,120,false,1080,2400,100,1200,340,1460);
+        assertTrue(iconScrollUp.ey<=1200-84);
+
+        DeskTouchAccessibilityService.WheelStroke iconScrollDown=
+            DeskTouchAccessibilityService.computeWheelStroke(
+                220,1220,-120,false,1080,2400,100,1200,340,1460);
+        assertTrue(iconScrollDown.ey>=1460+84);
+
+        // Even near the top margin where upward clearance is tight, the stroke must not
+        // start and end inside the same app icon box.
+        DeskTouchAccessibilityService.WheelStroke topIconScrollUp=
+            DeskTouchAccessibilityService.computeWheelStroke(
+                220,420,120,false,1080,2400,100,260,340,520);
+        assertTrue(topIconScrollUp.sy>520 && topIconScrollUp.ey<topIconScrollUp.sy);
     }
 }

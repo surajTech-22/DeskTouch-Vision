@@ -685,11 +685,11 @@ final class DeskTouchSession implements AutoCloseable {
                 udpKeepAliveFuture=udpPacer.scheduleWithFixedDelay(()->{
                     if(!running || udpChannel!=ch)return;
                     if(!ch.confirmed || claim>0 || !DeskTouchAccessibilityService.ready(application))return;
-                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<140)return;
+                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<40)return;
                     PowerManager pm=(PowerManager)application.getSystemService(Context.POWER_SERVICE);
                     if(pm!=null && !pm.isInteractive())return;
                     ch.sendWarm();
-                },180,180,TimeUnit.MILLISECONDS);
+                },50,50,TimeUnit.MILLISECONDS);
             }
         } catch(Exception ignored) {
         }

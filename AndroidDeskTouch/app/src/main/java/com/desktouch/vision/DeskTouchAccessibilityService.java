@@ -49,6 +49,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private PointerDotView pointerDot;
     private int pointerDotSize;
     private float pointerDotHalf;
+    private WindowManager.LayoutParams pointerParams;
     private WindowManager.LayoutParams compactPointerParams;
     private volatile int displayWidth=1,displayHeight=1;
     private volatile int x,y;
@@ -195,7 +196,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(event!=null&&event.getEventType()==
             AccessibilityEvent.TYPE_TOUCH_INTERACTION_START && !remoteGesture){
             DeskTouchRuntime.remoteNativeTouch();
-            removePointer();
+            hidePointer();
         }
     }
     @Override public void onInterrupt(){
@@ -232,7 +233,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS |
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED |
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT);
         params.gravity=Gravity.TOP|Gravity.LEFT;
         if(Build.VERSION.SDK_INT>=28)
@@ -263,6 +265,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 WindowManager.LayoutParams full=overlayLayoutParams(screenWidth,screenHeight);
                 if(tryAttachOverlay(root,full)){
                     pointerDot=dot;
+                    pointerParams=full;
                     compactPointerParams=null;
                     attached=true;
                 }else{
@@ -284,6 +287,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                     if(!tryAttachOverlay(root,compact)){
                         cursorRoot=null;
                         pointerDot=null;
+                        pointerParams=null;
                         compactPointerParams=null;
                         lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
                         Log.e("DeskTouchPointer",
@@ -293,14 +297,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                     }
                 }
                 pointerDot=dot;
+                pointerParams=compact;
                 compactPointerParams=compact;
                 Log.w("DeskTouchPointer","Full-screen pointer overlay unavailable; compact accessibility overlay active");
             }
         }
         if(cursorRoot==null||pointerDot==null)return;
         if(cursorRoot.getVisibility()!=View.VISIBLE)cursorRoot.setVisibility(View.VISIBLE);
-        if(!cursorRoot.getKeepScreenOn())cursorRoot.setKeepScreenOn(true);
+        if(pointerDot.getVisibility()!=View.VISIBLE)pointerDot.setVisibility(View.VISIBLE);
         int localX=x,localY=y;
+        boolean compactMoved=false;
         if(compactPointerParams!=null){
             WindowManager.LayoutParams compact=compactPointerParams;
             int left=PointerOverlayGeometry.followOrigin(x,compact.x,
@@ -309,16 +315,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 screenHeight,compact.height,compact.height/6);
             if(compact.x!=left || compact.y!=top){
                 compact.x=left;compact.y=top;
-                try{windows.updateViewLayout(cursorRoot,compact);}
-                catch(RuntimeException revoked){
-                    Log.e("DeskTouchPointer",
-                        "Compact pointer overlay update rejected; remote control revoked");
-                    DeskTouchRuntime.pointerOverlayUnavailable();
-                    removePointer();
-                    return;
-                }
+                compactMoved=true;
             }
             localX=x-left;localY=y-top;
+        }
+        if(!applyKeepScreenOn(true,compactMoved)){
+            Log.e("DeskTouchPointer",
+                "Pointer overlay update rejected; remote control revoked");
+            DeskTouchRuntime.pointerOverlayUnavailable();
+            removePointer();
+            return;
         }
         if(localX!=lastOverlayX || localY!=lastOverlayY){
             lastOverlayX=localX;lastOverlayY=localY;
@@ -356,12 +362,32 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         gestureRunning=false;
         remoteGesture=false;
     }
+    private boolean applyKeepScreenOn(boolean keepAwake,boolean forceLayout){
+        if(cursorRoot==null)return false;
+        if(cursorRoot.getKeepScreenOn()!=keepAwake)cursorRoot.setKeepScreenOn(keepAwake);
+        WindowManager.LayoutParams lp=pointerParams;
+        if(lp==null || windows==null)return true;
+        int nextFlags=keepAwake
+            ? (lp.flags | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            : (lp.flags & ~WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        boolean changed=nextFlags!=lp.flags;
+        lp.flags=nextFlags;
+        if(changed || forceLayout){
+            try{windows.updateViewLayout(cursorRoot,lp);}
+            catch(RuntimeException rejected){return false;}
+        }
+        return true;
+    }
+    private boolean pointerVisible(){
+        return cursorRoot!=null && pointerDot!=null &&
+            cursorRoot.getVisibility()==View.VISIBLE &&
+            pointerDot.getVisibility()==View.VISIBLE;
+    }
     private void hidePointer(){
         resetGestureState();
-        if(cursorRoot!=null){
-            cursorRoot.setKeepScreenOn(false);
-            cursorRoot.setVisibility(View.GONE);
-        }
+        if(pointerDot!=null && pointerDot.getVisibility()!=View.INVISIBLE)
+            pointerDot.setVisibility(View.INVISIBLE);
+        if(cursorRoot!=null && !applyKeepScreenOn(false,false))removePointer();
     }
     private void removePointer(){
         resetGestureState();
@@ -371,6 +397,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         }
         cursorRoot=null;
         pointerDot=null;
+        pointerParams=null;
         compactPointerParams=null;
     }
     private void schedulePointerFrame(){
@@ -395,9 +422,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true)){
-            if(service.cursorRoot==null ||
-                service.cursorRoot.getVisibility()!=View.VISIBLE ||
-                applied!=null)
+            if(!service.pointerVisible() || applied!=null)
                 service.ui.post(service::flushPointer);
             else service.schedulePointerFrame();
         }
@@ -436,8 +461,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
         // pointer position, never the previous animation frame.
-        if(remoteActive && (pendingX!=x || pendingY!=y || cursorRoot==null ||
-            cursorRoot.getVisibility()!=View.VISIBLE))
+        if(remoteActive && (pendingX!=x || pendingY!=y || !pointerVisible()))
             showPointer(pendingX,pendingY);
         Runnable ack=pendingApplied;
         pendingApplied=null;
@@ -479,46 +503,120 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             this.durationMs=durationMs;
         }
     }
+    private Rect findClickableBoundsAt(int px,int py){
+        int w=Math.max(100,displayWidth),h=Math.max(100,displayHeight);
+        Rect match=findClickableInTree(getRootInActiveWindow(),px,py,w,h);
+        if(match!=null)return match;
+        List<AccessibilityWindowInfo> windowsList=getWindows();
+        if(windowsList==null)return null;
+        for(AccessibilityWindowInfo win:windowsList){
+            if(win==null)continue;
+            match=findClickableInTree(win.getRoot(),px,py,w,h);
+            if(match!=null)return match;
+        }
+        return null;
+    }
+    private static Rect findClickableInTree(
+        AccessibilityNodeInfo root,int px,int py,int screenWidth,int screenHeight)
+    {
+        if(root==null)return null;
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        Rect best=null;
+        long bestArea=Long.MAX_VALUE;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=120){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(px,py))continue;
+            if(node.isEnabled() && node.isClickable() && !node.isScrollable()){
+                int bw=bounds.width(),bh=bounds.height();
+                if(bw>0 && bh>0 && bw<screenWidth*0.55f && bh<screenHeight*0.45f){
+                    long area=(long)bw*bh;
+                    if(area<=bestArea){
+                        bestArea=area;
+                        best=new Rect(bounds);
+                    }
+                }
+            }
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        return best;
+    }
     static WheelStroke computeWheelStroke(int px,int py,int amount,boolean horizontal,
             int screenWidth,int screenHeight){
-        int step=Math.max(48,Math.min(140,Math.abs(amount)));
-        // Mouse wheel up (amount > 0) drags content down (+step) to scroll the page upward,
-        // rather than swiping upward into the launcher/app-drawer gesture.
-        int signedDelta=horizontal
-            ? (amount>0 ? -step : step)
-            : (amount>0 ? step : -step);
+        return computeWheelStroke(px,py,amount,horizontal,screenWidth,screenHeight,0,0,0,0);
+    }
+    static WheelStroke computeWheelStroke(int px,int py,int amount,boolean horizontal,
+            int screenWidth,int screenHeight,
+            int iconLeft,int iconTop,int iconRight,int iconBottom){
         int w=Math.max(100,screenWidth);
         int h=Math.max(100,screenHeight);
+        int axisSize=horizontal ? w : h;
+        int minStep=Math.max(120,Math.round(axisSize*0.075f));
+        int maxStep=Math.max(minStep,Math.round(axisSize*(horizontal?0.24f:0.18f)));
+        int scaled=Math.round(Math.abs(amount)*(axisSize/1600f));
+        int step=Math.max(minStep,Math.min(maxStep,scaled));
+        // Restore 0.3.30 wheel direction; keep strokes crisp (<100ms) and long enough
+        // to exit clickable icons beyond Android touch slop without triggering a tap.
+        int signedDelta=amount>0 ? -step : step;
         int minX=Math.round(w*0.10f);
         int maxX=Math.round(w*0.90f);
         int minY=Math.round(h*0.14f);
         int maxY=Math.round(h*0.80f);
         if(maxX-minX<60){minX=0;maxX=w-1;}
         if(maxY-minY<60){minY=0;maxY=h-1;}
-        int sx=Math.max(minX,Math.min(maxX,px));
-        int sy=Math.max(minY,Math.min(maxY,py));
-        int ex=sx;
-        int ey=sy;
-        if(horizontal){
-            ex=sx+signedDelta;
-            if(ex>maxX){
-                sx=Math.max(minX,maxX-Math.abs(signedDelta));
-                ex=Math.min(maxX,sx+Math.abs(signedDelta));
-            }else if(ex<minX){
-                sx=Math.min(maxX,minX+Math.abs(signedDelta));
-                ex=Math.max(minX,sx-Math.abs(signedDelta));
-            }
-        }else{
-            ey=sy+signedDelta;
-            if(ey>maxY){
-                sy=Math.max(minY,maxY-Math.abs(signedDelta));
-                ey=Math.min(maxY,sy+Math.abs(signedDelta));
-            }else if(ey<minY){
-                sy=Math.min(maxY,minY+Math.abs(signedDelta));
-                ey=Math.max(minY,sy-Math.abs(signedDelta));
+        int minBound=horizontal ? minX : minY;
+        int maxBound=horizontal ? maxX : maxY;
+        int start=Math.max(minBound,Math.min(maxBound,horizontal ? px : py));
+        int end=start+signedDelta;
+        if(end>maxBound){
+            start=Math.max(minBound,maxBound-Math.abs(signedDelta));
+            end=Math.min(maxBound,start+Math.abs(signedDelta));
+        }else if(end<minBound){
+            start=Math.min(maxBound,minBound+Math.abs(signedDelta));
+            end=Math.max(minBound,start-Math.abs(signedDelta));
+        }
+        if(iconRight>iconLeft && iconBottom>iconTop){
+            int escapeMargin=Math.max(84,Math.round(axisSize*0.035f));
+            int maxEscape=Math.max(step,Math.round(axisSize*0.34f));
+            int edgeLow=horizontal ? iconLeft : iconTop;
+            int edgeHigh=horizontal ? iconRight : iconBottom;
+            if(signedDelta<0){
+                int clearEnd=edgeLow-escapeMargin;
+                if(end>clearEnd){
+                    if(clearEnd>=minBound && start-clearEnd<=maxEscape){
+                        end=clearEnd;
+                    }else if(start>=edgeLow && start<=edgeHigh && edgeHigh+escapeMargin<=maxBound){
+                        start=edgeHigh+escapeMargin;
+                        end=Math.max(minBound,start-step);
+                    }else{
+                        end=Math.max(minBound,Math.max(clearEnd,start-maxEscape));
+                    }
+                }
+            }else{
+                int clearEnd=edgeHigh+escapeMargin;
+                if(end<clearEnd){
+                    if(clearEnd<=maxBound && clearEnd-start<=maxEscape){
+                        end=clearEnd;
+                    }else if(start>=edgeLow && start<=edgeHigh && edgeLow-escapeMargin>=minBound){
+                        start=edgeLow-escapeMargin;
+                        end=Math.min(maxBound,start+step);
+                    }else{
+                        end=Math.min(maxBound,Math.min(clearEnd,start+maxEscape));
+                    }
+                }
             }
         }
-        return new WheelStroke(sx,sy,ex,ey,110L);
+        int sx=horizontal ? start : Math.max(minX,Math.min(maxX,px));
+        int sy=horizontal ? Math.max(minY,Math.min(maxY,py)) : start;
+        int ex=horizontal ? end : sx;
+        int ey=horizontal ? sy : end;
+        return new WheelStroke(sx,sy,ex,ey,45L);
     }
     static void wheel(int amount,boolean horizontal){
         DeskTouchAccessibilityService service=instance;
@@ -526,9 +624,17 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.ui.post(()->{
             if(!service.remoteActive || !ready(service))return;
             service.flushPointerBeforeAction();
-            WheelStroke stroke=computeWheelStroke(
-                service.x,service.y,amount,horizontal,service.displayWidth,service.displayHeight);
-            if(stroke.sx==stroke.ex && stroke.sy==stroke.ey)return;
+            Rect clickableBounds=service.findClickableBoundsAt(service.x,service.y);
+            WheelStroke stroke=clickableBounds==null
+                ? computeWheelStroke(service.x,service.y,amount,horizontal,
+                    service.displayWidth,service.displayHeight)
+                : computeWheelStroke(service.x,service.y,amount,horizontal,
+                    service.displayWidth,service.displayHeight,
+                    clickableBounds.left,clickableBounds.top,
+                    clickableBounds.right,clickableBounds.bottom);
+            int minTravel=Math.max(48,Math.round(
+                Math.max(100,horizontal?service.displayWidth:service.displayHeight)*0.025f));
+            if(Math.hypot(stroke.ex-stroke.sx,stroke.ey-stroke.sy)<minTravel)return;
             TouchAction tail=service.pendingActions.peekLast();
             if(tail!=null && tail.kind==TouchAction.TYPE_SCROLL && tail.horizontal==horizontal){
                 if(horizontal){
@@ -536,15 +642,17 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                     int w=Math.max(100,service.displayWidth);
                     int minX=Math.round(w*0.10f),maxX=Math.round(w*0.90f);
                     if(maxX-minX<60){minX=0;maxX=w-1;}
-                    int combined=Math.max(-420,Math.min(420,(tail.ex-tail.sx)+deltaX));
+                    int combined=Math.max(-520,Math.min(520,(tail.ex-tail.sx)+deltaX));
                     tail.ex=Math.max(minX,Math.min(maxX,tail.sx+combined));
+                    if(Math.abs(tail.ex-tail.sx)<minTravel)service.pendingActions.removeLast();
                 }else{
                     int deltaY=stroke.ey-stroke.sy;
                     int h=Math.max(100,service.displayHeight);
                     int minY=Math.round(h*0.14f),maxY=Math.round(h*0.80f);
                     if(maxY-minY<60){minY=0;maxY=h-1;}
-                    int combined=Math.max(-420,Math.min(420,(tail.ey-tail.sy)+deltaY));
+                    int combined=Math.max(-560,Math.min(560,(tail.ey-tail.sy)+deltaY));
                     tail.ey=Math.max(minY,Math.min(maxY,tail.sy+combined));
+                    if(Math.abs(tail.ey-tail.sy)<minTravel)service.pendingActions.removeLast();
                 }
                 return;
             }
@@ -792,6 +900,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 continue;
             }
             if(command.kind==TouchAction.TYPE_UP)continue;
+            if(command.kind==TouchAction.TYPE_SCROLL &&
+                Math.hypot(command.ex-command.sx,command.ey-command.sy)<36.0)
+                continue;
             dispatchSingleGesture(command.sx,command.sy,command.ex,command.ey,command.duration);
             return;
         }

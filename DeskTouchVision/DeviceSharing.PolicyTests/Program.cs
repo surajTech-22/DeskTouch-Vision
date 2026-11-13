@@ -1479,6 +1479,20 @@ var uiThread = new Thread(() =>
                 "Normal end-of-stroke trailing settle sync must route separately without inflating tcp_fallback");
         }
 
+        using (var warmEvent = new ManualResetEventSlim())
+        {
+            int warmCount = 0;
+            using var warmPacer = new FastMovePacer(
+                canSendUdp: () => true,
+                sendUdp: _ => true,
+                queueReliableTcp: _ => { },
+                sendWarm: () => { if (Interlocked.Increment(ref warmCount) >= 1) warmEvent.Set(); });
+            warmPacer.SetWarmActive(true);
+            warmPacer.SetWarmActive(false);
+            Check(warmEvent.Wait(TimeSpan.FromSeconds(2)) && warmCount >= 1,
+                "FastMovePacer must keep warm keepalive window open briefly after leaving phone");
+        }
+
         var onlinePeer = NearbyComputerDiscovery.ParseReply(
             "DT1-ONLINE|STUDIO-PC|" + new string('B', 64),
             System.Net.IPAddress.Parse("192.168.1.42"));

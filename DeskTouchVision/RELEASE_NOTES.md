@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.32 — Smooth Switch-Back, Screen Keep-Awake, Safe App-Icon Scroll, and In-App Android Updates
+
+DeskTouch Vision eliminates switch-back stalls and wireless queue drops, keeps the phone screen awake while the remote pointer is active, restores the previous scroll direction while preventing scrolls over app icons from opening apps, and downloads/installs Android updates directly inside the app.
+
+- **No more switch-back lag or wireless stalls:** Switched fast-lane packets to low-delay traffic scheduling instead of starving normal confirmations in the voice queue, paced Android pointer traffic smoothly for phone refresh rates, kept interactive phone radios warm at a faster 50 ms cadence while screen-on plus a 15-second Windows warm cooldown between edge crossings, raised idle settle sync delay to avoid redundant mid-pause packets, and kept the pointer surface warm cleanly without slow cold restarts.
+- **Screen stays awake while controlling the phone:** Fixed a regression where keep-screen-on stopped updating the overlay window flags while the pointer stayed active; the phone now stays awake whenever the remote cursor is active on screen and resumes normal sleep as soon as the cursor leaves.
+- **Restored scroll direction & fixed accidental app launches when scrolling:** Restored the previous scroll direction, scaled swipe distance beyond Android touch slop with crisp 45 ms strokes, detected clickable icons under the cursor so scroll strokes exit well past the icon bounds before lifting, and dropped canceled zero-distance scroll bursts.
+- **Direct in-app Android update downloads:** Restored verified SHA-256 APK download and native package-installer launch directly inside DeskTouch instead of opening Chrome, with signing verification and in-app progress feedback.
+
+---
+
 # DeskTouch Vision v0.3.31 — Instant Phone Handoff, Scroll & Trusted-Device Fixes, and Pointer Sensitivity
 
 DeskTouch Vision eliminates intermittent wireless phone handoff delays, fixes upward scroll gestures opening the app drawer on Android, repairs Android trusted-device reconnection and management, and adds customizable mouse pointer sensitivity on both Windows and Android.

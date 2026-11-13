@@ -44,6 +44,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _trustDevice = Button("Trust device");
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
+    private readonly Button _androidDownload = Button("Get Android app");
     private readonly LinkLabel _checkUpdates = new()
     {
         Text = "Check for updates",
@@ -122,7 +123,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (!_updatingTargetChoice && _targetChoice.SelectedItem is TargetOption target)
                 SelectConnectedTarget(target.Id);
         };
-        // Every connected Windows computer is selected by clicking its screen tile.
+        // Every connected phone/PC is selected by clicking its SCREEN tile.
         // The previous two-option dropdown falsely implied two independent
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
@@ -135,7 +136,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings })
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -150,9 +151,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _summary.ForeColor = Color.FromArgb(230, 231, 234);
         _summary.AutoEllipsis = true;
         var explanation = new Label { Dock = DockStyle.Fill,
-            Text = "Your built-in or connected keyboard and mouse always take priority when used. " +
-                   "Drag the connected PC in the diagram to choose its screen edge. " +
-                   "Emergency return: Ctrl + Alt + Shift + F12.",
+            Text = "Your keyboard and mouse always take priority when used. " +
+                   "Drag devices in the diagram to arrange screen edges. " +
+                   "Phone toggle: Ctrl + Alt + M  •  Emergency return: Ctrl + Alt + Shift + F12.",
             ForeColor = Color.FromArgb(179, 184, 193) };
         // WinForms docks in reverse z-order: add Fill before Top to give
         // the title its own space instead of covering the explanation.
@@ -191,6 +192,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
         _nativeDisplaySettings.Click += (_, _) => OpenNativeDisplays();
+        _androidDownload.Click += (_, _) => { using var view = new AndroidDownloadDialog(); view.ShowDialog(this); };
         _checkUpdates.LinkClicked += async (_, _) =>
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
@@ -243,6 +245,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             ShowFromTray();
             ManageTrustedDevices();
+        });
+        _trayMenu.Items.Add("Get Android app", null, (_, _) =>
+        {
+            ShowFromTray();
+            using var view = new AndroidDownloadDialog();
+            view.ShowDialog(this);
         });
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
         _startupMenu = new ToolStripMenuItem("Launch in tray when Windows starts")
@@ -337,7 +345,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         Text = name, Width = name switch {
             "Windows display settings" => 178, "Copy pairing code" => 155,
-            "Add devices" => 145, _ => 112 },
+            "Add devices" => 145, "Get Android app" => 150, _ => 112 },
         FlatStyle = FlatStyle.Flat,
         FlatAppearance = { BorderColor = Color.FromArgb(85, 89, 100), BorderSize = 1 },
         ForeColor = Color.White,
@@ -346,6 +354,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Cursor = Cursors.Hand,
         Font = new Font("Segoe UI", 9)
     };
+
+    internal static void RotateLogIfNeeded(string logPath, long maxBytes = 512 * 1024)
+    {
+        var info = new FileInfo(logPath);
+        if (!info.Exists || info.Length <= maxBytes) return;
+        string backup = Path.Combine(info.DirectoryName!, "connection.prev.log");
+        File.Move(logPath, backup, overwrite: true);
+    }
 
     private void Status(string message)
     {
@@ -363,9 +379,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "DeskTouchVision", "logs");
             Directory.CreateDirectory(logs);
+            string logFile = Path.Combine(logs, "connection.log");
+            RotateLogIfNeeded(logFile);
             // Status strings intentionally contain no pairing secrets, keys or
             // raw keyboard events. Keep connection-stage errors diagnosable.
-            File.AppendAllText(Path.Combine(logs, "connection.log"),
+            File.AppendAllText(logFile,
                 DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
         }
         catch { /* Never block Windows input for diagnostic logging. */ }
@@ -391,14 +409,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_host != null)
         {
             int members=_host.EnvironmentMembers.Count;
+            int android=_host.EnvironmentMembers.Count(m=>m.Platform=="Android");
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
                             $"{_remoteAddress}  ·  {_host.RemoteMonitors.Monitors.Count} display(s)" +
-                            $"     ·     {members} connected computer(s)";
+                            $"     ·     {members} environment device(s), {android} Android";
         }
         else if (_incomingPeer != null)
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
                             $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  " +
-                            $"{1+(_receiver?.ConnectedPeerCount??0)} computers in one environment";
+                            $"{1+(_receiver?.ConnectedPeerCount??0)} devices in one environment" +
+                            $" ({_receiver?.ConnectedPeers.Count(p=>p.Peer.Platform=="Android")??0} Android)";
         else
             _summary.Text = $"{Environment.MachineName}  ·  {localScreens} Windows display(s)" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
@@ -411,8 +431,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.LocalDeviceName = Environment.MachineName;
             _display.LocalIsEnvironmentHub = _host == null;
             _display.Local = MonitorTopology.Capture();
-            // Computer placement belongs to the shared Windows environment.
-            // Selecting a destination never changes physical Windows monitors.
+            // Device placement is an ENVIRONMENT property, not a transient
+            // keyboard-authority selection. Selecting Android must never
+            // move the Windows PC from the left side to another tile.
             var tiles = new List<EnvironmentDisplayTile>();
             int baseTargetId=0;
             if(_host!=null)
@@ -436,7 +457,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 var connected=_receiver?.ConnectedPeers ??
                     Array.Empty<(int Id,ConnectedPeer Peer)>();
                 // First connected Windows PC is a permanent layout anchor.
-                // Each connected Windows computer keeps its own stable layout tile.
+                // A selected Android phone remains beside it, not in its slot.
                 var main=connected.Where(p=>p.Peer.Platform=="Windows")
                     .OrderBy(p=>p.Id).FirstOrDefault();
                 if(main.Peer==null)
@@ -519,6 +540,88 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.ArrangedTargetOrder(baseId));
     }
 
+    private bool CurrentDestinationIsAndroid()
+    {
+        if(_captureUsesInbound || _host==null)
+        {
+            int id=_receiver?.SelectedPeerId??0;
+            return id>0 && _receiver?.ConnectedPeers
+                .Any(p=>p.Id==id && p.Peer.Platform=="Android")==true;
+        }
+        int target=_host.SelectedEnvironmentTargetId;
+        return target>0 && _host.EnvironmentMembers.Any(
+            m=>m.Id==target && m.Platform=="Android" &&
+                m.SupportsReverseInput);
+    }
+
+    private void AttachCaptureHandlers(SourceCapture capture)
+    {
+        capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
+        capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
+        capture.ToggleMobileRequested+=JumpToMobileOrReturn;
+    }
+
+    private void JumpToMobileOrReturn()
+    {
+        if(IsDisposed || _closing.IsCancellationRequested)return;
+        if(_capture?.RemoteActive==true)
+        {
+            _capture.ReturnLocal();
+            return;
+        }
+        int? androidTargetId=null;
+        if(_captureUsesInbound || _host==null)
+        {
+            var peers=_receiver?.ConnectedPeers ??
+                Array.Empty<(int Id,ConnectedPeer Peer)>();
+            int current=_receiver?.SelectedPeerId ?? 0;
+            var currentAndroid=peers.FirstOrDefault(
+                p=>p.Id==current && p.Peer.Platform=="Android" && p.Peer.SupportsReverseInput);
+            if(currentAndroid.Peer!=null)
+                androidTargetId=currentAndroid.Id;
+            else
+            {
+                var firstReady=peers.FirstOrDefault(
+                    p=>p.Peer.Platform=="Android" && p.Peer.SupportsReverseInput);
+                if(firstReady.Peer!=null)
+                    androidTargetId=firstReady.Id;
+                else if(peers.Any(p=>p.Peer.Platform=="Android"))
+                {
+                    Status("Android control is paused or off on the phone. Tap Resume in the phone app.");
+                    return;
+                }
+            }
+        }
+        else
+        {
+            int current=_host.SelectedEnvironmentTargetId;
+            var readyMember=_host.EnvironmentMembers.FirstOrDefault(
+                m=>m.Id==current && m.Platform=="Android" && m.SupportsReverseInput);
+            if(readyMember==null)
+                readyMember=_host.EnvironmentMembers.FirstOrDefault(
+                    m=>m.Platform=="Android" && m.SupportsReverseInput);
+            if(readyMember!=null)
+                androidTargetId=-readyMember.Id;
+            else if(_host.EnvironmentMembers.Any(m=>m.Platform=="Android"))
+            {
+                Status("Android control is paused or off on the phone. Tap Resume in the phone app.");
+                return;
+            }
+        }
+        if(androidTargetId==null)
+        {
+            Status("No Android phone connected yet. Open DeskTouch on your phone to connect.");
+            return;
+        }
+        if(androidTargetId.Value==CurrentInputTargetId() && _capture?.IsArmed==true)
+        {
+            _capture.BeginDirectHandoff();
+            return;
+        }
+        SelectConnectedTargetCore(androidTargetId.Value,_preferredEdge,0.5,
+            requestHandoff:true,directHandoff:true);
+    }
+
     private int CurrentInputTargetId() =>
         _captureUsesInbound || _host==null
             ? _receiver?.SelectedPeerId ?? EnvironmentRouteOrder.Local
@@ -548,7 +651,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         if(destination.Value==CurrentInputTargetId())
         {
-            // A user may have clicked the computer tile earlier without
+            // A user may have clicked the phone/PC tile earlier without
             // taking authority. Crossing the edge of THAT already-selected
             // device must still request its first input grant.
             if(!remote && _capture?.IsArmed==true)
@@ -569,7 +672,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private bool _retargetingInput;
     private bool SelectConnectedTargetCore(int id,MonitorEdge edge,
-        double fraction,bool requestHandoff)
+        double fraction,bool requestHandoff,bool directHandoff = false)
     {
         if(_retargetingInput)return false;
         _retargetingInput=true;
@@ -586,7 +689,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     return false;
                 // A release MUST go over the PREVIOUS authenticated route;
                 // changing the hub destination first would release the wrong
-                // Windows computer and leave keyboard authority stranded.
+                // phone/PC and leave keyboard authority stranded.
                 _capture?.ReturnLocal();
                 if(!_host.SelectEnvironmentTarget(chosen))
                 {
@@ -618,7 +721,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if(next==null)return false;
             // No SourceCapture.Dispose()/Arm() cycle on device switch: that
             // discarded physical key/mouse events and caused intermittent
-            // Windows-to-Windows handoff failures.
+            // Windows/Android handoff failures.
             if(_capture!=null)
                 _capture.Retarget(next,edge,
                     requestHandoff&&wasControllingRemote);
@@ -626,11 +729,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 _capture=new SourceCapture(this,next,Status,edge,
                     preserveRawInput:true);
-                _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                    _capture.Arm();
+                AttachCaptureHandlers(_capture);
+                _capture.Arm();
             }
             if(requestHandoff)
-                _capture.BeginLinkedHandoff(edge,fraction);
+            {
+                if(directHandoff)
+                    _capture.BeginDirectHandoff();
+                else
+                    _capture.BeginLinkedHandoff(edge,fraction);
+            }
             RefreshDisplays();
             Status("Destination: "+(selectedPeer?.Name ??
                 _host?.RemoteSystemName ?? "shared environment")+
@@ -654,8 +762,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _capture = new SourceCapture(this, _receiver.BindSelectedInput(), Status,
                 _preferredEdge, preserveRawInput: true);
-            _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-                _capture.Arm();
+            AttachCaptureHandlers(_capture);
+            _capture.Arm();
             _captureInboundPeerId=_receiver.SelectedPeerId;
             Status("Windows controls " + _incomingPeer.Name +
                 " across the existing authenticated connection.");
@@ -831,6 +939,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 }
                 ArmSelectedInbound();
             }
+            else if (peer.Platform == "Android" && !peer.SupportsReverseInput)
+            {
+                Status("Android connected. Enable DeskTouch Accessibility control " +
+                    "on the phone to share mouse and keyboard.");
+            }
             RefreshDisplays();
         });
     }
@@ -997,7 +1110,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 Environment.NewLine+Environment.NewLine+
                 "Connected members:"+Environment.NewLine+known+
                 Environment.NewLine+Environment.NewLine+
-                "To add another Windows PC, open DeskTouch on that PC and " +
+                "To add another PC or phone, open DeskTouch on that device and " +
                 "join this environment's Windows hub. Existing devices remain " +
                 "connected; no session needs to be replaced.",
                 "DeskTouch shared environment",MessageBoxButtons.OK,
@@ -1012,7 +1125,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
         _connecting = true;
         // Never tear down Windows's incoming TLS listener when this PC also
-        // initiates an outgoing connection. Other Windows PCs may connect
+        // initiates an outgoing connection. Other mobiles and PCs may connect
         // concurrently. The same authenticated hub arbitrates input authority.
         UpdateButtons();
         Status("Connecting securely. The other computer may ask its user to approve...");
@@ -1079,8 +1192,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _captureUsesInbound = false;
         _capture = new SourceCapture(this, session, Status, _preferredEdge,
             preserveRawInput: true);
-        _capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
-            session.AuthorityControlPacket += HandleRemoteState;
+        AttachCaptureHandlers(_capture);
+        session.AuthorityControlPacket += HandleRemoteState;
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;

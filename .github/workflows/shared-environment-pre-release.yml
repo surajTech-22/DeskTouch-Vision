@@ -48,14 +48,15 @@ jobs:
               !(Test-Path preview/DeviceSharing/DeskTouch.DeviceShare.exe)) {
             throw "Missing required Windows preview executables"
           }
-      - name: Assert Windows-only source and remove stale mobile artifacts
+      - name: Assert clean Windows + Android source without Bluetooth HID clutter
         shell: pwsh
         run: |
-          if (Test-Path AndroidDeskTouch) { throw "Android project must be absent" }
-          if (Test-Path preview/DeskTouchVision-android-preview.apk) { throw "Android APK in Windows-only package" }
-          if (Test-Path preview/DeviceSharing/AndroidDeskTouch) { throw "Android binaries must not be bundled" }
+          if (!(Test-Path AndroidDeskTouch)) { throw "Android project must be present" }
+          if (Test-Path preview/DeskTouchVision-android-preview.apk) { throw "Android APK must not be bundled inside Windows package" }
+          if (Test-Path preview/DeviceSharing/AndroidDeskTouch) { throw "Android binaries must not be bundled inside Windows package" }
           $form=Get-Content DeskTouchVision/DeviceSharing/DisplaySettingsForm.cs -Raw
-          if ($form -match 'Get Android app|Android HID|Bluetooth check') { throw "Obsolete Android controls present" }
+          if ($form -match 'Android HID|Bluetooth check') { throw "Unused Bluetooth HID controls present" }
+          if (!($form -match 'Get Android app')) { throw "Get Android app action must be present" }
       - name: Record Windows test summary
         shell: pwsh
         run: |

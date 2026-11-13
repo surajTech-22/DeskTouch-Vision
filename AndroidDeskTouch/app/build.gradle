@@ -1,0 +1,43 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.desktouch.vision'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.desktouch.vision'
+        minSdk 26
+        targetSdk 35
+        versionCode 26
+        versionName '0.3.25'
+        testInstrumentationRunner 'android.test.InstrumentationTestRunner'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    // A stable signing key must be supplied via GitHub Actions secrets or a
+    // private build environment. Never publish an APK signing key in the repo.
+    def store=System.getenv('DESKTOUCH_SIGN_STORE_FILE')
+    def password=System.getenv('DESKTOUCH_SIGN_STORE_PASSWORD')
+    def alias=System.getenv('DESKTOUCH_SIGN_KEY_ALIAS')
+    def signingKeyPass=System.getenv('DESKTOUCH_SIGN_KEY_PASSWORD')
+    def stableSigned=store && password && alias && signingKeyPass
+    if(stableSigned) {
+        signingConfigs {
+            stableRelease {
+                storeFile file(store)
+                storeType 'PKCS12'
+                storePassword password
+                keyAlias alias
+                keyPassword signingKeyPass
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if(stableSigned) signingConfig signingConfigs.stableRelease
+        }
+    }
+    testOptions { unitTests.returnDefaultValues = true }
+}
+dependencies { implementation 'androidx.core:core:1.15.0'; testImplementation 'junit:junit:4.13.2'; testImplementation 'org.json:json:20240303' }

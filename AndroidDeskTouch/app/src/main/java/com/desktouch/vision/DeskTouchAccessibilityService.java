@@ -1,0 +1,761 @@
+package com.desktouch.vision;
+
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.GestureDescription;
+import android.accessibilityservice.InputMethod;
+import android.text.InputType;
+import android.view.inputmethod.EditorInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+import android.os.Build;
+import android.content.Context;
+import android.graphics.Path;
+import android.graphics.PixelFormat;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.InputDevice;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
+import android.view.Choreographer;
+import android.graphics.Rect;
+import android.view.View;
+import android.view.WindowManager;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+import java.util.ArrayDeque;
+import java.util.List;
+
+/**
+ * Opt-in Windows -> Android control through Android's public Accessibility API.
+ * A TLS connection alone NEVER enables remote gestures or reading editable text.
+ * No root, hidden system input injection, or bypass of Android user approval.
+ * Remote control is limited to gestures and non-password editable fields.
+ */
+public final class DeskTouchAccessibilityService extends AccessibilityService {
+    private static volatile DeskTouchAccessibilityService instance;
+    private static final String PREFS="desktouch_android_control";
+    private static final String ALLOWED="user_allowed_windows_control";
+    private static final String PAUSED_FOR_BANKING="paused_for_banking";
+    private final Handler ui=new Handler(Looper.getMainLooper());
+    private WindowManager windows;
+    private View cursor;
+    private WindowManager.LayoutParams compactPointerParams;
+    private volatile int displayWidth=1,displayHeight=1;
+    private volatile int x,y;
+    private volatile int pendingX,pendingY;
+    private volatile long pendingArrivalNanos;
+    private final java.util.concurrent.atomic.AtomicInteger coalescedMoves=
+        new java.util.concurrent.atomic.AtomicInteger();
+    private long lastPerfReportNanos;
+    private int renderFrames,maxLocalFrameDelayMs;
+    private volatile Runnable pendingApplied;
+    private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
+        new java.util.concurrent.atomic.AtomicBoolean();
+    private final Choreographer.FrameCallback pointerFrame = ignored -> flushPointer();
+    private int lastOverlayX=Integer.MIN_VALUE,lastOverlayY=Integer.MIN_VALUE;
+    private int downX,downY;
+    private boolean held,shift,control,alt,remoteGesture;
+    private boolean gestureRunning;
+    private final ArrayDeque<GestureCommand> pendingGestures=new ArrayDeque<>();
+    private static final class GestureCommand {
+        final int sx,sy,ex,ey;
+        final long duration;
+        GestureCommand(int sx,int sy,int ex,int ey,long duration){
+            this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;this.duration=duration;
+        }
+    }
+    private final class PointerSurface extends View {
+        private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ring=new Paint(Paint.ANTI_ALIAS_FLAG);
+        PointerSurface(Context context){
+            super(context);
+            setWillNotDraw(false);
+            setKeepScreenOn(true); // Active approved remote pointer window only.
+            fill.setColor(0xff37b6f6);
+            ring.setColor(0xffffffff);
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(dp(2));
+        }
+        @Override protected void onDraw(Canvas canvas){
+            super.onDraw(canvas);
+            int px=lastOverlayX,py=lastOverlayY;
+            if(px==Integer.MIN_VALUE||py==Integer.MIN_VALUE)return;
+            float radius=dp(9);
+            canvas.drawCircle(px,py,radius,fill);
+            canvas.drawCircle(px,py,radius,ring);
+        }
+    }
+
+    private volatile boolean remoteActive;
+
+    static boolean allowed(Context context){
+        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+            .getBoolean(ALLOWED,false);
+    }
+    static boolean isPausedForBanking(Context context){
+        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+            .getBoolean(PAUSED_FOR_BANKING,false);
+    }
+    static void setAllowed(Context context,boolean allowed){
+        // Persist the user's app-level approval synchronously BEFORE the
+        // package installer can kill this process. In-place signed upgrades
+        // retain these preferences; an uninstall/data-clear cannot.
+        android.content.SharedPreferences.Editor editor=
+            context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+                .putBoolean(ALLOWED,allowed);
+        if(allowed)editor.putBoolean(PAUSED_FOR_BANKING,false);
+        if(!editor.commit())
+            throw new IllegalStateException("Cannot save Android control preference");
+        if(!allowed){
+            DeskTouchAccessibilityService service=instance;
+            if(service!=null){
+                service.remoteActive=false;
+                service.ui.post(service::removePointer);
+            }
+            DeskTouchRuntime.remoteNativeTouch();
+        }
+    }
+    static void pauseForBanking(Context context){
+        if(!context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+            .putBoolean(ALLOWED,false)
+            .putBoolean(PAUSED_FOR_BANKING,true)
+            .commit())
+            throw new IllegalStateException("Cannot save banking pause preference");
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null){
+            service.remoteActive=false;
+            service.ui.post(()->{
+                service.removePointer();
+                service.disableSelf();
+            });
+        }
+        DeskTouchRuntime.remoteNativeTouch();
+        DeskTouchRuntime.accessibilityPermissionChanged();
+    }
+    static boolean ready(Context context){
+        return instance!=null && allowed(context);
+    }
+    @Override public void onServiceConnected(){
+        super.onServiceConnected();
+        instance=this;
+        if(isPausedForBanking(this))
+            getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+                .putBoolean(PAUSED_FOR_BANKING,false).apply();
+        windows=(WindowManager)getSystemService(WINDOW_SERVICE);
+        refreshDisplayGeometry();
+        DeskTouchRuntime.accessibilityPermissionChanged();
+    }
+    private void refreshDisplayGeometry(){
+        android.graphics.Point size=PhoneScreenGeometry.read(this);
+        displayWidth=Math.max(1,size.x);displayHeight=Math.max(1,size.y);
+    }
+    @Override public void onConfigurationChanged(android.content.res.Configuration config){
+        super.onConfigurationChanged(config);
+        removePointer(); // Old overlay size is wrong after rotation.
+        refreshDisplayGeometry();
+        DeskTouchRuntime.publishPhoneGeometry();
+    }
+    @Override public void onAccessibilityEvent(AccessibilityEvent event){
+        // Touch from the phone user takes priority over remote input.
+        // Events generated by our own approved gestures are ignored.
+        if(event!=null&&event.getEventType()==
+            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START && !remoteGesture){
+            DeskTouchRuntime.remoteNativeTouch();
+            removePointer();
+        }
+    }
+    @Override public void onInterrupt(){
+        DeskTouchRuntime.remoteNativeTouch();
+        removePointer();
+    }
+    @Override public void onDestroy(){
+        if(instance==this)instance=null;
+        DeskTouchRuntime.accessibilityPermissionChanged();
+        DeskTouchRuntime.remoteNativeTouch();
+        removePointer();
+        super.onDestroy();
+    }
+    private int dp(float px){return Math.round(px*getResources().getDisplayMetrics().density);}
+    private void showPointer(int requestedX,int requestedY){
+        if(!ready(this))return;
+        // Read the physical-display geometry once per rotation, not on every
+        // mouse frame. This matches the topology advertised by TCP hello.
+        int screenWidth=displayWidth,screenHeight=displayHeight;
+        x=Math.max(0,Math.min(screenWidth-1,requestedX));
+        y=Math.max(0,Math.min(screenHeight-1,requestedY));
+        if(cursor==null){
+            // First use the existing single full-screen NON-TOUCHABLE
+            // accessibility overlay: no expensive relayout on each motion.
+            PointerSurface pointer=new PointerSurface(this);
+            WindowManager.LayoutParams params=new WindowManager.LayoutParams(
+                screenWidth,
+                screenHeight,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                PixelFormat.TRANSLUCENT);
+            params.gravity=Gravity.TOP|Gravity.LEFT;
+            params.x=0;params.y=0;
+            // Do not silently shrink the overlay to the app's content area
+            // when the status and navigation bars occupy physical pixels.
+            if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
+            try{
+                windows.addView(pointer,params);
+                cursor=pointer;
+                compactPointerParams=null;
+                lastOverlayX=x;lastOverlayY=y;
+            }catch(RuntimeException fullOverlayRejected){
+                // A Xiaomi/OEM window policy may reject a full-screen
+                // accessibility overlay even while the service is active.
+                // Retry with a compact, non-touchable native accessibility
+                // overlay inside THIS app; never request a separate app or
+                // silent SYSTEM_ALERT_WINDOW permission.
+                int width=Math.min(screenWidth,dp(96));
+                int height=Math.min(screenHeight,dp(96));
+                WindowManager.LayoutParams compact=new WindowManager.LayoutParams(
+                    width,height,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                    PixelFormat.TRANSLUCENT);
+                compact.gravity=Gravity.TOP|Gravity.LEFT;
+                if(Build.VERSION.SDK_INT>=30)compact.setFitInsetsTypes(0);
+                compact.x=PointerOverlayGeometry.origin(x,screenWidth,width);
+                compact.y=PointerOverlayGeometry.origin(y,screenHeight,height);
+                PointerSurface smaller=new PointerSurface(this);
+                try{
+                    windows.addView(smaller,compact);
+                    cursor=smaller;
+                    compactPointerParams=compact;
+                    lastOverlayX=x-compact.x;
+                    lastOverlayY=y-compact.y;
+                    Log.w("DeskTouchPointer","Full-screen pointer overlay unavailable; compact accessibility overlay active");
+                }catch(RuntimeException compactRejected){
+                    cursor=null;
+                    compactPointerParams=null;
+                    lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+                    // Do not leave Windows waiting for a fake cursor-applied
+                    // acknowledgement. Revoke the lease over the authenticated
+                    // session so its keyboard/mouse remain local.
+                    Log.e("DeskTouchPointer",
+                        "Android rejected both pointer overlays; remote control revoked");
+                    DeskTouchRuntime.pointerOverlayUnavailable();
+                    return;
+                }
+            }
+        }
+        if(cursor==null)return;
+        if(compactPointerParams!=null){
+            WindowManager.LayoutParams compact=compactPointerParams;
+            int left=PointerOverlayGeometry.followOrigin(x,compact.x,
+                screenWidth,compact.width,compact.width/6);
+            int top=PointerOverlayGeometry.followOrigin(y,compact.y,
+                screenHeight,compact.height,compact.height/6);
+            if(compact.x!=left || compact.y!=top){
+                compact.x=left;compact.y=top;
+                try{windows.updateViewLayout(cursor,compact);}
+                catch(RuntimeException revoked){
+                    Log.e("DeskTouchPointer",
+                        "Compact pointer overlay update rejected; remote control revoked");
+                    DeskTouchRuntime.pointerOverlayUnavailable();
+                    removePointer();
+                    return;
+                }
+            }
+            int localX=x-left,localY=y-top;
+            if(localX!=lastOverlayX||localY!=lastOverlayY){
+                lastOverlayX=localX;lastOverlayY=localY;
+                cursor.invalidate();
+            }
+            return;
+        }
+        if(x!=lastOverlayX || y!=lastOverlayY){
+            int oldX=lastOverlayX,oldY=lastOverlayY;
+            lastOverlayX=x;lastOverlayY=y;
+            int halo=dp(14);
+            int left=Math.max(0,Math.min(oldX,x)-halo);
+            int top=Math.max(0,Math.min(oldY,y)-halo);
+            int right=Math.min(cursor.getWidth(),Math.max(oldX,x)+halo);
+            int bottom=Math.min(cursor.getHeight(),Math.max(oldY,y)+halo);
+            if(right>left&&bottom>top)
+                cursor.invalidate(left,top,right,bottom);
+            else cursor.invalidate();
+        }
+    }
+    private void removePointer(){
+        held=false;
+        remoteActive=false;
+        pendingApplied=null;
+        Choreographer.getInstance().removeFrameCallback(pointerFrame);
+        moveScheduled.set(false);
+        lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+        pendingGestures.clear();
+        gestureRunning=false;
+        if(cursor!=null&&windows!=null){
+            try{windows.removeView(cursor);}catch(RuntimeException ignored){}
+        }
+        cursor=null;
+        compactPointerParams=null;
+    }
+    static boolean pointer(int px,int py,Runnable applied){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null||!ready(service))return false;
+        service.remoteActive=true;
+        // Retain the newest position on fast mice/touchpads instead of
+        // filling Android's UI queue with hundreds of obsolete moves.
+        service.pendingX=px;
+        service.pendingY=py;
+        service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
+        if(applied!=null)service.pendingApplied=applied;
+        if(service.moveScheduled.compareAndSet(false,true))
+            service.ui.post(()->Choreographer.getInstance()
+                .postFrameCallback(service.pointerFrame));
+        else service.coalescedMoves.incrementAndGet();
+        return true;
+    }
+    private void flushPointer(){
+        int px=pendingX,py=pendingY;
+        long arrival=pendingArrivalNanos;
+        long now=SystemClock.elapsedRealtimeNanos();
+        if(remoteActive&&ready(this))showPointer(px,py);
+        if(remoteActive && arrival>0 && now>=arrival){
+            int ageMs=(int)Math.min(5000,(now-arrival)/1_000_000L);
+            maxLocalFrameDelayMs=Math.max(maxLocalFrameDelayMs,ageMs);
+            renderFrames++;
+            if(lastPerfReportNanos==0)lastPerfReportNanos=now;
+            if(now-lastPerfReportNanos>=5_000_000_000L){
+                // No coordinates, text, keys, device identities or IPs.
+                Log.i("DeskTouchTiming","frames="+renderFrames+
+                    " newest_moves_coalesced="+coalescedMoves.getAndSet(0)+
+                    " worst_local_ui_delay_ms="+maxLocalFrameDelayMs);
+                lastPerfReportNanos=now;
+                maxLocalFrameDelayMs=renderFrames=0;
+            }
+        }
+        Runnable ack=pendingApplied;
+        pendingApplied=null;
+        moveScheduled.set(false);
+        if(remoteActive&&cursor!=null&&ack!=null&&ready(this))ack.run();
+        if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
+            moveScheduled.compareAndSet(false,true))
+            Choreographer.getInstance().postFrameCallback(pointerFrame);
+    }
+    private void flushPointerBeforeAction(){
+        // A click or scroll must operate at the most recently received
+        // pointer position, never the previous animation frame.
+        if(remoteActive && (pendingX!=x || pendingY!=y || cursor==null))
+            showPointer(pendingX,pendingY);
+        Runnable ack=pendingApplied;
+        pendingApplied=null;
+        if(cursor!=null && ack!=null && remoteActive)ack.run();
+    }
+    static void endRemote(){
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null)service.ui.post(service::removePointer);
+    }
+    static long gestureDurationMs(int dx,int dy){
+        long distance=Math.round(Math.hypot(dx,dy));
+        if(distance<=12)return 45L;
+        return Math.min(420L,Math.max(90L,distance/2L));
+    }
+    static void mouseButton(int button,boolean pressed){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null||!ready(service))return;
+        if(button!=1 && button!=2 && button!=3)return;
+        service.ui.post(()->{
+            if(!service.remoteActive || !ready(service))return;
+            service.flushPointerBeforeAction();
+            if(button==2){
+                if(!pressed)service.performGlobalAction(GLOBAL_ACTION_BACK);
+                return;
+            }
+            if(button==3){
+                if(!pressed)service.performGlobalAction(GLOBAL_ACTION_HOME);
+                return;
+            }
+            if(pressed){
+                service.held=true;service.downX=service.x;service.downY=service.y;
+            }else if(service.held){
+                service.held=false;
+                // Use exact coordinates for taps and distance-scaled durations
+                // for swipes/drags so short drags never teleport across lists.
+                long duration=gestureDurationMs(service.x-service.downX,service.y-service.downY);
+                service.enqueueGesture(service.downX,service.downY,
+                    service.x,service.y,duration);
+            }
+        });
+    }
+    static void wheel(int amount,boolean horizontal){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null||!ready(service)||amount==0)return;
+        service.ui.post(()->{
+            if(!service.remoteActive || !ready(service))return;
+            service.flushPointerBeforeAction();
+            // Native accessibility scroll actions are dispatched directly to
+            // the scrollable UI node under the cursor. This avoids an
+            // unnecessary 120ms gesture when the target exposes scrolling.
+            if(!horizontal && service.performNativeScroll(amount))return;
+            int distance=Math.max(55,Math.min(210,Math.abs(amount)));
+            int sx=service.x,sy=service.y;
+            int ex=horizontal?sx+(amount>0?-distance:distance):sx;
+            int ey=horizontal?sy:sy+(amount>0?-distance:distance);
+            service.enqueueGesture(sx,sy,ex,ey,85);
+        });
+    }
+
+    private boolean performNativeClick(){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root==null)return false;
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        AccessibilityNodeInfo target=null,editor=null;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=96){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(x,y))continue;
+            if(node.isEditable() && node.isEnabled())editor=node;
+            if(node.isClickable() && node.isEnabled())target=node;
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        if(editor!=null){
+            boolean clicked=editor.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            boolean focused=editor.isFocused() ||
+                editor.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            if(clicked||focused)return true;
+        }
+        if(target==null)return false;
+        // Some WebView editors receive a click but do not start the input
+        // connection until they are also marked as focused.
+        if(target.isEditable())
+            target.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+        return target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+    }
+
+    private boolean performNativeScroll(int amount){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root==null)return false;
+        // Bound traversal so a huge UI tree cannot stall the main thread.
+        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
+        nodes.push(root);
+        AccessibilityNodeInfo target=null;
+        int visited=0;
+        Rect bounds=new Rect();
+        while(!nodes.isEmpty() && ++visited<=96){
+            AccessibilityNodeInfo node=nodes.pop();
+            node.getBoundsInScreen(bounds);
+            if(!bounds.contains(x,y))continue;
+            if(node.isScrollable())target=node;
+            for(int i=node.getChildCount()-1;i>=0;i--){
+                AccessibilityNodeInfo child=node.getChild(i);
+                if(child!=null)nodes.push(child);
+            }
+        }
+        if(target==null)return false;
+        int action=amount>0?AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD:
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
+        return target.performAction(action);
+    }
+
+    private void enqueueGesture(int sx,int sy,int ex,int ey,long duration){
+        if(!remoteActive || !ready(this))return;
+        // dispatchGesture cancels an already running gesture. Serialize
+        // commands instead of repeatedly interrupting taps and swipes.
+        if(pendingGestures.size()>=6)pendingGestures.pollFirst();
+        pendingGestures.addLast(new GestureCommand(sx,sy,ex,ey,duration));
+        pumpGestures();
+    }
+    private void pumpGestures(){
+        if(gestureRunning || !remoteActive || !ready(this))return;
+        GestureCommand command=pendingGestures.pollFirst();
+        if(command==null){remoteGesture=false;return;}
+        Path path=new Path();
+        path.moveTo(command.sx,command.sy);
+        if(command.sx!=command.ex||command.sy!=command.ey)
+            path.lineTo(command.ex,command.ey);
+        GestureDescription.StrokeDescription stroke=
+            new GestureDescription.StrokeDescription(path,0,command.duration);
+        GestureDescription gesture=new GestureDescription.Builder().addStroke(stroke).build();
+        remoteGesture=gestureRunning=true;
+        boolean started=dispatchGesture(gesture,new GestureResultCallback(){
+            @Override public void onCompleted(GestureDescription completed){
+                finishGesture();
+            }
+            @Override public void onCancelled(GestureDescription cancelled){
+                finishGesture();
+            }
+        },ui);
+        if(!started){
+            // Some OEMs reject gestures; fall back to node-click only then.
+            if(command.sx==command.ex && command.sy==command.ey)
+                performNativeClick();
+            finishGesture();
+        }
+    }
+    private void finishGesture(){
+        gestureRunning=false;
+        if(pendingGestures.isEmpty())remoteGesture=false;
+        pumpGestures();
+    }
+    static boolean safeEditorType(int inputType){
+        int kind=inputType & InputType.TYPE_MASK_CLASS;
+        int variant=inputType & InputType.TYPE_MASK_VARIATION;
+        if(kind==InputType.TYPE_CLASS_TEXT){
+            return variant!=InputType.TYPE_TEXT_VARIATION_PASSWORD &&
+                variant!=InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD &&
+                variant!=InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;
+        }
+        return kind!=InputType.TYPE_NULL &&
+            !(kind==InputType.TYPE_CLASS_NUMBER &&
+                variant==InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+    }
+
+    /**
+     * Chrome, WebView, and SearchView often report TYPE_NULL on their active
+     * AccessibilityInputConnection even when they are ordinary non-password boxes.
+     * Keep safeEditorType strict while allowing non-password TYPE_NULL connections.
+     */
+    static boolean allowsDirectInputConnection(boolean nodeIsPassword,int inputType){
+        if(nodeIsPassword)return false;
+        int kind=inputType & InputType.TYPE_MASK_CLASS;
+        if(kind==InputType.TYPE_NULL)return true;
+        return safeEditorType(inputType);
+    }
+
+    static boolean isSupportedShortcutKey(int vk,boolean ctrl,boolean alt,boolean shift){
+        return ctrl && !alt && !shift &&
+            (vk==0x41 || vk==0x43 || vk==0x56 || vk==0x58);
+    }
+
+    private AccessibilityNodeInfo focusedEditor(){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root!=null){
+            AccessibilityNodeInfo node=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if(node!=null)return node;
+        }
+        // WebView/editors may expose focused input under a separate
+        // interactive window, not under getRootInActiveWindow().
+        List<AccessibilityWindowInfo> windows=getWindows();
+        if(windows==null)return null;
+        for(AccessibilityWindowInfo window:windows){
+            if(window==null)continue;
+            AccessibilityNodeInfo tree=window.getRoot();
+            if(tree==null)continue;
+            AccessibilityNodeInfo node=tree.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+            if(node!=null)return node;
+        }
+        return null;
+    }
+
+    private InputMethod.AccessibilityInputConnection nativeEditor(
+        AccessibilityNodeInfo focusedField)
+    {
+        if(Build.VERSION.SDK_INT<33 ||
+            (focusedField!=null && focusedField.isPassword()))
+            return null;
+        try {
+            InputMethod method=getInputMethod();
+            if(method==null)return null;
+            InputMethod.AccessibilityInputConnection connection=
+                method.getCurrentInputConnection();
+            if(connection==null)return null;
+            EditorInfo info=method.getCurrentInputEditorInfo();
+            boolean nodePassword=focusedField!=null && focusedField.isPassword();
+            if(info!=null)
+                return allowsDirectInputConnection(nodePassword,info.inputType)
+                    ? connection : null;
+            return focusedField!=null && focusedField.isEditable() && !nodePassword
+                ? connection : null;
+        }catch(RuntimeException unavailable){return null;}
+    }
+
+    private boolean sendNativeKey(int vk,AccessibilityNodeInfo field){
+        if(Build.VERSION.SDK_INT<33)return false;
+        InputMethod.AccessibilityInputConnection editor=nativeEditor(field);
+        int keyCode=RemoteImeKeys.androidKeyCode(vk);
+        if(editor==null || keyCode==KeyEvent.KEYCODE_UNKNOWN)return false;
+        try{
+            long now=SystemClock.uptimeMillis();
+            KeyEvent down=new KeyEvent(now,now,KeyEvent.ACTION_DOWN,keyCode,0,0,
+                KeyCharacterMap.VIRTUAL_KEYBOARD,0,KeyEvent.FLAG_SOFT_KEYBOARD,
+                InputDevice.SOURCE_KEYBOARD);
+            KeyEvent up=KeyEvent.changeAction(down,KeyEvent.ACTION_UP);
+            editor.sendKeyEvent(down);
+            editor.sendKeyEvent(up);
+            return true;
+        }catch(RuntimeException unavailable){return false;}
+    }
+
+    private boolean performShortcutAction(int vk,AccessibilityNodeInfo field){
+        if(!isSupportedShortcutKey(vk,control,alt,shift))return false;
+        if(field!=null && field.isPassword())return false;
+        int menuId=vk==0x41?android.R.id.selectAll:
+            vk==0x43?android.R.id.copy:
+            vk==0x58?android.R.id.cut:android.R.id.paste;
+        if(Build.VERSION.SDK_INT>=33){
+            InputMethod.AccessibilityInputConnection editor=nativeEditor(field);
+            if(editor!=null){
+                try{
+                    editor.performContextMenuAction(menuId);
+                    return true;
+                }catch(RuntimeException ignored){}
+            }
+        }
+        if(field==null)return false;
+        if(vk==0x41){
+            CharSequence text=field.getText();
+            int len=text==null?0:text.length();
+            Bundle sel=new Bundle();
+            sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,0);
+            sel.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,len);
+            return field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,sel);
+        }
+        int action=vk==0x43?AccessibilityNodeInfo.ACTION_COPY:
+            vk==0x58?AccessibilityNodeInfo.ACTION_CUT:
+            AccessibilityNodeInfo.ACTION_PASTE;
+        return field.performAction(action);
+    }
+
+    private boolean commitNativeText(String incoming,
+        AccessibilityNodeInfo focusedField)
+    {
+        InputMethod.AccessibilityInputConnection editor=nativeEditor(focusedField);
+        if(editor==null)return false;
+        try{
+            editor.commitText(incoming,1,null);
+            return true;
+        }catch(RuntimeException unavailable){
+            return false; // fallback to ACTION_SET_TEXT where available
+        }
+    }
+
+    private boolean nativeDelete(int vk,AccessibilityNodeInfo field){
+        if(vk!=8 && vk!=46)return false;
+        InputMethod.AccessibilityInputConnection editor=nativeEditor(field);
+        if(editor==null)return false;
+        try{
+            editor.deleteSurroundingText(vk==8?1:0,vk==46?1:0);
+            return true;
+        }catch(RuntimeException unavailable){return false;}
+    }
+
+    static void text(String incoming,Runnable rejected){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null||!ready(service)||
+            incoming==null||incoming.length()==0||incoming.length()>512){
+            if(rejected!=null)rejected.run();
+            return;
+        }
+        service.ui.post(()->{
+            if(!service.remoteActive || !ready(service)){
+                if(rejected!=null)rejected.run();
+                return;
+            }
+            AccessibilityNodeInfo field=service.focusedEditor();
+            if(service.commitNativeText(incoming,field) ||
+                DeskTouchInputMethod.commitRemoteText(incoming))return;
+            if(field==null||!field.isEditable()||field.isPassword()){
+                if(rejected!=null)rejected.run();
+                return;
+            }
+            CharSequence original=field.getText();
+            String content=original==null?"":original.toString();
+            int start=field.getTextSelectionStart();
+            int end=field.getTextSelectionEnd();
+            if(start<0)start=content.length();
+            if(end<0)end=start;
+            start=Math.max(0,Math.min(content.length(),start));
+            end=Math.max(start,Math.min(content.length(),end));
+            String value=content.substring(0,start)+incoming+content.substring(end);
+            Bundle args=new Bundle();
+            args.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,value);
+            if(field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,args)){
+                Bundle selection=new Bundle();
+                int caret=start+incoming.length();
+                selection.putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,caret);
+                selection.putInt(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,caret);
+                field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,selection);
+            }else if(rejected!=null)rejected.run();
+        });
+    }
+
+    static void key(int vk,boolean pressed,Runnable rejected){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || !ready(service)){
+            if(pressed && rejected!=null)rejected.run();
+            return;
+        }
+        service.ui.post(()->{
+            if(!ready(service)||!service.remoteActive ||
+                !service.applyKey(vk,pressed)){
+                if(pressed && rejected!=null)rejected.run();
+            }
+        });
+    }
+    private boolean applyKey(int vk,boolean pressed){
+        if(vk==16||vk==160||vk==161){shift=pressed;return true;}
+        if(vk==17||vk==162||vk==163){control=pressed;return true;}
+        if(vk==18||vk==164||vk==165){alt=pressed;return true;}
+        if(!pressed)return true;
+        AccessibilityNodeInfo field=focusedEditor();
+        if(control||alt){
+            return performShortcutAction(vk,field);
+        }
+        if(vk==27)return performGlobalAction(GLOBAL_ACTION_BACK);
+        if(vk==0x24 && !isTextFieldFocused())
+            return performGlobalAction(GLOBAL_ACTION_HOME);
+        // Send Enter and Tab as real key events first so search bars, address bars,
+        // and dialogs submit or advance focus instead of inserting raw newlines.
+        if((vk==13||vk==9) && (sendNativeKey(vk,field) ||
+            DeskTouchInputMethod.sendRemoteKey(vk)))
+            return true;
+        String printable=WindowsKeyText.printable(vk,shift);
+        if(printable!=null && (commitNativeText(printable,field) ||
+            DeskTouchInputMethod.commitRemoteText(printable)))return true;
+        if(sendNativeKey(vk,field) || nativeDelete(vk,field) ||
+            DeskTouchInputMethod.sendRemoteKey(vk))
+            return true;
+        if(field==null || !field.isEditable() || field.isPassword())
+            return false;
+        CharSequence value=field.getText();
+        String original=value==null?"":value.toString();
+        WindowsKeyText.Edit change=WindowsKeyText.apply(original,
+            field.getTextSelectionStart()<0?original.length():field.getTextSelectionStart(),
+            field.getTextSelectionEnd()<0?original.length():field.getTextSelectionEnd(),
+            vk,shift);
+        if(change==null)return false;
+        if(!change.text.equals(original)){
+            Bundle update=new Bundle();
+            update.putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,change.text);
+            if(!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,update))
+                return false;
+        }
+        Bundle caret=new Bundle();
+        caret.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT,change.cursor);
+        caret.putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,change.cursor);
+        field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,caret);
+        return true;
+    }
+    private boolean isTextFieldFocused(){
+        AccessibilityNodeInfo root=getRootInActiveWindow();
+        if(root==null)return false;
+        AccessibilityNodeInfo focused=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+        return focused!=null&&focused.isEditable();
+    }
+}

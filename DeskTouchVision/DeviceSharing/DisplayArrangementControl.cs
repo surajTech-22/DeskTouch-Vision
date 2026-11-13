@@ -11,6 +11,7 @@ namespace DeskTouch.DeviceShare;
 internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
     int ScreenCount,bool SupportsInput,string? StableIdentity=null)
 {
+    internal bool IsAndroid => Platform=="Android";
     // Prefer a persistent authenticated device identity. The hub roster only
     // exposes a connection-scoped route ID, so names are a UI fallback until
     // the peer advertises its stable ID (never IP based).
@@ -232,8 +233,12 @@ internal sealed class DisplayArrangementControl : Control
     {
         return online.Where(p=>p.TargetId!=selectedTargetId)
             .GroupBy(p=>p.TargetId).Select(g=>g.First())
-            // Input-capable Windows computers remain reachable first.
-            .OrderBy(p=>p.SupportsInput?0:1)
+            .OrderBy(p=>p.IsAndroid?1:0)
+            // Keep input-capable phone tiles adjacent to the linked Windows
+            // displays. A view-only Android device still appears in the
+            // diagram but must not stand between the PC and a controllable
+            // phone, making that phone's outer edge unreachable.
+            .ThenBy(p=>p.SupportsInput?0:1)
             .ThenBy(p=>p.Name,StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -462,8 +467,8 @@ internal sealed class DisplayArrangementControl : Control
             DrawPlaceholder(g, _placeholderHit);
         }
 
-        // Extra Windows PCs use the same monitor tile treatment as the hub,
-        // without introducing another dock, panel or virtual display.
+        // Extra Windows PCs and Android phones use the exact same screen
+        // tiles/labels as native and selected displays, never a footer/deck.
         foreach(var extra in extras)
         {
             var group = Fit(extra.World,full,scale,offsetX,offsetY);
@@ -477,7 +482,8 @@ internal sealed class DisplayArrangementControl : Control
             {
                 var screen=new RectangleF(group.Left+(screenWidth+gap)*index,
                     group.Top,screenWidth,group.Height);
-                DrawScreen(g,screen,extra.Device.Name,index+1,false,false);
+                DrawScreen(g,screen,extra.Device.Name,index+1,false,false,
+                    extra.Device.IsAndroid?"Android":null);
             }
             _environmentHits.Add((group,extra.Device.TargetId));
         }
@@ -491,7 +497,7 @@ internal sealed class DisplayArrangementControl : Control
         // Connection tiles represent REACHABLE screen neighbors, not distant
         // floating thumbnails. The previous 90+ world-pixel gap could exceed
         // SpatialNeighbor's (scale-dependent) allowed crossing distance on
-        // wide Displays windows or mixed-resolution multi-monitor systems.
+        // wide Displays windows, especially for narrow portrait phones.
         // Use a small stable world-space seam so every default connected
         // screen can be reached without the user manually dragging it first.
         int connectedGap=Math.Clamp(mainScreenArea.Height/140,8,24);
@@ -499,8 +505,11 @@ internal sealed class DisplayArrangementControl : Control
         foreach(var device in members)
         {
             int count=Math.Clamp(device.ScreenCount,1,8);
-            int height=Math.Max(380,(int)(mainScreenArea.Height*.79));
-            int width=Math.Max(420,(int)(height*.95*count));
+            int height=Math.Max(380,
+                (int)(mainScreenArea.Height * (device.IsAndroid ? 0.88 : 0.79)));
+            int width=device.IsAndroid
+                ? Math.Max(300,(int)(height*.64))
+                : Math.Max(420,(int)(height*.95*count));
             var preview=new Rectangle(nextX,
                 mainScreenArea.Top+(mainScreenArea.Height-height)/2,width,height);
             result.Add((device,preview));
@@ -521,7 +530,7 @@ internal sealed class DisplayArrangementControl : Control
     }
 
     private static void DrawScreen(Graphics g, RectangleF rect, string deviceName,
-        int displayNumber, bool primary, bool local)
+        int displayNumber, bool primary, bool local, string? platform = null)
     {
         if (rect.Width < 5 || rect.Height < 5) return;
         using var path = Rounded(rect, 9);
@@ -533,7 +542,9 @@ internal sealed class DisplayArrangementControl : Control
         g.FillPath(fill, path);
         g.DrawPath(outline, path);
         if (rect.Width < 38 || rect.Height < 28) return;
-        float labelHeight = Math.Min(27, Math.Max(13, rect.Height * .23f));
+        float labelHeight = platform=="Android"
+            ? Math.Min(52,Math.Max(26,rect.Height*.36f))
+            : Math.Min(27, Math.Max(13, rect.Height * .23f));
         var title = new RectangleF(rect.Left + 4, rect.Top + 3,
             Math.Max(1, rect.Width - 8), labelHeight);
         using var nameFont = new Font("Segoe UI Semibold",
@@ -543,8 +554,10 @@ internal sealed class DisplayArrangementControl : Control
         {
             Alignment = StringAlignment.Center,
             LineAlignment = StringAlignment.Near,
-            Trimming = StringTrimming.EllipsisCharacter,
-            FormatFlags = StringFormatFlags.NoWrap
+            Trimming = platform=="Android"
+                ? StringTrimming.EllipsisWord : StringTrimming.EllipsisCharacter,
+            FormatFlags = platform=="Android"
+                ? (StringFormatFlags)0 : StringFormatFlags.NoWrap
         };
         g.DrawString(deviceName, nameFont, Brushes.White, title, format);
         var numberTile = new RectangleF(rect.Left + 4,
@@ -552,7 +565,8 @@ internal sealed class DisplayArrangementControl : Control
             Math.Max(1, rect.Width - 8),
             Math.Min(15, Math.Max(1, rect.Height - labelHeight - 7)));
         if (numberTile.Height >= 9)
-            DrawCenter(g, $"Display {displayNumber}",
+            DrawCenter(g, platform == "Android"
+                ? $"Android · {displayNumber}" : $"Display {displayNumber}",
                 numberTile, Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
     }
 

@@ -121,7 +121,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
     internal static bool AllowsForwardInput(ConnectedPeer peer) =>
-        peer.Platform == "Windows";
+        peer.Platform != "Android" || peer.SupportsForwardInput;
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
     internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
@@ -189,6 +189,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             catch(Exception) { /* peer may disconnect while receiving layout */ }
     }
 
+
+    internal static bool AllowsAndroidCapability(ConnectedPeer source, Packet packet) =>
+        source.Platform=="Android" && packet.Type=="android-capability" &&
+        packet.A is 0 or 1;
 
     internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
         bool differentPeers, int claim) =>
@@ -619,13 +623,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // it to authenticate the source or grant remote keyboard authority.
         string? hint = hello.Fingerprint is { Length:64 } id &&
             id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
-        // Only Windows desktop peers may enter a DeskTouch environment.
-        // Reject previous Android clients BEFORE registering any input lease.
-        if (!string.IsNullOrWhiteSpace(hello.Platform) &&
-            !string.Equals(hello.Platform, "Windows", StringComparison.Ordinal))
-            throw new InvalidDataException("Only Windows computers are supported.");
+        string platform = string.Equals(hello.Platform, "Android",
+            StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
         return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
-            hello.ReverseInputSupported ?? true, hint, "Windows", true);
+            hello.ReverseInputSupported ?? true, hint, platform,
+            platform != "Android" || hello.ForwardInputSupported == true);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -684,7 +686,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             bool first;
             lock(_authorityGate) first=_selected==null;
             if(first) Select(session);
-            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" Windows computers).");
+            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
             // The server advertises its CURRENT system name after successful
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
@@ -733,6 +735,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         PeerPlacementChanged?.Invoke(edge);
                     continue;
                 }
+                if(p.Type=="reverse-key-unavailable")
+                {
+                    RelayLease? relay;
+                    lock(_authorityGate)
+                    {
+                        _relayByTarget.TryGetValue(session.Id,out relay);
+                        if(relay!=null && relay.Claim!=p.A)relay=null;
+                    }
+                    if(relay!=null)
+                    {
+                        try { await SendToAsync(relay.Source,
+                            new Packet("android-keyboard-unavailable"),token); }
+                        catch(Exception){}
+                    }
+                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
+                        _status("Android keyboard input unavailable: tap an editable field on the phone and verify DeskTouch Accessibility is enabled.");
+                    continue;
+                }
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
@@ -762,6 +782,34 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             lock(_authorityGate) _hubClaims.Remove(session.Id);
                         ReverseControlMessage?.Invoke(p);
                     }
+                    continue;
+                }
+                if(p.Type=="android-capability")
+                {
+                    if(!AllowsAndroidCapability(session.Peer,p))continue;
+                    bool canReceive=p.A==1;
+                    if(session.Peer.SupportsReverseInput==canReceive)continue;
+                    session.Peer=session.Peer with {SupportsReverseInput=canReceive};
+                    if(!canReceive)
+                    {
+                        // Revoking or pausing Android Accessibility must immediately
+                        // stop any hub-local or routed keyboard/mouse lease.
+                        TrySendReverseTo(session.Id,new Packet("reset"));
+                        RelayLease? relay;
+                        lock(_authorityGate)
+                            _relayByTarget.TryGetValue(session.Id,out relay);
+                        if(relay!=null)
+                        {
+                            var removed=RemoveRelayFromSource(relay.Source.Id);
+                            if(removed!=null)
+                                await RevokeRelayAsync(removed,true,token);
+                        }
+                    }
+                    await PublishEnvironmentAsync(token);
+                    PeerListChanged?.Invoke();
+                    _status(canReceive
+                        ? "Android Accessibility active on an existing secure connection."
+                        : "Android control paused for banking or helper turned off; phone stays connected.");
                     continue;
                 }
                 if(p.Type=="environment-placement-update")
@@ -849,7 +897,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     bool granted=false;
                     lock(_authorityGate)
                     {
-                        // Only an authenticated Windows input controller can claim authority.
+                        // Only an authenticated Windows or opt-in Android input controller can claim authority.
                         if(p.A>0 && AllowsForwardInput(session.Peer) &&
                            (_owner==null || ReferenceEquals(_owner,session)) &&
                            (AllowForwardClaim?.Invoke() ?? true) && _priority.TryClaim())
@@ -1375,7 +1423,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                         members.Select(m=>m.Id).Distinct().Count()!=members.Length ||
                         members.Any(m=>m.Id<0 || m.Name.Length is < 1 or > 100 ||
                             m.Name.Any(char.IsControl) ||
-                            m.Platform != "Windows"))
+                            m.Platform is not ("Windows" or "Android")))
                         throw new InvalidDataException("Invalid authenticated environment roster.");
                     Volatile.Write(ref _environmentMembers,members);
                     Volatile.Write(ref _environmentOwnId,p.A);
@@ -1433,6 +1481,9 @@ internal sealed class HostSession : IInputSession, IDisposable
                     HeartbeatAcknowledged?.Invoke();
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
+                else if (p.Type == "android-keyboard-unavailable")
+                    InputDeliveryWarning?.Invoke(
+                        "Android has no supported focused text field. Tap an editable field on the phone, then type. Check DeskTouch Accessibility if paused.");
                 else if (p.Type == "keyboard-unavailable")
                     InputDeliveryWarning?.Invoke("The receiving Windows PC rejected keyboard " +
                         "input. Click a normal text field on that PC and check whether " +

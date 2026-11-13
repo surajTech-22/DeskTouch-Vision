@@ -170,13 +170,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Cannot verify Windows-only release assets" }
             if (!($assets -contains 'DeskTouchVision-win-x64.zip') -or
                 !($assets -contains 'DeskTouchVision-win-x64.zip.sha256')) {
-              throw "Windows-only release is missing the installer or its SHA-256"
+              throw "Windows release is missing the installer or its SHA-256"
             }
-            # Publish exactly one event after both Windows assets exist.
-            try {
-              Invoke-WebRequest -Uri 'https://ntfy.sh/desktouch-vision-surajtech22-qrp9f4x2' -Method Post -Body "desktouch-release:$tag" -ContentType 'text/plain' -TimeoutSec 12 | Out-Null
-            } catch {
-              Write-Warning "Release event could not be posted: $_"
-            }
-            Write-Host "Windows-only DeskTouch release complete: $tag"
+            Write-Host "Windows release assets verified for $tag. Coordinated announcement runs after signed Android APK attaches."
           }

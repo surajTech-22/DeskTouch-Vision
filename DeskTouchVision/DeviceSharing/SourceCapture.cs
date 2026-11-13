@@ -55,8 +55,38 @@ internal sealed class SourceCapture : IDisposable
     // Request a different already authenticated environment member when
     // crossing its actual screen boundary. Never connects another socket.
     internal Func<MonitorEdge,double,bool>? NavigateEnvironment { get; set; }
+    internal Func<bool>? DestinationIsAndroid { get; set; }
+    internal event Action? ToggleMobileRequested;
+
+    internal static string? AndroidPrintableKey(int vk,bool shift)
+    {
+        if(vk is >=0x41 and <=0x5A)
+            return ((char)(vk+(shift?0:32))).ToString();
+        if(vk is >=0x30 and <=0x39)
+            return shift ? ")!@#$%^&*("[vk-0x30].ToString()
+                : ((char)vk).ToString();
+        if(vk is >=0x60 and <=0x69)
+            return ((char)('0'+vk-0x60)).ToString();
+        if(vk==0x20)return " ";
+        return vk switch{
+            0xBA=>shift?":":";", 0xBB=>shift?"+":"=",
+            0xBC=>shift?"<":",", 0xBD=>shift?"_":"-",
+            0xBE=>shift?">":".", 0xBF=>shift?"?":"/",
+            0xC0=>shift?"~":"`", 0xDB=>shift?"{":"[",
+            0xDC=>shift?"|":"\\", 0xDD=>shift?"}":"]",
+            0xDE=>shift?"\"":"'", _=>null
+        };
+    }
+
+    internal static bool ShouldToggleMobileShortcut(bool down,int vk,bool ctrl,
+        bool alt,bool shift) =>
+        down && vk == 0x4D && ctrl && alt && !shift;
+
     private System.Windows.Forms.Timer? _slowEdgeTimer;
     private bool _controlPressed, _altPressed, _shiftPressed;
+    private int _remoteModifierDownMask;
+    private bool _suppressMobileShortcutUp;
+    private bool _directShortcutEntry;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
     internal bool IsClaimPending =>
@@ -166,7 +196,13 @@ internal sealed class SourceCapture : IDisposable
         if(_edge!=approach)SetEdge(approach);
         var source=_localMonitors.EntryPoint(approach,
             Math.Clamp(fraction,0d,1d));
-        EnterRemote(source);
+        EnterRemote(source, directShortcut: false);
+    }
+
+    internal void BeginDirectHandoff()
+    {
+        if(!IsArmed || RemoteActive || IsClaimPending)return;
+        EnterRemote(new System.Drawing.Point(_anchorX, _anchorY), directShortcut: true);
     }
 
     internal void Arm()
@@ -233,30 +269,43 @@ internal sealed class SourceCapture : IDisposable
         if (priorLease > 0)
             _session.TrySend(new Packet("release", priorLease));
         _cooldownUntil = Environment.TickCount64 + 1000;
+        _remoteModifierDownMask = 0;
         // Return to the real Windows screen the cursor left, not an empty
-        // rectangle or another physical monitor.
-        var nativeEdge = _localMonitors.EntryPoint(
-            _edge, _localMonitors.EdgeFraction(_pendingPoint, _edge));
-        var interior = _edge switch
+        // rectangle or another physical monitor. When entered via Ctrl+Alt+M,
+        // place the cursor safely inside the primary monitor center.
+        System.Drawing.Point localReturn;
+        if (_directShortcutEntry)
         {
-            MonitorEdge.Left => new System.Drawing.Point(nativeEdge.X + 72, nativeEdge.Y),
-            MonitorEdge.Right => new System.Drawing.Point(nativeEdge.X - 72, nativeEdge.Y),
-            MonitorEdge.Top => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y + 72),
-            MonitorEdge.Bottom => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y - 72),
-            _ => nativeEdge
-        };
-        var localReturn = _localMonitors.ClampToRealMonitor(interior);
+            _directShortcutEntry = false;
+            localReturn = _localMonitors.ClampToRealMonitor(
+                new System.Drawing.Point(_anchorX, _anchorY));
+        }
+        else
+        {
+            var nativeEdge = _localMonitors.EntryPoint(
+                _edge, _localMonitors.EdgeFraction(_pendingPoint, _edge));
+            var interior = _edge switch
+            {
+                MonitorEdge.Left => new System.Drawing.Point(nativeEdge.X + 72, nativeEdge.Y),
+                MonitorEdge.Right => new System.Drawing.Point(nativeEdge.X - 72, nativeEdge.Y),
+                MonitorEdge.Top => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y + 72),
+                MonitorEdge.Bottom => new System.Drawing.Point(nativeEdge.X, nativeEdge.Y - 72),
+                _ => nativeEdge
+            };
+            localReturn = _localMonitors.ClampToRealMonitor(interior);
+        }
         Win.SetCursorPos(localReturn.X, localReturn.Y);
         _hasLastPhysicalPointer = false;
         ResetEdgeTracking();
         _status("Control returned to this Windows computer.");
     }
 
-    private void EnterRemote(System.Drawing.Point sourcePoint)
+    private void EnterRemote(System.Drawing.Point sourcePoint, bool directShortcut = false)
     {
         if (!IsArmed || RemoteActive ||
             Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return;
         _slowEdge.Reset();
+        _directShortcutEntry = directShortcut;
         _pendingPoint = sourcePoint;
         int request = _claims.Begin();
         _claimStarted = Environment.TickCount64;
@@ -421,12 +470,17 @@ internal sealed class SourceCapture : IDisposable
                     _localMonitors.IsExternalEdge(Cursor.Position, edge,
                         EdgeHandoffPolicy.EdgeZonePixels + 2))
                 {
-                    _status($"Outward {source} detected at {edge.ToString().ToLowerInvariant()} external Windows screen edge.");
                     double fraction=_localMonitors.EdgeFraction(cursor,edge);
                     if(NavigateEnvironment!=null)
-                        NavigateEnvironment(edge,fraction); // no arbitrary PC fallback
+                    {
+                        if(NavigateEnvironment(edge,fraction))
+                            _status($"Outward {source} detected at {edge.ToString().ToLowerInvariant()} external Windows screen edge.");
+                    }
                     else if(edge==_edge)
+                    {
+                        _status($"Outward {source} detected at {edge.ToString().ToLowerInvariant()} external Windows screen edge.");
                         EnterRemote(cursor);
+                    }
                 }
             }
             finally { Interlocked.Exchange(ref _switchPending, 0); }
@@ -518,6 +572,18 @@ internal sealed class SourceCapture : IDisposable
         if (key.vkCode is 0x11 or 0xA2 or 0xA3) _controlPressed = down;
         if (key.vkCode is 0x12 or 0xA4 or 0xA5) _altPressed = down;
         if (key.vkCode is 0x10 or 0xA0 or 0xA1) _shiftPressed = down;
+        if (IsArmed && ShouldToggleMobileShortcut(down, (int)key.vkCode,
+            _controlPressed, _altPressed, _shiftPressed))
+        {
+            _suppressMobileShortcutUp = true;
+            Post(() => ToggleMobileRequested?.Invoke());
+            return (IntPtr)1;
+        }
+        if (!down && _suppressMobileShortcutUp && key.vkCode == 0x4D)
+        {
+            _suppressMobileShortcutUp = false;
+            return (IntPtr)1;
+        }
         if (RemoteActive && down && key.vkCode == 0x7B &&
             _controlPressed && _altPressed && _shiftPressed)
         {
@@ -526,6 +592,39 @@ internal sealed class SourceCapture : IDisposable
         }
         if (RemoteActive)
         {
+            int modMask = key.vkCode switch
+            {
+                0x11 or 0xA2 or 0xA3 => 1,
+                0x12 or 0xA4 or 0xA5 => 2,
+                0x10 or 0xA0 or 0xA1 => 4,
+                _ => 0
+            };
+            if (modMask != 0)
+            {
+                if (down)
+                    _remoteModifierDownMask |= modMask;
+                else if ((_remoteModifierDownMask & modMask) == 0)
+                    // This modifier was pressed locally before entering remote
+                    // (e.g. during Ctrl+Alt+M); let Windows receive its UP event.
+                    return Win.CallNextHookEx(_keyHook, code, wParam, lParam);
+                else
+                    _remoteModifierDownMask &= ~modMask;
+            }
+            // Android's Accessibility API is an editable-field/IME API, not
+            // raw hardware keyboard injection. Send printable characters
+            // through the authenticated reverse-text route so Chrome/WebView
+            // can commit them using the active Android InputConnection.
+            // Modifier, Ctrl/Alt shortcuts, and navigation keys use reverse-key.
+            if (DestinationIsAndroid?.Invoke() == true && !_controlPressed && !_altPressed)
+            {
+                var printable = AndroidPrintableKey((int)key.vkCode, _shiftPressed);
+                if (printable != null)
+                {
+                    if (down && !_session.TrySend(new Packet("text", Text: printable)))
+                        Post(ReturnLocal);
+                    return (IntPtr)1;
+                }
+            }
             bool extended = (key.flags & 1) != 0;
             if(!_session.TrySend(new Packet("key",(int)key.scanCode,
                 extended?1:0,down?1:0,(int)key.vkCode)))

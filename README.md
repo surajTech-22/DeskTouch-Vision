@@ -1,21 +1,22 @@
-# DeskTouch Vision — Windows-only keyboard and mouse sharing
+# DeskTouch Vision — Windows & Android keyboard and mouse sharing
 
-DeskTouch Vision shares a Windows keyboard and mouse across multiple **Windows computers** on a trusted private Wi-Fi or Ethernet network. Android, BLE HID and Android Debug Bridge (ADB) support were removed in v0.3.24.
+DeskTouch Vision shares your **keyboard and mouse across Windows PCs and Android phones** on a trusted private Wi-Fi network — with no Developer Options, USB cables, or Bluetooth dongles required.
 
 ## How it works
 
-Each Windows computer keeps its existing real monitors and native keyboard/mouse. DeskTouch adds other authenticated Windows computers to the Displays arrangement. Drag their groups beside your local screens and cross the outside edge to transfer input. Handoff works in both directions; your physical local input always takes priority. Press **Ctrl+Alt+Shift+F12** for emergency return.
-
-A shared environment uses an encrypted TLS connection with explicit user approval. Trust a known Windows device by its persistent cryptographic fingerprint and token; reconnect finds its current IP dynamically and does not rely on a saved IP address. The app remains listening and sharing while hidden in the Windows tray.
+Each Windows PC keeps its existing monitors and local input priority, while connected PCs and portrait Android phone screens appear side-by-side in **Displays**.
+- **Edge Glide:** Drag a PC or Android phone tile next to any monitor edge and slide your cursor across to control it.
+- **Quick Mobile Toggle:** Press **`Ctrl + Alt + M`** to jump straight between PC and your connected Android phone. Press **`Ctrl + Alt + Shift + F12`** anytime for emergency return to Windows.
+- **Two-Way Control:** Control Android with your Windows mouse/keyboard (Right Click = Back, Middle Click = Home, full typing & search Enter/Arrows/`Ctrl+A/C/X/V`), or control Windows from the Android touchpad & keyboard.
+- **Pause for Banking:** On Android, tap **Pause for Banking** (Quick Settings tile, ongoing notification, or in-app) before opening banking/UPI apps, and tap Resume later.
+- **Trusted Wi-Fi Reconnect:** Devices recognize each other by their persistent encrypted TLS fingerprint and reconnect automatically when back on the same Wi-Fi (no remembered IP addresses).
 
 ## Install and pair
 
-1. Download `DeskTouchVision-win-x64.zip` from https://github.com/surajTech-22/DeskTouch-Vision/releases/latest on each Windows PC.
-2. Extract and run `INSTALL_DESKTOUCH.cmd`. Start DeskTouch on both PCs and keep it open or in the notification tray.
-3. On the receiving PC click **Copy pairing code**. On the controlling PC select **Add devices**, enter the code and approve. You may also choose a discoverable Windows PC on the same LAN.
-4. Drag its screen group next to an actual local monitor. Moving the mouse outward across that edge requests secure control.
-5. To reconnect automatically choose **Trust device** and approve on the other PC. Manage or revoke these permissions through **Trusted devices**.
-6. **Disconnect** ends the connection; **Exit DeskTouch** in the notification area fully shuts down sharing.
+1. Download `DeskTouchVision-win-x64.zip` from https://github.com/surajTech-22/DeskTouch-Vision/releases/latest on Windows, extract, and run `INSTALL_DESKTOUCH.cmd`.
+2. Click **Get Android app** on Windows and scan the QR code with your phone's camera to install `DeskTouchVision-android-preview.apk`.
+3. On Android, open DeskTouch Vision, follow the short Accessibility / Restricted Settings setup (Battery: No restrictions for Xiaomi/Redmi), tap **Find devices**, join your PC, and approve on Windows.
+4. Click **Trust connected PC** on Android so both devices reconnect automatically over Wi-Fi.
 
 ## Diagnostics
 

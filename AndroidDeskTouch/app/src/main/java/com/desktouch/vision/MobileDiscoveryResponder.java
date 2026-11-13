@@ -18,11 +18,20 @@ import java.util.Locale;
  * Its Keystore-backed public key is a stable identity hint, not authentication.
  */
 final class MobileDiscoveryResponder implements AutoCloseable {
+    interface OnlineListener {
+        void onDesktopOnline(DesktopDiscovery.Device device);
+    }
+
     private static final String KEY_ALIAS="DeskTouchVision.MobileIdentity.v1";
     private DatagramSocket listener;
     private Thread thread;
     private WifiManager.MulticastLock multicastLock;
     private volatile boolean running;
+    private volatile OnlineListener onlineListener;
+
+    void setOnlineListener(OnlineListener listener) {
+        this.onlineListener=listener;
+    }
 
     static String mobileFingerprint() throws Exception {
         KeyStore store=KeyStore.getInstance("AndroidKeyStore");
@@ -46,8 +55,8 @@ final class MobileDiscoveryResponder implements AutoCloseable {
     }
     synchronized void start(Context context) throws Exception {
         if(running)return;
-        String device=(Build.MANUFACTURER+" "+Build.MODEL).replace("|","-")
-            .replace("\n"," ").replace("\r"," ").trim();
+        String device=PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL)
+            .replace("|","-").replace("\n"," ").replace("\r"," ").trim();
         if(device.length()>85)device=device.substring(0,85);
         String response="DT1-MOBILE|"+device+"|"+mobileFingerprint();
         byte[] payload=response.getBytes(StandardCharsets.US_ASCII);
@@ -72,16 +81,23 @@ final class MobileDiscoveryResponder implements AutoCloseable {
                         listener.receive(request);
                         String probe=new String(request.getData(),0,request.getLength(),
                             StandardCharsets.US_ASCII);
-                        if(!"DT1-DISCOVER".equals(probe))continue;
                         InetAddress remote=request.getAddress();
-                        if(remote.isLoopbackAddress()||remote.isAnyLocalAddress())continue;
+                        if(remote==null || remote.isLoopbackAddress() ||
+                            remote.isAnyLocalAddress())continue;
                         byte[] bytes=remote.getAddress();
                         if(bytes.length!=4)continue;
                         int a=bytes[0]&255,b=bytes[1]&255;
                         if(!(a==10||(a==172&&b>=16&&b<=31)||
                             (a==192&&b==168)||(a==169&&b==254)))continue;
-                        listener.send(new DatagramPacket(payload,payload.length,
-                            remote,request.getPort()));
+                        if("DT1-DISCOVER".equals(probe)) {
+                            listener.send(new DatagramPacket(payload,payload.length,
+                                remote,request.getPort()));
+                            continue;
+                        }
+                        DesktopDiscovery.Device online=
+                            DesktopDiscovery.parseOnline(probe,remote.getHostAddress());
+                        OnlineListener notify=onlineListener;
+                        if(online!=null && notify!=null) notify.onDesktopOnline(online);
                     }catch(SocketTimeoutException ignored){}
                     catch(Exception ex){if(running)android.util.Log.w("DeskTouch","Discovery reply failed",ex);}
                 }

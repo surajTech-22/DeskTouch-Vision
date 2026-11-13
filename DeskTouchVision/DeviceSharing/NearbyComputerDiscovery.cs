@@ -23,6 +23,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private const string ReadyPrefix = "DT1-READY|";
     private const string BusyPrefix = "DT1-BUSY|";
     private const string MobilePrefix = "DT1-MOBILE|";
+    private const string OnlinePrefix = "DT1-ONLINE|";
     private readonly CancellationTokenSource _stop = new();
     private readonly string _fingerprint;
     private readonly Func<bool> _canAcceptConnections;
@@ -116,9 +117,10 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         if (!IsPrivateLan(address) || response.Length is < 75 or > 260) return null;
         bool isMobile = response.StartsWith(MobilePrefix, StringComparison.Ordinal);
         bool busy = response.StartsWith(BusyPrefix, StringComparison.Ordinal);
-        if (!isMobile && !busy &&
+        bool online = response.StartsWith(OnlinePrefix, StringComparison.Ordinal);
+        if (!isMobile && !busy && !online &&
             !response.StartsWith(ReadyPrefix, StringComparison.Ordinal)) return null;
-        string prefix = isMobile ? MobilePrefix : busy ? BusyPrefix : ReadyPrefix;
+        string prefix = isMobile ? MobilePrefix : busy ? BusyPrefix : online ? OnlinePrefix : ReadyPrefix;
         var parts = response[prefix.Length..].Split('|');
         if (parts.Length != 2 || parts[0].Length is < 1 or > 100 ||
             parts[0].Any(char.IsControl) ||
@@ -133,20 +135,15 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         peers.GroupBy(p => (p.IsAndroid, p.Fingerprint),
                 EqualityComparer<(bool, string)>.Default)
             .Select(g => g.OrderByDescending(p => p.CanReceive)
-                .ThenByDescending(p=>p.IsHub).First())
+                .ThenByDescending(p => p.IsHub).First())
             .OrderBy(p => p.IsAndroid)
-            .ThenByDescending(p=>p.IsHub)
+            .ThenByDescending(p => p.IsHub)
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ThenBy(p => p.Address, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-    internal static async Task<IReadOnlyList<NearbyComputer>> FindAsync(CancellationToken cancel)
+    private static HashSet<string> GetBroadcastDestinations()
     {
-        var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
-        var advertisedHubs = new ConcurrentDictionary<string,string>(
-            StringComparer.OrdinalIgnoreCase);
-        using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
-        udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         var destinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             IPAddress.Broadcast.ToString()
@@ -167,19 +164,74 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 destinations.Add(new IPAddress(broadcast).ToString());
             }
         }
+        return destinations;
+    }
+
+    internal static async Task BroadcastOnlineAnnouncementAsync(
+        string fingerprint, CancellationToken cancel = default)
+    {
+        if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit)) return;
+        var name = Environment.MachineName.Replace("|", "-");
+        byte[] payload = Encoding.ASCII.GetBytes(
+            OnlinePrefix + name + "|" + fingerprint.ToUpperInvariant());
+        try
+        {
+            using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
+            var destinations = GetBroadcastDestinations();
+            for (int burst = 0; burst < 2; burst++)
+            {
+                if (cancel.IsCancellationRequested) break;
+                foreach (string host in destinations)
+                {
+                    try
+                    {
+                        await udp.SendAsync(payload,
+                            new IPEndPoint(IPAddress.Parse(host), DiscoveryPort), cancel);
+                    }
+                    catch (SocketException) { }
+                    catch (OperationCanceledException) { return; }
+                }
+                if (burst == 0)
+                {
+                    try { await Task.Delay(120, cancel); }
+                    catch (OperationCanceledException) { return; }
+                }
+            }
+        }
+        catch (SocketException) { }
+    }
+
+    internal static Task<IReadOnlyList<NearbyComputer>> FindAsync(CancellationToken cancel) =>
+        FindInternalAsync(null, cancel);
+
+    internal static Task<IReadOnlyList<NearbyComputer>> FindFastAsync(
+        IReadOnlySet<string>? targetFingerprints, CancellationToken cancel) =>
+        FindInternalAsync(targetFingerprints, cancel);
+
+    private static async Task<IReadOnlyList<NearbyComputer>> FindInternalAsync(
+        IReadOnlySet<string>? targetFingerprints, CancellationToken cancel)
+    {
+        bool fastMode = targetFingerprints is { Count: > 0 };
+        var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
+        var advertisedHubs = new ConcurrentDictionary<string,string>(
+            StringComparer.OrdinalIgnoreCase);
+        using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
+        udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+        var destinations = GetBroadcastDestinations();
         byte[] probe = Encoding.ASCII.GetBytes(Probe);
         // Retry broadcast a few times: Wi-Fi roaming and firewalls can discard
         // the first discovery packet without implying a disconnected Windows PC.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancel);
-        deadline.CancelAfter(TimeSpan.FromMilliseconds(3700));
+        deadline.CancelAfter(TimeSpan.FromMilliseconds(fastMode ? 1800 : 3700));
         var sendAt = DateTime.UtcNow;
         int attempts = 0;
+        bool matchedTarget = false;
         while (!deadline.IsCancellationRequested)
         {
-            if (attempts < 3 && DateTime.UtcNow >= sendAt)
+            if (!matchedTarget && attempts < 3 && DateTime.UtcNow >= sendAt)
             {
                 attempts++;
-                sendAt = DateTime.UtcNow.AddMilliseconds(900);
+                sendAt = DateTime.UtcNow.AddMilliseconds(fastMode ? 450 : 900);
                 foreach (string host in destinations)
                 {
                     try { await udp.SendAsync(probe,
@@ -189,7 +241,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 }
             }
             using var slice = CancellationTokenSource.CreateLinkedTokenSource(deadline.Token);
-            slice.CancelAfter(TimeSpan.FromMilliseconds(300));
+            slice.CancelAfter(TimeSpan.FromMilliseconds(fastMode ? 120 : 300));
             try
             {
                 var packet = await udp.ReceiveAsync(slice.Token);
@@ -203,7 +255,15 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 }
                 var peer = ParseReply(response, packet.RemoteEndPoint.Address);
                 if (peer is not null)
+                {
                     found[(peer.IsAndroid ? "android:" : "windows:") + peer.Fingerprint] = peer;
+                    if (fastMode && !matchedTarget && !peer.IsAndroid &&
+                        targetFingerprints!.Contains(peer.Fingerprint))
+                    {
+                        matchedTarget = true;
+                        deadline.CancelAfter(120);
+                    }
+                }
             }
             catch (OperationCanceledException) when (!deadline.IsCancellationRequested) { }
             catch (OperationCanceledException) { break; }

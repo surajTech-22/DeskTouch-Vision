@@ -1364,6 +1364,77 @@ var uiThread = new Thread(() =>
         ((DeskTouchVision.IUpdateCloseHost)view).CloseForVerifiedUpdate();
         Check(view.IsDisposed,
             "A verified update must completely close tray host and free input hooks");
+
+        // v0.3.28 phone display info, real-ratio inline preview, smooth Android mouse normalization,
+        // modifier key-up cleanup on ReturnLocal, zero-stall UDP click sync, and DT1-ONLINE beacon.
+        var portraitLayout = "[{\"Name\":\"Android screen\",\"X\":0,\"Y\":0,\"Width\":1080,\"Height\":2400,\"Primary\":true,\"DensityDpi\":440,\"RefreshHz\":120,\"RotationDegrees\":0,\"Orientation\":\"Portrait\",\"OsVersion\":\"Android 15\",\"AppVersion\":\"0.3.28\"}]";
+        var helloJson = System.Text.Json.JsonSerializer.Serialize(new PeerHello(
+            "Redmi Note", portraitLayout, true, "A".PadRight(64, 'A'), "Android", true,
+            "Android 15", "0.3.28", 440, 120, 0));
+        var parsedPeer = ReceiverServer.ReadHello(helloJson);
+        string screenSummary = parsedPeer.FormatScreenInfo();
+        Check(parsedPeer.OsVersion == "Android 15" && parsedPeer.AppVersion == "0.3.28" &&
+            parsedPeer.DensityDpi == 440 && parsedPeer.RefreshHz == 120 &&
+            screenSummary.Contains("1080 × 2400") && screenSummary.Contains("440 dpi") &&
+            screenSummary.Contains("120 Hz") && screenSummary.Contains("Android 15"),
+            "ConnectedPeer must preserve and format full Android display dimensions and info");
+
+        var portraitTopo = MonitorTopology.FromWire(portraitLayout);
+        var landscapeTopo = MonitorTopology.FromWire(
+            "[{\"Name\":\"Android screen\",\"X\":0,\"Y\":0,\"Width\":2400,\"Height\":1080,\"Primary\":true,\"RotationDegrees\":90,\"Orientation\":\"Landscape\"}]");
+        var composedPortrait = DisplayArrangementControl.ComposeInlineDevices(
+            new System.Drawing.Rectangle(0, 0, 1920, 1080),
+            new[] { new EnvironmentDisplayTile(1, "Phone", "Android", 1, true, "FP1", portraitTopo) });
+        var composedLandscape = DisplayArrangementControl.ComposeInlineDevices(
+            new System.Drawing.Rectangle(0, 0, 1920, 1080),
+            new[] { new EnvironmentDisplayTile(1, "Phone", "Android", 1, true, "FP1", landscapeTopo) });
+        Check(composedPortrait[0].World.Width < composedPortrait[0].World.Height,
+            "Portrait phone tile must reflect vertical phone proportions");
+        Check(composedLandscape[0].World.Width > composedLandscape[0].World.Height,
+            "Landscape rotated phone tile must reflect horizontal phone proportions");
+
+        double androidStep = SourceCapture.ScaleRawDeltaPrecise(20, 10, true, 440);
+        double winStep = SourceCapture.ScaleRawDeltaPrecise(20, 10, false);
+        Check(androidStep > 0 && androidStep < winStep,
+            "Android mouse delta must be normalized rather than amplified with desktop 1.45x factor");
+        Check(SourceCapture.ModifiersForMask(1 | 2 | 4).SequenceEqual(new[] { 0x11, 0x12, 0x10 }),
+            "ModifiersForMask must extract held Ctrl, Alt, and Shift virtual keys");
+
+        var capSession = new RecordingInputSession(portraitTopo);
+        using (var modCapture = new SourceCapture(diagram, capSession, _ => { }, MonitorEdge.Right, preserveRawInput: true))
+        {
+            typeof(SourceCapture).GetField("_active",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(modCapture, 1);
+            typeof(SourceCapture).GetField("_activeClaim",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(modCapture, 77);
+            typeof(SourceCapture).GetField("_remoteModifierDownMask",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.SetValue(modCapture, 5); // Ctrl + Shift
+            modCapture.ReturnLocal();
+            var relIdx = capSession.Packets.FindIndex(p => p.Type == "release");
+            var keyUps = capSession.Packets.Take(relIdx).Where(p => p.Type == "key" && p.C == 0).Select(p => p.D).ToArray();
+            Check(relIdx >= 2 && keyUps.Contains(0x11) && keyUps.Contains(0x10),
+                "ReturnLocal must release held remote modifier keys before releasing the remote lease");
+        }
+
+        using (var pacer = new FastMovePacer(
+            canSendUdp: () => true,
+            sendUdp: _ => true,
+            queueReliableTcp: _ => { }))
+        {
+            pacer.TryHandleMove(new Packet("move", 400, 900));
+            Check(pacer.TakePendingReliableSync(skipIfUdpDelivered: true) == null,
+                "Clicks must skip redundant pre-click TCP move flush when UDP already sent the latest move");
+            pacer.TryHandleMove(new Packet("move", 420, 910));
+            Check(pacer.TakePendingReliableSync(skipIfUdpDelivered: false)?.A == 420,
+                "Reliable settle sync still returns latest move when requested");
+        }
+
+        var onlinePeer = NearbyComputerDiscovery.ParseReply(
+            "DT1-ONLINE|STUDIO-PC|" + new string('B', 64),
+            System.Net.IPAddress.Parse("192.168.1.42"));
+        Check(onlinePeer is { CanReceive: true, IsAndroid: false, Name: "STUDIO-PC" },
+            "NearbyComputerDiscovery.ParseReply must recognize DT1-ONLINE announcements on private LAN");
+
         uiCompletion.TrySetResult(true);
     }
     catch (Exception ex) { uiCompletion.TrySetException(ex); }

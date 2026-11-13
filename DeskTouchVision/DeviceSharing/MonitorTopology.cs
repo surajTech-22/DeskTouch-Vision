@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Windows.Forms;
 
 namespace DeskTouch.DeviceShare;
@@ -8,7 +9,20 @@ namespace DeskTouch.DeviceShare;
 /// Copies the Windows display geometry. No virtual display drivers or Windows
 /// display setting changes: native Extended Desktop remains authoritative.
 /// </summary>
-internal sealed record MonitorRect(string Name, int X, int Y, int Width, int Height, bool Primary)
+internal sealed record MonitorRect(
+    string Name,
+    int X,
+    int Y,
+    int Width,
+    int Height,
+    bool Primary,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? DensityDpi = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RefreshHz = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RotationDegrees = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Orientation = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? DeviceName = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? OsVersion = null,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AppVersion = null)
 {
     internal Rectangle Bounds => new(X, Y, Width, Height);
 }
@@ -46,6 +60,28 @@ internal sealed class MonitorTopology
             s.DeviceName, s.Bounds.X, s.Bounds.Y, s.Bounds.Width, s.Bounds.Height, s.Primary)));
 
     internal string ToWire() => JsonSerializer.Serialize(Monitors);
+
+    internal string DescribeSummary(string platform)
+    {
+        var primary = Monitors.FirstOrDefault(m => m.Primary) ?? Monitors[0];
+        var parts = new List<string> { $"{primary.Width} × {primary.Height}" };
+        if (string.Equals(platform, "Android", StringComparison.OrdinalIgnoreCase))
+        {
+            string orient = !string.IsNullOrWhiteSpace(primary.Orientation)
+                ? primary.Orientation
+                : (primary.Width > primary.Height ? "Landscape" : "Portrait");
+            parts.Add(primary.RotationDegrees is int rot && rot != 0 ? $"{orient} ({rot}°)" : orient);
+            if (primary.DensityDpi is > 0) parts.Add($"{primary.DensityDpi} dpi");
+            if (primary.RefreshHz is > 0) parts.Add($"{primary.RefreshHz} Hz");
+            if (!string.IsNullOrWhiteSpace(primary.OsVersion)) parts.Add(primary.OsVersion);
+            if (!string.IsNullOrWhiteSpace(primary.AppVersion)) parts.Add($"v{primary.AppVersion}");
+        }
+        else if (Monitors.Count > 1)
+        {
+            parts.Add($"{Monitors.Count} displays");
+        }
+        return string.Join(" · ", parts);
+    }
 
     internal static MonitorTopology FromWire(string? json)
     {

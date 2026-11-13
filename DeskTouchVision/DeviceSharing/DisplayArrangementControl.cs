@@ -9,7 +9,8 @@ namespace DeskTouch.DeviceShare;
 /// only; only the placement of an AUTHENTICATED remote computer is draggable.
 /// </summary>
 internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
-    int ScreenCount,bool SupportsInput,string? StableIdentity=null)
+    int ScreenCount,bool SupportsInput,string? StableIdentity=null,
+    MonitorTopology? Topology=null,string? ScreenDetails=null)
 {
     internal bool IsAndroid => Platform=="Android";
     // Prefer a persistent authenticated device identity. The hub roster only
@@ -74,6 +75,18 @@ internal sealed class DisplayArrangementControl : Control
     {
         get => _remoteDeviceName;
         set { _remoteDeviceName = CleanDeviceName(value, "Connected device"); Invalidate(); }
+    }
+    private string? _remotePlatform;
+    internal string? RemotePlatform
+    {
+        get => _remotePlatform;
+        set { _remotePlatform = value; Invalidate(); }
+    }
+    private string? _remoteScreenDetails;
+    internal string? RemoteScreenDetails
+    {
+        get => _remoteScreenDetails;
+        set { _remoteScreenDetails = value; Invalidate(); }
     }
     internal static string CleanDeviceName(string? name, string fallback)
     {
@@ -342,6 +355,47 @@ internal sealed class DisplayArrangementControl : Control
         return new Point(_dragOrigin.X + delta.X, _dragOrigin.Y + delta.Y);
     }
 
+    private static Size ScaledTopologySize(int referenceHeight, MonitorTopology? topo,
+        bool isAndroid, int screenCount)
+    {
+        int height = Math.Max(380,
+            (int)(referenceHeight * (isAndroid ? 0.86 : 0.79)));
+        int width;
+        if (topo != null)
+        {
+            double ratio = (double)topo.Bounds.Width / Math.Max(1, topo.Bounds.Height);
+            ratio = isAndroid ? Math.Clamp(ratio, 0.35, 2.5) : Math.Clamp(ratio, 0.5, 4.5);
+            width = Math.Max(isAndroid ? 160 : 360, (int)Math.Round(height * ratio));
+        }
+        else
+        {
+            width = isAndroid
+                ? Math.Max(300, (int)(height * .64))
+                : Math.Max(420, (int)(height * .95 * screenCount));
+        }
+        return new Size(width, height);
+    }
+
+    private static void DrawTopologyMonitors(Graphics g, RectangleF group,
+        MonitorTopology topo, string deviceName, string? platform, string? primaryDetails)
+    {
+        int ordinal = 0;
+        float bw = Math.Max(1, topo.Bounds.Width);
+        float bh = Math.Max(1, topo.Bounds.Height);
+        foreach (var m in topo.Monitors.OrderBy(m => m.Primary ? 0 : 1))
+        {
+            int number = ++ordinal;
+            var screen = new RectangleF(
+                group.Left + (m.X - topo.Bounds.Left) / bw * group.Width,
+                group.Top + (m.Y - topo.Bounds.Top) / bh * group.Height,
+                Math.Max(6, m.Width / bw * group.Width),
+                Math.Max(6, m.Height / bh * group.Height));
+            DrawScreen(g, screen, deviceName, DisplayNumber(m, number),
+                m.Primary, false, platform, m.Bounds.Size,
+                number == 1 ? primaryDetails : null);
+        }
+    }
+
     private static Rectangle Placement(Rectangle local, Rectangle remote, MonitorEdge edge)
     {
         const int gap = 110;
@@ -391,10 +445,12 @@ internal sealed class DisplayArrangementControl : Control
 
         var l = _local.Bounds;
         var r = _remote?.Bounds;
-        var remotePos = r is null
-            ? Placement(l, new Rectangle(0, 0, Math.Max(900, l.Width * 2 / 3),
-                Math.Max(540, l.Height * 2 / 3)), _remoteEdge)
-            : Placement(l, r.Value, _remoteEdge);
+        var remoteBox = r is null
+            ? new Rectangle(0, 0, Math.Max(900, l.Width * 2 / 3), Math.Max(540, l.Height * 2 / 3))
+            : _remotePlatform == "Android"
+                ? new Rectangle(Point.Empty, ScaledTopologySize(l.Height, _remote, true, 1))
+                : r.Value;
+        var remotePos = Placement(l, remoteBox, _remoteEdge);
 
         // All authenticated screens belong in the SAME display arrangement.
         // Their preview rectangles are visual placements only: Android is
@@ -435,7 +491,8 @@ internal sealed class DisplayArrangementControl : Control
         {
             var tile = Fit(m.Bounds, full, scale, offsetX, offsetY);
             DrawScreen(g, tile, LocalDeviceName,
-                DisplayNumber(m, ++localOrdinal), m.Primary, true);
+                DisplayNumber(m, ++localOrdinal), m.Primary, true,
+                resolution: m.Bounds.Size);
         }
 
         if (_remote is { } remote)
@@ -448,18 +505,8 @@ internal sealed class DisplayArrangementControl : Control
                 group.Y += _dragCurrent.Y - _dragOrigin.Y;
             }
             _remoteHit = group;
-            int remoteOrdinal = 0;
-            foreach (var m in remote.Monitors.OrderBy(m => m.Primary ? 0 : 1))
-            {
-                var rect = new Rectangle(
-                    remotePos.Left + m.X - remote.Bounds.Left,
-                    remotePos.Top + m.Y - remote.Bounds.Top, m.Width, m.Height);
-                var tile = Fit(rect, full, scale, offsetX, offsetY);
-                if (_draggingRemote)
-                    tile.Offset(_dragCurrent.X - _dragOrigin.X, _dragCurrent.Y - _dragOrigin.Y);
-                DrawScreen(g, tile, RemoteDeviceName,
-                    DisplayNumber(m, ++remoteOrdinal), m.Primary, false);
-            }
+            DrawTopologyMonitors(g, group, remote, RemoteDeviceName,
+                _remotePlatform, _remoteScreenDetails);
         }
         else if(extras.Length == 0)
         {
@@ -475,15 +522,25 @@ internal sealed class DisplayArrangementControl : Control
             if(extra.Device.TargetId==_draggingMemberId)
                 group.Offset(_dragCurrent.X-_dragOrigin.X,
                     _dragCurrent.Y-_dragOrigin.Y);
-            int count=Math.Clamp(extra.Device.ScreenCount,1,8);
-            float gap=Math.Min(7,group.Width / Math.Max(3,count*8));
-            float screenWidth=(group.Width-gap*(count-1))/count;
-            for(int index=0;index<count;index++)
+            if (extra.Device.Topology is { } extraTopo)
             {
-                var screen=new RectangleF(group.Left+(screenWidth+gap)*index,
-                    group.Top,screenWidth,group.Height);
-                DrawScreen(g,screen,extra.Device.Name,index+1,false,false,
-                    extra.Device.IsAndroid?"Android":null);
+                DrawTopologyMonitors(g, group, extraTopo, extra.Device.Name,
+                    extra.Device.IsAndroid ? "Android" : null,
+                    extra.Device.ScreenDetails ?? extraTopo.DescribeSummary(extra.Device.Platform));
+            }
+            else
+            {
+                int count=Math.Clamp(extra.Device.ScreenCount,1,8);
+                float gap=Math.Min(7,group.Width / Math.Max(3,count*8));
+                float screenWidth=(group.Width-gap*(count-1))/count;
+                for(int index=0;index<count;index++)
+                {
+                    var screen=new RectangleF(group.Left+(screenWidth+gap)*index,
+                        group.Top,screenWidth,group.Height);
+                    DrawScreen(g,screen,extra.Device.Name,index+1,false,false,
+                        extra.Device.IsAndroid?"Android":null,
+                        details: index==0 ? extra.Device.ScreenDetails : null);
+                }
             }
             _environmentHits.Add((group,extra.Device.TargetId));
         }
@@ -505,13 +562,10 @@ internal sealed class DisplayArrangementControl : Control
         foreach(var device in members)
         {
             int count=Math.Clamp(device.ScreenCount,1,8);
-            int height=Math.Max(380,
-                (int)(mainScreenArea.Height * (device.IsAndroid ? 0.88 : 0.79)));
-            int width=device.IsAndroid
-                ? Math.Max(300,(int)(height*.64))
-                : Math.Max(420,(int)(height*.95*count));
+            var size=ScaledTopologySize(mainScreenArea.Height,
+                device.Topology,device.IsAndroid,count);
             var preview=new Rectangle(nextX,
-                mainScreenArea.Top+(mainScreenArea.Height-height)/2,width,height);
+                mainScreenArea.Top+(mainScreenArea.Height-size.Height)/2,size.Width,size.Height);
             result.Add((device,preview));
             nextX=preview.Right+connectedGap;
         }
@@ -530,7 +584,8 @@ internal sealed class DisplayArrangementControl : Control
     }
 
     private static void DrawScreen(Graphics g, RectangleF rect, string deviceName,
-        int displayNumber, bool primary, bool local, string? platform = null)
+        int displayNumber, bool primary, bool local, string? platform = null,
+        Size? resolution = null, string? details = null)
     {
         if (rect.Width < 5 || rect.Height < 5) return;
         using var path = Rounded(rect, 9);
@@ -543,7 +598,7 @@ internal sealed class DisplayArrangementControl : Control
         g.DrawPath(outline, path);
         if (rect.Width < 38 || rect.Height < 28) return;
         float labelHeight = platform=="Android"
-            ? Math.Min(52,Math.Max(26,rect.Height*.36f))
+            ? Math.Min(48,Math.Max(22,rect.Height*.32f))
             : Math.Min(27, Math.Max(13, rect.Height * .23f));
         var title = new RectangleF(rect.Left + 4, rect.Top + 3,
             Math.Max(1, rect.Width - 8), labelHeight);
@@ -561,13 +616,51 @@ internal sealed class DisplayArrangementControl : Control
         };
         g.DrawString(deviceName, nameFont, Brushes.White, title, format);
         var numberTile = new RectangleF(rect.Left + 4,
-            Math.Min(rect.Bottom - 17, rect.Top + labelHeight + 5),
+            Math.Min(rect.Bottom - 17, rect.Top + labelHeight + 4),
             Math.Max(1, rect.Width - 8),
-            Math.Min(15, Math.Max(1, rect.Height - labelHeight - 7)));
+            Math.Min(15, Math.Max(1, rect.Height - labelHeight - 6)));
         if (numberTile.Height >= 9)
             DrawCenter(g, platform == "Android"
                 ? $"Android · {displayNumber}" : $"Display {displayNumber}",
                 numberTile, Brushes.WhiteSmoke, Math.Clamp(rect.Width / 19, 7, 9));
+        float nextTop = numberTile.Bottom + 2;
+        if (resolution is { Width: > 0, Height: > 0 } res && rect.Height - (nextTop - rect.Top) >= 14)
+        {
+            var resRect = new RectangleF(rect.Left + 4, nextTop,
+                Math.Max(1, rect.Width - 8), Math.Min(15, rect.Bottom - nextTop - 3));
+            if (resRect.Height >= 10)
+            {
+                DrawCenter(g, $"{res.Width} × {res.Height}", resRect,
+                    Brushes.LightCyan, Math.Clamp(rect.Width / 20f, 6.8f, 8.8f));
+                nextTop = resRect.Bottom + 2;
+            }
+        }
+        if (!string.IsNullOrWhiteSpace(details) && rect.Width >= 56 &&
+            rect.Bottom - nextTop >= 14)
+        {
+            string extraText = details;
+            if (resolution is { Width: > 0, Height: > 0 } resSize)
+            {
+                string prefix = $"{resSize.Width} × {resSize.Height}";
+                if (extraText.StartsWith(prefix, StringComparison.Ordinal))
+                    extraText = extraText[prefix.Length..].TrimStart(' ', '·');
+            }
+            if (!string.IsNullOrWhiteSpace(extraText))
+            {
+                var detailRect = new RectangleF(rect.Left + 4, nextTop,
+                    Math.Max(1, rect.Width - 8), Math.Max(1, rect.Bottom - nextTop - 4));
+                using var detailFont = new Font("Segoe UI",
+                    Math.Clamp(Math.Min(rect.Width / 22f, rect.Height / 15f), 6.5f, 8.2f));
+                using var detailBrush = new SolidBrush(Color.FromArgb(224, 234, 244));
+                using var detailFormat = new StringFormat
+                {
+                    Alignment = StringAlignment.Center,
+                    LineAlignment = StringAlignment.Near,
+                    Trimming = StringTrimming.EllipsisWord
+                };
+                g.DrawString(extraText, detailFont, detailBrush, detailRect, detailFormat);
+            }
+        }
     }
 
     private static GraphicsPath Rounded(RectangleF rect, float radius)

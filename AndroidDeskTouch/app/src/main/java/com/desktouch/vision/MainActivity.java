@@ -7,6 +7,10 @@ import android.os.*;
 import android.provider.Settings;
 import android.text.*;
 import android.view.*;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputConnectionWrapper;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.*;
 import java.util.List;
 
@@ -18,8 +22,9 @@ public final class MainActivity extends Activity {
     private TextView permissionState;
     private DeskTouchSession session;
     private View pointerPad;
-    private float prevX,prevY,downX,downY;
-    private boolean dragged;
+    private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
+    private boolean dragged,twoFingerMoved;
+    private int maxPointerCount;
     private volatile boolean scanning;
     private float pointerSpeed=2.8f;
     private boolean suppressTypedText;
@@ -222,16 +227,47 @@ public final class MainActivity extends Activity {
         pointerPad.setOnTouchListener((v,event)->{
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:
-                    prevX=downX=event.getX();prevY=downY=event.getY();dragged=false;
+                    prevX=downX=event.getX();prevY=downY=event.getY();
+                    dragged=false;twoFingerMoved=false;maxPointerCount=1;
+                    twoFingerScrollCarry=0f;
                     v.requestFocus();return true;
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
+                    if(event.getPointerCount()>=2){
+                        twoFingerPrevY=(event.getY(0)+event.getY(1))*0.5f;
+                        twoFingerScrollCarry=0f;
+                    }
+                    return true;
                 case MotionEvent.ACTION_MOVE:
+                    if(event.getPointerCount()>=2){
+                        maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
+                        float avgY=(event.getY(0)+event.getY(1))*0.5f;
+                        float sdy=avgY-twoFingerPrevY;
+                        twoFingerPrevY=avgY;
+                        if(Math.abs(sdy)>0.5f){
+                            twoFingerScrollCarry+=sdy;
+                            if(Math.abs(twoFingerScrollCarry)>dp(6))twoFingerMoved=true;
+                            int step=dp(14);
+                            while(Math.abs(twoFingerScrollCarry)>=step){
+                                int wheelAmount=twoFingerScrollCarry>0 ? 120 : -120;
+                                DeskTouchRuntime.session(MainActivity.this).wheel(wheelAmount,false);
+                                twoFingerScrollCarry-=twoFingerScrollCarry>0 ? step : -step;
+                            }
+                        }
+                        return true;
+                    }
+                    if(maxPointerCount>1)return true;
                     float dx=event.getX()-prevX,dy=event.getY()-prevY;
                     if(Math.abs(event.getX()-downX)+Math.abs(event.getY()-downY)>dp(9))
                         dragged=true;
                     DeskTouchRuntime.session(MainActivity.this).moveBy(dx*pointerSpeed,dy*pointerSpeed);
                     prevX=event.getX();prevY=event.getY();return true;
                 case MotionEvent.ACTION_UP:
-                    if(!dragged)DeskTouchRuntime.session(MainActivity.this).click(1);
+                    if(maxPointerCount>=2){
+                        if(!twoFingerMoved)DeskTouchRuntime.session(MainActivity.this).click(2);
+                    }else if(!dragged){
+                        DeskTouchRuntime.session(MainActivity.this).click(1);
+                    }
                     v.performClick();return true;
                 default:return true;
             }
@@ -240,6 +276,47 @@ public final class MainActivity extends Activity {
             pointerPad.requestFocus();pointerPad.requestPointerCapture();
             status.setText("Physical mouse captured; use Back to release it.");
         });
+        TextView keyboardLabel=new TextView(this);
+        keyboardLabel.setText("Type on the selected Windows screen using Android keyboard");
+        keyboardLabel.setTextColor(Color.WHITE);page.addView(keyboardLabel);
+        EditText keyboardInput=new EditText(this){
+            @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs){
+                InputConnection base=super.onCreateInputConnection(outAttrs);
+                if(outAttrs!=null){
+                    outAttrs.imeOptions=(outAttrs.imeOptions&~EditorInfo.IME_MASK_ACTION)
+                        | EditorInfo.IME_ACTION_NONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI;
+                }
+                if(base==null)return null;
+                return new InputConnectionWrapper(base,true){
+                    @Override public boolean deleteSurroundingText(int beforeLength,int afterLength){
+                        if(getText()!=null && getText().length()==0 && beforeLength>0){
+                            DeskTouchSession s=DeskTouchRuntime.session(MainActivity.this);
+                            if(s.isActive()){
+                                s.key(0x08,true);s.key(0x08,false);
+                                return true;
+                            }
+                        }
+                        return super.deleteSurroundingText(beforeLength,afterLength);
+                    }
+                    @Override public boolean sendKeyEvent(KeyEvent event){
+                        if(event!=null && event.getAction()==KeyEvent.ACTION_DOWN &&
+                            event.getKeyCode()==KeyEvent.KEYCODE_DEL &&
+                            getText()!=null && getText().length()==0){
+                            DeskTouchSession s=DeskTouchRuntime.session(MainActivity.this);
+                            if(s.isActive()){
+                                s.key(0x08,true);s.key(0x08,false);
+                                return true;
+                            }
+                        }
+                        return super.sendKeyEvent(event);
+                    }
+                };
+            }
+        };
+        keyboardInput.setHint("Tap to open the Android keyboard");
+        keyboardInput.setSingleLine(false);
+        keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
+            android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         LinearLayout mouseActions=new LinearLayout(this);
         mouseActions.setOrientation(LinearLayout.HORIZONTAL);
         mouseActions.setPadding(0,dp(6),0,dp(10));
@@ -251,15 +328,12 @@ public final class MainActivity extends Activity {
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(120,false));
         addCompactButton(mouseActions,"Scroll ↓",
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(-120,false));
+        addCompactButton(mouseActions,"Keyboard",()->{
+            keyboardInput.requestFocus();
+            InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
+            if(imm!=null)imm.showSoftInput(keyboardInput,InputMethodManager.SHOW_IMPLICIT);
+        });
         page.addView(mouseActions);
-        TextView keyboardLabel=new TextView(this);
-        keyboardLabel.setText("Type on the selected Windows screen using Android keyboard");
-        keyboardLabel.setTextColor(Color.WHITE);page.addView(keyboardLabel);
-        EditText keyboardInput=new EditText(this);
-        keyboardInput.setHint("Tap to open the Android keyboard");
-        keyboardInput.setSingleLine(false);
-        keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
-            android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         page.addView(keyboardInput);
         final String[] previousTyped={""};
         keyboardInput.addTextChangedListener(new TextWatcher(){
@@ -268,14 +342,15 @@ public final class MainActivity extends Activity {
             public void afterTextChanged(Editable editable){
                 if(suppressTypedText)return;
                 String next=editable.toString();
-                if(session!=null&&DeskTouchRuntime.session(MainActivity.this).isActive()){
+                DeskTouchSession active=DeskTouchRuntime.session(MainActivity.this);
+                if(active.isActive()){
                     int common=0;
                     while(common<previousTyped[0].length()&&common<next.length()&&
                         previousTyped[0].charAt(common)==next.charAt(common))common++;
                     for(int n=common;n<previousTyped[0].length();n++){
-                        DeskTouchRuntime.session(MainActivity.this).key(8,true);DeskTouchRuntime.session(MainActivity.this).key(8,false);
+                        active.key(8,true);active.key(8,false);
                     }
-                    if(common<next.length())DeskTouchRuntime.session(MainActivity.this).text(next.substring(common));
+                    if(common<next.length())sendRemoteTextWithNewlines(active,next.substring(common));
                 }
                 previousTyped[0]=next;
                 if(next.length()>800){
@@ -326,6 +401,18 @@ public final class MainActivity extends Activity {
         super.onResume();
         updateVisibleScreenAwake();
         refreshPermissionState();
+        AutoConnectService.nudgeReconnect(this);
+    }
+    private static void sendRemoteTextWithNewlines(DeskTouchSession target,String added){
+        int start=0;
+        for(int i=0;i<added.length();i++){
+            if(added.charAt(i)=='\n'){
+                if(i>start)target.text(added.substring(start,i));
+                target.key(0x0D,true);target.key(0x0D,false);
+                start=i+1;
+            }
+        }
+        if(start<added.length())target.text(added.substring(start));
     }
     private void refreshPermissionState(){
         if(permissionState==null)return;
@@ -338,11 +425,13 @@ public final class MainActivity extends Activity {
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addCompactButton(LinearLayout parent,String label,Runnable action){
         Button b=new Button(this);
-        b.setText(label);b.setAllCaps(false);
+        b.setText(label);b.setAllCaps(false);b.setTextSize(12f);
+        b.setMinWidth(0);b.setMinimumWidth(0);
+        b.setPadding(dp(4),dp(6),dp(4),dp(6));
         b.setOnClickListener(v->action.run());
         LinearLayout.LayoutParams params=new LinearLayout.LayoutParams(
             0,-2,1f);
-        params.setMargins(dp(3),0,dp(3),0);
+        params.setMargins(dp(2),0,dp(2),0);
         parent.addView(b,params);
     }
     private void addButton(LinearLayout parent,String label,Runnable action){

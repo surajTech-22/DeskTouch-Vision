@@ -70,6 +70,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private int pendingLiftX,pendingLiftY;
     private boolean dragFallbackPending;
     private int gestureGeneration;
+    private Choreographer choreographer;
+    private final Choreographer.FrameCallback frameCallback = frameTimeNanos -> flushPointer();
     private final ArrayDeque<TouchAction> pendingActions=new ArrayDeque<>();
     private static final class TouchAction {
         static final int TYPE_GESTURE = 1;
@@ -158,6 +160,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     @Override public void onServiceConnected(){
         super.onServiceConnected();
         instance=this;
+        try { choreographer=Choreographer.getInstance(); }
+        catch(RuntimeException ignored) { choreographer=null; }
         if(isPausedForBanking(this))
             getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
                 .putBoolean(PAUSED_FOR_BANKING,false).apply();
@@ -190,6 +194,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     @Override public void onDestroy(){
         if(instance==this)instance=null;
+        if(choreographer!=null){
+            try{choreographer.removeFrameCallback(frameCallback);}
+            catch(Throwable ignored){}
+            choreographer=null;
+        }
         DeskTouchRuntime.accessibilityPermissionChanged();
         DeskTouchRuntime.remoteNativeTouch();
         removePointer();
@@ -211,9 +220,13 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS |
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT);
         params.gravity=Gravity.TOP|Gravity.LEFT;
+        if(Build.VERSION.SDK_INT>=28)
+            params.layoutInDisplayCutoutMode=
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
         return params;
     }
@@ -297,6 +310,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         GestureDescription.StrokeDescription dangling=activeStroke;
         activeStroke=null;
         held=false;
+        shift=false;
+        control=false;
+        alt=false;
         pendingLift=false;
         dragFallbackPending=false;
         if(dangling!=null && windows!=null){
@@ -311,6 +327,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         remoteActive=false;
         pendingApplied=null;
         moveScheduled.set(false);
+        if(choreographer!=null){
+            try{choreographer.removeFrameCallback(frameCallback);}
+            catch(Throwable ignored){}
+        }
         lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
         pendingActions.clear();
         gestureRunning=false;
@@ -322,6 +342,17 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         pointerDot=null;
         compactPointerParams=null;
     }
+    private void schedulePointerFrame(){
+        Choreographer vsync=choreographer;
+        if(vsync!=null){
+            try{
+                vsync.postFrameCallback(frameCallback);
+                return;
+            }catch(RuntimeException ignored){}
+        }
+        ui.post(this::flushPointer);
+    }
+
     static boolean pointer(int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return false;
@@ -333,7 +364,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true))
-            service.ui.post(service::flushPointer);
+            service.schedulePointerFrame();
         else service.coalescedMoves.incrementAndGet();
         return true;
     }
@@ -364,7 +395,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             continueDragIfReady();
         if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
             moveScheduled.compareAndSet(false,true))
-            ui.post(this::flushPointer);
+            schedulePointerFrame();
     }
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
@@ -392,7 +423,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             if(!service.remoteActive || !ready(service))return;
             service.flushPointerBeforeAction();
             if(button==2){
-                if(!pressed)service.performGlobalAction(GLOBAL_ACTION_BACK);
+                if(pressed)service.performGlobalAction(GLOBAL_ACTION_BACK);
                 return;
             }
             if(button==3){
@@ -553,7 +584,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         path.lineTo(x,y);
         GestureDescription.StrokeDescription next;
         try{
-            next=activeStroke.continueStroke(path,0,14L,true);
+            next=activeStroke.continueStroke(path,0,8L,true);
         }catch(RuntimeException badContinuation){
             activeStroke=null;
             dragFallbackPending=true;
@@ -761,13 +792,20 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
         nodes.push(root);
         AccessibilityNodeInfo editor=null;
+        long bestArea=Long.MAX_VALUE;
         int visited=0;
         Rect bounds=new Rect();
-        while(!nodes.isEmpty() && ++visited<=96){
+        while(!nodes.isEmpty() && ++visited<=240){
             AccessibilityNodeInfo node=nodes.pop();
             node.getBoundsInScreen(bounds);
             if(!bounds.contains(px,py))continue;
-            if(node.isEditable() && node.isEnabled())editor=node;
+            if(node.isEditable() && node.isEnabled()){
+                long area=(long)Math.max(1,bounds.width())*Math.max(1,bounds.height());
+                if(area<=bestArea){
+                    bestArea=area;
+                    editor=node;
+                }
+            }
             for(int i=node.getChildCount()-1;i>=0;i--){
                 AccessibilityNodeInfo child=node.getChild(i);
                 if(child!=null)nodes.push(child);
@@ -889,6 +927,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
 
     static void text(String incoming,Runnable rejected){
+        text(incoming,null,rejected);
+    }
+
+    static void text(String incoming,Runnable accepted,Runnable rejected){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service)||
             incoming==null||incoming.length()==0||incoming.length()>512){
@@ -904,7 +946,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             if(field==null || !field.isEditable())
                 field=service.focusEditableAtPoint(service.x,service.y);
             if(service.commitNativeText(incoming,field) ||
-                DeskTouchInputMethod.commitRemoteText(incoming))return;
+                DeskTouchInputMethod.commitRemoteText(incoming)){
+                if(accepted!=null)accepted.run();
+                return;
+            }
             if(field==null||!field.isEditable()||field.isPassword()){
                 if(rejected!=null)rejected.run();
                 return;
@@ -929,11 +974,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 selection.putInt(
                     AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,caret);
                 field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,selection);
+                if(accepted!=null)accepted.run();
             }else if(rejected!=null)rejected.run();
         });
     }
 
     static void key(int vk,boolean pressed,Runnable rejected){
+        key(vk,pressed,null,rejected);
+    }
+
+    static void key(int vk,boolean pressed,Runnable accepted,Runnable rejected){
         DeskTouchAccessibilityService service=instance;
         if(service==null || !ready(service)){
             if(pressed && rejected!=null)rejected.run();
@@ -943,6 +993,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             if(!ready(service)||!service.remoteActive ||
                 !service.applyKey(vk,pressed)){
                 if(pressed && rejected!=null)rejected.run();
+            }else if(pressed && accepted!=null){
+                accepted.run();
             }
         });
     }
@@ -962,7 +1014,13 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             return performGlobalAction(GLOBAL_ACTION_HOME);
         // Send Enter and Tab as real key events first so search bars, address bars,
         // and dialogs submit or advance focus instead of inserting raw newlines.
-        if((vk==13||vk==9) && (sendNativeKey(vk,field) ||
+        if(vk==13 && (sendNativeKey(vk,field) ||
+            (Build.VERSION.SDK_INT>=30 && field!=null && !field.isPassword() &&
+                field.performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.getId())) ||
+            DeskTouchInputMethod.sendRemoteKey(vk)))
+            return true;
+        if(vk==9 && (sendNativeKey(vk,field) ||
             DeskTouchInputMethod.sendRemoteKey(vk)))
             return true;
         String printable=WindowsKeyText.printable(vk,shift);
@@ -994,9 +1052,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         return true;
     }
     private boolean isTextFieldFocused(){
-        AccessibilityNodeInfo root=getRootInActiveWindow();
-        if(root==null)return false;
-        AccessibilityNodeInfo focused=root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
-        return focused!=null&&focused.isEditable();
+        AccessibilityNodeInfo focused=focusedEditor();
+        return focused!=null && focused.isEditable();
     }
 }

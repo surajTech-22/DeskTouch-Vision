@@ -249,5 +249,38 @@ public final class ProtocolSourceTest {
         assertNotNull(newer);
         assertEquals(200,newer.a);
         assertNull(client.tryOpen(olderSeq,olderSeq.length));
+
+        byte[] warmFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        assertEquals(FastUdpChannel.FRAME_SIZE,
+            server.seal(FastUdpChannel.OP_WARM,0,0,0,120,warmFrame));
+        FastUdpChannel.Message warmMsg=client.tryOpen(warmFrame,warmFrame.length);
+        assertNotNull(warmMsg);
+        assertEquals(FastUdpChannel.OP_WARM,warmMsg.op);
+    }
+    @Test public void phoneGeometryAndOnlineBeaconHelpersWork(){
+        assertEquals(0,PhoneScreenGeometry.rotationDegrees(0));
+        assertEquals(90,PhoneScreenGeometry.rotationDegrees(1));
+        assertEquals(180,PhoneScreenGeometry.rotationDegrees(2));
+        assertEquals(270,PhoneScreenGeometry.rotationDegrees(3));
+        assertEquals("Portrait",PhoneScreenGeometry.orientationName(1080,2400));
+        assertEquals("Landscape",PhoneScreenGeometry.orientationName(2400,1080));
+        assertEquals("Xiaomi 23090RA98I",
+            PhoneScreenGeometry.cleanDeviceName("Xiaomi","Xiaomi 23090RA98I"));
+        assertEquals("Google Pixel 8",
+            PhoneScreenGeometry.cleanDeviceName("Google","Pixel 8"));
+        PhoneScreenGeometry.Info info=new PhoneScreenGeometry.Info(
+            1080,2400,440,120,0,"Xiaomi 14","Android 15","0.3.28");
+        assertEquals("Portrait",info.orientation);
+        assertEquals(440,info.densityDpi);
+        assertEquals(120,info.refreshHz);
+
+        DesktopDiscovery.Device online=DesktopDiscovery.parseOnline(
+            "DT1-ONLINE|WORKSTATION|"+"E".repeat(64),"192.168.1.55");
+        assertNotNull(online);
+        assertEquals("WORKSTATION",online.name);
+        assertTrue(online.ready);
+        assertFalse(online.android);
+        assertNull(DesktopDiscovery.parseOnline("DT1-READY|BAD|"+"E".repeat(64),"192.168.1.55"));
+        assertNull(DesktopDiscovery.parseOnline("DT1-ONLINE|BAD|short","192.168.1.55"));
     }
 }

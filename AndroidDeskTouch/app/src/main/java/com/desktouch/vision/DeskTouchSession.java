@@ -1,8 +1,11 @@
 package com.desktouch.vision;
 
-import android.os.Build;
-import android.os.SystemClock;
 import android.content.Context;
+import android.hardware.display.DisplayManager;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.*;
@@ -78,7 +81,10 @@ final class DeskTouchSession implements AutoCloseable {
     private final List<int[]> monitors=new ArrayList<>();
     private int cursorX,cursorY;
     private int screenX,screenY,screenWidth,screenHeight;
-    private volatile int announcedPhoneWidth,announcedPhoneHeight;
+    private volatile int announcedPhoneWidth,announcedPhoneHeight,announcedPhoneRotation;
+    private volatile long lastUdpReverseMoveAtMs;
+    private ScheduledFuture<?> udpProbeRetryFuture;
+    private DisplayManager.DisplayListener displayListener;
     private volatile java.util.List<EnvironmentTarget> environmentTargets =
         java.util.Collections.emptyList();
     private volatile int environmentOwnId;
@@ -221,7 +227,7 @@ final class DeskTouchSession implements AutoCloseable {
                 DataInputStream in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
                 DataOutputStream out=new DataOutputStream(new BufferedOutputStream(ssl.getOutputStream()));
                 new Packet(saved==null?"auth-request":"auth-trusted",0,0,0,0,
-                    saved==null?Build.MANUFACTURER+" "+Build.MODEL:saved).write(out);
+                    saved==null?PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL):saved).write(out);
                 Packet ready=Packet.read(in);
                 if(!"ready".equals(ready.type)) throw new SecurityException("Windows did not approve pairing");
                 ArrayList<int[]> parsed=new ArrayList<>();
@@ -240,27 +246,35 @@ final class DeskTouchSession implements AutoCloseable {
                     throw new SecurityException("Windows display geometry mismatch");
                 // Reconnect must use the same physical display dimensions as
                 // the Accessibility pointer and its gesture coordinates.
-                android.graphics.Point physical=PhoneScreenGeometry.read(application);
-                int width=Math.max(200,physical.x>0?physical.x:androidWidth);
-                int height=Math.max(100,physical.y>0?physical.y:androidHeight);
-                JSONArray myLayout=new JSONArray();
-                myLayout.put(new JSONObject().put("Name","Android screen").put("X",0).put("Y",0)
-                    .put("Width",width).put("Height",height).put("Primary",true));
-                JSONObject hello=new JSONObject().put("Name",Build.MANUFACTURER+" "+Build.MODEL)
+                PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(application);
+                int width=Math.max(200,info.width>0?info.width:androidWidth);
+                int height=Math.max(100,info.height>0?info.height:androidHeight);
+                if(width!=info.width || height!=info.height)
+                    info=new PhoneScreenGeometry.Info(width,height,info.densityDpi,info.refreshHz,
+                        info.rotationDegrees,info.deviceName,info.osVersion,info.appVersion);
+                JSONArray myLayout=buildLayoutArray(info);
+                JSONObject hello=new JSONObject().put("Name",info.deviceName)
                     .put("Layout",myLayout.toString())
                     .put("ReverseInputSupported",
                         DeskTouchAccessibilityService.ready(application))
                     .put("ForwardInputSupported",true)
-                    .put("Platform","Android");
+                    .put("Platform","Android")
+                    .put("OsVersion",info.osVersion)
+                    .put("DensityDpi",info.densityDpi)
+                    .put("RefreshHz",info.refreshHz)
+                    .put("RotationDegrees",info.rotationDegrees);
+                if(!info.appVersion.isEmpty())hello.put("AppVersion",info.appVersion);
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
                 screenX=minX;screenY=minY;screenWidth=ready.c;screenHeight=ready.d;
                 cursorX=parsed.get(0)[0]+parsed.get(0)[2]/2;
                 cursorY=parsed.get(0)[1]+parsed.get(0)[3]/2;
                 fingerprint=pinned;
-                announcedPhoneWidth=width;announcedPhoneHeight=height;
+                announcedPhoneWidth=info.width;announcedPhoneHeight=info.height;
+                announcedPhoneRotation=info.rotationDegrees;
                 peerInetAddress=ssl.getInetAddress();
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
+                registerDisplayListener();
                 if(!DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
                 // Allow for transient Android CPU/Wi-Fi scheduling pauses.
@@ -331,6 +345,56 @@ final class DeskTouchSession implements AutoCloseable {
     }
     // Windows forwards approved local or environment-relayed input through
     // the SAME authenticated session. Native phone touch retains priority.
+    private static JSONArray buildLayoutArray(PhoneScreenGeometry.Info info)
+            throws org.json.JSONException {
+        JSONArray array=new JSONArray();
+        JSONObject primary=new JSONObject()
+            .put("Name","Android screen")
+            .put("X",0)
+            .put("Y",0)
+            .put("Width",info.width)
+            .put("Height",info.height)
+            .put("Primary",true)
+            .put("DensityDpi",info.densityDpi)
+            .put("RefreshHz",info.refreshHz)
+            .put("RotationDegrees",info.rotationDegrees)
+            .put("Orientation",info.orientation)
+            .put("DeviceName",info.deviceName)
+            .put("OsVersion",info.osVersion);
+        if(!info.appVersion.isEmpty()) primary.put("AppVersion",info.appVersion);
+        array.put(primary);
+        return array;
+    }
+    private void registerDisplayListener(){
+        DisplayManager dm=(DisplayManager)application.getSystemService(Context.DISPLAY_SERVICE);
+        if(dm==null || displayListener!=null) return;
+        DisplayManager.DisplayListener listener=new DisplayManager.DisplayListener(){
+            @Override public void onDisplayAdded(int displayId){}
+            @Override public void onDisplayRemoved(int displayId){}
+            @Override public void onDisplayChanged(int displayId){
+                if(displayId==android.view.Display.DEFAULT_DISPLAY)
+                    publishPhoneGeometry();
+            }
+        };
+        displayListener=listener;
+        try{dm.registerDisplayListener(listener,new Handler(Looper.getMainLooper()));}
+        catch(RuntimeException ignored){displayListener=null;}
+    }
+    private void unregisterDisplayListener(){
+        DisplayManager.DisplayListener listener=displayListener;
+        displayListener=null;
+        if(listener==null)return;
+        DisplayManager dm=(DisplayManager)application.getSystemService(Context.DISPLAY_SERVICE);
+        if(dm!=null)try{dm.unregisterDisplayListener(listener);}catch(RuntimeException ignored){}
+    }
+    private void warmOrProbeUdp(){
+        FastUdpChannel ch=udpChannel;
+        if(ch==null || udpPacer.isShutdown())return;
+        udpPacer.execute(()->{
+            if(ch.confirmed)ch.sendWarm();
+            else ch.sendProbe();
+        });
+    }
     private void handleWindowsControl(Packet p){
         if("reverse-claim".equals(p.type)){
             if(p.a<=0 || hasClaim() ||
@@ -341,6 +405,8 @@ final class DeskTouchSession implements AutoCloseable {
                 return;
             }
             reverseLease=p.a;reverseApplied=0;reportedMissingKeyboard=0;
+            lastUdpReverseMoveAtMs=0;
+            warmOrProbeUdp();
             RemoteInputPower.begin(application);
             send(new Packet("reverse-granted",p.a));
             status("Windows is allowed to control this Android screen.");
@@ -356,6 +422,11 @@ final class DeskTouchSession implements AutoCloseable {
             return;
         }
         if("reverse-move".equals(p.type)){
+            FastUdpChannel ch=udpChannel;
+            if(ch!=null && ch.confirmed && reverseApplied==reverseLease &&
+                SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<40){
+                return;
+            }
             final int lease=reverseLease;
             boolean posted=DeskTouchAccessibilityService.pointer(p.a,p.b,()->{
                 if(reverseLease==lease && reverseApplied!=lease){
@@ -371,6 +442,8 @@ final class DeskTouchSession implements AutoCloseable {
         }else if("reverse-key".equals(p.type)){
             final int activeLease=reverseLease;
             DeskTouchAccessibilityService.key(p.d,p.c!=0,()->{
+                if(reverseLease==activeLease)reportedMissingKeyboard=0;
+            },()->{
                 // No typed characters/scan codes are exposed to the hub.
                 if(reverseLease==activeLease && reportedMissingKeyboard!=activeLease){
                     reportedMissingKeyboard=activeLease;
@@ -381,6 +454,8 @@ final class DeskTouchSession implements AutoCloseable {
             p.text.length()>0 && p.text.length()<=512){
             final int activeLease=reverseLease;
             DeskTouchAccessibilityService.text(p.text,()->{
+                if(reverseLease==activeLease)reportedMissingKeyboard=0;
+            },()->{
                 // Never send text, character values or typed data back to
                 // the hub; report only the failed authority lease number.
                 if(reverseLease==activeLease &&
@@ -410,21 +485,20 @@ final class DeskTouchSession implements AutoCloseable {
         if(reverseLease>0)clearReverseControl(true);
         active=false;
         claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
+        warmOrProbeUdp();
         send(new Packet("claim",claim));
         status("Requesting Windows mouse and keyboard authority");
     }
     void publishPhoneGeometry(){
         if(!running)return;
-        android.graphics.Point actual=PhoneScreenGeometry.read(application);
-        if(actual.x==announcedPhoneWidth&&actual.y==announcedPhoneHeight)return;
-        if(actual.x<200||actual.y<100)return;
+        PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(application);
+        if(info.width==announcedPhoneWidth && info.height==announcedPhoneHeight &&
+            info.rotationDegrees==announcedPhoneRotation)return;
+        if(info.width<200||info.height<100)return;
         try {
-            JSONArray layout=new JSONArray();
-            layout.put(new JSONObject().put("Name","Android screen")
-                .put("X",0).put("Y",0)
-                .put("Width",actual.x).put("Height",actual.y)
-                .put("Primary",true));
-            announcedPhoneWidth=actual.x;announcedPhoneHeight=actual.y;
+            JSONArray layout=buildLayoutArray(info);
+            announcedPhoneWidth=info.width;announcedPhoneHeight=info.height;
+            announcedPhoneRotation=info.rotationDegrees;
             // Publish rotations on the existing authenticated TLS link.
             send(new Packet("topology",0,0,0,0,layout.toString()));
         }catch(org.json.JSONException ignored){}
@@ -546,11 +620,14 @@ final class DeskTouchSession implements AutoCloseable {
             closeUdpChannel();
             FastUdpChannel ch=new FastUdpChannel(addr,p.a,p.b,key,new FastUdpChannel.Listener(){
                 @Override public void onProbeConfirmed(){
+                    ScheduledFuture<?> retry=udpProbeRetryFuture;
+                    if(retry!=null)retry.cancel(false);
                     if(running) send(new Packet("udp-ack"));
                 }
                 @Override public void onReverseMove(int x,int y,int lease){
                     if(!running || lease<=0 || lease!=reverseLease
                         || !DeskTouchAccessibilityService.ready(application)) return;
+                    lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
                     boolean posted=DeskTouchAccessibilityService.pointer(x,y,()->{
                         if(reverseLease==lease && reverseApplied!=lease){
                             reverseApplied=lease;
@@ -563,10 +640,24 @@ final class DeskTouchSession implements AutoCloseable {
             udpChannel=ch;
             send(new Packet("udp-ready",ch.localPort()));
             ch.sendProbe();
+            final int[] attempts={0};
+            if(!udpPacer.isShutdown()) {
+                udpProbeRetryFuture=udpPacer.scheduleWithFixedDelay(()->{
+                    if(!running || udpChannel!=ch || ch.confirmed || ++attempts[0]>12){
+                        ScheduledFuture<?> f=udpProbeRetryFuture;
+                        if(f!=null)f.cancel(false);
+                        return;
+                    }
+                    ch.sendProbe();
+                },180,180,TimeUnit.MILLISECONDS);
+            }
         } catch(Exception ignored) {
         }
     }
     private void closeUdpChannel(){
+        ScheduledFuture<?> retry=udpProbeRetryFuture;
+        udpProbeRetryFuture=null;
+        if(retry!=null) retry.cancel(false);
         FastUdpChannel old=udpChannel;
         udpChannel=null;
         if(old!=null) old.close();
@@ -583,7 +674,9 @@ final class DeskTouchSession implements AutoCloseable {
     }
     private Packet takePendingUdpMoveSync(){
         synchronized(udpPacerLock){
-            Packet latest=throttledUdpMove!=null ? throttledUdpMove : pendingTcpSyncMove;
+            FastUdpChannel ch=udpChannel;
+            Packet latest=throttledUdpMove!=null ? throttledUdpMove
+                : (ch!=null && ch.confirmed ? null : pendingTcpSyncMove);
             throttledUdpMove=null;
             pendingTcpSyncMove=null;
             if(scheduledThrottleFlush!=null){scheduledThrottleFlush.cancel(false);scheduledThrottleFlush=null;}
@@ -597,7 +690,7 @@ final class DeskTouchSession implements AutoCloseable {
             Packet sync=null;
             synchronized(udpPacerLock){
                 if(throttledUdpMove==null && pendingTcpSyncMove!=null &&
-                    SystemClock.uptimeMillis()-lastAnyMoveMs>=15){
+                    SystemClock.uptimeMillis()-lastAnyMoveMs>=42){
                     sync=pendingTcpSyncMove;
                     pendingTcpSyncMove=null;
                 }
@@ -606,7 +699,7 @@ final class DeskTouchSession implements AutoCloseable {
                 final Packet toSend=sync;
                 sender.execute(()->writeNow(toSend));
             }
-        },16,TimeUnit.MILLISECONDS);
+        },45,TimeUnit.MILLISECONDS);
     }
     private void send(Packet p){
         if(sender.isShutdown())return;
@@ -619,7 +712,7 @@ final class DeskTouchSession implements AutoCloseable {
                     long now=SystemClock.uptimeMillis();
                     lastAnyMoveMs=now;
                     pendingTcpSyncMove=p;
-                    if(now-lastUdpMoveMs>=3){
+                    if(now-lastUdpMoveMs>=2){
                         lastUdpMoveMs=now;
                         throttledUdpMove=null;
                         if(scheduledThrottleFlush!=null){
@@ -644,7 +737,7 @@ final class DeskTouchSession implements AutoCloseable {
                                 FastUdpChannel c=udpChannel;
                                 if(deferred!=null && c!=null && c.confirmed && active && curClaim>0)
                                     c.send(FastUdpChannel.OP_MOVE,deferred.a,deferred.b,curClaim);
-                            },4,TimeUnit.MILLISECONDS);
+                            },2,TimeUnit.MILLISECONDS);
                         }
                     }
                     scheduleUdpTrailingSyncLocked();
@@ -681,6 +774,7 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
     private synchronized void closeConnection(){
+        unregisterDisplayListener();
         closeUdpChannel();
         clearReverseControl(false);
         RemoteInputPower.end();

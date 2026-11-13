@@ -33,6 +33,15 @@ final class DesktopDiscovery {
             ready,!ready&&!busy);
     }
 
+    static Device parseOnline(String reply,String source) {
+        if(reply==null || !reply.startsWith("DT1-ONLINE|"))return null;
+        String[] parts=reply.substring("DT1-ONLINE|".length()).split("\\|",-1);
+        if(parts.length!=2||parts[0].isBlank()||
+            parts[0].length()>100||!parts[1].matches("[A-Fa-f0-9]{64}"))
+            return null;
+        return new Device(parts[0],source,parts[1].toUpperCase(Locale.ROOT),true,false);
+    }
+
     static boolean isRemoteDevice(Device device,String localFingerprint){
         return device!=null && !(device.android &&
             device.fingerprint.equalsIgnoreCase(localFingerprint));
@@ -88,8 +97,18 @@ final class DesktopDiscovery {
         return group.isEmpty()?null:group.get(0);
     }
     static List<Device> scan() throws Exception {
+        return scanInternal(null);
+    }
+
+    static List<Device> scanFast(Set<String> targetFingerprints) throws Exception {
+        return scanInternal(targetFingerprints==null || targetFingerprints.isEmpty()
+            ? null : targetFingerprints);
+    }
+
+    private static List<Device> scanInternal(Set<String> quickTargetFingerprints) throws Exception {
         // These IPs exist only during the current discovery and TCP connection;
         // saved identities always use cryptographic fingerprints, never IP.
+        boolean fastMode=quickTargetFingerprints!=null && !quickTargetFingerprints.isEmpty();
         Map<String,Device> devices=new LinkedHashMap<>();
         Map<String,String> sourceIpByFingerprint=new HashMap<>();
         List<String[]> pendingLinks=new ArrayList<>();
@@ -102,7 +121,7 @@ final class DesktopDiscovery {
         byte[] probe="DT1-DISCOVER".getBytes(StandardCharsets.US_ASCII);
         try(DatagramSocket socket=new DatagramSocket()) {
             socket.setBroadcast(true);
-            socket.setSoTimeout(280);
+            socket.setSoTimeout(fastMode ? 120 : 280);
             Set<InetAddress> destinations=new HashSet<>();
             destinations.add(InetAddress.getByName("255.255.255.255"));
             Enumeration<NetworkInterface> interfaces=NetworkInterface.getNetworkInterfaces();
@@ -112,14 +131,17 @@ final class DesktopDiscovery {
                 for(InterfaceAddress addr:nic.getInterfaceAddresses())
                     if(addr.getBroadcast()!=null) destinations.add(addr.getBroadcast());
             }
-            long deadline=System.nanoTime()+3_800_000_000L;
+            long deadline=System.nanoTime()+(fastMode ? 1_800_000_000L : 3_800_000_000L);
+            long retryNs=fastMode ? 450_000_000L : 900_000_000L;
+            int maxSends=3;
             int sends=0;
             long nextSend=0;
+            boolean matchedTarget=false;
             while(System.nanoTime()<deadline){
                 long now=System.nanoTime();
-                if(sends<3 && now>=nextSend){
+                if(!matchedTarget && sends<maxSends && now>=nextSend){
                     sends++;
-                    nextSend=now+900_000_000L;
+                    nextSend=now+retryNs;
                     for(InetAddress dest:destinations) {
                         try {socket.send(new DatagramPacket(probe,probe.length,dest,37378));}
                         catch(Exception ignored) { /* some adapters block broadcast */ }
@@ -148,6 +170,7 @@ final class DesktopDiscovery {
                     continue;
                 }
                 Device device=parse(message,ip);
+                if(device==null) device=parseOnline(message,ip);
                 if(device==null)continue;
                 if(!isRemoteDevice(device,ownAndroidIdentity))continue;
                 if(result.getAddress().isLoopbackAddress()||
@@ -156,6 +179,12 @@ final class DesktopDiscovery {
                 Device old=devices.get(key);
                 if(old==null||(!old.ready&&device.ready))devices.put(key,device);
                 if(!device.android)sourceIpByFingerprint.put(device.fingerprint,ip);
+                if(fastMode && !matchedTarget && !device.android && device.ready &&
+                    quickTargetFingerprints.contains(device.fingerprint)) {
+                    matchedTarget=true;
+                    // Collect any trailing DT1-HUB/DT1-LINK burst before returning quickly.
+                    deadline=Math.min(deadline,System.nanoTime()+120_000_000L);
+                }
             }
         }
         ArrayList<Device> found=new ArrayList<>(devices.values());

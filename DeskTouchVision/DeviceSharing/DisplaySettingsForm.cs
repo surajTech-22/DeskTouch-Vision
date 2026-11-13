@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Threading.Channels;
 using System.Windows.Forms;
 using DeskTouchVision;
+using Microsoft.Win32;
 
 namespace DeskTouch.DeviceShare;
 
@@ -215,6 +217,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
             catch (Exception ex) { Status("Windows sign-in startup could not be enabled: " + ex.Message); }
             UpdateClient.StartEventUpdates(this);
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
             _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 5000 };
             _trustedScanTimer.Tick += async (_, _) => await ScanTrustedAsync();
             _trustedScanTimer.Start();
@@ -294,6 +298,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         WindowState = FormWindowState.Normal;
         Activate();
         BringToFront();
+        BroadcastOnlinePresence();
     }
 
     private void HideToTray(bool showBalloon = true)
@@ -441,21 +446,33 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _disconnect.Enabled = _host != null ||
             _receiver?.ConnectedPeerCount > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
+        var localDesc = _display.Local?.DescribeSummary("Windows") ?? $"{localScreens} display(s)";
         if (_host != null)
         {
             int members=_host.EnvironmentMembers.Count;
             int android=_host.EnvironmentMembers.Count(m=>m.Platform=="Android");
-            _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
-                            $"{_remoteAddress}  ·  {_host.RemoteMonitors.Monitors.Count} display(s)" +
-                            $"     ·     {members} environment device(s), {android} Android";
+            var phoneMember = _host.EnvironmentMembers.FirstOrDefault(m => m.Platform == "Android");
+            string phoneInfo = phoneMember != null
+                ? $"  +  {phoneMember.Name} ({MonitorTopology.FromWire(phoneMember.Layout).DescribeSummary("Android")})"
+                : "";
+            _summary.Text = $"{Environment.MachineName} ({localDesc})  +  " +
+                            $"{_remoteAddress} ({_host.RemoteMonitors.DescribeSummary("Windows")})" +
+                            $"{phoneInfo}  ·  {members} device(s)";
         }
         else if (_incomingPeer != null)
-            _summary.Text = $"{Environment.MachineName}  ·  {localScreens} display(s)     +     " +
-                            $"{_incomingPeer.Name}  ·  {_incomingPeer.Monitors.Monitors.Count} display(s)  ·  " +
-                            $"{1+(_receiver?.ConnectedPeerCount??0)} devices in one environment" +
-                            $" ({_receiver?.ConnectedPeers.Count(p=>p.Peer.Platform=="Android")??0} Android)";
+        {
+            var phonePeer = _incomingPeer.Platform == "Android"
+                ? _incomingPeer
+                : _receiver?.ConnectedPeers.Select(p => p.Peer).FirstOrDefault(p => p.Platform == "Android");
+            string extraPhone = phonePeer != null && !ReferenceEquals(phonePeer, _incomingPeer)
+                ? $"  +  {phonePeer.Name} ({phonePeer.FormatScreenInfo()})"
+                : "";
+            _summary.Text = $"{Environment.MachineName} ({localDesc})  +  " +
+                            $"{_incomingPeer.Name} ({_incomingPeer.FormatScreenInfo()}){extraPhone}  ·  " +
+                            $"{1+(_receiver?.ConnectedPeerCount??0)} in environment";
+        }
         else
-            _summary.Text = $"{Environment.MachineName}  ·  {localScreens} Windows display(s)" +
+            _summary.Text = $"{Environment.MachineName}  ·  {localDesc}" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
     }
 
@@ -479,12 +496,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _host.RemoteMonitors : MonitorTopology.FromWire(hub.Layout);
                 _display.Remote=baseTopology;
                 _display.RemoteDeviceName=hub?.Name ?? _remoteAddress;
+                _display.RemotePlatform=hub?.Platform;
+                _display.RemoteScreenDetails=hub?.Platform == "Android"
+                    ? baseTopology.DescribeSummary("Android") : null;
                 foreach(var member in _host.EnvironmentMembers)
                 {
                     if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId)continue;
+                    var memberTopology = MonitorTopology.FromWire(member.Layout);
                     tiles.Add(new EnvironmentDisplayTile(-member.Id,member.Name,
-                        member.Platform,MonitorTopology.FromWire(member.Layout).Monitors.Count,
-                        member.SupportsReverseInput,member.StableIdentity));
+                        member.Platform,memberTopology.Monitors.Count,
+                        member.SupportsReverseInput,member.StableIdentity,
+                        memberTopology,memberTopology.DescribeSummary(member.Platform)));
                 }
             }
             else
@@ -500,12 +522,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 baseTargetId=main.Id;
                 _display.Remote=main.Peer?.Monitors;
                 _display.RemoteDeviceName=main.Peer?.Name ?? "Connected device";
+                _display.RemotePlatform=main.Peer?.Platform;
+                _display.RemoteScreenDetails=main.Peer != null
+                    ? main.Peer.FormatScreenInfo() : null;
                 foreach(var (id,peer) in connected)
                 {
                     if(id==baseTargetId)continue;
                     tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
                         peer.Platform,peer.Monitors.Monitors.Count,
-                        peer.SupportsReverseInput,peer.DeviceFingerprint));
+                        peer.SupportsReverseInput,peer.DeviceFingerprint,
+                        peer.Monitors,peer.FormatScreenInfo()));
                 }
             }
             _display.EnvironmentDevices =
@@ -854,6 +880,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             return neighbours;
                         }, () => _host == null);
                     _discovery.Start();
+                    BroadcastOnlinePresence();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
             }
@@ -1346,7 +1373,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             // Discovery finds CURRENT network addresses; the saved file has
             // NO IP address, only the receiver's persistent TLS fingerprint.
-            var peers = await NearbyComputerDiscovery.FindAsync(_closing.Token);
+            var targetFingerprints = _trusted.Outgoing
+                .Select(x => x.Fingerprint)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var peers = await NearbyComputerDiscovery.FindFastAsync(
+                targetFingerprints, _closing.Token);
             var remembered = peers.Select(p => new { Peer = p,
                 Saved = _trusted.FindAutoConnect(p.Fingerprint) }).ToArray();
             // Reconnect to the existing environment hub; never silently
@@ -1659,10 +1690,46 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         base.WndProc(ref message);
     }
 
+    private void BroadcastOnlinePresence()
+    {
+        string? fp = _receiver?.Fingerprint;
+        if (string.IsNullOrWhiteSpace(fp) || _closing.IsCancellationRequested) return;
+        _ = Task.Run(async () =>
+        {
+            try { await NearbyComputerDiscovery.BroadcastOnlineAnnouncementAsync(fp, _closing.Token); }
+            catch (OperationCanceledException) { }
+            catch (Exception) { }
+        });
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode != PowerModes.Resume || _closing.IsCancellationRequested) return;
+        BroadcastOnlinePresence();
+        PostToUi(() =>
+        {
+            _retryTrustedAfter = DateTime.MinValue;
+            _ = ScanTrustedAsync();
+        });
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        if (_closing.IsCancellationRequested) return;
+        BroadcastOnlinePresence();
+        PostToUi(() =>
+        {
+            _retryTrustedAfter = DateTime.MinValue;
+            _ = ScanTrustedAsync();
+        });
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
             _closing.Cancel();
             _logChannel.Writer.TryComplete();
             _trustedScanTimer?.Dispose();

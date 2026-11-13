@@ -13,10 +13,32 @@ namespace DeskTouch.DeviceShare;
 
 internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     bool SupportsReverseInput = true, string? DeviceFingerprint = null,
-    string Platform = "Windows", bool SupportsForwardInput = false);
+    string Platform = "Windows", bool SupportsForwardInput = false,
+    string? OsVersion = null, string? AppVersion = null,
+    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null)
+{
+    internal string FormatScreenInfo()
+    {
+        var baseSummary = Monitors.DescribeSummary(Platform);
+        var extras = new List<string>();
+        if (!baseSummary.Contains("dpi", StringComparison.OrdinalIgnoreCase) && DensityDpi is > 0)
+            extras.Add($"{DensityDpi} dpi");
+        if (!baseSummary.Contains("Hz", StringComparison.OrdinalIgnoreCase) && RefreshHz is > 0)
+            extras.Add($"{RefreshHz} Hz");
+        if (!string.IsNullOrWhiteSpace(OsVersion) &&
+            !baseSummary.Contains(OsVersion, StringComparison.OrdinalIgnoreCase))
+            extras.Add(OsVersion);
+        if (!string.IsNullOrWhiteSpace(AppVersion) &&
+            !baseSummary.Contains("v" + AppVersion, StringComparison.OrdinalIgnoreCase))
+            extras.Add($"v{AppVersion}");
+        return extras.Count == 0 ? baseSummary : baseSummary + " · " + string.Join(" · ", extras);
+    }
+}
 internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
-    string? Platform = null, bool? ForwardInputSupported = null);
+    string? Platform = null, bool? ForwardInputSupported = null,
+    string? OsVersion = null, string? AppVersion = null,
+    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null);
 
 // Issued exclusively by the authenticated hub over an existing TLS session.
 // Id is a connection-scoped route identifier, not a device identity or trust proof.
@@ -593,6 +615,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _hubClaims[id]=packet.A;
                 Volatile.Write(ref selected.ActiveReverseLease, packet.A);
                 selected.MovePacer?.SetWarmActive(true);
+                if (_udpHub != null && selected.UdpPeer is { HasEndpoint: true } udpPeer)
+                    _udpHub.Send(udpPeer, udpPeer.Confirmed ? FastUdpOp.Warm : FastUdpOp.Probe,
+                        udpPeer.Confirmed ? 0 : _udpHub.Port, 0, 0);
             }
             else if(packet.Type is "reset" or "release")
             {
@@ -664,9 +689,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
                     continue;
                 }
-                var udpSync = session.MovePacer?.TakePendingReliableSync();
+                bool isImmediateControl = p.Type is "button" or "wheel";
+                var udpSync = session.MovePacer?.TakePendingReliableSync(
+                    skipIfUdpDelivered: isImmediateControl);
                 var tcpPrior = Interlocked.Exchange(ref session.LatestReverseMove, null);
-                var prior = udpSync ?? tcpPrior;
+                var prior = udpSync ?? (isImmediateControl && session.UdpPeer is { Confirmed: true }
+                    ? null : tcpPrior);
                 if (prior != null)
                     await SendToAsync(session, ReverseInputProtocol.Encode(prior), token);
                 await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
@@ -717,9 +745,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             id.All(Uri.IsHexDigit) ? id.ToUpperInvariant() : null;
         string platform = string.Equals(hello.Platform, "Android",
             StringComparison.OrdinalIgnoreCase) ? "Android" : "Windows";
-        return new ConnectedPeer(name, MonitorTopology.FromWire(hello.Layout),
+        var monitors = MonitorTopology.FromWire(hello.Layout);
+        var primaryMon = monitors.Monitors.FirstOrDefault(m => m.Primary) ?? monitors.Monitors[0];
+        return new ConnectedPeer(name, monitors,
             hello.ReverseInputSupported ?? true, hint, platform,
-            platform != "Android" || hello.ForwardInputSupported == true);
+            platform != "Android" || hello.ForwardInputSupported == true,
+            !string.IsNullOrWhiteSpace(hello.OsVersion) ? hello.OsVersion : primaryMon.OsVersion,
+            !string.IsNullOrWhiteSpace(hello.AppVersion) ? hello.AppVersion : primaryMon.AppVersion,
+            hello.DensityDpi ?? primaryMon.DensityDpi,
+            hello.RefreshHz ?? primaryMon.RefreshHz,
+            hello.RotationDegrees ?? primaryMon.RotationDegrees);
     }
 
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
@@ -821,13 +856,30 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type=="udp-ready")
                 {
                     if (_udpHub != null && session.UdpPeer != null && p.A is > 0 and <= 65535)
+                    {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
+                        var retryPeer = session.UdpPeer;
+                        var hub = _udpHub;
+                        _ = Task.Run(async () =>
+                        {
+                            for (int i = 0; i < 4 && !token.IsCancellationRequested && !retryPeer.Confirmed; i++)
+                            {
+                                try { await Task.Delay(200, token); }
+                                catch (OperationCanceledException) { return; }
+                                if (!retryPeer.Confirmed)
+                                    hub.Send(retryPeer, FastUdpOp.Probe, hub.Port, 0, 0);
+                            }
+                        }, token);
+                    }
                     continue;
                 }
                 if(p.Type=="udp-ack")
                 {
-                    if (session.UdpPeer != null)
+                    if (session.UdpPeer != null && !session.UdpPeer.Confirmed)
+                    {
                         session.UdpPeer.Confirmed = true;
+                        _status($"Low-latency input confirmed for {session.Peer.Name}.");
+                    }
                     continue;
                 }
                 if(p.Type=="trust-request")
@@ -854,8 +906,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="topology")
                 {
-                    session.Peer=session.Peer with {Monitors=MonitorTopology.FromWire(p.Text)};
+                    var updatedTopology=MonitorTopology.FromWire(p.Text);
+                    var primaryMon=updatedTopology.Monitors.FirstOrDefault(m=>m.Primary)
+                        ?? updatedTopology.Monitors[0];
+                    session.Peer=session.Peer with {
+                        Monitors=updatedTopology,
+                        DensityDpi=primaryMon.DensityDpi ?? session.Peer.DensityDpi,
+                        RefreshHz=primaryMon.RefreshHz ?? session.Peer.RefreshHz,
+                        RotationDegrees=primaryMon.RotationDegrees ?? session.Peer.RotationDegrees,
+                        OsVersion=!string.IsNullOrWhiteSpace(primaryMon.OsVersion)
+                            ? primaryMon.OsVersion : session.Peer.OsVersion,
+                        AppVersion=!string.IsNullOrWhiteSpace(primaryMon.AppVersion)
+                            ? primaryMon.AppVersion : session.Peer.AppVersion
+                    };
                     await PublishEnvironmentAsync(token);
+                    PeerListChanged?.Invoke();
                     if(ReferenceEquals(Volatile.Read(ref _selected),session))
                         PeerTopologyChanged?.Invoke(session.Peer);
                     continue;
@@ -1792,12 +1857,14 @@ internal sealed class HostSession : IInputSession, IDisposable
                         await Wire.WriteAsync(_ssl, move, _cancel.Token);
                     continue;
                 }
+                bool isImmediateControl = p.Type is "button" or "wheel";
                 // Rare full queue race: never lose a final movement.
                 var udpSync = p.Type is ("release" or "reset" or "claim")
                     ? null
-                    : _movePacer?.TakePendingReliableSync();
+                    : _movePacer?.TakePendingReliableSync(skipIfUdpDelivered: isImmediateControl);
                 var tcpLatest = Interlocked.Exchange(ref _latestMove, null);
-                var latest = udpSync ?? tcpLatest;
+                var latest = udpSync ?? (isImmediateControl && Volatile.Read(ref _udpAckSent) == 1
+                    ? null : tcpLatest);
                 if (latest != null)
                     await Wire.WriteAsync(_ssl, latest, _cancel.Token);
                 await Wire.WriteAsync(_ssl, p, _cancel.Token);

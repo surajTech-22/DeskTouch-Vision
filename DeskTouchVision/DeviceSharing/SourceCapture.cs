@@ -92,6 +92,8 @@ internal sealed class SourceCapture : IDisposable
     private int _remoteModifierDownMask;
     private bool _suppressMobileShortcutUp;
     private bool _directShortcutEntry;
+    private double _remoteFracX, _remoteFracY;
+    private int _androidReturnPushPx;
 
     internal bool RemoteActive => Volatile.Read(ref _active) != 0;
     internal bool IsClaimPending =>
@@ -258,6 +260,22 @@ internal sealed class SourceCapture : IDisposable
         }
     }
 
+    internal static IReadOnlyList<int> ModifiersForMask(int mask)
+    {
+        var vks = new List<int>(3);
+        if ((mask & 1) != 0) vks.Add(0x11); // Ctrl
+        if ((mask & 2) != 0) vks.Add(0x12); // Alt
+        if ((mask & 4) != 0) vks.Add(0x10); // Shift
+        return vks;
+    }
+
+    private void ReleaseHeldRemoteModifiers()
+    {
+        int mask = Interlocked.Exchange(ref _remoteModifierDownMask, 0);
+        foreach (int vk in ModifiersForMask(mask))
+            _session.TrySend(new Packet("key", 0, 0, 0, vk));
+    }
+
     internal void ReturnLocal()
     {
         _continuingAcrossDevices=false;
@@ -270,11 +288,14 @@ internal sealed class SourceCapture : IDisposable
         if (awaitingApplied > 0)
             _session.TrySend(new Packet("release", awaitingApplied));
         if (Interlocked.Exchange(ref _active, 0) == 0) return;
+        ReleaseHeldRemoteModifiers();
         int priorLease = Interlocked.Exchange(ref _activeClaim, 0);
         if (priorLease > 0)
             _session.TrySend(new Packet("release", priorLease));
         _cooldownUntil = Environment.TickCount64 + 180;
-        _remoteModifierDownMask = 0;
+        _remoteFracX = 0;
+        _remoteFracY = 0;
+        _androidReturnPushPx = 0;
         // Return to the real Windows screen the cursor left, not an empty
         // rectangle or another physical monitor. When entered via Ctrl+Alt+M,
         // place the cursor safely inside the primary monitor center.
@@ -314,6 +335,7 @@ internal sealed class SourceCapture : IDisposable
         _pendingPoint = sourcePoint;
         int request = _claims.Begin();
         _claimStarted = Environment.TickCount64;
+        _session.TrySend(new Packet("warm"));
         // Never hide or park local pointer until the authenticated target
         // acknowledges THIS exact request. A stale grant cannot switch owners.
         if (!_session.TrySend(new Packet("claim", request)))
@@ -394,6 +416,9 @@ internal sealed class SourceCapture : IDisposable
         _lastRawMs = now;
         _lastFallbackMs = 0;
         _hookMovesWithoutRaw = 0;
+        _remoteFracX = 0;
+        _remoteFracY = 0;
+        _androidReturnPushPx = 0;
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
@@ -477,11 +502,11 @@ internal sealed class SourceCapture : IDisposable
         {
             long now = Environment.TickCount64;
             if (now - _lastWarmHintMs >= 45 &&
-                (_localMonitors.IsExternalEdge(cursor, _edge, 28) ||
+                (_localMonitors.IsExternalEdge(cursor, _edge, 60) ||
                  (NavigateEnvironment != null &&
-                  (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), 28) ||
-                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().First, 28) ||
-                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().Second, 28)))))
+                  (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), 60) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().First, 60) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().Second, 60)))))
             {
                 _lastWarmHintMs = now;
                 _session.TrySend(new Packet("warm"));
@@ -708,8 +733,19 @@ internal sealed class SourceCapture : IDisposable
             // Suppress only the immediately duplicated raw event;
             // alternating input sources must not double movement speed.
             if (!ShouldDropDuplicateRaw(_lastFallbackMs, now))
-                MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
-                    ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
+            {
+                bool targetAndroid = DestinationIsAndroid?.Invoke() == true;
+                int? dpi = _remoteMonitors.Monitors.FirstOrDefault()?.DensityDpi;
+                double sx = ScaleRawDeltaPrecise(input.Mouse.LastX, _mouseSpeed, targetAndroid, dpi);
+                double sy = ScaleRawDeltaPrecise(input.Mouse.LastY, _mouseSpeed, targetAndroid, dpi);
+                _remoteFracX += sx;
+                _remoteFracY += sy;
+                int dx = (int)Math.Truncate(_remoteFracX);
+                int dy = (int)Math.Truncate(_remoteFracY);
+                _remoteFracX -= dx;
+                _remoteFracY -= dy;
+                MoveRemote(dx, dy);
+            }
         }
         else
         {
@@ -754,6 +790,38 @@ internal sealed class SourceCapture : IDisposable
         return scaled == 0 ? Math.Sign(raw) : scaled;
     }
 
+    internal static double ScaleRawDeltaPrecise(
+        int raw, int systemMouseSpeed, bool isAndroid, int? remoteDensityDpi = null)
+    {
+        if (raw == 0) return 0;
+        int bounded = Math.Clamp(raw, isAndroid ? -450 : -800, isAndroid ? 450 : 800);
+        double speedFactor = Math.Clamp(systemMouseSpeed, 1, 20) / 10.0;
+        if (!isAndroid)
+            return bounded * speedFactor * 1.45;
+        double dpiFactor = remoteDensityDpi is > 0
+            ? Math.Clamp(remoteDensityDpi.Value / 440.0, 0.70, 1.35)
+            : 1.0;
+        return bounded * speedFactor * 0.95 * dpiFactor;
+    }
+
+    private static int EdgeOvershoot(MonitorRect monitor, int nextX, int nextY, MonitorEdge edge) =>
+        edge switch
+        {
+            MonitorEdge.Left => monitor.X - nextX,
+            MonitorEdge.Right => nextX - (monitor.X + monitor.Width - 1),
+            MonitorEdge.Top => monitor.Y - nextY,
+            MonitorEdge.Bottom => nextY - (monitor.Y + monitor.Height - 1),
+            _ => 0
+        };
+
+    private bool ShouldCrossAndroidReturnEdge(bool isAndroidTarget, bool isReturnEdge,
+        MonitorRect monitor, int nextX, int nextY, MonitorEdge edge)
+    {
+        if (!isAndroidTarget || !isReturnEdge) return true;
+        int overshoot = EdgeOvershoot(monitor, nextX, nextY, edge);
+        return (_androidReturnPushPx += Math.Max(1, overshoot)) >= 12;
+    }
+
     private void MoveRemote(int dx, int dy)
     {
         if (!RemoteActive || (dx == 0 && dy == 0)) return;
@@ -761,12 +829,14 @@ internal sealed class SourceCapture : IDisposable
         int nextY = _remoteY + dy;
         var monitor = _remoteMonitors.MonitorAt(new System.Drawing.Point(_remoteX, _remoteY));
         var returnEdge = Opposite(_edge);
-        bool withinEntryGrace = Environment.TickCount64 - _enteredRemoteAt < 180;
+        bool withinEntryGrace = Environment.TickCount64 - _enteredRemoteAt < 260;
+        bool isAndroidTarget = DestinationIsAndroid?.Invoke() == true;
         if(monitor!=null && NavigateEnvironment!=null)
         {
             // The inline diagram may have another authenticated screen on
             // either side. Crossing its exterior edge should select that
             // device, not trap the cursor or terminate other TLS sessions.
+            bool crossedAny = false;
             foreach(var side in new[]{
                 MonitorEdge.Left,MonitorEdge.Right,MonitorEdge.Top,MonitorEdge.Bottom})
             {
@@ -789,6 +859,11 @@ internal sealed class SourceCapture : IDisposable
                     _=>new System.Drawing.Point(_remoteX,_remoteY)
                 };
                 if(!_remoteMonitors.IsExternalEdge(border,side,1))continue;
+                crossedAny = true;
+                if (!ShouldCrossAndroidReturnEdge(isAndroidTarget, side == returnEdge,
+                    monitor, nextX, nextY, side))
+                    break;
+                if (side == returnEdge) _androidReturnPushPx = 0;
                 double fraction=_remoteMonitors.EdgeFraction(border,side);
                 if(Interlocked.CompareExchange(ref _switchPending,1,0)==0)
                 {
@@ -807,6 +882,7 @@ internal sealed class SourceCapture : IDisposable
                 }
                 return;
             }
+            if (isAndroidTarget && !crossedAny) _androidReturnPushPx = 0;
         }
         if (monitor != null && !withinEntryGrace)
         {
@@ -829,14 +905,23 @@ internal sealed class SourceCapture : IDisposable
             if (NavigateEnvironment==null && leaving &&
                 _remoteMonitors.IsExternalEdge(borderPoint, returnEdge, 1))
             {
-                if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0 &&
-                    !Post(() =>
-                    {
-                        try { ReturnLocal(); }
-                        finally { Interlocked.Exchange(ref _switchPending, 0); }
-                    }))
-                    Interlocked.Exchange(ref _switchPending, 0);
-                return;
+                if (ShouldCrossAndroidReturnEdge(isAndroidTarget, true,
+                    monitor, nextX, nextY, returnEdge))
+                {
+                    _androidReturnPushPx = 0;
+                    if (Interlocked.CompareExchange(ref _switchPending, 1, 0) == 0 &&
+                        !Post(() =>
+                        {
+                            try { ReturnLocal(); }
+                            finally { Interlocked.Exchange(ref _switchPending, 0); }
+                        }))
+                        Interlocked.Exchange(ref _switchPending, 0);
+                    return;
+                }
+            }
+            else if (isAndroidTarget && !leaving && NavigateEnvironment == null)
+            {
+                _androidReturnPushPx = 0;
             }
         }
         // The OS can have real monitors with gaps / negative screen coordinates.

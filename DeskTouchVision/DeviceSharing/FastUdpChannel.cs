@@ -475,10 +475,10 @@ internal sealed class FastUdpClient : IDisposable
 /// </summary>
 internal sealed class FastMovePacer : IDisposable
 {
-    private const double MinUdpIntervalMs = 3.0;
-    private const int ThrottleFlushDelayMs = 4;
-    private const int TrailingTcpSyncDelayMs = 16;
-    private const int WarmKeepaliveIntervalMs = 20;
+    private const double MinUdpIntervalMs = 1.5;
+    private const int ThrottleFlushDelayMs = 2;
+    private const int TrailingTcpSyncDelayMs = 45;
+    private const int WarmKeepaliveIntervalMs = 12;
 
     private readonly object _gate = new();
     private readonly Func<bool> _canSendUdp;
@@ -538,11 +538,13 @@ internal sealed class FastMovePacer : IDisposable
         return true;
     }
 
-    internal Packet? TakePendingReliableSync()
+    internal Packet? TakePendingReliableSync(bool skipIfUdpDelivered = false)
     {
         lock (_gate)
         {
-            var packet = _throttledUdp ?? _pendingTcpSync;
+            var packet = skipIfUdpDelivered && _canSendUdp()
+                ? _throttledUdp
+                : (_throttledUdp ?? _pendingTcpSync);
             _throttledUdp = null;
             _pendingTcpSync = null;
             UpdateTimerLocked();

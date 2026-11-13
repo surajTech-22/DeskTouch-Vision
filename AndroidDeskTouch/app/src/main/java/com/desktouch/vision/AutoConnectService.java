@@ -7,6 +7,7 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
 import android.os.*;
 import android.provider.Settings;
 import android.util.Log;
@@ -34,7 +35,10 @@ public final class AutoConnectService extends Service {
     private TrustedWindows trust;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback wifiCallback;
+    private BroadcastReceiver wakeReceiver;
     private volatile boolean scanning;
+    private volatile boolean pendingWake;
+    private volatile boolean retryScheduled;
 
     static boolean enabled(Context context) {
         return context.getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -82,6 +86,17 @@ public final class AutoConnectService extends Service {
         if(service==null)return;
         NotificationManager manager=service.getSystemService(NotificationManager.class);
         if(manager!=null)manager.notify(NOTIFICATION_ID,service.buildNotification());
+    }
+
+    static void nudgeReconnect(Context context) {
+        AutoConnectService service=activeInstance;
+        if(service!=null) {
+            service.triggerFastReconnect();
+            return;
+        }
+        if(context!=null && enabled(context) && reconnectEnabled(context)) {
+            start(context.getApplicationContext());
+        }
     }
 
     private Notification buildNotification() {
@@ -133,6 +148,14 @@ public final class AutoConnectService extends Service {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
         else startForeground(NOTIFICATION_ID,notification);
         responder=new MobileDiscoveryResponder();
+        responder.setOnlineListener(device->{
+            if(device==null || trust==null) return;
+            Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
+                .getStringSet("pausedPeers",java.util.Collections.emptySet());
+            if(trust.fingerprints().contains(device.fingerprint) &&
+                !paused.contains(device.fingerprint))
+                triggerFastReconnect();
+        });
         try { responder.start(this); }
         catch(Exception error) {
             Log.w("DeskTouch","Android discovery responder unavailable",error);
@@ -140,6 +163,7 @@ public final class AutoConnectService extends Service {
         scheduler=Executors.newSingleThreadScheduledExecutor();
         scheduler.scheduleWithFixedDelay(this::autoConnect,0,10,TimeUnit.SECONDS);
         registerWifiReconnectCallback();
+        registerWakeReceivers();
         // Updates are downloaded only from official GitHub and SHA-256 checked.
         // Android's own installer must still be approved by the user.
         scheduler.scheduleWithFixedDelay(
@@ -165,41 +189,96 @@ public final class AutoConnectService extends Service {
         }
     }
 
+    private void registerWakeReceivers() {
+        IntentFilter filter=new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        wakeReceiver=new BroadcastReceiver() {
+            @Override public void onReceive(Context context,Intent intent) {
+                triggerFastReconnect();
+            }
+        };
+        try {
+            if(Build.VERSION.SDK_INT>=33)
+                registerReceiver(wakeReceiver,filter,Context.RECEIVER_NOT_EXPORTED);
+            else
+                registerReceiver(wakeReceiver,filter);
+        } catch(Exception error) {
+            wakeReceiver=null;
+            Log.w("DeskTouch","Screen/Wi-Fi wake receiver unavailable",error);
+        }
+    }
+
     private void triggerFastReconnect() {
+        if(scanning) pendingWake=true;
         ScheduledExecutorService pool=scheduler;
         if(pool!=null && !pool.isShutdown())
             pool.execute(this::autoConnect);
     }
+
+    private void scheduleInteractiveFollowUp() {
+        ScheduledExecutorService pool=scheduler;
+        if(pool==null || pool.isShutdown() || retryScheduled) return;
+        PowerManager power=getSystemService(PowerManager.class);
+        if(power!=null && !power.isInteractive()) return;
+        retryScheduled=true;
+        pool.schedule(()->{
+            retryScheduled=false;
+            autoConnect();
+        },3500,TimeUnit.MILLISECONDS);
+    }
+
     private void autoConnect() {
         if(scanning || !reconnectEnabled(this) || !enabled(this)) return;
         scanning=true;
+        boolean connectedNow=false;
         try {
             Set<String> verified=trust.fingerprints();
             Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
                 .getStringSet("pausedPeers",java.util.Collections.emptySet());
-            if(verified.isEmpty()) return; // no silent first-time pairing
+            Set<String> eligible=new HashSet<>(verified);
+            eligible.removeAll(paused);
+            if(eligible.isEmpty()) return; // no silent first-time pairing
             android.graphics.Point display=PhoneScreenGeometry.read(this);
             // One logical environment => ONE TLS gateway session from this
             // Android device. Other Windows/phone members are authenticated
             // separately TO THAT HUB and routed by its environment roster.
-            if(DeskTouchRuntime.connectedCount()>0)return;
+            if(DeskTouchRuntime.connectedCount()>0) {
+                connectedNow=true;
+                return;
+            }
             java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
-                DesktopDiscovery.windowsGroups(DesktopDiscovery.scan());
+                DesktopDiscovery.windowsGroups(DesktopDiscovery.scanFast(eligible));
             for(java.util.List<DesktopDiscovery.Device> members:groups.values()){
-                java.util.Set<String> eligible=new java.util.HashSet<>(verified);
-                eligible.removeAll(paused);
                 DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
                     members,java.util.Collections.emptySet(),eligible);
                 if(gateway==null||!gateway.ready||
                     !eligible.contains(gateway.fingerprint))continue;
-                if(DeskTouchRuntime.isConnecting(gateway.fingerprint))return;
+                if(DeskTouchRuntime.isConnecting(gateway.fingerprint)) {
+                    connectedNow=true;
+                    return;
+                }
                 DeskTouchSession selected=DeskTouchRuntime.select(this,gateway.fingerprint);
                 selected.connect(gateway,display.x,display.y);
+                connectedNow=true;
                 return; // never auto-open pairwise connections to group members
             }
         }catch(Exception error){
             Log.w("DeskTouch","Trusted LAN reconnect deferred",error);
-        }finally{scanning=false;}
+        }finally{
+            scanning=false;
+            if(!connectedNow) {
+                if(pendingWake) {
+                    pendingWake=false;
+                    triggerFastReconnect();
+                } else if(reconnectEnabled(this) && enabled(this)) {
+                    scheduleInteractiveFollowUp();
+                }
+            } else {
+                pendingWake=false;
+            }
+        }
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId) {
         String action=intent!=null ? intent.getAction() : null;
@@ -222,6 +301,11 @@ public final class AutoConnectService extends Service {
         if(connectivityManager!=null && wifiCallback!=null) {
             try { connectivityManager.unregisterNetworkCallback(wifiCallback); }
             catch(Exception ignored) {}
+        }
+        if(wakeReceiver!=null) {
+            try { unregisterReceiver(wakeReceiver); }
+            catch(Exception ignored) {}
+            wakeReceiver=null;
         }
         if(scheduler!=null)scheduler.shutdownNow();
         if(responder!=null)responder.close();

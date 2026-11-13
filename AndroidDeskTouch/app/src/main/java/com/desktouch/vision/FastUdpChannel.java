@@ -208,6 +208,10 @@ final class FastUdpChannel implements Closeable {
         send(OP_PROBE, port, 0, 0);
     }
 
+    void sendWarm() {
+        send(OP_WARM, 0, 0, 0);
+    }
+
     boolean send(byte op, int a, int b, int lease) {
         if (closed) return false;
         synchronized (sendBuffer) {
@@ -246,7 +250,10 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_PROBE_ACK) {
                     markConfirmed();
+                } else if (msg.op == OP_WARM) {
+                    markConfirmed();
                 } else if (msg.op == OP_REVERSE_MOVE) {
+                    markConfirmed();
                     listener.onReverseMove(msg.a, msg.b, msg.lease);
                 }
             } catch (Exception e) {

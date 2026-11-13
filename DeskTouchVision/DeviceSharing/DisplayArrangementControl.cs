@@ -106,6 +106,8 @@ internal sealed class DisplayArrangementControl : Control
     private RectangleF _remoteHit;
     private RectangleF _remoteBaseHit;
     private RectangleF _localHit;
+    private RectangleF[] _localMonitorHits = Array.Empty<RectangleF>();
+    private RectangleF[] _remoteMonitorHits = Array.Empty<RectangleF>();
     private RectangleF _placeholderHit;
     private bool _draggingRemote;
     private Point _dragOrigin;
@@ -154,20 +156,157 @@ internal sealed class DisplayArrangementControl : Control
     internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
         _environmentHits.Select(x=>(x.TargetId,x.Hit)).ToArray();
 
+    private static RectangleF SelectExposedOriginRect(
+        RectangleF groupBounds, IReadOnlyList<RectangleF> monitors,
+        MonitorEdge direction, float cross)
+    {
+        if (monitors.Count == 0) return groupBounds;
+        bool horizontal = direction is MonitorEdge.Left or MonitorEdge.Right;
+        const float edgeTolerance = 8f;
+        RectangleF? chosen = null;
+        foreach (var mon in monitors)
+        {
+            if (mon.Width <= 0 || mon.Height <= 0) continue;
+            float from = horizontal ? mon.Top : mon.Left;
+            float to = horizontal ? mon.Bottom : mon.Right;
+            if (cross < from - edgeTolerance || cross > to + edgeTolerance) continue;
+            if (chosen is not { } best) { chosen = mon; continue; }
+            bool outer = direction switch
+            {
+                MonitorEdge.Left => mon.Left < best.Left,
+                MonitorEdge.Right => mon.Right > best.Right,
+                MonitorEdge.Top => mon.Top < best.Top,
+                MonitorEdge.Bottom => mon.Bottom > best.Bottom,
+                _ => false
+            };
+            if (outer) chosen = mon;
+        }
+        return chosen ?? groupBounds;
+    }
+
     internal int? AdjacentTarget(int currentId,MonitorEdge direction,
         int baseTargetId,double fraction=0.5)
     {
         // Only the ACTUAL shared screen edge can grant a transition. A screen
-        // somewhere in a direction is not a neighbor. Treat the phone's drag
-        // rectangle and both Windows monitor groups in the same diagram.
-        var regions=new List<(int Id,RectangleF Bounds)> {
-            (EnvironmentRouteOrder.Local,_localHit),(baseTargetId,_remoteHit)
+        // somewhere in a direction is not a neighbor. Resolve each physical
+        // monitor edge (including uneven dual-monitor heights/tops) while
+        // keeping EdgeFraction anchored to the device group bounds.
+        var devices = new List<(int Id, RectangleF Group, IReadOnlyList<RectangleF> Monitors)> {
+            (EnvironmentRouteOrder.Local, _localHit,
+                _localMonitorHits.Length > 0 ? _localMonitorHits :
+                    (_localHit.Width > 0 ? new[] { _localHit } : Array.Empty<RectangleF>())),
+            (baseTargetId, _remoteHit,
+                _remoteMonitorHits.Length > 0 ? _remoteMonitorHits :
+                    (_remoteHit.Width > 0 ? new[] { _remoteHit } : Array.Empty<RectangleF>()))
         };
-        foreach(var item in _environmentHits)
-            if(_environmentDevices.Any(d=>d.TargetId==item.TargetId &&
-                d.SupportsInput))
-                regions.Add((item.TargetId,item.Hit));
-        return SpatialNeighbor(regions,currentId,direction,fraction);
+        foreach (var item in _environmentHits)
+            if (_environmentDevices.Any(d => d.TargetId == item.TargetId && d.SupportsInput))
+                devices.Add((item.TargetId, item.Hit, new[] { item.Hit }));
+
+        var origin = devices.FirstOrDefault(d => d.Id == currentId);
+        if (origin.Group.Width <= 0 || origin.Group.Height <= 0) return null;
+
+        bool horizontal = direction is MonitorEdge.Left or MonitorEdge.Right;
+        fraction = Math.Clamp(double.IsFinite(fraction) ? fraction : 0.5, 0, 1);
+        float cross = (float)(horizontal
+            ? origin.Group.Top + fraction * origin.Group.Height
+            : origin.Group.Left + fraction * origin.Group.Width);
+
+        var originEdge = SelectExposedOriginRect(
+            origin.Group, origin.Monitors, direction, cross);
+
+        int? FindBest(RectangleF edgeRect)
+        {
+            float originFrom = horizontal ? edgeRect.Top : edgeRect.Left;
+            float originTo = horizontal ? edgeRect.Bottom : edgeRect.Right;
+            int? best = null;
+            double nearest = double.PositiveInfinity;
+            foreach (var candidate in devices)
+            {
+                if (candidate.Id == currentId) continue;
+                foreach (var target in candidate.Monitors)
+                {
+                    if (target.Width <= 0 || target.Height <= 0) continue;
+                    double gap = direction switch
+                    {
+                        MonitorEdge.Right => target.Left - edgeRect.Right,
+                        MonitorEdge.Left => edgeRect.Left - target.Right,
+                        MonitorEdge.Bottom => target.Top - edgeRect.Bottom,
+                        MonitorEdge.Top => edgeRect.Top - target.Bottom,
+                        _ => double.PositiveInfinity
+                    };
+                    double allowance = Math.Max(12, Math.Min(42,
+                        Math.Min(horizontal ? edgeRect.Width : edgeRect.Height,
+                            horizontal ? target.Width : target.Height) * 0.19));
+                    if (gap < -4 || gap > allowance) continue;
+                    float from = horizontal ? target.Top : target.Left;
+                    float to = horizontal ? target.Bottom : target.Right;
+                    const float tolerance = 8f;
+                    bool aligned = cross >= from - tolerance && cross <= to + tolerance;
+                    // When a tall portrait phone is centered beside a shorter screen
+                    // that spans most of that side, don't strand its upper/lower corners.
+                    if (!aligned)
+                    {
+                        float originSpan = originTo - originFrom;
+                        float targetSpan = to - from;
+                        bool centeredTargetInsideOrigin = from >= originFrom - tolerance &&
+                            to <= originTo + tolerance &&
+                            originSpan > 1f && targetSpan >= originSpan * 0.65f;
+                        if (!centeredTargetInsideOrigin) continue;
+                    }
+                    double distance = Math.Max(0, gap);
+                    if (distance < nearest) { nearest = distance; best = candidate.Id; }
+                }
+            }
+            return best;
+        }
+
+        return FindBest(originEdge) ??
+            (originEdge != origin.Group ? FindBest(origin.Group) : null);
+    }
+
+    internal MonitorEdge? EdgeToward(int fromId, int toId, int baseTargetId)
+    {
+        RectangleF? FindBounds(int id)
+        {
+            if (id == EnvironmentRouteOrder.Local) return _localHit;
+            if (id == baseTargetId) return _remoteHit;
+            var hit = _environmentHits.FirstOrDefault(x => x.TargetId == id);
+            return hit.Hit.Width > 0 ? hit.Hit : null;
+        }
+        if (FindBounds(fromId) is not { Width: > 0, Height: > 0 } from ||
+            FindBounds(toId) is not { Width: > 0, Height: > 0 } to)
+            return null;
+        double projX = Math.Clamp(((to.Left + to.Width / 2f) - from.Left) / Math.Max(1f, from.Width), 0, 1);
+        double projY = Math.Clamp(((to.Top + to.Height / 2f) - from.Top) / Math.Max(1f, from.Height), 0, 1);
+        foreach (var candidateEdge in new[] {
+            MonitorEdge.Left, MonitorEdge.Right, MonitorEdge.Top, MonitorEdge.Bottom })
+        {
+            double frac = candidateEdge is MonitorEdge.Left or MonitorEdge.Right ? projY : projX;
+            if (AdjacentTarget(fromId, candidateEdge, baseTargetId, frac) == toId)
+                return candidateEdge;
+        }
+        IReadOnlyList<RectangleF> fromMonitors = fromId == EnvironmentRouteOrder.Local && _localMonitorHits.Length > 0
+            ? _localMonitorHits
+            : fromId == baseTargetId && _remoteMonitorHits.Length > 0
+                ? _remoteMonitorHits
+                : new[] { from };
+        float toCx = to.Left + to.Width / 2f;
+        float toCy = to.Top + to.Height / 2f;
+        var nearest = fromMonitors[0];
+        float bestDistSq = float.MaxValue;
+        foreach (var mon in fromMonitors)
+        {
+            float cx = Math.Clamp(toCx, mon.Left, mon.Right);
+            float cy = Math.Clamp(toCy, mon.Top, mon.Bottom);
+            float distSq = (toCx - cx) * (toCx - cx) + (toCy - cy) * (toCy - cy);
+            if (distSq < bestDistSq) { bestDistSq = distSq; nearest = mon; }
+        }
+        float dx = toCx - (nearest.Left + nearest.Width / 2f);
+        float dy = toCy - (nearest.Top + nearest.Height / 2f);
+        return Math.Abs(dx) >= Math.Abs(dy)
+            ? (dx >= 0 ? MonitorEdge.Right : MonitorEdge.Left)
+            : (dy >= 0 ? MonitorEdge.Bottom : MonitorEdge.Top);
     }
 
     internal static int? SpatialNeighbor(
@@ -207,7 +346,7 @@ internal sealed class DisplayArrangementControl : Control
             float to=horizontal?target.Bottom:target.Right;
             // A pointer crossing the TOP part of one screen must not leap
             // to a phone attached to the bottom part of another screen.
-            float tolerance=2f;
+            float tolerance=8f;
             if(cross < from-tolerance || cross>to+tolerance)continue;
             double distance=Math.Max(0,gap);
             if(distance<nearest){nearest=distance;best=item.Id;}
@@ -306,7 +445,7 @@ internal sealed class DisplayArrangementControl : Control
     }
 
     internal static RectangleF SnapToConnectedScreen(RectangleF proposed,
-        IReadOnlyList<RectangleF> otherScreens)
+        IReadOnlyList<RectangleF> otherScreens, float gap = 8f)
     {
         // A screen dropped inside another screen has no meaningful border.
         // Snap to the nearest FREE exterior edge (all four directions).
@@ -316,7 +455,6 @@ internal sealed class DisplayArrangementControl : Control
         foreach(var anchor in otherScreens)
         {
             if(anchor.Width<1 || anchor.Height<1)continue;
-            const float gap=8f;
             foreach(var side in new[]{MonitorEdge.Left,MonitorEdge.Right,
                 MonitorEdge.Top,MonitorEdge.Bottom})
             {
@@ -359,7 +497,7 @@ internal sealed class DisplayArrangementControl : Control
         bool isAndroid, int screenCount)
     {
         int height = Math.Max(380,
-            (int)(referenceHeight * (isAndroid ? 0.86 : 0.79)));
+            (int)(referenceHeight * (isAndroid ? 0.90 : 0.79)));
         int width;
         if (topo != null)
         {
@@ -398,7 +536,11 @@ internal sealed class DisplayArrangementControl : Control
 
     private static Rectangle Placement(Rectangle local, Rectangle remote, MonitorEdge edge)
     {
-        const int gap = 110;
+        // Symmetric world-space seam across devices so hub and guest agree on
+        // screen spacing and portrait phones stay comfortably within crossing range.
+        int gap = Math.Clamp(
+            Math.Min(Math.Min(local.Width, local.Height), Math.Min(remote.Width, remote.Height)) / 100,
+            10, 16);
         int x, y;
         switch (edge)
         {
@@ -422,6 +564,30 @@ internal sealed class DisplayArrangementControl : Control
         return new Rectangle(x, y, remote.Width, remote.Height);
     }
 
+    private static bool IsAttachedWithoutOverlap(Rectangle candidate,
+        IReadOnlyList<Rectangle> anchors)
+    {
+        foreach (var anchor in anchors)
+        {
+            var overlap = Rectangle.Intersect(candidate, anchor);
+            if (overlap.Width > 2 && overlap.Height > 2) return false;
+        }
+        foreach (var anchor in anchors)
+        {
+            int overlapY = Math.Min(candidate.Bottom, anchor.Bottom) -
+                Math.Max(candidate.Top, anchor.Top);
+            int overlapX = Math.Min(candidate.Right, anchor.Right) -
+                Math.Max(candidate.Left, anchor.Left);
+            int horizGap = Math.Max(candidate.Left - anchor.Right,
+                anchor.Left - candidate.Right);
+            int vertGap = Math.Max(candidate.Top - anchor.Bottom,
+                anchor.Top - candidate.Bottom);
+            if (overlapY >= 16 && horizGap is >= -4 and <= 40) return true;
+            if (overlapX >= 16 && vertGap is >= -4 and <= 40) return true;
+        }
+        return false;
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
@@ -432,6 +598,8 @@ internal sealed class DisplayArrangementControl : Control
         _remoteHit = RectangleF.Empty;
         _remoteBaseHit = RectangleF.Empty;
         _localHit = RectangleF.Empty;
+        _localMonitorHits = Array.Empty<RectangleF>();
+        _remoteMonitorHits = Array.Empty<RectangleF>();
         _placeholderHit = RectangleF.Empty;
         _environmentHits.Clear();
         _worldMemberRects.Clear();
@@ -461,18 +629,46 @@ internal sealed class DisplayArrangementControl : Control
         // even when every peer has received the identical drag offset.
         var hubBounds=LocalIsEnvironmentHub ? l : remotePos;
         _hubWorldOrigin=hubBounds.Location;
-        var extras=ComposeInlineDevices(core,_environmentDevices)
-            .Select(extra=>{
-                PointF? canonical=_memberOffsets.TryGetValue(
-                    extra.Device.CanonicalLayoutKey,out var position)
-                    ? position:null;
-                PointF? legacy=_memberOffsets.TryGetValue(
-                    extra.Device.LayoutKey,out var old) ? old:null;
-                var moved=ResolveMemberWorld(extra.World,hubBounds,
-                    canonical,legacy);
-                _worldMemberRects[extra.Device.TargetId]=moved;
-                return (extra.Device,World:moved);
-            }).ToArray();
+        var placedWorld = new List<Rectangle>(_local.Monitors.Select(m => m.Bounds));
+        if (_remote is { } remoteTopology && r is { } remoteRawBounds)
+        {
+            if (_remotePlatform == "Android")
+                placedWorld.Add(remotePos);
+            else
+            {
+                float sx = (float)remotePos.Width / Math.Max(1, remoteRawBounds.Width);
+                float sy = (float)remotePos.Height / Math.Max(1, remoteRawBounds.Height);
+                foreach (var m in remoteTopology.Monitors)
+                    placedWorld.Add(new Rectangle(
+                        remotePos.Left + (int)Math.Round((m.X - remoteRawBounds.Left) * sx),
+                        remotePos.Top + (int)Math.Round((m.Y - remoteRawBounds.Top) * sy),
+                        Math.Max(6, (int)Math.Round(m.Width * sx)),
+                        Math.Max(6, (int)Math.Round(m.Height * sy))));
+            }
+        }
+        var extrasList = new List<(EnvironmentDisplayTile Device, Rectangle World)>();
+        foreach (var extra in ComposeInlineDevices(core, _environmentDevices))
+        {
+            PointF? canonical = _memberOffsets.TryGetValue(
+                extra.Device.CanonicalLayoutKey, out var position)
+                ? position : null;
+            PointF? legacy = _memberOffsets.TryGetValue(
+                extra.Device.LayoutKey, out var old) ? old : null;
+            var moved = ResolveMemberWorld(extra.World, hubBounds,
+                canonical, legacy);
+            // Auto-heal stale/detached saved offsets (e.g., from older snap gaps or
+            // after moving the linked Windows PC) so tiles never float unreachable.
+            if ((canonical != null || legacy != null) &&
+                !IsAttachedWithoutOverlap(moved, placedWorld))
+            {
+                var anchors = placedWorld.Select(rect => (RectangleF)rect).ToArray();
+                moved = Rectangle.Round(SnapToConnectedScreen(moved, anchors, 12f));
+            }
+            placedWorld.Add(moved);
+            _worldMemberRects[extra.Device.TargetId] = moved;
+            extrasList.Add((extra.Device, moved));
+        }
+        var extras = extrasList.ToArray();
         var full = core;
         foreach(var additional in extras)
             full = Rectangle.Union(full,additional.World);
@@ -486,14 +682,17 @@ internal sealed class DisplayArrangementControl : Control
         float offsetY = (Height - full.Height * scale) / 2f;
 
         _localHit = Fit(l,full,scale,offsetX,offsetY);
+        var localHits = new List<RectangleF>(_local.Monitors.Count);
         int localOrdinal = 0;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
         {
             var tile = Fit(m.Bounds, full, scale, offsetX, offsetY);
+            localHits.Add(tile);
             DrawScreen(g, tile, LocalDeviceName,
                 DisplayNumber(m, ++localOrdinal), m.Primary, true,
                 resolution: m.Bounds.Size);
         }
+        _localMonitorHits = localHits.ToArray();
 
         if (_remote is { } remote)
         {
@@ -505,6 +704,20 @@ internal sealed class DisplayArrangementControl : Control
                 group.Y += _dragCurrent.Y - _dragOrigin.Y;
             }
             _remoteHit = group;
+            if (_remotePlatform == "Android")
+            {
+                _remoteMonitorHits = new[] { group };
+            }
+            else
+            {
+                float bw = Math.Max(1, remote.Bounds.Width);
+                float bh = Math.Max(1, remote.Bounds.Height);
+                _remoteMonitorHits = remote.Monitors.Select(m => new RectangleF(
+                    group.Left + (m.X - remote.Bounds.Left) / bw * group.Width,
+                    group.Top + (m.Y - remote.Bounds.Top) / bh * group.Height,
+                    Math.Max(6, m.Width / bw * group.Width),
+                    Math.Max(6, m.Height / bh * group.Height))).ToArray();
+            }
             DrawTopologyMonitors(g, group, remote, RemoteDeviceName,
                 _remotePlatform, _remoteScreenDetails);
         }
@@ -762,12 +975,16 @@ internal sealed class DisplayArrangementControl : Control
                     var wanted=new RectangleF(_draggingMemberHit.X+memberDeltaX,
                         _draggingMemberHit.Y+memberDeltaY,
                         _draggingMemberHit.Width,_draggingMemberHit.Height);
-                    var occupied=new List<RectangleF>{_localHit};
-                    if(_remoteHit.Width>0)occupied.Add(_remoteHit);
+                    var occupied = new List<RectangleF>();
+                    if (_localMonitorHits.Length > 0) occupied.AddRange(_localMonitorHits);
+                    else if (_localHit.Width > 0) occupied.Add(_localHit);
+                    if (_remoteMonitorHits.Length > 0) occupied.AddRange(_remoteMonitorHits);
+                    else if (_remoteHit.Width > 0) occupied.Add(_remoteHit);
                     foreach(var other in _environmentHits)
                         if(other.TargetId!=id)occupied.Add(other.Hit);
-                    var snapped=SnapToConnectedScreen(wanted,occupied);
                     float scale=Math.Max(.001f,_layoutScale);
+                    var snapped=SnapToConnectedScreen(wanted,occupied,
+                        Math.Clamp(10f*scale,2f,10f));
                     // Convert the FINAL snapped viewport position back into
                     // world units relative to the one hub reference. Never
                     // publish a local view's change-from-default offset.

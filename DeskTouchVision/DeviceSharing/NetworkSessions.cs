@@ -358,11 +358,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             ReverseInputProtocol.Encode(latest),token);
                     continue;
                 }
+                bool isImmediateControl = packet.Type is "button" or "wheel";
                 var udpSync = packet.Type is ("release" or "reset")
                     ? null
-                    : relay.Target.MovePacer?.TakePendingReliableSync();
+                    : relay.Target.MovePacer?.TakePendingReliableSync(
+                        skipIfUdpDelivered: isImmediateControl);
                 var tcpPreceding = Interlocked.Exchange(ref relay.LatestMove,null);
-                var preceding = udpSync ?? tcpPreceding;
+                var preceding = udpSync ?? (isImmediateControl &&
+                    relay.Target.UdpPeer is { Confirmed: true } ? null : tcpPreceding);
                 if(preceding!=null)
                     await SendToAsync(relay.Target,
                         ReverseInputProtocol.Encode(preceding),token);
@@ -836,7 +839,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             bool first;
             lock(_authorityGate) first=_selected==null;
             if(first) Select(session);
-            _status("Connected: "+peer.Name+" ("+ConnectedPeerCount+" simultaneous devices).");
+            string versionSuffix = string.IsNullOrWhiteSpace(peer.AppVersion)
+                ? "" : " [v" + peer.AppVersion + "]";
+            _status("Connected: "+peer.Name+versionSuffix+" ("+ConnectedPeerCount+" simultaneous devices).");
             // The server advertises its CURRENT system name after successful
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
@@ -875,10 +880,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="udp-ack")
                 {
-                    if (session.UdpPeer != null && !session.UdpPeer.Confirmed)
+                    if (session.UdpPeer != null)
                     {
                         session.UdpPeer.Confirmed = true;
-                        _status($"Low-latency input confirmed for {session.Peer.Name}.");
+                        if (session.UdpPeer.TryMarkConfirmedLogged())
+                            _status($"Low-latency input confirmed for {session.Peer.Name}.");
                     }
                     continue;
                 }
@@ -1292,18 +1298,28 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private void OnUdpHubMessage(FastUdpHub.Peer peer, FastUdpMessage msg)
     {
-        if (msg.Op != FastUdpOp.Move) return;
         if (!_sessions.TryGetValue(peer.SessionId, out var session)) return;
+        if (peer.Confirmed && peer.TryMarkConfirmedLogged())
+            _status($"Low-latency input confirmed for {session.Peer.Name}.");
+        if (msg.Op is not (FastUdpOp.Move or FastUdpOp.Warm)) return;
 
         RelayLease? forward = null;
         lock (_authorityGate)
             _relayBySource.TryGetValue(session.Id, out forward);
         if (forward != null)
         {
-            if (forward.Granted)
-                QueueRoutedInput(forward, new Packet("move", msg.A, msg.B));
+            if (!forward.Granted) return;
+            if (msg.Op == FastUdpOp.Warm)
+            {
+                var targetUdp = forward.Target.UdpPeer;
+                if (targetUdp is { HasEndpoint: true } && _udpHub != null)
+                    _udpHub.Send(targetUdp, FastUdpOp.Warm, 0, 0, 0);
+                return;
+            }
+            QueueRoutedInput(forward, new Packet("move", msg.A, msg.B));
             return;
         }
+        if (msg.Op != FastUdpOp.Move) return;
         if (session.EnvironmentTargetId != 0) return;
 
         int lease;

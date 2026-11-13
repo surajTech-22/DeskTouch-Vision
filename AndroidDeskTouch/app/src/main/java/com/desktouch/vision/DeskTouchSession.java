@@ -428,12 +428,13 @@ final class DeskTouchSession implements AutoCloseable {
                 return;
             }
             final int lease=reverseLease;
-            boolean posted=DeskTouchAccessibilityService.pointer(p.a,p.b,()->{
+            Runnable ack=reverseApplied==lease ? null : ()->{
                 if(reverseLease==lease && reverseApplied!=lease){
                     reverseApplied=lease;
                     send(new Packet("reverse-active",lease));
                 }
-            });
+            };
+            boolean posted=DeskTouchAccessibilityService.pointer(p.a,p.b,ack);
             if(!posted)revokeRemoteFromNative();
         }else if("reverse-button".equals(p.type)){
             DeskTouchAccessibilityService.mouseButton(p.a,p.b!=0);
@@ -628,12 +629,13 @@ final class DeskTouchSession implements AutoCloseable {
                     if(!running || lease<=0 || lease!=reverseLease
                         || !DeskTouchAccessibilityService.ready(application)) return;
                     lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
-                    boolean posted=DeskTouchAccessibilityService.pointer(x,y,()->{
+                    Runnable ack=reverseApplied==lease ? null : ()->{
                         if(reverseLease==lease && reverseApplied!=lease){
                             reverseApplied=lease;
                             send(new Packet("reverse-active",lease));
                         }
-                    });
+                    };
+                    boolean posted=DeskTouchAccessibilityService.pointer(x,y,ack);
                     if(!posted) revokeRemoteFromNative();
                 }
             });

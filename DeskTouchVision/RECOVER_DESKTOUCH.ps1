@@ -5,10 +5,10 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$release = 'v0.3.28'
+$release = 'v0.3.29'
 $baseUrl = "https://github.com/surajTech-22/DeskTouch-Vision/releases/download/$release"
 $archiveName = 'DeskTouchVision-win-x64.zip'
-$expectedAppVersion = '0.3.28.0'
+$expectedAppVersion = '0.3.29.0'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null

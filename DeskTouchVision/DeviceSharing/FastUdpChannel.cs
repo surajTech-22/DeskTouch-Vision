@@ -196,7 +196,11 @@ internal sealed class FastUdpHub : IDisposable
         private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
         private IPEndPoint? _remoteEndPoint;
         internal volatile bool Confirmed;
+        private int _confirmedLogged;
         internal long LastMoveSentTicks;
+
+        internal bool TryMarkConfirmedLogged() =>
+            Interlocked.CompareExchange(ref _confirmedLogged, 1, 0) == 0;
 
         internal Peer(int sessionId, IPAddress expectedAddress)
         {

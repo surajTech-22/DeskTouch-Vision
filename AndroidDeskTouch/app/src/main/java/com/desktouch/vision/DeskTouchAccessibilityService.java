@@ -39,6 +39,7 @@ import java.util.List;
  */
 public final class DeskTouchAccessibilityService extends AccessibilityService {
     private static volatile DeskTouchAccessibilityService instance;
+    private static volatile Boolean cachedAllowed;
     private static final String PREFS="desktouch_android_control";
     private static final String ALLOWED="user_allowed_windows_control";
     private static final String PAUSED_FOR_BANKING="paused_for_banking";
@@ -110,8 +111,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private volatile boolean remoteActive;
 
     static boolean allowed(Context context){
-        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+        Boolean cached=cachedAllowed;
+        if(cached!=null)return cached;
+        boolean value=context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
             .getBoolean(ALLOWED,false);
+        cachedAllowed=value;
+        return value;
     }
     static boolean isPausedForBanking(Context context){
         return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
@@ -127,6 +132,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(allowed)editor.putBoolean(PAUSED_FOR_BANKING,false);
         if(!editor.commit())
             throw new IllegalStateException("Cannot save Android control preference");
+        cachedAllowed=allowed;
         if(!allowed){
             DeskTouchAccessibilityService service=instance;
             if(service!=null){
@@ -142,6 +148,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             .putBoolean(PAUSED_FOR_BANKING,true)
             .commit())
             throw new IllegalStateException("Cannot save banking pause preference");
+        cachedAllowed=false;
         RemoteInputPower.end();
         DeskTouchAccessibilityService service=instance;
         if(service!=null){
@@ -160,6 +167,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     @Override public void onServiceConnected(){
         super.onServiceConnected();
         instance=this;
+        cachedAllowed=null;
         try { choreographer=Choreographer.getInstance(); }
         catch(RuntimeException ignored) { choreographer=null; }
         if(isPausedForBanking(this))
@@ -221,6 +229,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS |
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED |
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT);
         params.gravity=Gravity.TOP|Gravity.LEFT;
@@ -241,6 +250,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             FrameLayout root=new FrameLayout(this);
             root.setKeepScreenOn(true); // Active approved remote pointer window only.
             PointerDotView dot=new PointerDotView(this);
+            dot.setLayerType(View.LAYER_TYPE_HARDWARE,null);
             pointerDotSize=dp(24);
             pointerDotHalf=pointerDotSize/2f;
             root.addView(dot,new FrameLayout.LayoutParams(
@@ -363,8 +373,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.pendingY=py;
         service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
-        if(service.moveScheduled.compareAndSet(false,true))
-            service.schedulePointerFrame();
+        if(service.moveScheduled.compareAndSet(false,true)){
+            if(service.cursorRoot==null)service.ui.post(service::flushPointer);
+            else service.schedulePointerFrame();
+        }
         else service.coalescedMoves.incrementAndGet();
         return true;
     }
@@ -511,7 +523,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             startLiveStrokeDown(x,y);
             return;
         }
-        enqueueAction(new TouchAction(TouchAction.TYPE_DOWN,x,y,x,y,12L,false));
+        enqueueAction(new TouchAction(TouchAction.TYPE_DOWN,x,y,x,y,8L,false));
     }
     private void handleLeftUp(){
         if(!held && !pendingLift && activeStroke==null && pendingActions.isEmpty())return;
@@ -521,7 +533,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 if(!gestureRunning)dispatchLiveStrokeUp(x,y);
                 else{pendingLift=true;pendingLiftX=x;pendingLiftY=y;}
             }else{
-                enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,10L,false));
+                enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,8L,false));
             }
             return;
         }
@@ -532,7 +544,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             return;
         }
         if(!pendingActions.isEmpty())
-            enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,10L,false));
+            enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,8L,false));
     }
     private void enqueueAction(TouchAction action){
         if(!remoteActive || !ready(this))return;
@@ -544,7 +556,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         Path path=new Path();
         path.moveTo(px,py);
         GestureDescription.StrokeDescription stroke=
-            new GestureDescription.StrokeDescription(path,0,12L,true);
+            new GestureDescription.StrokeDescription(path,0,8L,true);
         final int gen=++gestureGeneration;
         activeStroke=stroke;
         strokeX=px;strokeY=py;
@@ -623,7 +635,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(px!=strokeX||py!=strokeY)path.lineTo(px,py);
         GestureDescription.StrokeDescription up;
         try{
-            up=cur.continueStroke(path,0,10L,false);
+            up=cur.continueStroke(path,0,8L,false);
         }catch(RuntimeException badUp){
             gestureRunning=false;
             enqueueAction(new TouchAction(TouchAction.TYPE_GESTURE,

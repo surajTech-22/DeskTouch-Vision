@@ -501,12 +501,13 @@ internal sealed class SourceCapture : IDisposable
         if (IsArmed && !RemoteActive)
         {
             long now = Environment.TickCount64;
+            const int warmEdgeRadiusPx = 140;
             if (now - _lastWarmHintMs >= 45 &&
-                (_localMonitors.IsExternalEdge(cursor, _edge, 60) ||
+                (_localMonitors.IsExternalEdge(cursor, _edge, warmEdgeRadiusPx) ||
                  (NavigateEnvironment != null &&
-                  (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), 60) ||
-                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().First, 60) ||
-                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().Second, 60)))))
+                  (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), warmEdgeRadiusPx) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().First, warmEdgeRadiusPx) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().Second, warmEdgeRadiusPx)))))
             {
                 _lastWarmHintMs = now;
                 _session.TrySend(new Packet("warm"));
@@ -537,11 +538,15 @@ internal sealed class SourceCapture : IDisposable
             {
                 // The pointer may have moved away before the UI thread gets
                 // the queued action. Do not switch based on a stale event.
+                var liveCursor = Cursor.Position;
                 if (IsArmed && !RemoteActive &&
-                    _localMonitors.IsExternalEdge(Cursor.Position, edge,
+                    _localMonitors.IsExternalEdge(liveCursor, edge,
                         EdgeHandoffPolicy.EdgeZonePixels + 2))
                 {
-                    double fraction=_localMonitors.EdgeFraction(cursor,edge);
+                    double fraction=_localMonitors.EdgeFraction(
+                        _localMonitors.IsExternalEdge(liveCursor, edge,
+                            EdgeHandoffPolicy.EdgeZonePixels + 2) ? liveCursor : cursor,
+                        edge);
                     if(NavigateEnvironment!=null)
                     {
                         if(NavigateEnvironment(edge,fraction))
@@ -550,7 +555,7 @@ internal sealed class SourceCapture : IDisposable
                     else if(edge==_edge)
                     {
                         _status($"Outward {source} detected at {edge.ToString().ToLowerInvariant()} external Windows screen edge.");
-                        EnterRemote(cursor);
+                        EnterRemote(liveCursor);
                     }
                 }
             }
@@ -879,6 +884,13 @@ internal sealed class SourceCapture : IDisposable
                         finally{Interlocked.Exchange(ref _switchPending,0);}
                     }))
                         Interlocked.Exchange(ref _switchPending,0);
+                }
+                var slid = _remoteMonitors.ClampToRealMonitor(new System.Drawing.Point(nextX, nextY));
+                if (slid.X != _remoteX || slid.Y != _remoteY)
+                {
+                    _remoteX = slid.X;
+                    _remoteY = slid.Y;
+                    _session.TrySend(new Packet("move", _remoteX, _remoteY));
                 }
                 return;
             }

@@ -1435,6 +1435,135 @@ var uiThread = new Thread(() =>
         Check(onlinePeer is { CanReceive: true, IsAndroid: false, Name: "STUDIO-PC" },
             "NearbyComputerDiscovery.ParseReply must recognize DT1-ONLINE announcements on private LAN");
 
+        var dualLocal = new MonitorTopology(new[] {
+            new MonitorRect(@"\\.\DISPLAY2", 0, 0, 1920, 1080, true),
+            new MonitorRect(@"\\.\DISPLAY1", 1920, 182, 1366, 768, false)
+        });
+        foreach (var diagramSize in new[] {
+            new System.Drawing.Size(780, 500),
+            new System.Drawing.Size(1000, 620) })
+        {
+            using var phoneDiagram = new DisplayArrangementControl
+            {
+                Size = diagramSize,
+                Local = dualLocal,
+                Remote = portraitTopo,
+                RemotePlatform = "Android"
+            };
+            foreach (var placementEdge in new[] {
+                MonitorEdge.Left, MonitorEdge.Right, MonitorEdge.Bottom })
+            {
+                phoneDiagram.RemoteEdge = placementEdge;
+                using var bmp = new System.Drawing.Bitmap(diagramSize.Width, diagramSize.Height);
+                phoneDiagram.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, diagramSize.Width, diagramSize.Height));
+                Check(phoneDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, placementEdge, 1, 0.5) == 1,
+                    $"Portrait phone placed at {placementEdge} of dual Windows monitors must shift at {diagramSize}");
+                if (placementEdge is MonitorEdge.Left or MonitorEdge.Right)
+                {
+                    Check(phoneDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, placementEdge, 1, 0.06) == 1 &&
+                        phoneDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, placementEdge, 1, 0.94) == 1,
+                        $"Side phone placement ({placementEdge}) must shift smoothly across upper and taskbar edges");
+                }
+                var returnEdge = placementEdge switch
+                {
+                    MonitorEdge.Left => MonitorEdge.Right,
+                    MonitorEdge.Right => MonitorEdge.Left,
+                    MonitorEdge.Bottom => MonitorEdge.Top,
+                    _ => MonitorEdge.Bottom
+                };
+                Check(phoneDiagram.AdjacentTarget(1, returnEdge, 1, 0.5) == EnvironmentRouteOrder.Local,
+                    $"Returning from phone placed at {placementEdge} via {returnEdge} must reach Windows");
+            }
+        }
+
+        // Regression: multi-monitor uneven heights (DISPLAY2 1080p + DISPLAY1 768p)
+        // must snap dragged phone flush to DISPLAY1, heal detached layouts, and match EdgeToward.
+        var winPeerTopo = new MonitorTopology(new[] {
+            new MonitorRect("WIN_PEER", 0, 0, 1920, 1080, true)
+        });
+        using (var multiDiagram = new DisplayArrangementControl
+        {
+            Size = new System.Drawing.Size(960, 560),
+            Local = dualLocal,
+            Remote = winPeerTopo,
+            RemotePlatform = "Windows",
+            RemoteEdge = MonitorEdge.Left,
+            EnvironmentDevices = DisplayArrangementControl.ProjectEnvironment(new[] {
+                new EnvironmentDisplayTile(-5, "Xiaomi", "Android", 1, true)
+            }, 0)
+        })
+        {
+            using (var bmp = new System.Drawing.Bitmap(960, 560))
+                multiDiagram.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, 960, 560));
+
+            var localMonitorHitsField = typeof(DisplayArrangementControl).GetField("_localMonitorHits",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+            var localHits = (System.Drawing.RectangleF[])localMonitorHitsField.GetValue(multiDiagram)!;
+            var display1Hit = localHits.OrderByDescending(r => r.Left).First();
+            var phoneHitBefore = multiDiagram.OnlineHitRegions.First(x => x.TargetId == -5).Hit;
+            int pStartX = (int)(phoneHitBefore.Left + phoneHitBefore.Width / 2f);
+            int pStartY = (int)(phoneHitBefore.Top + phoneHitBefore.Height / 2f);
+            int pDropX = (int)(display1Hit.Left + display1Hit.Width * 0.5f);
+            int pDropY = (int)(display1Hit.Bottom + phoneHitBefore.Height / 2f + 2f);
+            down.Invoke(multiDiagram, new object[] { new System.Windows.Forms.MouseEventArgs(
+                System.Windows.Forms.MouseButtons.Left, 1, pStartX, pStartY, 0) });
+            move.Invoke(multiDiagram, new object[] { new System.Windows.Forms.MouseEventArgs(
+                System.Windows.Forms.MouseButtons.Left, 1, pDropX, pDropY, 0) });
+            up.Invoke(multiDiagram, new object[] { new System.Windows.Forms.MouseEventArgs(
+                System.Windows.Forms.MouseButtons.Left, 1, pDropX, pDropY, 0) });
+
+            using (var bmp = new System.Drawing.Bitmap(960, 560))
+                multiDiagram.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, 960, 560));
+            localHits = (System.Drawing.RectangleF[])localMonitorHitsField.GetValue(multiDiagram)!;
+            display1Hit = localHits.OrderByDescending(r => r.Left).First();
+            var phoneSnapped = multiDiagram.OnlineHitRegions.First(x => x.TargetId == -5).Hit;
+            Check(phoneSnapped.Top >= display1Hit.Bottom - 2f && phoneSnapped.Top <= display1Hit.Bottom + 18f,
+                "Portrait phone dragged under elevated DISPLAY1 must snap flush to DISPLAY1 without leaving a void");
+            Check(multiDiagram.EdgeToward(EnvironmentRouteOrder.Local, -5, 1) == MonitorEdge.Bottom,
+                "EdgeToward must report Bottom when portrait phone is placed below DISPLAY1");
+            Check(multiDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, MonitorEdge.Bottom, 1, 0.80) == -5 &&
+                multiDiagram.AdjacentTarget(-5, MonitorEdge.Top, 1, 0.5) == EnvironmentRouteOrder.Local,
+                "Bottom placement under elevated DISPLAY1 must shift downward and return upward cleanly");
+
+            // Stale/detached synced offset must auto-heal on paint rather than floating unreachable.
+            var tile = multiDiagram.EnvironmentDevices.Single();
+            multiDiagram.RestoreMemberOffsets(new Dictionary<string, System.Drawing.PointF>
+            {
+                [tile.CanonicalLayoutKey] = new System.Drawing.PointF(2870f, 1500f)
+            });
+            using (var bmp = new System.Drawing.Bitmap(960, 560))
+                multiDiagram.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, 960, 560));
+            bool healedReachable = new[] { MonitorEdge.Left, MonitorEdge.Right, MonitorEdge.Top, MonitorEdge.Bottom }
+                .Any(e => Enumerable.Range(1, 19).Any(i =>
+                    multiDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, e, 1, i / 20.0) == -5));
+            Check(healedReachable &&
+                multiDiagram.EdgeToward(EnvironmentRouteOrder.Local, -5, 1) is { } healedEdge &&
+                Enumerable.Range(1, 19).Any(i =>
+                    multiDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, healedEdge, 1, i / 20.0) == -5),
+                "Detached saved/synced layout offsets must auto-heal into shifting range");
+        }
+
+        var shortLaptop = new MonitorTopology(new[] {
+            new MonitorRect(@"\\.\DISPLAY1", 0, 0, 1366, 768, true)
+        });
+        using (var shortDiagram = new DisplayArrangementControl
+        {
+            Size = new System.Drawing.Size(780, 500),
+            Local = shortLaptop,
+            Remote = portraitTopo,
+            RemotePlatform = "Android",
+            RemoteEdge = MonitorEdge.Right
+        })
+        {
+            using (var bmp = new System.Drawing.Bitmap(780, 500))
+                shortDiagram.DrawToBitmap(bmp, new System.Drawing.Rectangle(0, 0, 780, 500));
+            Check(shortDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, MonitorEdge.Right, 1, 0.03) == 1 &&
+                shortDiagram.AdjacentTarget(EnvironmentRouteOrder.Local, MonitorEdge.Right, 1, 0.97) == 1 &&
+                shortDiagram.AdjacentTarget(1, MonitorEdge.Left, 1, 0.03) == EnvironmentRouteOrder.Local &&
+                shortDiagram.AdjacentTarget(1, MonitorEdge.Left, 1, 0.97) == EnvironmentRouteOrder.Local,
+                "Centered portrait phone beside 768p display must not strand upper/lower corner transitions");
+        }
+
         uiCompletion.TrySetResult(true);
     }
     catch (Exception ex) { uiCompletion.TrySetException(ex); }

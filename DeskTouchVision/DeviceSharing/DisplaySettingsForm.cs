@@ -70,6 +70,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private string _currentFingerprint = "";
     private NotifyIcon? _trayIcon;
     private ContextMenuStrip? _trayMenu;
+    private bool _formDisposed;
     private ToolStripMenuItem? _startupMenu;
     private bool _exitRequested;
     private bool _trayTipShown;
@@ -674,12 +675,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Status("No Android phone connected yet. Open DeskTouch on your phone to connect.");
             return;
         }
+        var actualEdge=_display.EdgeToward(EnvironmentRouteOrder.Local,androidTargetId.Value,
+            CurrentBaseTargetId())??_preferredEdge;
         if(androidTargetId.Value==CurrentInputTargetId() && _capture?.IsArmed==true)
         {
+            _capture.SetEdge(actualEdge);
             _capture.BeginDirectHandoff();
             return;
         }
-        SelectConnectedTargetCore(androidTargetId.Value,_preferredEdge,0.5,
+        SelectConnectedTargetCore(androidTargetId.Value,actualEdge,0.5,
             requestHandoff:true,directHandoff:true);
     }
 
@@ -688,18 +692,23 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ? _receiver?.SelectedPeerId ?? EnvironmentRouteOrder.Local
             : -_host.SelectedEnvironmentTargetId;
 
+    private int CurrentBaseTargetId()
+    {
+        if(_host!=null)return 0;
+        int baseId=_receiver?.ConnectedPeers.Where(p=>p.Peer.Platform=="Windows")
+            .OrderBy(p=>p.Id).Select(p=>p.Id).FirstOrDefault()??0;
+        return baseId!=0 ? baseId :
+            _receiver?.ConnectedPeers.OrderBy(p=>p.Id)
+                .Select(p=>p.Id).FirstOrDefault()??0;
+    }
+
     private bool NavigateEnvironmentFromCapture(MonitorEdge edge,double fraction)
     {
         var order=ConnectedEnvironmentOrder();
         if(order==null)return false;
         bool remote=_capture?.RemoteActive==true;
         int starting=remote?CurrentInputTargetId():EnvironmentRouteOrder.Local;
-        int baseId=_host!=null ? 0 :
-            _receiver?.ConnectedPeers.Where(p=>p.Peer.Platform=="Windows")
-                .OrderBy(p=>p.Id).Select(p=>p.Id).FirstOrDefault()??0;
-        if(baseId==0 && _host==null)
-            baseId=_receiver?.ConnectedPeers.OrderBy(p=>p.Id)
-                .Select(p=>p.Id).FirstOrDefault()??0;
+        int baseId=CurrentBaseTargetId();
         // A visual member in the same direction is NOT necessarily an
         // adjacent screen. Check the exact boundary and crossing position.
         // No fallback to sorted connection order or arbitrary left/right PC.
@@ -1477,6 +1486,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void HandleSharedEnvironmentLayout(
         IReadOnlyDictionary<string,PointF> canonicalPositions) => PostToUi(() =>
     {
+        if(canonicalPositions.Count==0)return;
         _display.RestoreMemberOffsets(canonicalPositions);
         SavePreferredEdge();
         // Applying a hub snapshot MUST NOT re-send it as a local drag.
@@ -1728,9 +1738,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     {
         if (disposing)
         {
+            if (_formDisposed)
+            {
+                base.Dispose(disposing);
+                return;
+            }
+            _formDisposed = true;
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
-            _closing.Cancel();
+            try { _closing.Cancel(); } catch (ObjectDisposedException) { }
             _logChannel.Writer.TryComplete();
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;

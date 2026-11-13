@@ -1,10 +1,12 @@
 package com.desktouch.vision;
 
 import android.os.Build;
+import android.os.SystemClock;
 import android.content.Context;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.*;
+import java.net.InetAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -14,6 +16,9 @@ import java.security.cert.X509Certificate;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import javax.net.ssl.*;
 
 /**
@@ -41,11 +46,25 @@ final class DeskTouchSession implements AutoCloseable {
     private final Context application;
     private volatile int reverseLease,reverseApplied,reportedMissingKeyboard;
     private final ExecutorService sender=Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService udpPacer=Executors.newSingleThreadScheduledExecutor(r->{
+        Thread t=new Thread(r,"DeskTouch UdpSend");
+        t.setDaemon(true);
+        return t;
+    });
     private final Object writeLock=new Object();
+    private final Object udpPacerLock=new Object();
     private final java.util.concurrent.atomic.AtomicReference<Packet> newestMove =
         new java.util.concurrent.atomic.AtomicReference<>();
     private final java.util.concurrent.atomic.AtomicBoolean moveEnqueued =
         new java.util.concurrent.atomic.AtomicBoolean();
+    private Packet throttledUdpMove;
+    private Packet pendingTcpSyncMove;
+    private long lastUdpMoveMs;
+    private long lastAnyMoveMs;
+    private ScheduledFuture<?> scheduledThrottleFlush;
+    private ScheduledFuture<?> scheduledTrailingSync;
+    private volatile FastUdpChannel udpChannel;
+    private volatile InetAddress peerInetAddress;
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
     private volatile DataOutputStream output;
@@ -196,6 +215,7 @@ final class DeskTouchSession implements AutoCloseable {
                 ssl.connect(new java.net.InetSocketAddress(device.address,37377),12000);
                 ssl.setTcpNoDelay(true);
                 ssl.setKeepAlive(true);
+                try { ssl.setTrafficClass(0x10); } catch (Exception ignored) {}
                 ssl.setSoTimeout(50000);
                 ssl.startHandshake();
                 DataInputStream in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
@@ -239,6 +259,7 @@ final class DeskTouchSession implements AutoCloseable {
                 cursorY=parsed.get(0)[1]+parsed.get(0)[3]/2;
                 fingerprint=pinned;
                 announcedPhoneWidth=width;announcedPhoneHeight=height;
+                peerInetAddress=ssl.getInetAddress();
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
                 if(!DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
@@ -268,9 +289,14 @@ final class DeskTouchSession implements AutoCloseable {
     }
     private void readLoop(){
         try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (Throwable ignored) {}
+        try {
             while(running){
                 Packet p=Packet.read(input);
-                if("environment-roster".equals(p.type)){
+                if("udp-channel".equals(p.type)){
+                    setupUdpChannel(p);
+                } else if("environment-roster".equals(p.type)){
                     acceptEnvironmentRoster(p);
                 } else if("environment-unavailable".equals(p.type)){
                     status("Environment member went offline. Select another device.");
@@ -511,9 +537,128 @@ final class DeskTouchSession implements AutoCloseable {
         try {synchronized(writeLock){p.write(output);}}
         catch(Exception e){status("Connection lost: "+e.getMessage());closeConnection();}
     }
+    private void setupUdpChannel(Packet p){
+        InetAddress addr=peerInetAddress;
+        if(addr==null || p.a<=0 || p.a>65535 || p.text==null || p.text.isEmpty()) return;
+        try {
+            byte[] key=Base64.getDecoder().decode(p.text);
+            if(key.length!=FastUdpChannel.KEY_SIZE) return;
+            closeUdpChannel();
+            FastUdpChannel ch=new FastUdpChannel(addr,p.a,p.b,key,new FastUdpChannel.Listener(){
+                @Override public void onProbeConfirmed(){
+                    if(running) send(new Packet("udp-ack"));
+                }
+                @Override public void onReverseMove(int x,int y,int lease){
+                    if(!running || lease<=0 || lease!=reverseLease
+                        || !DeskTouchAccessibilityService.ready(application)) return;
+                    boolean posted=DeskTouchAccessibilityService.pointer(x,y,()->{
+                        if(reverseLease==lease && reverseApplied!=lease){
+                            reverseApplied=lease;
+                            send(new Packet("reverse-active",lease));
+                        }
+                    });
+                    if(!posted) revokeRemoteFromNative();
+                }
+            });
+            udpChannel=ch;
+            send(new Packet("udp-ready",ch.localPort()));
+            ch.sendProbe();
+        } catch(Exception ignored) {
+        }
+    }
+    private void closeUdpChannel(){
+        FastUdpChannel old=udpChannel;
+        udpChannel=null;
+        if(old!=null) old.close();
+        clearPendingUdpMoves();
+    }
+    private Packet clearPendingUdpMoves(){
+        synchronized(udpPacerLock){
+            throttledUdpMove=null;
+            pendingTcpSyncMove=null;
+            if(scheduledThrottleFlush!=null){scheduledThrottleFlush.cancel(false);scheduledThrottleFlush=null;}
+            if(scheduledTrailingSync!=null){scheduledTrailingSync.cancel(false);scheduledTrailingSync=null;}
+            return null;
+        }
+    }
+    private Packet takePendingUdpMoveSync(){
+        synchronized(udpPacerLock){
+            Packet latest=throttledUdpMove!=null ? throttledUdpMove : pendingTcpSyncMove;
+            throttledUdpMove=null;
+            pendingTcpSyncMove=null;
+            if(scheduledThrottleFlush!=null){scheduledThrottleFlush.cancel(false);scheduledThrottleFlush=null;}
+            if(scheduledTrailingSync!=null){scheduledTrailingSync.cancel(false);scheduledTrailingSync=null;}
+            return latest;
+        }
+    }
+    private void scheduleUdpTrailingSyncLocked(){
+        if(scheduledTrailingSync!=null) scheduledTrailingSync.cancel(false);
+        scheduledTrailingSync=udpPacer.schedule(()->{
+            Packet sync=null;
+            synchronized(udpPacerLock){
+                if(throttledUdpMove==null && pendingTcpSyncMove!=null &&
+                    SystemClock.uptimeMillis()-lastAnyMoveMs>=15){
+                    sync=pendingTcpSyncMove;
+                    pendingTcpSyncMove=null;
+                }
+            }
+            if(sync!=null && running && active){
+                final Packet toSend=sync;
+                sender.execute(()->writeNow(toSend));
+            }
+        },16,TimeUnit.MILLISECONDS);
+    }
     private void send(Packet p){
         if(sender.isShutdown())return;
         if("move".equals(p.type)){
+            FastUdpChannel ch=udpChannel;
+            int activeClaim=claim;
+            if(ch!=null && ch.confirmed && active && activeClaim>0){
+                boolean sendNow=false;
+                synchronized(udpPacerLock){
+                    long now=SystemClock.uptimeMillis();
+                    lastAnyMoveMs=now;
+                    pendingTcpSyncMove=p;
+                    if(now-lastUdpMoveMs>=3){
+                        lastUdpMoveMs=now;
+                        throttledUdpMove=null;
+                        if(scheduledThrottleFlush!=null){
+                            scheduledThrottleFlush.cancel(false);
+                            scheduledThrottleFlush=null;
+                        }
+                        sendNow=true;
+                    } else {
+                        throttledUdpMove=p;
+                        if(scheduledThrottleFlush==null || scheduledThrottleFlush.isDone()){
+                            scheduledThrottleFlush=udpPacer.schedule(()->{
+                                Packet deferred=null;
+                                int curClaim=claim;
+                                synchronized(udpPacerLock){
+                                    if(throttledUdpMove!=null){
+                                        deferred=throttledUdpMove;
+                                        throttledUdpMove=null;
+                                        lastUdpMoveMs=SystemClock.uptimeMillis();
+                                    }
+                                    scheduledThrottleFlush=null;
+                                }
+                                FastUdpChannel c=udpChannel;
+                                if(deferred!=null && c!=null && c.confirmed && active && curClaim>0)
+                                    c.send(FastUdpChannel.OP_MOVE,deferred.a,deferred.b,curClaim);
+                            },4,TimeUnit.MILLISECONDS);
+                        }
+                    }
+                    scheduleUdpTrailingSyncLocked();
+                }
+                newestMove.set(null);
+                if(sendNow){
+                    udpPacer.execute(()->{
+                        FastUdpChannel c=udpChannel;
+                        if(c!=null && c.confirmed && active && activeClaim>0)
+                            c.send(FastUdpChannel.OP_MOVE,p.a,p.b,activeClaim);
+                    });
+                }
+                return;
+            }
             newestMove.set(p);
             if(moveEnqueued.compareAndSet(false,true))
                 sender.execute(()->{
@@ -524,16 +669,22 @@ final class DeskTouchSession implements AutoCloseable {
                     } while(newestMove.get()!=null &&
                         moveEnqueued.compareAndSet(false,true));
                 });
-        }else sender.execute(()->{
-            Packet preceding=newestMove.getAndSet(null);
-            if(preceding!=null)writeNow(preceding);
-            writeNow(p);
-        });
+        }else {
+            final boolean isRelease="release".equals(p.type)||"reset".equals(p.type);
+            sender.execute(()->{
+                Packet udpSync=isRelease ? clearPendingUdpMoves() : takePendingUdpMoveSync();
+                Packet tcpPrior=newestMove.getAndSet(null);
+                Packet preceding=isRelease ? tcpPrior : (udpSync!=null ? udpSync : tcpPrior);
+                if(preceding!=null)writeNow(preceding);
+                writeNow(p);
+            });
+        }
     }
     private synchronized void closeConnection(){
+        closeUdpChannel();
         clearReverseControl(false);
         RemoteInputPower.end();
-        running=false;active=false;claim=0;pendingTrust=null;
+        running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         SSLSocket sock=socket;socket=null;
@@ -545,6 +696,7 @@ final class DeskTouchSession implements AutoCloseable {
     }
     @Override public void close(){
         closeConnection();
+        udpPacer.shutdownNow();
         sender.shutdownNow();
     }
 }

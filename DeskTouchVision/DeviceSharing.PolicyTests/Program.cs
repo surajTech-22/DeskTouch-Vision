@@ -138,6 +138,56 @@ Check(SourceCapture.ScaleRawDelta(0, 10) == 0,
     "Idle mouse must not generate artificial movement");
 Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow movements.");
 
+// Verify authenticated FastUdpCodec encryption, AAD header binding, and replay rejection,
+// plus FastMovePacer first-frame immediacy and reliable pre-click TCP coordinate flush.
+{
+    byte[] udpKey = System.Security.Cryptography.RandomNumberGenerator.GetBytes(FastUdpCodec.KeySize);
+    using var srvCodec = new FastUdpCodec(udpKey, peerId: 9, isServer: true);
+    using var cliCodec = new FastUdpCodec(udpKey, peerId: 9, isServer: false);
+    using var otherCli = new FastUdpCodec(udpKey, peerId: 10, isServer: false);
+
+    byte[] f1 = new byte[FastUdpCodec.FrameSize];
+    Check(srvCodec.Seal(FastUdpOp.ReverseMove, 480, 960, 77, 10, f1) == FastUdpCodec.FrameSize,
+        "FastUdpCodec must emit fixed 48-byte authenticated frame");
+    Check(otherCli.TryOpen(f1, out _ ) == false,
+        "Wrong peer ID cannot accept another peer's UDP packet");
+    Check(cliCodec.TryOpen(f1, out var m1) && m1.Op == FastUdpOp.ReverseMove &&
+        m1.A == 480 && m1.B == 960 && m1.Lease == 77,
+        "Client must authenticate server UDP move");
+    Check(!cliCodec.TryOpen(f1, out _),
+        "Replayed UDP sequence must be rejected");
+
+    byte[] f2 = new byte[FastUdpCodec.FrameSize];
+    srvCodec.Seal(FastUdpOp.ReverseMove, 500, 990, 77, 14, f2);
+    byte[] bad = (byte[])f2.Clone();
+    bad[24] ^= 0x33;
+    Check(!cliCodec.TryOpen(bad, out _),
+        "Tampered UDP payload must fail AES-GCM authentication");
+    Check(!srvCodec.TryOpen(f2, out _),
+        "Server direction cannot decrypt its own server-originated frame");
+    Check(cliCodec.TryOpen(f2, out var m2) && m2.A == 500 && m2.B == 990,
+        "Legitimate next packet must still succeed after tampered frame");
+
+    var udpSent = new List<Packet>();
+    var tcpSent = new List<Packet>();
+    using var pacer = new FastMovePacer(
+        canSendUdp: () => true,
+        sendUdp: pkt => { udpSent.Add(pkt); return true; },
+        queueReliableTcp: pkt => tcpSent.Add(pkt));
+    Check(pacer.TryHandleMove(new Packet("move", 10, 20)),
+        "First move must go out immediately via FastUdp");
+    Check(udpSent.Count == 1 && udpSent[0].A == 10 && udpSent[0].B == 20,
+        "First UDP coordinate must transmit without delay");
+    pacer.TryHandleMove(new Packet("move", 30, 40));
+    pacer.TryHandleMove(new Packet("move", 55, 75));
+    var sync = pacer.TakePendingReliableSync();
+    Check(sync != null && sync.A == 55 && sync.B == 75,
+        "Pre-click flush must extract the newest coordinate reliably for TCP before button press");
+    Check(pacer.TakePendingReliableSync() == null,
+        "Reliable sync must drain cleanly once flushed");
+}
+Console.WriteLine("PASS: FastUdp AES-256-GCM replay protection and move pacing verified.");
+
 // An idle, discoverable DeskTouch listener must never install global input
 // hooks or grant remote authority. Only a connected, monitored peer can claim.
 Check(!InputClaimLifecyclePolicy.CanGrant(false, false, false),

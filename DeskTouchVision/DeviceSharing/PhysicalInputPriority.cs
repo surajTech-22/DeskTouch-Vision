@@ -75,9 +75,11 @@ internal static class InputClaimLifecyclePolicy
 /// </summary>
 internal sealed class PhysicalInputMonitor : IDisposable
 {
+    private const uint RawBufferSize = 4096;
     private readonly Control _window;
     private readonly Win.HookProc _keyboardProc, _mouseProc;
     private IntPtr _keyboardHook, _mouseHook;
+    private IntPtr _rawBuffer = Marshal.AllocHGlobal((int)RawBufferSize);
     private volatile bool _running;
     internal bool IsRunning => _running;
     internal LocalInputPriority Priority { get; } = new();
@@ -164,30 +166,24 @@ internal sealed class PhysicalInputMonitor : IDisposable
     internal void HandleRawInput(IntPtr handle)
     {
         if (!_running) return;
-        uint size = 0;
+        IntPtr ptr = Volatile.Read(ref _rawBuffer);
+        if (ptr == IntPtr.Zero) return;
         uint headerSize = (uint)Marshal.SizeOf<Win.RAWINPUTHEADER>();
-        if (Win.GetRawInputData(handle, Win.RID_INPUT, IntPtr.Zero,
-            ref size, headerSize) == uint.MaxValue || size < headerSize || size > 4096)
-            return;
-        var ptr = Marshal.AllocHGlobal((int)size);
-        try
+        uint size = RawBufferSize;
+        uint read = Win.GetRawInputData(handle, Win.RID_INPUT, ptr, ref size, headerSize);
+        if (read == uint.MaxValue || read < headerSize) return;
+        var header = Marshal.PtrToStructure<Win.RAWINPUTHEADER>(ptr);
+        if (header.Device == IntPtr.Zero) return; // reject virtual/unidentified source
+        if (header.Type == 1) // RIM_TYPEKEYBOARD; no scan codes stored
         {
-            if (Win.GetRawInputData(handle, Win.RID_INPUT, ptr,
-                ref size, headerSize) == uint.MaxValue) return;
-            var header = Marshal.PtrToStructure<Win.RAWINPUTHEADER>(ptr);
-            if (header.Device == IntPtr.Zero) return; // reject virtual/unidentified source
-            if (header.Type == 1) // RIM_TYPEKEYBOARD; no scan codes stored
-            {
-                RecordPhysicalIfLocal();
-            }
-            else if (header.Type == 0 && size >= Marshal.SizeOf<Win.RAWINPUT>())
-            {
-                var mouse = Marshal.PtrToStructure<Win.RAWINPUT>(ptr).Mouse;
-                if (mouse.LastX != 0 || mouse.LastY != 0 || mouse.Buttons != 0)
-                    RecordPhysicalIfLocal();
-            }
+            RecordPhysicalIfLocal();
         }
-        finally { Marshal.FreeHGlobal(ptr); }
+        else if (header.Type == 0 && read >= (uint)Marshal.SizeOf<Win.RAWINPUT>())
+        {
+            var mouse = Marshal.PtrToStructure<Win.RAWINPUT>(ptr).Mouse;
+            if (mouse.LastX != 0 || mouse.LastY != 0 || mouse.Buttons != 0)
+                RecordPhysicalIfLocal();
+        }
     }
 
     public void Dispose()
@@ -214,5 +210,7 @@ internal sealed class PhysicalInputMonitor : IDisposable
             Win.RegisterRawInputDevices(remove, (uint)remove.Length,
                 (uint)Marshal.SizeOf<Win.RAWINPUTDEVICE>());
         }
+        IntPtr rawBuffer = Interlocked.Exchange(ref _rawBuffer, IntPtr.Zero);
+        if (rawBuffer != IntPtr.Zero) Marshal.FreeHGlobal(rawBuffer);
     }
 }

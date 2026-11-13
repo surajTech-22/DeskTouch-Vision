@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using System.Threading.Channels;
 using System.Windows.Forms;
 using DeskTouchVision;
 
@@ -363,6 +364,48 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         File.Move(logPath, backup, overwrite: true);
     }
 
+    private readonly Channel<string> _logChannel = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(256)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+    private int _logWriterStarted;
+
+    private static void BoostProcessResponsiveness()
+    {
+        try
+        {
+            using var current = Process.GetCurrentProcess();
+            if (current.PriorityClass == ProcessPriorityClass.Normal)
+                current.PriorityClass = ProcessPriorityClass.AboveNormal;
+        }
+        catch { /* Best-effort process priority; never fail sharing if restricted. */ }
+    }
+
+    private async Task WriteLogsAsync()
+    {
+        try
+        {
+            string logs = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DeskTouchVision", "logs");
+            string logFile = Path.Combine(logs, "connection.log");
+            await foreach (string line in _logChannel.Reader.ReadAllAsync())
+            {
+                try
+                {
+                    Directory.CreateDirectory(logs);
+                    RotateLogIfNeeded(logFile);
+                    await File.AppendAllTextAsync(logFile, line);
+                }
+                catch { /* Never block Windows input for diagnostic logging. */ }
+            }
+        }
+        catch { }
+    }
+
     private void Status(string message)
     {
         if (IsDisposed || Disposing) return;
@@ -373,20 +416,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             return;
         }
         _status.Text = message;
-        try
-        {
-            string logs = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "DeskTouchVision", "logs");
-            Directory.CreateDirectory(logs);
-            string logFile = Path.Combine(logs, "connection.log");
-            RotateLogIfNeeded(logFile);
-            // Status strings intentionally contain no pairing secrets, keys or
-            // raw keyboard events. Keep connection-stage errors diagnosable.
-            File.AppendAllText(logFile,
-                DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
-        }
-        catch { /* Never block Windows input for diagnostic logging. */ }
+        if (Interlocked.CompareExchange(ref _logWriterStarted, 1, 0) == 0)
+            _ = Task.Run(WriteLogsAsync);
+        // Status strings intentionally contain no pairing secrets, keys or
+        // raw keyboard events. Keep connection-stage errors diagnosable.
+        _logChannel.Writer.TryWrite(
+            DateTimeOffset.Now.ToString("o") + " " + message + Environment.NewLine);
         UpdateButtons();
     }
 
@@ -781,6 +816,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_receiver != null || _host != null || _connecting || _closing.IsCancellationRequested) return;
         try
         {
+            BoostProcessResponsiveness();
             // Discovery and trusted auto-connect do not need global keyboard
             // or mouse hooks. Arm input monitoring only after TLS pairing has
             // authenticated an active incoming peer.
@@ -1173,6 +1209,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void AdoptHost(HostSession session, string name, string fingerprint)
     {
+        BoostProcessResponsiveness();
         _host = session;
         _remoteAddress = name;
         _currentFingerprint = fingerprint;
@@ -1610,7 +1647,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Crucial for TWO-WAY input: native priority detection AND mouse
             // capture must see the same real raw event on either computer.
             // Previously receiving mode discarded it before SourceCapture.
-            _nativeInput?.HandleRawInput(message.LParam);
+            if (_capture?.OutboundInputReserved != true)
+                _nativeInput?.HandleRawInput(message.LParam);
             _capture?.OnRawInput(message.LParam);
         }
         if (message.Msg == 0x007E && IsHandleCreated && !Disposing)
@@ -1626,6 +1664,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (disposing)
         {
             _closing.Cancel();
+            _logChannel.Writer.TryComplete();
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;
             if (_trayIcon != null)

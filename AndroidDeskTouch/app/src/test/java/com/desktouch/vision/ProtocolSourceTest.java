@@ -195,4 +195,59 @@ public final class ProtocolSourceTest {
             java.util.Collections.emptySet(),
             java.util.Collections.emptySet()).ready);
     }
+    @Test public void fastUdpCodecAuthenticatesAndRejectsReplay() throws Exception {
+        byte[] key=new byte[FastUdpChannel.KEY_SIZE];
+        for(int i=0;i<key.length;i++) key[i]=(byte)(i+1);
+        FastUdpChannel.Codec server=new FastUdpChannel.Codec(key,7,true);
+        FastUdpChannel.Codec client=new FastUdpChannel.Codec(key,7,false);
+
+        byte[] frame1=new byte[FastUdpChannel.FRAME_SIZE];
+        assertEquals(FastUdpChannel.FRAME_SIZE,
+            server.seal(FastUdpChannel.OP_REVERSE_MOVE,540,1200,42,100,frame1));
+        FastUdpChannel.Message decoded1=client.tryOpen(frame1,frame1.length);
+        assertNotNull(decoded1);
+        assertEquals(FastUdpChannel.OP_REVERSE_MOVE,decoded1.op);
+        assertEquals(540,decoded1.a);
+        assertEquals(1200,decoded1.b);
+        assertEquals(42,decoded1.lease);
+
+        // Replay must be rejected cleanly.
+        assertNull(client.tryOpen(frame1,frame1.length));
+
+        byte[] frame2=new byte[FastUdpChannel.FRAME_SIZE];
+        server.seal(FastUdpChannel.OP_REVERSE_MOVE,600,1300,42,104,frame2);
+        byte[] tamperedCipher=frame2.clone();
+        tamperedCipher[20]^=0x55;
+        assertNull(client.tryOpen(tamperedCipher,tamperedCipher.length));
+
+        byte[] tamperedHeader=frame2.clone();
+        tamperedHeader[8]^=0x01; // AAD mismatch even if seq looks higher
+        assertNull(client.tryOpen(tamperedHeader,tamperedHeader.length));
+
+        FastUdpChannel.Message decoded2=client.tryOpen(frame2,frame2.length);
+        assertNotNull(decoded2);
+        assertEquals(600,decoded2.a);
+        assertEquals(1300,decoded2.b);
+
+        // Wrong direction / self-reflection cannot decrypt on sender side.
+        assertNull(server.tryOpen(frame2,frame2.length));
+        byte[] c2s=new byte[FastUdpChannel.FRAME_SIZE];
+        client.seal(FastUdpChannel.OP_MOVE,320,240,99,200,c2s);
+        FastUdpChannel.Message up=server.tryOpen(c2s,c2s.length);
+        assertNotNull(up);
+        assertEquals(FastUdpChannel.OP_MOVE,up.op);
+        assertEquals(320,up.a);
+        assertEquals(240,up.b);
+        assertEquals(99,up.lease);
+
+        // Stale out-of-order lower sequence must be rejected after higher accepted.
+        byte[] olderSeq=new byte[FastUdpChannel.FRAME_SIZE];
+        byte[] newerSeq=new byte[FastUdpChannel.FRAME_SIZE];
+        server.seal(FastUdpChannel.OP_REVERSE_MOVE,100,100,42,110,olderSeq);
+        server.seal(FastUdpChannel.OP_REVERSE_MOVE,200,200,42,114,newerSeq);
+        FastUdpChannel.Message newer=client.tryOpen(newerSeq,newerSeq.length);
+        assertNotNull(newer);
+        assertEquals(200,newer.a);
+        assertNull(client.tryOpen(olderSeq,olderSeq.length));
+    }
 }

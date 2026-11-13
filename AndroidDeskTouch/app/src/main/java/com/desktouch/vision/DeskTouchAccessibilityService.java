@@ -27,6 +27,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.widget.FrameLayout;
 import java.util.ArrayDeque;
 import java.util.List;
 
@@ -43,7 +44,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private static final String PAUSED_FOR_BANKING="paused_for_banking";
     private final Handler ui=new Handler(Looper.getMainLooper());
     private WindowManager windows;
-    private View cursor;
+    private FrameLayout cursorRoot;
+    private PointerDotView pointerDot;
+    private int pointerDotSize;
+    private float pointerDotHalf;
     private WindowManager.LayoutParams compactPointerParams;
     private volatile int displayWidth=1,displayHeight=1;
     private volatile int x,y;
@@ -56,26 +60,37 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private volatile Runnable pendingApplied;
     private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
         new java.util.concurrent.atomic.AtomicBoolean();
-    private final Choreographer.FrameCallback pointerFrame = ignored -> flushPointer();
     private int lastOverlayX=Integer.MIN_VALUE,lastOverlayY=Integer.MIN_VALUE;
     private int downX,downY;
     private boolean held,shift,control,alt,remoteGesture;
     private boolean gestureRunning;
-    private final ArrayDeque<GestureCommand> pendingGestures=new ArrayDeque<>();
-    private static final class GestureCommand {
-        final int sx,sy,ex,ey;
-        final long duration;
-        GestureCommand(int sx,int sy,int ex,int ey,long duration){
-            this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;this.duration=duration;
+    private GestureDescription.StrokeDescription activeStroke;
+    private int strokeX,strokeY;
+    private boolean pendingLift;
+    private int pendingLiftX,pendingLiftY;
+    private boolean dragFallbackPending;
+    private int gestureGeneration;
+    private final ArrayDeque<TouchAction> pendingActions=new ArrayDeque<>();
+    private static final class TouchAction {
+        static final int TYPE_GESTURE = 1;
+        static final int TYPE_DOWN = 2;
+        static final int TYPE_UP = 3;
+        static final int TYPE_SCROLL = 4;
+        final int kind;
+        int sx,sy,ex,ey;
+        long duration;
+        boolean horizontal;
+        TouchAction(int kind,int sx,int sy,int ex,int ey,long duration,boolean horizontal){
+            this.kind=kind;this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;
+            this.duration=duration;this.horizontal=horizontal;
         }
     }
-    private final class PointerSurface extends View {
+    private final class PointerDotView extends View {
         private final Paint fill=new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ring=new Paint(Paint.ANTI_ALIAS_FLAG);
-        PointerSurface(Context context){
+        PointerDotView(Context context){
             super(context);
             setWillNotDraw(false);
-            setKeepScreenOn(true); // Active approved remote pointer window only.
             fill.setColor(0xff37b6f6);
             ring.setColor(0xffffffff);
             ring.setStyle(Paint.Style.STROKE);
@@ -83,11 +98,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         }
         @Override protected void onDraw(Canvas canvas){
             super.onDraw(canvas);
-            int px=lastOverlayX,py=lastOverlayY;
-            if(px==Integer.MIN_VALUE||py==Integer.MIN_VALUE)return;
+            float cx=getWidth()/2f,cy=getHeight()/2f;
             float radius=dp(9);
-            canvas.drawCircle(px,py,radius,fill);
-            canvas.drawCircle(px,py,radius,ring);
+            canvas.drawCircle(cx,cy,radius,fill);
+            canvas.drawCircle(cx,cy,radius,ring);
         }
     }
 
@@ -182,6 +196,27 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         super.onDestroy();
     }
     private int dp(float px){return Math.round(px*getResources().getDisplayMetrics().density);}
+    private boolean tryAttachOverlay(FrameLayout root,WindowManager.LayoutParams params){
+        try{
+            windows.addView(root,params);
+            cursorRoot=root;
+            return true;
+        }catch(RuntimeException rejected){
+            return false;
+        }
+    }
+    private WindowManager.LayoutParams overlayLayoutParams(int width,int height){
+        WindowManager.LayoutParams params=new WindowManager.LayoutParams(
+            width,height,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            PixelFormat.TRANSLUCENT);
+        params.gravity=Gravity.TOP|Gravity.LEFT;
+        if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
+        return params;
+    }
     private void showPointer(int requestedX,int requestedY){
         if(!ready(this))return;
         // Read the physical-display geometry once per rotation, not on every
@@ -189,71 +224,49 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         int screenWidth=displayWidth,screenHeight=displayHeight;
         x=Math.max(0,Math.min(screenWidth-1,requestedX));
         y=Math.max(0,Math.min(screenHeight-1,requestedY));
-        if(cursor==null){
-            // First use the existing single full-screen NON-TOUCHABLE
-            // accessibility overlay: no expensive relayout on each motion.
-            PointerSurface pointer=new PointerSurface(this);
-            WindowManager.LayoutParams params=new WindowManager.LayoutParams(
-                screenWidth,
-                screenHeight,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-                PixelFormat.TRANSLUCENT);
-            params.gravity=Gravity.TOP|Gravity.LEFT;
-            params.x=0;params.y=0;
-            // Do not silently shrink the overlay to the app's content area
-            // when the status and navigation bars occupy physical pixels.
-            if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
-            try{
-                windows.addView(pointer,params);
-                cursor=pointer;
+        if(cursorRoot==null){
+            FrameLayout root=new FrameLayout(this);
+            root.setKeepScreenOn(true); // Active approved remote pointer window only.
+            PointerDotView dot=new PointerDotView(this);
+            pointerDotSize=dp(24);
+            pointerDotHalf=pointerDotSize/2f;
+            root.addView(dot,new FrameLayout.LayoutParams(
+                pointerDotSize,pointerDotSize,Gravity.TOP|Gravity.LEFT));
+
+            WindowManager.LayoutParams full=overlayLayoutParams(screenWidth,screenHeight);
+            if(tryAttachOverlay(root,full)){
+                pointerDot=dot;
                 compactPointerParams=null;
-                lastOverlayX=x;lastOverlayY=y;
-            }catch(RuntimeException fullOverlayRejected){
-                // A Xiaomi/OEM window policy may reject a full-screen
-                // accessibility overlay even while the service is active.
-                // Retry with a compact, non-touchable native accessibility
-                // overlay inside THIS app; never request a separate app or
-                // silent SYSTEM_ALERT_WINDOW permission.
-                int width=Math.min(screenWidth,dp(96));
-                int height=Math.min(screenHeight,dp(96));
-                WindowManager.LayoutParams compact=new WindowManager.LayoutParams(
-                    width,height,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-                    PixelFormat.TRANSLUCENT);
-                compact.gravity=Gravity.TOP|Gravity.LEFT;
-                if(Build.VERSION.SDK_INT>=30)compact.setFitInsetsTypes(0);
-                compact.x=PointerOverlayGeometry.origin(x,screenWidth,width);
-                compact.y=PointerOverlayGeometry.origin(y,screenHeight,height);
-                PointerSurface smaller=new PointerSurface(this);
-                try{
-                    windows.addView(smaller,compact);
-                    cursor=smaller;
-                    compactPointerParams=compact;
-                    lastOverlayX=x-compact.x;
-                    lastOverlayY=y-compact.y;
-                    Log.w("DeskTouchPointer","Full-screen pointer overlay unavailable; compact accessibility overlay active");
-                }catch(RuntimeException compactRejected){
-                    cursor=null;
-                    compactPointerParams=null;
-                    lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
-                    // Do not leave Windows waiting for a fake cursor-applied
-                    // acknowledgement. Revoke the lease over the authenticated
-                    // session so its keyboard/mouse remain local.
-                    Log.e("DeskTouchPointer",
-                        "Android rejected both pointer overlays; remote control revoked");
-                    DeskTouchRuntime.pointerOverlayUnavailable();
-                    return;
+            }else{
+                // Xiaomi/OEM policies may reject a full-screen overlay; fall back to
+                // a medium or compact non-touchable accessibility overlay.
+                WindowManager.LayoutParams compact=overlayLayoutParams(
+                    Math.min(screenWidth,dp(240)),Math.min(screenHeight,dp(240)));
+                compact.x=PointerOverlayGeometry.origin(x,screenWidth,compact.width);
+                compact.y=PointerOverlayGeometry.origin(y,screenHeight,compact.height);
+                if(!tryAttachOverlay(root,compact)){
+                    compact=overlayLayoutParams(
+                        Math.min(screenWidth,dp(96)),Math.min(screenHeight,dp(96)));
+                    compact.x=PointerOverlayGeometry.origin(x,screenWidth,compact.width);
+                    compact.y=PointerOverlayGeometry.origin(y,screenHeight,compact.height);
+                    if(!tryAttachOverlay(root,compact)){
+                        cursorRoot=null;
+                        pointerDot=null;
+                        compactPointerParams=null;
+                        lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
+                        Log.e("DeskTouchPointer",
+                            "Android rejected pointer overlays; remote control revoked");
+                        DeskTouchRuntime.pointerOverlayUnavailable();
+                        return;
+                    }
                 }
+                pointerDot=dot;
+                compactPointerParams=compact;
+                Log.w("DeskTouchPointer","Full-screen pointer overlay unavailable; compact accessibility overlay active");
             }
         }
-        if(cursor==null)return;
+        if(cursorRoot==null||pointerDot==null)return;
+        int localX=x,localY=y;
         if(compactPointerParams!=null){
             WindowManager.LayoutParams compact=compactPointerParams;
             int left=PointerOverlayGeometry.followOrigin(x,compact.x,
@@ -262,7 +275,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 screenHeight,compact.height,compact.height/6);
             if(compact.x!=left || compact.y!=top){
                 compact.x=left;compact.y=top;
-                try{windows.updateViewLayout(cursor,compact);}
+                try{windows.updateViewLayout(cursorRoot,compact);}
                 catch(RuntimeException revoked){
                     Log.e("DeskTouchPointer",
                         "Compact pointer overlay update rejected; remote control revoked");
@@ -271,38 +284,42 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                     return;
                 }
             }
-            int localX=x-left,localY=y-top;
-            if(localX!=lastOverlayX||localY!=lastOverlayY){
-                lastOverlayX=localX;lastOverlayY=localY;
-                cursor.invalidate();
-            }
-            return;
+            localX=x-left;localY=y-top;
         }
-        if(x!=lastOverlayX || y!=lastOverlayY){
-            int oldX=lastOverlayX,oldY=lastOverlayY;
-            lastOverlayX=x;lastOverlayY=y;
-            int halo=dp(14);
-            int left=Math.max(0,Math.min(oldX,x)-halo);
-            int top=Math.max(0,Math.min(oldY,y)-halo);
-            int right=Math.min(cursor.getWidth(),Math.max(oldX,x)+halo);
-            int bottom=Math.min(cursor.getHeight(),Math.max(oldY,y)+halo);
-            if(right>left&&bottom>top)
-                cursor.invalidate(left,top,right,bottom);
-            else cursor.invalidate();
+        if(localX!=lastOverlayX || localY!=lastOverlayY){
+            lastOverlayX=localX;lastOverlayY=localY;
+            pointerDot.setTranslationX(localX-pointerDotHalf);
+            pointerDot.setTranslationY(localY-pointerDotHalf);
         }
     }
     private void removePointer(){
+        gestureGeneration++;
+        GestureDescription.StrokeDescription dangling=activeStroke;
+        activeStroke=null;
         held=false;
+        pendingLift=false;
+        dragFallbackPending=false;
+        if(dangling!=null && windows!=null){
+            try{
+                Path lift=new Path();
+                lift.moveTo(strokeX,strokeY);
+                dispatchGesture(new GestureDescription.Builder()
+                    .addStroke(dangling.continueStroke(lift,0,8L,false)).build(),
+                    null,null);
+            }catch(RuntimeException ignored){}
+        }
         remoteActive=false;
         pendingApplied=null;
         moveScheduled.set(false);
         lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
-        pendingGestures.clear();
+        pendingActions.clear();
         gestureRunning=false;
-        if(cursor!=null&&windows!=null){
-            try{windows.removeView(cursor);}catch(RuntimeException ignored){}
+        remoteGesture=false;
+        if(cursorRoot!=null&&windows!=null){
+            try{windows.removeView(cursorRoot);}catch(RuntimeException ignored){}
         }
-        cursor=null;
+        cursorRoot=null;
+        pointerDot=null;
         compactPointerParams=null;
     }
     static boolean pointer(int px,int py,Runnable applied){
@@ -342,7 +359,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         Runnable ack=pendingApplied;
         pendingApplied=null;
         moveScheduled.set(false);
-        if(remoteActive&&cursor!=null&&ack!=null&&ready(this))ack.run();
+        if(remoteActive&&cursorRoot!=null&&ack!=null&&ready(this))ack.run();
+        if(remoteActive&&ready(this)&&held&&activeStroke!=null&&!gestureRunning&&!pendingLift)
+            continueDragIfReady();
         if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
             moveScheduled.compareAndSet(false,true))
             ui.post(this::flushPointer);
@@ -350,11 +369,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
         // pointer position, never the previous animation frame.
-        if(remoteActive && (pendingX!=x || pendingY!=y || cursor==null))
+        if(remoteActive && (pendingX!=x || pendingY!=y || cursorRoot==null))
             showPointer(pendingX,pendingY);
         Runnable ack=pendingApplied;
         pendingApplied=null;
-        if(cursor!=null && ack!=null && remoteActive)ack.run();
+        if(cursorRoot!=null && ack!=null && remoteActive)ack.run();
     }
     static void endRemote(){
         DeskTouchAccessibilityService service=instance;
@@ -380,19 +399,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 if(!pressed)service.performGlobalAction(GLOBAL_ACTION_HOME);
                 return;
             }
-            if(pressed){
-                service.held=true;service.downX=service.x;service.downY=service.y;
-            }else if(service.held){
-                service.held=false;
-                int dx=service.x-service.downX,dy=service.y-service.downY;
-                if(Math.hypot(dx,dy)<=12)
-                    service.focusEditableAtPoint(service.x,service.y);
-                // Use exact coordinates for taps and distance-scaled durations
-                // for swipes/drags so short drags never teleport across lists.
-                long duration=gestureDurationMs(dx,dy);
-                service.enqueueGesture(service.downX,service.downY,
-                    service.x,service.y,duration);
-            }
+            if(pressed)service.handleLeftDown();
+            else service.handleLeftUp();
         });
     }
     static void wheel(int amount,boolean horizontal){
@@ -401,15 +409,33 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.ui.post(()->{
             if(!service.remoteActive || !ready(service))return;
             service.flushPointerBeforeAction();
-            // Native accessibility scroll actions are dispatched directly to
-            // the scrollable UI node under the cursor. This avoids an
-            // unnecessary 120ms gesture when the target exposes scrolling.
-            if(!horizontal && service.performNativeScroll(amount))return;
-            int distance=Math.max(55,Math.min(210,Math.abs(amount)));
+            int delta=Math.max(55,Math.min(220,Math.abs(amount)));
+            int signedDelta=amount>0 ? -delta : delta;
+            TouchAction tail=service.pendingActions.peekLast();
+            if(tail!=null && tail.kind==TouchAction.TYPE_SCROLL && tail.horizontal==horizontal){
+                if(horizontal){
+                    int combined=Math.max(-600,Math.min(600,(tail.ex-tail.sx)+signedDelta));
+                    tail.ex=tail.sx+combined;
+                }else{
+                    int combined=Math.max(-600,Math.min(600,(tail.ey-tail.sy)+signedDelta));
+                    tail.ey=tail.sy+combined;
+                }
+                return;
+            }
             int sx=service.x,sy=service.y;
-            int ex=horizontal?sx+(amount>0?-distance:distance):sx;
-            int ey=horizontal?sy:sy+(amount>0?-distance:distance);
-            service.enqueueGesture(sx,sy,ex,ey,85);
+            int ex=horizontal ? sx+signedDelta : sx;
+            int ey=horizontal ? sy : sy+signedDelta;
+            int scrollCount=0;
+            for(TouchAction a:service.pendingActions)
+                if(a.kind==TouchAction.TYPE_SCROLL)scrollCount++;
+            if(scrollCount>=2){
+                java.util.Iterator<TouchAction> it=service.pendingActions.iterator();
+                while(it.hasNext()){
+                    if(it.next().kind==TouchAction.TYPE_SCROLL){it.remove();break;}
+                }
+            }
+            service.enqueueAction(new TouchAction(
+                TouchAction.TYPE_SCROLL,sx,sy,ex,ey,40L,horizontal));
         });
     }
 
@@ -446,70 +472,235 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         return target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
     }
 
-    private boolean performNativeScroll(int amount){
-        AccessibilityNodeInfo root=getRootInActiveWindow();
-        if(root==null)return false;
-        // Bound traversal so a huge UI tree cannot stall the main thread.
-        ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
-        nodes.push(root);
-        AccessibilityNodeInfo target=null;
-        int visited=0;
-        Rect bounds=new Rect();
-        while(!nodes.isEmpty() && ++visited<=96){
-            AccessibilityNodeInfo node=nodes.pop();
-            node.getBoundsInScreen(bounds);
-            if(!bounds.contains(x,y))continue;
-            if(node.isScrollable())target=node;
-            for(int i=node.getChildCount()-1;i>=0;i--){
-                AccessibilityNodeInfo child=node.getChild(i);
-                if(child!=null)nodes.push(child);
-            }
+    private void handleLeftDown(){
+        if(held)return;
+        held=true;downX=x;downY=y;
+        dragFallbackPending=false;pendingLift=false;
+        if(!gestureRunning && activeStroke==null && pendingActions.isEmpty()){
+            startLiveStrokeDown(x,y);
+            return;
         }
-        if(target==null)return false;
-        int action=amount>0?AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD:
-            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
-        return target.performAction(action);
+        enqueueAction(new TouchAction(TouchAction.TYPE_DOWN,x,y,x,y,12L,false));
     }
-
-    private void enqueueGesture(int sx,int sy,int ex,int ey,long duration){
+    private void handleLeftUp(){
+        if(!held && !pendingLift && activeStroke==null && pendingActions.isEmpty())return;
+        held=false;
+        if(activeStroke!=null){
+            if(!pendingLift && pendingActions.isEmpty()){
+                if(!gestureRunning)dispatchLiveStrokeUp(x,y);
+                else{pendingLift=true;pendingLiftX=x;pendingLiftY=y;}
+            }else{
+                enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,10L,false));
+            }
+            return;
+        }
+        if(dragFallbackPending){
+            dragFallbackPending=false;
+            enqueueAction(new TouchAction(TouchAction.TYPE_GESTURE,
+                downX,downY,x,y,gestureDurationMs(x-downX,y-downY),false));
+            return;
+        }
+        if(!pendingActions.isEmpty())
+            enqueueAction(new TouchAction(TouchAction.TYPE_UP,x,y,x,y,10L,false));
+    }
+    private void enqueueAction(TouchAction action){
         if(!remoteActive || !ready(this))return;
-        // dispatchGesture cancels an already running gesture. Serialize
-        // commands instead of repeatedly interrupting taps and swipes.
-        if(pendingGestures.size()>=6)pendingGestures.pollFirst();
-        pendingGestures.addLast(new GestureCommand(sx,sy,ex,ey,duration));
-        pumpGestures();
+        if(pendingActions.size()>=8)pendingActions.pollFirst();
+        pendingActions.addLast(action);
+        pumpActions();
     }
-    private void pumpGestures(){
-        if(gestureRunning || !remoteActive || !ready(this))return;
-        GestureCommand command=pendingGestures.pollFirst();
-        if(command==null){remoteGesture=false;return;}
+    private void startLiveStrokeDown(int px,int py){
         Path path=new Path();
-        path.moveTo(command.sx,command.sy);
-        if(command.sx!=command.ex||command.sy!=command.ey)
-            path.lineTo(command.ex,command.ey);
+        path.moveTo(px,py);
         GestureDescription.StrokeDescription stroke=
-            new GestureDescription.StrokeDescription(path,0,command.duration);
+            new GestureDescription.StrokeDescription(path,0,12L,true);
+        final int gen=++gestureGeneration;
+        activeStroke=stroke;
+        strokeX=px;strokeY=py;
+        gestureRunning=true;remoteGesture=true;
+        boolean started=dispatchGesture(
+            new GestureDescription.Builder().addStroke(stroke).build(),
+            new GestureResultCallback(){
+                @Override public void onCompleted(GestureDescription completed){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeStepDone(false);
+                }
+                @Override public void onCancelled(GestureDescription cancelled){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeStepDone(true);
+                }
+            },ui);
+        if(!started){
+            activeStroke=null;
+            gestureRunning=false;
+            if(pendingLift){
+                pendingLift=false;
+                enqueueAction(new TouchAction(TouchAction.TYPE_GESTURE,
+                    downX,downY,pendingLiftX,pendingLiftY,
+                    gestureDurationMs(pendingLiftX-downX,pendingLiftY-downY),false));
+            }else if(held){
+                dragFallbackPending=true;
+            }
+            pumpActions();
+        }
+    }
+    private void continueDragIfReady(){
+        if(!remoteActive || !ready(this) || !held || activeStroke==null
+            || gestureRunning || pendingLift)return;
+        if(Math.hypot(x-strokeX,y-strokeY)<2.0)return;
+        Path path=new Path();
+        path.moveTo(strokeX,strokeY);
+        path.lineTo(x,y);
+        GestureDescription.StrokeDescription next;
+        try{
+            next=activeStroke.continueStroke(path,0,14L,true);
+        }catch(RuntimeException badContinuation){
+            activeStroke=null;
+            dragFallbackPending=true;
+            return;
+        }
+        final int gen=++gestureGeneration;
+        activeStroke=next;
+        strokeX=x;strokeY=y;
+        gestureRunning=true;remoteGesture=true;
+        boolean started=dispatchGesture(
+            new GestureDescription.Builder().addStroke(next).build(),
+            new GestureResultCallback(){
+                @Override public void onCompleted(GestureDescription completed){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeStepDone(false);
+                }
+                @Override public void onCancelled(GestureDescription cancelled){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeStepDone(true);
+                }
+            },ui);
+        if(!started){
+            activeStroke=null;
+            gestureRunning=false;
+            dragFallbackPending=held;
+            pumpActions();
+        }
+    }
+    private void dispatchLiveStrokeUp(int px,int py){
+        GestureDescription.StrokeDescription cur=activeStroke;
+        activeStroke=null;
+        pendingLift=false;
+        if(cur==null)return;
+        Path path=new Path();
+        path.moveTo(strokeX,strokeY);
+        if(px!=strokeX||py!=strokeY)path.lineTo(px,py);
+        GestureDescription.StrokeDescription up;
+        try{
+            up=cur.continueStroke(path,0,10L,false);
+        }catch(RuntimeException badUp){
+            gestureRunning=false;
+            enqueueAction(new TouchAction(TouchAction.TYPE_GESTURE,
+                downX,downY,px,py,gestureDurationMs(px-downX,py-downY),false));
+            return;
+        }
+        final int gen=++gestureGeneration;
+        gestureRunning=true;remoteGesture=true;
+        boolean started=dispatchGesture(
+            new GestureDescription.Builder().addStroke(up).build(),
+            new GestureResultCallback(){
+                @Override public void onCompleted(GestureDescription completed){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeLiftDone();
+                }
+                @Override public void onCancelled(GestureDescription cancelled){
+                    if(gen!=gestureGeneration)return;
+                    onStrokeLiftDone();
+                }
+            },ui);
+        if(!started){
+            gestureRunning=false;
+            pumpActions();
+        }
+    }
+    private void onStrokeStepDone(boolean cancelled){
+        gestureRunning=false;
+        if(!remoteActive || !ready(this)){
+            activeStroke=null;pendingLift=false;remoteGesture=false;
+            pendingActions.clear();
+            return;
+        }
+        if(cancelled){
+            activeStroke=null;
+            if(pendingLift){
+                pendingLift=false;
+                enqueueAction(new TouchAction(TouchAction.TYPE_GESTURE,
+                    downX,downY,pendingLiftX,pendingLiftY,
+                    gestureDurationMs(pendingLiftX-downX,pendingLiftY-downY),false));
+            }else if(held){
+                dragFallbackPending=true;
+            }
+            pumpActions();
+            return;
+        }
+        if(pendingLift && activeStroke!=null){
+            dispatchLiveStrokeUp(pendingLiftX,pendingLiftY);
+            return;
+        }
+        if(held && activeStroke!=null)continueDragIfReady();
+    }
+    private void onStrokeLiftDone(){
+        gestureRunning=false;
+        if(!pendingActions.isEmpty())pumpActions();
+        else if(activeStroke==null)remoteGesture=false;
+    }
+    private void pumpActions(){
+        while(!gestureRunning && activeStroke==null && remoteActive && ready(this)){
+            TouchAction command=pendingActions.pollFirst();
+            if(command==null){remoteGesture=false;return;}
+            if(command.kind==TouchAction.TYPE_DOWN){
+                TouchAction next=pendingActions.peekFirst();
+                if(next!=null && next.kind==TouchAction.TYPE_UP){
+                    pendingActions.pollFirst();
+                    dispatchSingleGesture(command.sx,command.sy,next.ex,next.ey,
+                        gestureDurationMs(next.ex-command.sx,next.ey-command.sy));
+                    return;
+                }
+                if(held){
+                    startLiveStrokeDown(x,y);
+                    return;
+                }
+                continue;
+            }
+            if(command.kind==TouchAction.TYPE_UP)continue;
+            dispatchSingleGesture(command.sx,command.sy,command.ex,command.ey,command.duration);
+            return;
+        }
+    }
+    private void dispatchSingleGesture(int sx,int sy,int ex,int ey,long duration){
+        Path path=new Path();
+        path.moveTo(sx,sy);
+        if(sx!=ex||sy!=ey)path.lineTo(ex,ey);
+        GestureDescription.StrokeDescription stroke=
+            new GestureDescription.StrokeDescription(path,0,duration);
         GestureDescription gesture=new GestureDescription.Builder().addStroke(stroke).build();
+        final int gen=++gestureGeneration;
         remoteGesture=gestureRunning=true;
         boolean started=dispatchGesture(gesture,new GestureResultCallback(){
             @Override public void onCompleted(GestureDescription completed){
+                if(gen!=gestureGeneration)return;
                 finishGesture();
             }
             @Override public void onCancelled(GestureDescription cancelled){
+                if(gen!=gestureGeneration)return;
                 finishGesture();
             }
         },ui);
         if(!started){
             // Some OEMs reject gestures; fall back to node-click only then.
-            if(command.sx==command.ex && command.sy==command.ey)
-                performNativeClick();
+            if(sx==ex && sy==ey)performNativeClick();
             finishGesture();
         }
     }
     private void finishGesture(){
         gestureRunning=false;
-        if(pendingGestures.isEmpty())remoteGesture=false;
-        pumpGestures();
+        if(pendingActions.isEmpty() && activeStroke==null)remoteGesture=false;
+        pumpActions();
     }
     static boolean safeEditorType(int inputType){
         int kind=inputType & InputType.TYPE_MASK_CLASS;

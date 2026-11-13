@@ -24,7 +24,9 @@ internal sealed class SourceCapture : IDisposable
     private MonitorTopology _localMonitors, _remoteMonitors;
     private System.Drawing.Rectangle _local;
     private MonitorEdge _edge;
+    private const uint RawBufferSize = 4096;
     private IntPtr _keyHook, _mouseHook;
+    private IntPtr _rawBuffer = Marshal.AllocHGlobal((int)RawBufferSize);
     private int _armed, _active, _switchPending, _pending;
     private System.Drawing.Point _pendingPoint;
     private int _remoteX, _remoteY;
@@ -33,6 +35,8 @@ internal sealed class SourceCapture : IDisposable
     private long _enteredRemoteAt;
     private long _lastRawMs;
     private long _lastFallbackMs;
+    private long _lastWarmHintMs;
+    private int _hookMovesWithoutRaw;
     private bool _continuingAcrossDevices;
     internal bool OutboundInputReserved => RemoteActive ||
         (_continuingAcrossDevices && IsClaimPending);
@@ -389,6 +393,7 @@ internal sealed class SourceCapture : IDisposable
         _enteredRemoteAt = now;
         _lastRawMs = now;
         _lastFallbackMs = 0;
+        _hookMovesWithoutRaw = 0;
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active.");
@@ -470,15 +475,26 @@ internal sealed class SourceCapture : IDisposable
     {
         if (IsArmed && !RemoteActive)
         {
+            long now = Environment.TickCount64;
+            if (now - _lastWarmHintMs >= 45 &&
+                (_localMonitors.IsExternalEdge(cursor, _edge, 28) ||
+                 (NavigateEnvironment != null &&
+                  (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), 28) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().First, 28) ||
+                   _localMonitors.IsExternalEdge(cursor, OrthogonalEdges().Second, 28)))))
+            {
+                _lastWarmHintMs = now;
+                _session.TrySend(new Packet("warm"));
+            }
             _slowEdge.Observe(_localMonitors, cursor, _edge,
-                dx, dy, Environment.TickCount64);
+                dx, dy, now);
             _alternateSlowEdge.Observe(_localMonitors, cursor,
-                Opposite(_edge), dx, dy, Environment.TickCount64);
+                Opposite(_edge), dx, dy, now);
             var (first,second)=OrthogonalEdges();
             _orthogonalFirst.Observe(_localMonitors,cursor,first,
-                dx,dy,Environment.TickCount64);
+                dx,dy,now);
             _orthogonalSecond.Observe(_localMonitors,cursor,second,
-                dx,dy,Environment.TickCount64);
+                dx,dy,now);
         }
     }
 
@@ -530,10 +546,17 @@ internal sealed class SourceCapture : IDisposable
             {
                 // Some precision touchpads do not provide raw mouse packets.
                 // Fallback uses attempted pointer displacement from parked anchor.
-                if (Environment.TickCount64 - _lastRawMs > 650)
+                int dx = mouse.pt.X - _anchorX;
+                int dy = mouse.pt.Y - _anchorY;
+                if (dx != 0 || dy != 0)
                 {
-                    _lastFallbackMs=Environment.TickCount64;
-                    MoveRemote(mouse.pt.X - _anchorX, mouse.pt.Y - _anchorY);
+                    int missingRaw = ++_hookMovesWithoutRaw;
+                    long now = Environment.TickCount64;
+                    if (now - _lastRawMs > 60 && missingRaw >= 3)
+                    {
+                        _lastFallbackMs = now;
+                        MoveRemote(dx, dy);
+                    }
                 }
                 return (IntPtr)1;
             }
@@ -667,57 +690,53 @@ internal sealed class SourceCapture : IDisposable
     internal void OnRawInput(IntPtr lParam)
     {
         if (!IsArmed) return;
-        uint size = 0;
+        IntPtr memory = Volatile.Read(ref _rawBuffer);
+        if (memory == IntPtr.Zero) return;
         uint headerSize = (uint)Marshal.SizeOf<Win.RAWINPUTHEADER>();
-        uint result = Win.GetRawInputData(lParam, Win.RID_INPUT, IntPtr.Zero, ref size, headerSize);
-        if (result == uint.MaxValue || size < Marshal.SizeOf<Win.RAWINPUT>() || size > 4096) return;
-        IntPtr memory = Marshal.AllocHGlobal((int)size);
-        try
+        uint size = RawBufferSize;
+        uint read = Win.GetRawInputData(lParam, Win.RID_INPUT, memory, ref size, headerSize);
+        if (read == uint.MaxValue || read < (uint)Marshal.SizeOf<Win.RAWINPUT>()) return;
+        var input = Marshal.PtrToStructure<Win.RAWINPUT>(memory);
+        if (input.Header.Type != 0 || (input.Mouse.Flags & 1) != 0) return;
+        if (RemoteActive)
         {
-            uint read = Win.GetRawInputData(lParam, Win.RID_INPUT, memory, ref size, headerSize);
-            if (read == uint.MaxValue) return;
-            var input = Marshal.PtrToStructure<Win.RAWINPUT>(memory);
-            if (input.Header.Type != 0 || (input.Mouse.Flags & 1) != 0) return;
-            if (RemoteActive)
+            long now = Environment.TickCount64;
+            _lastRawMs = now;
+            _hookMovesWithoutRaw = 0;
+            // Mouse low-level hook and Raw Input can describe the SAME
+            // physical movement when a slow touchpad switches paths.
+            // Suppress only the immediately duplicated raw event;
+            // alternating input sources must not double movement speed.
+            if (!ShouldDropDuplicateRaw(_lastFallbackMs, now))
+                MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
+                    ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
+        }
+        else
+        {
+            // Windows may clamp the pointer at the last physical screen
+            // pixel. WM_INPUT still reports the mouse pushing outward.
+            // This is the missing-edge case that the old LL hook missed.
+            var cursor = Cursor.Position;
+            ObserveEdgeMotion(cursor, input.Mouse.LastX, input.Mouse.LastY);
+            if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
+                _edge, input.Mouse.LastX, input.Mouse.LastY))
+                RequestAtOuterEdge(cursor, "raw-mouse movement");
+            else if(NavigateEnvironment!=null &&
+                EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
+                    Opposite(_edge),input.Mouse.LastX,input.Mouse.LastY))
+                RequestAtOuterEdge(cursor, "raw alternate environment edge",
+                    Opposite(_edge));
+            else if(NavigateEnvironment!=null)
             {
-                long now=Environment.TickCount64;
-                _lastRawMs = now;
-                // Mouse low-level hook and Raw Input can describe the SAME
-                // physical movement when a slow touchpad switches paths.
-                // Suppress only the immediately duplicated raw event;
-                // alternating input sources must not double movement speed.
-                if(!ShouldDropDuplicateRaw(_lastFallbackMs,now))
-                    MoveRemote(ScaleRawDelta(input.Mouse.LastX, _mouseSpeed),
-                        ScaleRawDelta(input.Mouse.LastY, _mouseSpeed));
-            }
-            else
-            {
-                // Windows may clamp the pointer at the last physical screen
-                // pixel. WM_INPUT still reports the mouse pushing outward.
-                // This is the missing-edge case that the old LL hook missed.
-                var cursor = Cursor.Position;
-                ObserveEdgeMotion(cursor, input.Mouse.LastX, input.Mouse.LastY);
-                if (EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
-                    _edge, input.Mouse.LastX, input.Mouse.LastY))
-                    RequestAtOuterEdge(cursor, "raw-mouse movement");
-                else if(NavigateEnvironment!=null &&
-                    EdgeHandoffPolicy.ShouldRequest(_localMonitors, cursor,
-                        Opposite(_edge),input.Mouse.LastX,input.Mouse.LastY))
-                    RequestAtOuterEdge(cursor, "raw alternate environment edge",
-                        Opposite(_edge));
-                else if(NavigateEnvironment!=null)
-                {
-                    var (first,second)=OrthogonalEdges();
-                    if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
-                        first,input.Mouse.LastX,input.Mouse.LastY))
-                        RequestAtOuterEdge(cursor,"raw dragged device edge",first);
-                    else if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
-                        second,input.Mouse.LastX,input.Mouse.LastY))
-                        RequestAtOuterEdge(cursor,"raw dragged device edge",second);
-                }
+                var (first,second)=OrthogonalEdges();
+                if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                    first,input.Mouse.LastX,input.Mouse.LastY))
+                    RequestAtOuterEdge(cursor,"raw dragged device edge",first);
+                else if(EdgeHandoffPolicy.ShouldRequest(_localMonitors,cursor,
+                    second,input.Mouse.LastX,input.Mouse.LastY))
+                    RequestAtOuterEdge(cursor,"raw dragged device edge",second);
             }
         }
-        finally { Marshal.FreeHGlobal(memory); }
     }
 
     internal static bool ShouldDropDuplicateRaw(long lastHookFallback,long now) =>
@@ -729,7 +748,7 @@ internal sealed class SourceCapture : IDisposable
         // Raw Input omits the OS's pointer sensitivity. Cap extreme device
         // reports while preserving even one slow pixel of physical movement.
         if (raw == 0) return 0;
-        int bounded = Math.Clamp(raw, -400, 400);
+        int bounded = Math.Clamp(raw, -800, 800);
         double gain = Math.Clamp(systemMouseSpeed, 1, 20) / 10.0 * 1.45;
         int scaled = (int)Math.Round(bounded * gain, MidpointRounding.AwayFromZero);
         return scaled == 0 ? Math.Sign(raw) : scaled;
@@ -838,5 +857,7 @@ internal sealed class SourceCapture : IDisposable
             _slowEdgeTimer.Dispose();
             _slowEdgeTimer = null;
         }
+        IntPtr rawBuffer = Interlocked.Exchange(ref _rawBuffer, IntPtr.Zero);
+        if (rawBuffer != IntPtr.Zero) Marshal.FreeHGlobal(rawBuffer);
     }
 }

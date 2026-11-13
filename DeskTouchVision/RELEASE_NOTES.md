@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.34 — Fast-Lane Clicks, Scrolls & Handoffs, Smooth Entry, and Congestion-Free 5 GHz Wireless
+
+DeskTouch Vision eliminates intermittent click, scroll, and edge-switch stalls on 5 GHz wireless connections, removes Android display-mode entry spikes, and stops idle keepalive congestion while keeping screen keep-awake, scroll direction, app-icon scroll protection, and in-app Android updates intact.
+
+- **Zero TCP head-of-line stalls for clicks, scrolls, and edge switches:** Clicks, scrolls, edge claims, grants, and activation acknowledgements now travel over the authenticated AES-256-GCM fast UDP lane in parallel with reliable TCP backup using a 64-bit sliding deduplication window and stale-press guard, plus immediate pre-click UDP move flushes and UDP trailing settle sync so rare 5 GHz packet drops never freeze TCP for 200–450 ms.
+- **No more Android entry apply spikes or scroll Binder stalls:** Removed dynamic display `preferredRefreshRate` switching on accessibility overlay activation (keeping `FLAG_KEEP_SCREEN_ON` sleep prevention intact) and added short-range UI-thread scroll bounds caching so rapid wheel ticks skip redundant cross-window accessibility tree walks while preserving accidental app-launch protection.
+- **Congestion-free 5 GHz keepalive & faster edge pre-wake:** Stopped continuous 20 ms bidirectional keepalive flooding (moving idle Android keepalive to 55 ms only when inactive, rate-limiting Windows idle echo to 240 ms while inactive, tuning active warm interval to 35 ms with a 4-second cooldown, and widening Windows pre-edge wake radius to 320 px at 25 ms).
+
+---
+
 # DeskTouch Vision v0.3.33 — Bidirectional Phone Radio Keepalive, High-Refresh Overlay & Instant Cursor Pacing
 
 DeskTouch Vision eliminates the remaining mobile pointer lag on phones with aggressive wireless power saving, boosts active pointer smoothness on high-refresh displays, and refines in-app Android update feedback.

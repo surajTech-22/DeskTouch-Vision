@@ -13,7 +13,12 @@ internal enum FastUdpOp : byte
     Move = 2,
     Probe = 3,
     ProbeAck = 4,
-    Warm = 5
+    Warm = 5,
+    ReverseClaim = 6,
+    ReverseGranted = 7,
+    ReverseActive = 8,
+    ReverseButton = 9,
+    ReverseWheel = 10
 }
 
 internal readonly record struct FastUdpMessage(
@@ -226,13 +231,13 @@ internal sealed class FastUdpHub : IDisposable
             return Codec.Seal(op, a, b, lease, Environment.TickCount, scratchOut);
         }
 
-        internal bool Send(Socket socket, FastUdpOp op, int a, int b, int lease)
+        internal bool Send(Socket socket, FastUdpOp op, int a, int b, int lease, int? payloadTag = null)
         {
             IPEndPoint? target = Volatile.Read(ref _remoteEndPoint);
             if (target == null) return false;
             lock (_sendBuffer)
             {
-                int len = Codec.Seal(op, a, b, lease, Environment.TickCount, _sendBuffer);
+                int len = Codec.Seal(op, a, b, lease, payloadTag ?? Environment.TickCount, _sendBuffer);
                 if (len <= 0) return false;
                 try
                 {
@@ -293,10 +298,10 @@ internal sealed class FastUdpHub : IDisposable
         peer.Send(_socket, FastUdpOp.Probe, Port, 0, 0);
     }
 
-    internal bool Send(Peer peer, FastUdpOp op, int a, int b, int lease)
+    internal bool Send(Peer peer, FastUdpOp op, int a, int b, int lease, int? payloadTag = null)
     {
         if (_disposed) return false;
-        return peer.Send(_socket, op, a, b, lease);
+        return peer.Send(_socket, op, a, b, lease, payloadTag);
     }
 
     internal void RemovePeer(Peer? peer)
@@ -496,8 +501,8 @@ internal sealed class FastMovePacer : IDisposable
     private const double MinUdpIntervalMs = 1.5;
     private const int ThrottleFlushDelayMs = 2;
     private const int TrailingTcpSyncDelayMs = 130;
-    private const int WarmKeepaliveIntervalMs = 20;
-    private const int WarmCooldownSeconds = 15;
+    private const int WarmKeepaliveIntervalMs = 35;
+    private const int WarmCooldownSeconds = 4;
 
     private readonly object _gate = new();
     private readonly Func<bool> _canSendUdp;
@@ -581,6 +586,19 @@ internal sealed class FastMovePacer : IDisposable
 
     private double ActiveMinIntervalMsLocked() =>
         _effectiveMinIntervalMs > 0 ? _effectiveMinIntervalMs : MinUdpIntervalMs;
+
+    internal Packet? TakeThrottledUdpMove()
+    {
+        lock (_gate)
+        {
+            var packet = _throttledUdp;
+            if (packet == null) return null;
+            _throttledUdp = null;
+            _lastMoveUdpTicks = Stopwatch.GetTimestamp();
+            UpdateTimerLocked();
+            return packet;
+        }
+    }
 
     internal Packet? TakePendingReliableSync(bool skipIfUdpDelivered = false)
     {

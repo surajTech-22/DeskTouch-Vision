@@ -32,7 +32,57 @@ import javax.net.ssl.*;
  * No new Windows pairing protocol or replacement keyboard settings.
  */
 final class DeskTouchSession implements AutoCloseable {
-    static final int INTERACTIVE_KEEPALIVE_MS = 20;
+    static final int INTERACTIVE_KEEPALIVE_MS = 55;
+
+    static final class ReverseControlDeduplicator {
+        private int highestClaimDispatchSeq;
+        private int highestControlActionSeq;
+        private long seenControlActionMask;
+        private int lastExecutedButtonSeq;
+
+        synchronized boolean tryAcceptClaimDispatch(int claim, int dispatchSeq, int currentLease){
+            if(claim<=0) return false;
+            if(dispatchSeq>0){
+                if(dispatchSeq<=highestClaimDispatchSeq) return false;
+                highestClaimDispatchSeq=dispatchSeq;
+            }else if(currentLease==claim){
+                return false;
+            }
+            highestControlActionSeq=0;
+            seenControlActionMask=0L;
+            lastExecutedButtonSeq=0;
+            return true;
+        }
+
+        synchronized boolean tryAcceptControlAction(int seq, boolean isButton){
+            if(seq<=0) return true;
+            if(isButton && seq<=lastExecutedButtonSeq) return false;
+            if(highestControlActionSeq==0){
+                highestControlActionSeq=seq;
+                seenControlActionMask=1L;
+            }else{
+                int diff=seq-highestControlActionSeq;
+                if(diff>0){
+                    seenControlActionMask=diff>=64 ? 1L : ((seenControlActionMask<<diff)|1L);
+                    highestControlActionSeq=seq;
+                }else{
+                    int back=-diff;
+                    if(back>=64) return false;
+                    long bit=1L<<back;
+                    if((seenControlActionMask & bit)!=0L) return false;
+                    seenControlActionMask|=bit;
+                }
+            }
+            if(isButton) lastExecutedButtonSeq=seq;
+            return true;
+        }
+    }
+
+    private final ReverseControlDeduplicator reverseDedup = new ReverseControlDeduplicator();
+
+    boolean tryAcceptControlAction(int seq, boolean isButton){
+        return reverseDedup.tryAcceptControlAction(seq,isButton);
+    }
     interface Events { void status(String message); }
     static final class EnvironmentTarget {
         final int id;
@@ -426,21 +476,51 @@ final class DeskTouchSession implements AutoCloseable {
             else ch.sendProbe();
         });
     }
+    private void emitReverseActive(int lease){
+        if(reverseLease==lease && reverseApplied!=lease){
+            reverseApplied=lease;
+            FastUdpChannel ch=udpChannel;
+            if(ch!=null && ch.confirmed) ch.sendReverseActive(lease);
+            send(new Packet("reverse-active",lease));
+        }
+    }
+
+    private void handleReverseClaim(int claim, int dispatchSeq, boolean fromUdp){
+        if(claim<=0){
+            send(new Packet("reverse-busy",claim));
+            return;
+        }
+        boolean granted;
+        synchronized(reverseDedup){
+            if(!reverseDedup.tryAcceptClaimDispatch(claim,dispatchSeq,reverseLease)) return;
+            if(hasClaim() ||
+                !DeskTouchAccessibilityService.ready(application) ||
+                (reverseLease>0 && reverseLease!=claim) ||
+                !DeskTouchRuntime.claimAndroidControl(this)){
+                granted=false;
+            }else{
+                reverseLease=claim;
+                reverseApplied=0;
+                reportedMissingKeyboard=0;
+                lastUdpReverseMoveAtMs=0;
+                granted=true;
+            }
+        }
+        FastUdpChannel ch=udpChannel;
+        if(ch!=null && ch.confirmed) ch.sendReverseGranted(claim,granted);
+        if(!granted){
+            send(new Packet("reverse-busy",claim));
+            return;
+        }
+        send(new Packet("reverse-granted",claim));
+        if(!fromUdp) warmOrProbeUdp();
+        RemoteInputPower.begin(application);
+        status("Windows is allowed to control this Android screen.");
+    }
+
     private void handleWindowsControl(Packet p){
         if("reverse-claim".equals(p.type)){
-            if(p.a<=0 || hasClaim() ||
-                !DeskTouchAccessibilityService.ready(application) ||
-                (reverseLease>0 && reverseLease!=p.a) ||
-                !DeskTouchRuntime.claimAndroidControl(this)){
-                send(new Packet("reverse-busy",p.a));
-                return;
-            }
-            reverseLease=p.a;reverseApplied=0;reportedMissingKeyboard=0;
-            lastUdpReverseMoveAtMs=0;
-            send(new Packet("reverse-granted",p.a));
-            warmOrProbeUdp();
-            RemoteInputPower.begin(application);
-            status("Windows is allowed to control this Android screen.");
+            handleReverseClaim(p.a,p.c,false);
             return;
         }
         if("reverse-release".equals(p.type)||"reverse-reset".equals(p.type)){
@@ -459,18 +539,15 @@ final class DeskTouchSession implements AutoCloseable {
                 return;
             }
             final int lease=reverseLease;
-            Runnable ack=reverseApplied==lease ? null : ()->{
-                if(reverseLease==lease && reverseApplied!=lease){
-                    reverseApplied=lease;
-                    send(new Packet("reverse-active",lease));
-                }
-            };
+            Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
             boolean posted=DeskTouchAccessibilityService.pointer(p.a,p.b,ack);
             if(!posted)revokeRemoteFromNative();
         }else if("reverse-button".equals(p.type)){
-            DeskTouchAccessibilityService.mouseButton(p.a,p.b!=0);
+            if(tryAcceptControlAction(p.c,true))
+                DeskTouchAccessibilityService.mouseButton(p.a,p.b!=0);
         }else if("reverse-wheel".equals(p.type)){
-            DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
+            if(tryAcceptControlAction(p.c,false))
+                DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
         }else if("reverse-key".equals(p.type)){
             final int activeLease=reverseLease;
             DeskTouchAccessibilityService.key(p.d,p.c!=0,()->{
@@ -499,7 +576,10 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
     private void clearReverseControl(boolean notifyWindows){
-        int lease=reverseLease;reverseLease=0;reverseApplied=0;
+        int lease;
+        synchronized(reverseDedup){
+            lease=reverseLease;reverseLease=0;reverseApplied=0;
+        }
         DeskTouchRuntime.releaseAndroidControl(this);
         if(!running && lease>0)RemoteInputPower.end();
         DeskTouchAccessibilityService.endRemote();
@@ -660,14 +740,27 @@ final class DeskTouchSession implements AutoCloseable {
                     if(!running || lease<=0 || lease!=reverseLease
                         || !DeskTouchAccessibilityService.ready(application)) return;
                     lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
-                    Runnable ack=reverseApplied==lease ? null : ()->{
-                        if(reverseLease==lease && reverseApplied!=lease){
-                            reverseApplied=lease;
-                            send(new Packet("reverse-active",lease));
-                        }
-                    };
+                    Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
                     boolean posted=DeskTouchAccessibilityService.pointer(x,y,ack);
                     if(!posted) revokeRemoteFromNative();
+                }
+                @Override public void onReverseClaim(int claim,int dispatchSeq){
+                    if(!running) return;
+                    handleReverseClaim(claim,dispatchSeq,true);
+                }
+                @Override public void onReverseButton(int button,int down,int lease,int actionSeq){
+                    if(!running || lease<=0 || lease!=reverseLease
+                        || !DeskTouchAccessibilityService.ready(application)) return;
+                    lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
+                    if(tryAcceptControlAction(actionSeq,true))
+                        DeskTouchAccessibilityService.mouseButton(button,down!=0);
+                }
+                @Override public void onReverseWheel(int amount,int horizontal,int lease,int actionSeq){
+                    if(!running || lease<=0 || lease!=reverseLease
+                        || !DeskTouchAccessibilityService.ready(application)) return;
+                    lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
+                    if(tryAcceptControlAction(actionSeq,false))
+                        DeskTouchAccessibilityService.wheel(amount,horizontal!=0);
                 }
             });
             udpChannel=ch;
@@ -687,7 +780,8 @@ final class DeskTouchSession implements AutoCloseable {
                 udpKeepAliveFuture=udpPacer.scheduleWithFixedDelay(()->{
                     if(!running || udpChannel!=ch)return;
                     if(!ch.confirmed || !DeskTouchAccessibilityService.ready(application))return;
-                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<18)return;
+                    if(reverseLease>0 || hasClaim())return;
+                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<50)return;
                     if(keepAlivePm!=null && !keepAlivePm.isInteractive())return;
                     ch.sendWarm();
                 },INTERACTIVE_KEEPALIVE_MS,INTERACTIVE_KEEPALIVE_MS,TimeUnit.MILLISECONDS);

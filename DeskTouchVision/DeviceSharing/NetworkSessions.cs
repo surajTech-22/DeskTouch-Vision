@@ -88,6 +88,33 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int AppliedLease;
         internal int KeyboardFailureReported;
         internal int EnvironmentTargetId; // 0 is the local Windows hub
+        internal int ReverseActionSeq;
+        internal int ReverseClaimDispatchSeq;
+        internal bool HubGrantedAcked;
+        internal bool HubActiveAcked;
+        internal long LastAndroidWarmEchoTicks;
+
+        internal int NextReverseActionSeq()
+        {
+            int seq = Interlocked.Increment(ref ReverseActionSeq);
+            if (seq <= 0)
+            {
+                Interlocked.Exchange(ref ReverseActionSeq, 1);
+                return 1;
+            }
+            return seq;
+        }
+
+        internal int NextReverseClaimDispatchSeq()
+        {
+            int seq = Interlocked.Increment(ref ReverseClaimDispatchSeq);
+            if (seq <= 0)
+            {
+                Interlocked.Exchange(ref ReverseClaimDispatchSeq, 1);
+                return 1;
+            }
+            return seq;
+        }
     }
 
     private sealed class RelayLease
@@ -96,6 +123,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal required Session Target;
         internal required int Claim;
         internal bool Granted;
+        internal bool GrantedAcked;
+        internal bool ActiveAcked;
         // Routed pointer packets are coalesced while key and button events
         // preserve their order. Never block the hub's TCP receive loop on
         // every intermediate remote cursor coordinate.
@@ -445,7 +474,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return true;
     }
 
-    private static bool QueueRoutedInput(RelayLease relay,Packet packet)
+    private void SendFastControlAndAssignSeq(Session target, int lease, ref Packet packet)
+    {
+        if (packet.Type is not ("button" or "wheel")) return;
+        int actionSeq = target.NextReverseActionSeq();
+        packet = packet with { C = actionSeq };
+        if (_udpHub == null || target.UdpPeer is not { Confirmed: true } peerUdp || lease <= 0)
+            return;
+        var flushedMove = target.MovePacer?.TakeThrottledUdpMove();
+        if (flushedMove != null)
+            _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, flushedMove.A, flushedMove.B, lease);
+        var op = packet.Type == "button" ? FastUdpOp.ReverseButton : FastUdpOp.ReverseWheel;
+        _udpHub.Send(peerUdp, op, packet.A, packet.B, lease, actionSeq);
+    }
+
+    private bool QueueRoutedInput(RelayLease relay,Packet packet)
     {
         if(packet.Type=="move")
         {
@@ -456,6 +499,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
             return QueueTcpRelayMove(relay, packet, countAsFallback: true);
         }
+        if(packet.Type is "button" or "wheel")
+            SendFastControlAndAssignSeq(relay.Target, relay.Claim, ref packet);
         return relay.InputQueue.Writer.TryWrite(packet);
     }
 
@@ -663,6 +708,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
             return true;
         }
+        int fastClaimLease = 0;
         lock (_authorityGate)
         {
             if (packet.Type=="claim")
@@ -671,11 +717,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _hubClaims.ContainsKey(id))
                     return false;
                 _hubClaims[id]=packet.A;
+                selected.HubGrantedAcked = false;
+                selected.HubActiveAcked = false;
                 Volatile.Write(ref selected.ActiveReverseLease, packet.A);
                 selected.MovePacer?.SetWarmActive(true);
+                int dispatchSeq = selected.NextReverseClaimDispatchSeq();
+                packet = packet with { C = dispatchSeq };
                 if (_udpHub != null && selected.UdpPeer is { HasEndpoint: true } udpPeer)
-                    _udpHub.Send(udpPeer, udpPeer.Confirmed ? FastUdpOp.Warm : FastUdpOp.Probe,
-                        udpPeer.Confirmed ? 0 : _udpHub.Port, 0, 0);
+                {
+                    if (udpPeer.Confirmed)
+                        _udpHub.Send(udpPeer, FastUdpOp.ReverseClaim, packet.A, 0, packet.A, dispatchSeq);
+                    else
+                        _udpHub.Send(udpPeer, FastUdpOp.Probe, _udpHub.Port, 0, 0);
+                }
             }
             else if(packet.Type is "reset" or "release")
             {
@@ -683,6 +737,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     (packet.Type=="reset" || claim==packet.A))
                 {
                     _hubClaims.Remove(id);
+                    selected.HubGrantedAcked = false;
+                    selected.HubActiveAcked = false;
                     Volatile.Write(ref selected.ActiveReverseLease, 0);
                     selected.MovePacer?.SetWarmActive(false);
                     selected.MovePacer?.ClearPending();
@@ -692,7 +748,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // but must NEVER send a reset to another routed owner.
                     return packet.Type=="release";
             }
-            else if (!_hubClaims.ContainsKey(id))
+            else if (!_hubClaims.TryGetValue(id, out fastClaimLease))
                 return false;
         }
         if (packet.Type == "move")
@@ -704,6 +760,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
             return QueueTcpReverseMove(selected, packet, countAsFallback: true);
         }
+        if (packet.Type is "button" or "wheel")
+            SendFastControlAndAssignSeq(selected, fastClaimLease, ref packet);
         if (selected.ReverseQueue.Writer.TryWrite(packet)) return true;
         _status("Peer input queue stalled. Disconnecting that peer safely.");
         selected.Client.Close();
@@ -879,7 +937,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if (_udpHub != null && peerUdp is { Confirmed: true } && _sessions.ContainsKey(id))
                     _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
             },
-            queueTrailingSync: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: false));
+            queueTrailingSync: move =>
+            {
+                var peerUdp = session.UdpPeer;
+                int lease = Volatile.Read(ref session.ActiveReverseLease);
+                if (_udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
+                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease))
+                    return;
+                QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
+            });
         if(!_sessions.TryAdd(id,session))
         {
             session.MovePacer?.Dispose();
@@ -1017,49 +1083,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(p.Type is "reverse-granted" or "reverse-busy" or
                     "reverse-local-active" or "reverse-active")
                 {
-                    RelayLease? relay;
-                    lock (_authorityGate)
-                    {
-                        _relayByTarget.TryGetValue(session.Id, out relay);
-                        if (relay != null && relay.Claim != p.A) relay=null;
-                        if (relay != null && p.Type=="reverse-granted")
-                        {
-                            relay.Granted=true;
-                            Volatile.Write(ref session.ActiveReverseLease, relay.Claim);
-                            session.MovePacer?.SetWarmActive(true);
-                        }
-                    }
-                    if (relay != null)
-                    {
-                        // Deliver the destination's real grant/applied ACK to
-                        // the original authenticated controller, not the hub UI.
-                        if (p.Type is "reverse-busy" or "reverse-local-active")
-                        {
-                            Volatile.Write(ref session.ActiveReverseLease, 0);
-                            session.MovePacer?.SetWarmActive(false);
-                            session.MovePacer?.ClearPending();
-                            RemoveRelayFromSource(relay.Source.Id);
-                        }
-                        string response=p.Type["reverse-".Length..];
-                        if (p.Type!="reverse-active" || relay.Granted)
-                            try { await SendToAsync(relay.Source,
-                                new Packet(response,p.A),token); }
-                            catch (Exception) { }
-                    }
-                    else if(ReferenceEquals(Volatile.Read(ref _selected),session))
-                    {
-                        if(p.Type is "reverse-busy" or "reverse-local-active")
-                        {
-                            lock(_authorityGate)
-                            {
-                                _hubClaims.Remove(session.Id);
-                                Volatile.Write(ref session.ActiveReverseLease, 0);
-                            }
-                            session.MovePacer?.SetWarmActive(false);
-                            session.MovePacer?.ClearPending();
-                        }
-                        ReverseControlMessage?.Invoke(p);
-                    }
+                    await DispatchReverseStateAsync(session, p.Type, p.A, token);
                     continue;
                 }
                 if(p.Type=="android-capability")
@@ -1166,10 +1190,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
                         relay.Target.MovePacer?.SetMinIntervalMs(
                             relay.Target.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 2.0);
-                        if (relay.Target.UdpPeer is { Confirmed: true } relayUdp)
-                            _udpHub?.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
+                        int dispatchSeq = relay.Target.NextReverseClaimDispatchSeq();
+                        if (relay.Target.UdpPeer is { HasEndpoint: true } relayUdp && _udpHub != null)
+                        {
+                            if (relayUdp.Confirmed)
+                                _udpHub.Send(relayUdp, FastUdpOp.ReverseClaim, p.A, 0, p.A, dispatchSeq);
+                            else
+                                _udpHub.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
+                        }
                         try { await SendToAsync(relay.Target,
-                            new Packet("reverse-claim",p.A),token); }
+                            new Packet("reverse-claim", p.A, C: dispatchSeq), token); }
                         catch(Exception)
                         {
                             RemoveRelayFromSource(session.Id);
@@ -1368,11 +1398,107 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
+    private async Task DispatchReverseStateAsync(Session session, string stateType,
+        int claim, CancellationToken token)
+    {
+        RelayLease? relay = null;
+        bool forwardRelay = false;
+        bool clearRelay = false;
+        bool notifySelected = false;
+        lock (_authorityGate)
+        {
+            _relayByTarget.TryGetValue(session.Id, out relay);
+            if (relay != null && relay.Claim != claim) relay = null;
+            if (relay != null)
+            {
+                if (stateType == "reverse-granted")
+                {
+                    if (relay.GrantedAcked) return;
+                    relay.GrantedAcked = true;
+                    relay.Granted = true;
+                    Volatile.Write(ref session.ActiveReverseLease, relay.Claim);
+                    session.MovePacer?.SetWarmActive(true);
+                    forwardRelay = true;
+                }
+                else if (stateType == "reverse-active")
+                {
+                    if (!relay.Granted || relay.ActiveAcked) return;
+                    relay.ActiveAcked = true;
+                    forwardRelay = true;
+                }
+                else
+                {
+                    clearRelay = true;
+                    forwardRelay = true;
+                    Volatile.Write(ref session.ActiveReverseLease, 0);
+                    session.MovePacer?.SetWarmActive(false);
+                    session.MovePacer?.ClearPending();
+                    _relayBySource.Remove(relay.Source.Id);
+                    _relayByTarget.Remove(relay.Target.Id);
+                    Interlocked.Exchange(ref relay.LatestMove, null);
+                    relay.InputQueue.Writer.TryComplete();
+                }
+            }
+            else if (ReferenceEquals(Volatile.Read(ref _selected), session))
+            {
+                bool matchesClaim = _hubClaims.TryGetValue(session.Id, out int hubClaim) &&
+                    hubClaim == claim;
+                if (stateType == "reverse-granted")
+                {
+                    if (!matchesClaim || session.HubGrantedAcked) return;
+                    session.HubGrantedAcked = true;
+                }
+                else if (stateType == "reverse-active")
+                {
+                    if (!matchesClaim || session.HubActiveAcked) return;
+                    session.HubActiveAcked = true;
+                }
+                else
+                {
+                    if (matchesClaim)
+                    {
+                        _hubClaims.Remove(session.Id);
+                        session.HubGrantedAcked = false;
+                        session.HubActiveAcked = false;
+                        Volatile.Write(ref session.ActiveReverseLease, 0);
+                        session.MovePacer?.SetWarmActive(false);
+                        session.MovePacer?.ClearPending();
+                    }
+                    else if (stateType != "reverse-local-active")
+                        return;
+                }
+                notifySelected = true;
+            }
+        }
+        if (forwardRelay && relay != null)
+        {
+            _ = clearRelay;
+            string response = stateType["reverse-".Length..];
+            try { await SendToAsync(relay.Source, new Packet(response, claim), token); }
+            catch (Exception) { }
+        }
+        else if (notifySelected)
+        {
+            ReverseControlMessage?.Invoke(new Packet(stateType, claim));
+        }
+    }
+
     private void OnUdpHubMessage(FastUdpHub.Peer peer, FastUdpMessage msg)
     {
         if (!_sessions.TryGetValue(peer.SessionId, out var session)) return;
         if (peer.Confirmed && peer.TryMarkConfirmedLogged())
             _status($"Low-latency input confirmed for {session.Peer.Name}.");
+        if (msg.Op is FastUdpOp.ReverseGranted or FastUdpOp.ReverseActive)
+        {
+            if (msg.A > 0)
+            {
+                string stateType = msg.Op == FastUdpOp.ReverseGranted
+                    ? (msg.B != 0 ? "reverse-granted" : "reverse-busy")
+                    : "reverse-active";
+                _ = DispatchReverseStateAsync(session, stateType, msg.A, _cancel.Token);
+            }
+            return;
+        }
         if (msg.Op is not (FastUdpOp.Move or FastUdpOp.Warm)) return;
 
         RelayLease? forward = null;
@@ -1396,6 +1522,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (session.Peer.Platform == "Windows")
                 BroadcastWarmToConfirmedTargets(session.Id);
             else if (ShouldEchoAndroidWarm(session.Peer.Platform) &&
+                Volatile.Read(ref session.ActiveReverseLease) == 0 &&
+                CanEmitAndroidWarmEcho(Stopwatch.GetTimestamp(), ref session.LastAndroidWarmEchoTicks) &&
                 _udpHub != null && session.UdpPeer is { Confirmed: true } peerUdp)
                 _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
             return;
@@ -1430,9 +1558,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     }
 
     internal const double AndroidUdpMinIntervalMs = 3.5;
+    internal const long AndroidWarmEchoMinIntervalMs = 240;
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>
         string.Equals(platform, "Android", StringComparison.Ordinal);
+
+    internal static bool CanEmitAndroidWarmEcho(long nowTicks, ref long lastEchoTicks)
+    {
+        long previous = Interlocked.Read(ref lastEchoTicks);
+        if (previous != 0 &&
+            (nowTicks - previous) * 1000.0 / Stopwatch.Frequency < AndroidWarmEchoMinIntervalMs)
+            return false;
+        return Interlocked.CompareExchange(ref lastEchoTicks, nowTicks, previous) == previous;
+    }
 
     public void Dispose()
     {
@@ -1519,6 +1657,11 @@ internal sealed class HostSession : IInputSession, IDisposable
     private int _udpConfirmedLogged;
     private long _lastTcpWarmTicks;
     private string _lastLoggedVersions = "";
+    private readonly object _reverseDedupLock = new();
+    private int _reverseHighestClaimDispatchSeq;
+    private int _reverseHighestActionSeq;
+    private long _reverseSeenActionMask;
+    private int _reverseLastButtonSeq;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -1579,11 +1722,66 @@ internal sealed class HostSession : IInputSession, IDisposable
         lock (_reverseInputGate) _reverseInjector?.ReleaseAll();
     }
 
+    private bool TryAcceptReverseClaimDispatch(int claim, int dispatchSeq)
+    {
+        if (claim <= 0) return false;
+        lock (_reverseDedupLock)
+        {
+            if (dispatchSeq > 0)
+            {
+                if (dispatchSeq <= _reverseHighestClaimDispatchSeq) return false;
+                _reverseHighestClaimDispatchSeq = dispatchSeq;
+            }
+            else if (Volatile.Read(ref _reverseLease) == claim)
+            {
+                return false;
+            }
+            _reverseHighestActionSeq = 0;
+            _reverseSeenActionMask = 0;
+            _reverseLastButtonSeq = 0;
+            return true;
+        }
+    }
+
+    private bool TryAcceptReverseControlAction(int seq, bool isButton)
+    {
+        if (seq <= 0) return true;
+        lock (_reverseDedupLock)
+        {
+            if (isButton && seq <= _reverseLastButtonSeq) return false;
+            if (_reverseHighestActionSeq == 0)
+            {
+                _reverseHighestActionSeq = seq;
+                _reverseSeenActionMask = 1L;
+            }
+            else
+            {
+                int diff = seq - _reverseHighestActionSeq;
+                if (diff > 0)
+                {
+                    _reverseSeenActionMask = diff >= 64 ? 1L : ((_reverseSeenActionMask << diff) | 1L);
+                    _reverseHighestActionSeq = seq;
+                }
+                else
+                {
+                    int back = -diff;
+                    if (back >= 64) return false;
+                    long bit = 1L << back;
+                    if ((_reverseSeenActionMask & bit) != 0L) return false;
+                    _reverseSeenActionMask |= bit;
+                }
+            }
+            if (isButton) _reverseLastButtonSeq = seq;
+            return true;
+        }
+    }
+
     private void ProcessReverseInput(Packet packet)
     {
         if (!ReverseInputProtocol.TryDecode(packet, out var request)) return;
         if (request.Type == "claim")
         {
+            if (!TryAcceptReverseClaimDispatch(request.A, request.C)) return;
             bool permitted = request.A > 0 &&
                 (_allowReverseClaim?.Invoke() ?? false) &&
                 (_reversePriority?.TryClaim() ?? false);
@@ -1594,6 +1792,9 @@ internal sealed class HostSession : IInputSession, IDisposable
                 permitted = _reversePriority?.CanApplyRemote == true;
                 if (!permitted) ReleaseReverseAuthority();
             }
+            var udpGrant = Volatile.Read(ref _udpClient);
+            if (udpGrant is { Confirmed: true })
+                udpGrant.Send(FastUdpOp.ReverseGranted, request.A, permitted ? 1 : 0, request.A);
             TrySend(new Packet(permitted ? "reverse-granted" : "reverse-busy", request.A));
             return;
         }
@@ -1606,6 +1807,9 @@ internal sealed class HostSession : IInputSession, IDisposable
         }
         if (Volatile.Read(ref _reverseLease) <= 0 ||
             _reversePriority?.CanApplyRemote != true) return;
+        if (request.Type is "button" or "wheel" &&
+            !TryAcceptReverseControlAction(request.C, request.Type == "button"))
+            return;
         int active = Volatile.Read(ref _reverseLease);
         bool cursorApplied = false;
         lock (_reverseInputGate)
@@ -1619,7 +1823,12 @@ internal sealed class HostSession : IInputSession, IDisposable
         if (cursorApplied && _reversePriority?.CanApplyRemote == true &&
             Volatile.Read(ref _reverseLease) == active &&
             Interlocked.CompareExchange(ref _reverseAppliedLease, active, 0) == 0)
+        {
+            var udpActive = Volatile.Read(ref _udpClient);
+            if (udpActive is { Confirmed: true })
+                udpActive.Send(FastUdpOp.ReverseActive, active, 0, active);
             TrySend(new Packet("reverse-active", active));
+        }
     }
 
     private HostSession(TcpClient client, SslStream ssl, IPAddress serverAddress,
@@ -1645,7 +1854,15 @@ internal sealed class HostSession : IInputSession, IDisposable
                 if (udp is { Confirmed: true } && Volatile.Read(ref _closed) == 0)
                     udp.Send(FastUdpOp.Warm, 0, 0, 0);
             },
-            queueTrailingSync: move => QueueTcpMove(move, countAsFallback: false));
+            queueTrailingSync: move =>
+            {
+                var udp = _udpClient;
+                int lease = Volatile.Read(ref _forwardClaimLease);
+                if (udp is { Confirmed: true } && lease > 0 && Volatile.Read(ref _closed) == 0 &&
+                    udp.Send(FastUdpOp.Move, move.A, move.B, lease))
+                    return;
+                QueueTcpMove(move, countAsFallback: false);
+            });
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
@@ -2082,11 +2299,28 @@ internal sealed class HostSession : IInputSession, IDisposable
                     if (Interlocked.CompareExchange(ref _udpAckSent, 1, 0) == 0)
                         TrySend(new Packet("udp-ack"));
                 }
+                else if (msg.Op == FastUdpOp.ReverseClaim)
+                {
+                    if (msg.A > 0 && msg.Lease == msg.A)
+                        ProcessReverseInput(new Packet("reverse-claim", msg.A, C: msg.TimestampMs));
+                }
                 else if (msg.Op == FastUdpOp.ReverseMove)
                 {
                     int active = Volatile.Read(ref _reverseLease);
                     if (active > 0 && msg.Lease == active)
                         ProcessReverseInput(new Packet("reverse-move", msg.A, msg.B));
+                }
+                else if (msg.Op == FastUdpOp.ReverseButton)
+                {
+                    int active = Volatile.Read(ref _reverseLease);
+                    if (active > 0 && msg.Lease == active)
+                        ProcessReverseInput(new Packet("reverse-button", msg.A, msg.B, C: msg.TimestampMs));
+                }
+                else if (msg.Op == FastUdpOp.ReverseWheel)
+                {
+                    int active = Volatile.Read(ref _reverseLease);
+                    if (active > 0 && msg.Lease == active)
+                        ProcessReverseInput(new Packet("reverse-wheel", msg.A, msg.B, C: msg.TimestampMs));
                 }
             };
             Interlocked.Exchange(ref _highResTimer, Win.EnterHighResolutionTimer())?.Dispose();

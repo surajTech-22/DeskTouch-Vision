@@ -194,6 +194,56 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
     Check(stats.UdpDirect >= 2,
         "FastMovePacer telemetry stats must count direct FastUdp dispatches");
 
+    using (var clickPacer = new FastMovePacer(
+        canSendUdp: () => true,
+        sendUdp: _ => true,
+        queueReliableTcp: _ => { }))
+    {
+        clickPacer.TryHandleMove(new Packet("move", 400, 900));
+        clickPacer.TryHandleMove(new Packet("move", 455, 925)); // throttled inside MinUdpIntervalMs
+        var preClickMove = clickPacer.TakeThrottledUdpMove();
+        Check(preClickMove is { A: 455, B: 925 } &&
+            clickPacer.TakeThrottledUdpMove() == null &&
+            clickPacer.TakePendingReliableSync(skipIfUdpDelivered: true) == null,
+            "Clicks/scrolls must flush pending throttled UDP move once without re-sending over TCP");
+    }
+
+    byte[] extSrvKey = Enumerable.Range(21, 32).Select(x => (byte)x).ToArray();
+    using (var srvCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: true))
+    using (var cliCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: false))
+    {
+        byte[] fClaim = new byte[FastUdpCodec.FrameSize];
+        byte[] fBtn = new byte[FastUdpCodec.FrameSize];
+        byte[] fWheel = new byte[FastUdpCodec.FrameSize];
+        byte[] fGrant = new byte[FastUdpCodec.FrameSize];
+        byte[] fActive = new byte[FastUdpCodec.FrameSize];
+        srvCodec2.Seal(FastUdpOp.ReverseClaim, 55, 0, 55, 9, fClaim);
+        srvCodec2.Seal(FastUdpOp.ReverseButton, 1, 1, 55, 200, fBtn);
+        srvCodec2.Seal(FastUdpOp.ReverseWheel, -120, 0, 55, 201, fWheel);
+        cliCodec2.Seal(FastUdpOp.ReverseGranted, 55, 1, 55, 0, fGrant);
+        cliCodec2.Seal(FastUdpOp.ReverseActive, 55, 0, 55, 0, fActive);
+        Check(cliCodec2.TryOpen(fClaim, out var mClaim) && mClaim.Op == FastUdpOp.ReverseClaim && mClaim.TimestampMs == 9 &&
+            cliCodec2.TryOpen(fBtn, out var mBtn) && mBtn.Op == FastUdpOp.ReverseButton && mBtn.TimestampMs == 200 &&
+            cliCodec2.TryOpen(fWheel, out var mWheel) && mWheel.Op == FastUdpOp.ReverseWheel && mWheel.A == -120 && mWheel.TimestampMs == 201 &&
+            srvCodec2.TryOpen(fGrant, out var mGrant) && mGrant.Op == FastUdpOp.ReverseGranted && mGrant.B == 1 &&
+            srvCodec2.TryOpen(fActive, out var mActive) && mActive.Op == FastUdpOp.ReverseActive && mActive.Lease == 55,
+            "FastUdpCodec must authenticate extended fast-lane claim/button/wheel/grant/active ops cleanly");
+    }
+
+    long warmEchoTicks = 0;
+    long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+    Check(ReceiverServer.CanEmitAndroidWarmEcho(t0, ref warmEchoTicks) &&
+        !ReceiverServer.CanEmitAndroidWarmEcho(t0 + (long)(0.05 * System.Diagnostics.Stopwatch.Frequency), ref warmEchoTicks) &&
+        ReceiverServer.CanEmitAndroidWarmEcho(t0 + (long)(0.30 * System.Diagnostics.Stopwatch.Frequency), ref warmEchoTicks),
+        "Android warm echo must be rate-limited so idle 5GHz airtime is never flooded");
+
+    Check(ReceiverServer.ShouldEchoAndroidWarm("Android") &&
+        !ReceiverServer.ShouldEchoAndroidWarm("Windows") &&
+        !ReceiverServer.ShouldEchoAndroidWarm(null) &&
+        ReceiverServer.AndroidUdpMinIntervalMs <= 4.0 &&
+        ReceiverServer.AndroidUdpMinIntervalMs >= 2.0,
+        "Android fast lane keeps smooth pacing and throttled interactive wireless echo");
+
     using var hub = new FastUdpHub();
     var tempPeer = hub.AddPeer(99, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0))!;
     byte[] peerKey = Convert.FromBase64String(tempPeer.Base64Key);
@@ -1637,14 +1687,6 @@ uiThread.Start();
 await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
 uiThread.Join();
 Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");
-
-Check(ReceiverServer.ShouldEchoAndroidWarm("Android") &&
-    !ReceiverServer.ShouldEchoAndroidWarm("Windows") &&
-    !ReceiverServer.ShouldEchoAndroidWarm(null) &&
-    ReceiverServer.AndroidUdpMinIntervalMs <= 4.0 &&
-    ReceiverServer.AndroidUdpMinIntervalMs >= 2.0,
-    "Android fast lane keeps smooth pacing and echoes interactive wireless keepalive");
-Console.WriteLine("PASS: Android wireless keepalive echo and smooth pacing verified.");
 
 internal sealed class RecordingInputSession : IInputSession
 {

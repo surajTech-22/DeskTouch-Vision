@@ -29,6 +29,11 @@ final class FastUdpChannel implements Closeable {
     static final byte OP_PROBE = 3;
     static final byte OP_PROBE_ACK = 4;
     static final byte OP_WARM = 5;
+    static final byte OP_REVERSE_CLAIM = 6;
+    static final byte OP_REVERSE_GRANTED = 7;
+    static final byte OP_REVERSE_ACTIVE = 8;
+    static final byte OP_REVERSE_BUTTON = 9;
+    static final byte OP_REVERSE_WHEEL = 10;
 
     static final class Message {
         final byte op;
@@ -126,7 +131,7 @@ final class FastUdpChannel implements Closeable {
             int id = ((frame[6] & 0xFF) << 8) | (frame[7] & 0xFF);
             if (id != peerId) return null;
             byte op = frame[5];
-            if (op < OP_REVERSE_MOVE || op > OP_WARM) return null;
+            if (op < OP_REVERSE_MOVE || op > OP_REVERSE_WHEEL) return null;
             long seq = readLongBE(frame, 8);
             if (seq == 0) return null;
 
@@ -163,6 +168,9 @@ final class FastUdpChannel implements Closeable {
     interface Listener {
         void onProbeConfirmed();
         void onReverseMove(int x, int y, int lease);
+        default void onReverseClaim(int claim, int dispatchSeq) {}
+        default void onReverseButton(int button, int down, int lease, int actionSeq) {}
+        default void onReverseWheel(int amount, int horizontal, int lease, int actionSeq) {}
     }
 
     private final DatagramSocket socket;
@@ -212,6 +220,14 @@ final class FastUdpChannel implements Closeable {
         send(OP_WARM, 0, 0, 0);
     }
 
+    void sendReverseGranted(int lease, boolean granted) {
+        send(OP_REVERSE_GRANTED, lease, granted ? 1 : 0, lease);
+    }
+
+    void sendReverseActive(int lease) {
+        send(OP_REVERSE_ACTIVE, lease, 0, lease);
+    }
+
     boolean send(byte op, int a, int b, int lease) {
         if (closed) return false;
         synchronized (sendBuffer) {
@@ -255,6 +271,15 @@ final class FastUdpChannel implements Closeable {
                 } else if (msg.op == OP_REVERSE_MOVE) {
                     markConfirmed();
                     listener.onReverseMove(msg.a, msg.b, msg.lease);
+                } else if (msg.op == OP_REVERSE_CLAIM) {
+                    markConfirmed();
+                    listener.onReverseClaim(msg.a, msg.timestampMs);
+                } else if (msg.op == OP_REVERSE_BUTTON) {
+                    markConfirmed();
+                    if (msg.lease > 0) listener.onReverseButton(msg.a, msg.b, msg.lease, msg.timestampMs);
+                } else if (msg.op == OP_REVERSE_WHEEL) {
+                    markConfirmed();
+                    if (msg.lease > 0) listener.onReverseWheel(msg.a, msg.b, msg.lease, msg.timestampMs);
                 }
             } catch (Exception e) {
                 if (closed) break;

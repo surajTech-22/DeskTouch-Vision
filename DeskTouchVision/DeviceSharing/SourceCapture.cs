@@ -511,8 +511,8 @@ internal sealed class SourceCapture : IDisposable
         if (IsArmed && !RemoteActive)
         {
             long now = Environment.TickCount64;
-            const int warmEdgeRadiusPx = 260;
-            if (now - _lastWarmHintMs >= 35 &&
+            const int warmEdgeRadiusPx = 320;
+            if (now - _lastWarmHintMs >= 25 &&
                 (_localMonitors.IsExternalEdge(cursor, _edge, warmEdgeRadiusPx) ||
                  (NavigateEnvironment != null &&
                   (_localMonitors.IsExternalEdge(cursor, Opposite(_edge), warmEdgeRadiusPx) ||

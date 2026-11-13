@@ -258,8 +258,6 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             params.layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
-        maxRefreshRateHz=preferredActiveRefreshRate();
-        if(maxRefreshRateHz>0f)params.preferredRefreshRate=maxRefreshRateHz;
         return params;
     }
     private void showPointer(int requestedX,int requestedY){
@@ -389,10 +387,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         int nextFlags=keepAwake
             ? (lp.flags | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             : (lp.flags & ~WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        float nextHz=keepAwake ? maxRefreshRateHz : 0f;
-        boolean changed=nextFlags!=lp.flags || Float.compare(lp.preferredRefreshRate,nextHz)!=0;
+        boolean changed=nextFlags!=lp.flags;
         lp.flags=nextFlags;
-        lp.preferredRefreshRate=nextHz;
         if(changed || forceLayout){
             try{windows.updateViewLayout(cursorRoot,lp);}
             catch(RuntimeException rejected){return false;}
@@ -639,13 +635,35 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         int ey=horizontal ? sy : end;
         return new WheelStroke(sx,sy,ex,ey,45L);
     }
+    private Rect lastWheelBounds;
+    private long lastWheelBoundsAtMs;
+    private int lastWheelBoundsX;
+    private int lastWheelBoundsY;
+
+    private Rect cachedWheelClickableBounds(int px,int py){
+        long now=android.os.SystemClock.uptimeMillis();
+        TouchAction tail=pendingActions.peekLast();
+        boolean sameSpot=lastWheelBoundsAtMs!=0L &&
+            Math.hypot(px-lastWheelBoundsX,py-lastWheelBoundsY)<=24.0;
+        if(sameSpot && ((tail!=null && tail.kind==TouchAction.TYPE_SCROLL) ||
+            now-lastWheelBoundsAtMs<=180L)){
+            return lastWheelBounds!=null ? new Rect(lastWheelBounds) : null;
+        }
+        Rect found=findClickableBoundsAt(px,py);
+        lastWheelBounds=found!=null ? new Rect(found) : null;
+        lastWheelBoundsAtMs=now;
+        lastWheelBoundsX=px;
+        lastWheelBoundsY=py;
+        return found;
+    }
+
     static void wheel(int amount,boolean horizontal){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service)||amount==0)return;
         service.ui.post(()->{
             if(!service.remoteActive || !ready(service))return;
             service.flushPointerBeforeAction();
-            Rect clickableBounds=service.findClickableBoundsAt(service.x,service.y);
+            Rect clickableBounds=service.cachedWheelClickableBounds(service.x,service.y);
             WheelStroke stroke=clickableBounds==null
                 ? computeWheelStroke(service.x,service.y,amount,horizontal,
                     service.displayWidth,service.displayHeight)

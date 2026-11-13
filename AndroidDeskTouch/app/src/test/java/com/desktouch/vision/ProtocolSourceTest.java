@@ -283,6 +283,61 @@ public final class ProtocolSourceTest {
         assertNull(DesktopDiscovery.parseOnline("DT1-READY|BAD|"+"E".repeat(64),"192.168.1.55"));
         assertNull(DesktopDiscovery.parseOnline("DT1-ONLINE|BAD|short","192.168.1.55"));
     }
+    @Test public void fastUdpExtendedControlOpsAndDedupPreventStaleAndDuplicateActions() throws Exception {
+        byte[] key=new byte[FastUdpChannel.KEY_SIZE];
+        for(int i=0;i<key.length;i++) key[i]=(byte)(i+11);
+        FastUdpChannel.Codec server=new FastUdpChannel.Codec(key,9,true);
+        FastUdpChannel.Codec client=new FastUdpChannel.Codec(key,9,false);
+
+        byte[] claimFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        server.seal(FastUdpChannel.OP_REVERSE_CLAIM,42,0,42,7,claimFrame);
+        FastUdpChannel.Message claimMsg=client.tryOpen(claimFrame,claimFrame.length);
+        assertNotNull(claimMsg);
+        assertEquals(FastUdpChannel.OP_REVERSE_CLAIM,claimMsg.op);
+        assertEquals(42,claimMsg.a);
+        assertEquals(7,claimMsg.timestampMs);
+
+        byte[] buttonFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        server.seal(FastUdpChannel.OP_REVERSE_BUTTON,1,1,42,101,buttonFrame);
+        FastUdpChannel.Message buttonMsg=client.tryOpen(buttonFrame,buttonFrame.length);
+        assertNotNull(buttonMsg);
+        assertEquals(FastUdpChannel.OP_REVERSE_BUTTON,buttonMsg.op);
+        assertEquals(101,buttonMsg.timestampMs);
+
+        byte[] wheelFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        server.seal(FastUdpChannel.OP_REVERSE_WHEEL,-120,0,42,102,wheelFrame);
+        FastUdpChannel.Message wheelMsg=client.tryOpen(wheelFrame,wheelFrame.length);
+        assertNotNull(wheelMsg);
+        assertEquals(FastUdpChannel.OP_REVERSE_WHEEL,wheelMsg.op);
+        assertEquals(-120,wheelMsg.a);
+        assertEquals(102,wheelMsg.timestampMs);
+
+        byte[] grantedFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        client.seal(FastUdpChannel.OP_REVERSE_GRANTED,42,1,42,0,grantedFrame);
+        FastUdpChannel.Message grantedMsg=server.tryOpen(grantedFrame,grantedFrame.length);
+        assertNotNull(grantedMsg);
+        assertEquals(FastUdpChannel.OP_REVERSE_GRANTED,grantedMsg.op);
+        assertEquals(1,grantedMsg.b);
+
+        byte[] activeFrame=new byte[FastUdpChannel.FRAME_SIZE];
+        client.seal(FastUdpChannel.OP_REVERSE_ACTIVE,42,0,42,0,activeFrame);
+        FastUdpChannel.Message activeMsg=server.tryOpen(activeFrame,activeFrame.length);
+        assertNotNull(activeMsg);
+        assertEquals(FastUdpChannel.OP_REVERSE_ACTIVE,activeMsg.op);
+
+        DeskTouchSession.ReverseControlDeduplicator dedup=
+            new DeskTouchSession.ReverseControlDeduplicator();
+        assertTrue(dedup.tryAcceptClaimDispatch(42,7,0));
+        assertFalse(dedup.tryAcceptClaimDispatch(42,7,0)); // duplicate after release must not re-acquire
+        assertTrue(dedup.tryAcceptControlAction(1,true));   // UDP button down
+        assertFalse(dedup.tryAcceptControlAction(1,true));  // delayed TCP duplicate ignored
+        assertTrue(dedup.tryAcceptControlAction(2,true));   // UDP button up
+        assertFalse(dedup.tryAcceptControlAction(1,true));  // stale TCP down after newer up ignored
+        assertTrue(dedup.tryAcceptControlAction(4,true));   // newer button event
+        assertTrue(dedup.tryAcceptControlAction(3,false));  // slightly out-of-order missing wheel still applies
+        assertFalse(dedup.tryAcceptControlAction(3,false)); // wheel duplicate ignored
+    }
+
     @Test public void scrollWheelDirectionStaysInsideSafeScreenMargins(){
         DeskTouchAccessibilityService.WheelStroke up=
             DeskTouchAccessibilityService.computeWheelStroke(540,2100,120,false,1080,2400);
@@ -320,7 +375,7 @@ public final class ProtocolSourceTest {
         assertTrue(topIconScrollUp.sy>520 && topIconScrollUp.ey<topIconScrollUp.sy);
     }
     @Test public void interactiveKeepaliveIntervalStaysWithinWirelessWakeThreshold(){
-        assertTrue(DeskTouchSession.INTERACTIVE_KEEPALIVE_MS>0 &&
-            DeskTouchSession.INTERACTIVE_KEEPALIVE_MS<=25);
+        assertTrue(DeskTouchSession.INTERACTIVE_KEEPALIVE_MS>=45 &&
+            DeskTouchSession.INTERACTIVE_KEEPALIVE_MS<=70);
     }
 }

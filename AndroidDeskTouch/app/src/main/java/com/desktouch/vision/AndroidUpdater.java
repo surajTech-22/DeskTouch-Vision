@@ -159,32 +159,54 @@ final class AndroidUpdater {
     static void checkForUpdates(Activity activity,boolean interactive){
         if(busy)return;
         busy=true;
+        final AlertDialog[] checking={null};
+        if(interactive){
+            activity.runOnUiThread(()->{
+                if(!activity.isFinishing()&&!activity.isDestroyed()){
+                    checking[0]=new AlertDialog.Builder(activity)
+                        .setTitle("Checking for DeskTouch update")
+                        .setMessage("Checking for the latest Android update inside DeskTouch...")
+                        .setCancelable(false)
+                        .show();
+                }
+            });
+        }
         WORK.execute(()->{
             try{
                 Release release=fetchRelease();
                 latest=release;
                 int comparison=compareVersions(release.version,installedVersion(activity));
                 if(comparison>0){
-                    if(interactive)activity.runOnUiThread(()->new AlertDialog.Builder(activity)
-                        .setTitle("DeskTouch update "+release.version)
-                        .setMessage("An official Android update is available. The APK is SHA-256 verified. "+
-                            "Android will require your approval to install.")
-                        .setNegativeButton("Later",null)
-                        .setPositiveButton("Update existing app",(d,w)->installAvailableUpdate(activity))
-                        .show());
+                    if(interactive)activity.runOnUiThread(()->{
+                        dismissDialog(activity,checking[0]);
+                        new AlertDialog.Builder(activity)
+                            .setTitle("DeskTouch update "+release.version)
+                            .setMessage("An official Android update is available. The APK is SHA-256 verified. "+
+                                "DeskTouch will download and install it directly without opening a browser; "+
+                                "Android will ask for your approval to install.")
+                            .setNegativeButton("Later",null)
+                            .setPositiveButton("Update existing app",(d,w)->installAvailableUpdate(activity))
+                            .show();
+                    });
                     else {
                         File cached=downloadVerified(activity.getApplicationContext(),release);
                         notifyAvailable(activity.getApplicationContext(),release.version);
                     }
                 }else if(interactive)
-                    activity.runOnUiThread(()->new AlertDialog.Builder(activity)
-                        .setTitle("DeskTouch is up to date")
-                        .setMessage("Installed Android version: "+installedVersion(activity))
-                        .setPositiveButton("OK",null).show());
+                    activity.runOnUiThread(()->{
+                        dismissDialog(activity,checking[0]);
+                        new AlertDialog.Builder(activity)
+                            .setTitle("DeskTouch is up to date")
+                            .setMessage("Installed Android version: "+installedVersion(activity))
+                            .setPositiveButton("OK",null).show();
+                    });
             }catch(Exception e){
-                if(interactive)activity.runOnUiThread(()->new AlertDialog.Builder(activity)
-                    .setTitle("Could not check updates").setMessage(e.getMessage())
-                    .setPositiveButton("OK",null).show());
+                if(interactive)activity.runOnUiThread(()->{
+                    dismissDialog(activity,checking[0]);
+                    new AlertDialog.Builder(activity)
+                        .setTitle("Could not check updates").setMessage(e.getMessage())
+                        .setPositiveButton("OK",null).show();
+                });
                 else Log.w("DeskTouch","Update check deferred",e);
             }finally{busy=false;}
         });
@@ -331,6 +353,14 @@ final class AndroidUpdater {
         intent.setDataAndType(uri,"application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(intent);
+        try{
+            activity.startActivity(intent);
+        }catch(RuntimeException e){
+            new AlertDialog.Builder(activity)
+                .setTitle("Update installer unavailable")
+                .setMessage(e.getMessage())
+                .setPositiveButton("OK",null)
+                .show();
+        }
     }
 }

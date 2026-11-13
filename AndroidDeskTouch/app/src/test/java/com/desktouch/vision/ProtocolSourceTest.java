@@ -319,4 +319,8 @@ public final class ProtocolSourceTest {
                 220,420,120,false,1080,2400,100,260,340,520);
         assertTrue(topIconScrollUp.sy>520 && topIconScrollUp.ey<topIconScrollUp.sy);
     }
+    @Test public void interactiveKeepaliveIntervalStaysWithinWirelessWakeThreshold(){
+        assertTrue(DeskTouchSession.INTERACTIVE_KEEPALIVE_MS>0 &&
+            DeskTouchSession.INTERACTIVE_KEEPALIVE_MS<=25);
+    }
 }

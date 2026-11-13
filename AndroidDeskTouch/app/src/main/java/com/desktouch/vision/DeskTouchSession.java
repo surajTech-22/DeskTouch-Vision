@@ -32,6 +32,7 @@ import javax.net.ssl.*;
  * No new Windows pairing protocol or replacement keyboard settings.
  */
 final class DeskTouchSession implements AutoCloseable {
+    static final int INTERACTIVE_KEEPALIVE_MS = 20;
     interface Events { void status(String message); }
     static final class EnvironmentTarget {
         final int id;
@@ -682,14 +683,14 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                     ch.sendProbe();
                 },180,180,TimeUnit.MILLISECONDS);
+                final PowerManager keepAlivePm=(PowerManager)application.getSystemService(Context.POWER_SERVICE);
                 udpKeepAliveFuture=udpPacer.scheduleWithFixedDelay(()->{
                     if(!running || udpChannel!=ch)return;
-                    if(!ch.confirmed || claim>0 || !DeskTouchAccessibilityService.ready(application))return;
-                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<40)return;
-                    PowerManager pm=(PowerManager)application.getSystemService(Context.POWER_SERVICE);
-                    if(pm!=null && !pm.isInteractive())return;
+                    if(!ch.confirmed || !DeskTouchAccessibilityService.ready(application))return;
+                    if(SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<18)return;
+                    if(keepAlivePm!=null && !keepAlivePm.isInteractive())return;
                     ch.sendWarm();
-                },50,50,TimeUnit.MILLISECONDS);
+                },INTERACTIVE_KEEPALIVE_MS,INTERACTIVE_KEEPALIVE_MS,TimeUnit.MILLISECONDS);
             }
         } catch(Exception ignored) {
         }

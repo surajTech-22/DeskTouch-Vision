@@ -217,6 +217,23 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     private int dp(float px){return Math.round(px*getResources().getDisplayMetrics().density);}
     private volatile boolean fullOverlayRejected;
+    private float maxRefreshRateHz;
+    private float preferredActiveRefreshRate(){
+        if(Build.VERSION.SDK_INT<23)return 0f;
+        try{
+            android.hardware.display.DisplayManager dm=
+                (android.hardware.display.DisplayManager)getSystemService(DISPLAY_SERVICE);
+            android.view.Display display=dm!=null
+                ? dm.getDisplay(android.view.Display.DEFAULT_DISPLAY):null;
+            if(display==null)return 0f;
+            float best=0f;
+            for(android.view.Display.Mode mode:display.getSupportedModes()){
+                float hz=mode.getRefreshRate();
+                if(hz>best)best=hz;
+            }
+            return best>=85f?best:0f;
+        }catch(RuntimeException ignored){return 0f;}
+    }
     private boolean tryAttachOverlay(FrameLayout root,WindowManager.LayoutParams params){
         try{
             windows.addView(root,params);
@@ -241,6 +258,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             params.layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         if(Build.VERSION.SDK_INT>=30)params.setFitInsetsTypes(0);
+        maxRefreshRateHz=preferredActiveRefreshRate();
+        if(maxRefreshRateHz>0f)params.preferredRefreshRate=maxRefreshRateHz;
         return params;
     }
     private void showPointer(int requestedX,int requestedY){
@@ -370,8 +389,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         int nextFlags=keepAwake
             ? (lp.flags | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             : (lp.flags & ~WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        boolean changed=nextFlags!=lp.flags;
+        float nextHz=keepAwake ? maxRefreshRateHz : 0f;
+        boolean changed=nextFlags!=lp.flags || Float.compare(lp.preferredRefreshRate,nextHz)!=0;
         lp.flags=nextFlags;
+        lp.preferredRefreshRate=nextHz;
         if(changed || forceLayout){
             try{windows.updateViewLayout(cursorRoot,lp);}
             catch(RuntimeException rejected){return false;}

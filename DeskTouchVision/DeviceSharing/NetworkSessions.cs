@@ -477,7 +477,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
         CancellationToken token)
     {
-        relay.Target.MovePacer?.SetMinIntervalMs(relay.Target.Peer.Platform == "Android" ? 7.5 : 4.5);
+        relay.Target.MovePacer?.SetMinIntervalMs(relay.Target.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 4.5);
         if (_sessions.ContainsKey(relay.Target.Id))
         {
             try { await SendToAsync(relay.Target,
@@ -920,7 +920,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
                         session.MovePacer?.SetMinIntervalMs(
-                            session.Peer.Platform == "Android" ? 7.5 : 2.5);
+                            session.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 2.5);
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1165,7 +1165,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         // Relayed moves are already paced by the source PC; keep a short
                         // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
                         relay.Target.MovePacer?.SetMinIntervalMs(
-                            relay.Target.Peer.Platform == "Android" ? 7.5 : 2.0);
+                            relay.Target.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 2.0);
                         if (relay.Target.UdpPeer is { Confirmed: true } relayUdp)
                             _udpHub?.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
                         try { await SendToAsync(relay.Target,
@@ -1395,6 +1395,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             if (session.Peer.Platform == "Windows")
                 BroadcastWarmToConfirmedTargets(session.Id);
+            else if (ShouldEchoAndroidWarm(session.Peer.Platform) &&
+                _udpHub != null && session.UdpPeer is { Confirmed: true } peerUdp)
+                _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
             return;
         }
         if (msg.Op != FastUdpOp.Move) return;
@@ -1425,6 +1428,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             });
         }
     }
+
+    internal const double AndroidUdpMinIntervalMs = 3.5;
+
+    internal static bool ShouldEchoAndroidWarm(string? platform) =>
+        string.Equals(platform, "Android", StringComparison.Ordinal);
 
     public void Dispose()
     {

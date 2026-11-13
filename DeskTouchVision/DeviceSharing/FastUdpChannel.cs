@@ -496,7 +496,7 @@ internal sealed class FastMovePacer : IDisposable
     private const double MinUdpIntervalMs = 1.5;
     private const int ThrottleFlushDelayMs = 2;
     private const int TrailingTcpSyncDelayMs = 130;
-    private const int WarmKeepaliveIntervalMs = 35;
+    private const int WarmKeepaliveIntervalMs = 20;
     private const int WarmCooldownSeconds = 15;
 
     private readonly object _gate = new();

@@ -1638,6 +1638,14 @@ await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
 uiThread.Join();
 Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");
 
+Check(ReceiverServer.ShouldEchoAndroidWarm("Android") &&
+    !ReceiverServer.ShouldEchoAndroidWarm("Windows") &&
+    !ReceiverServer.ShouldEchoAndroidWarm(null) &&
+    ReceiverServer.AndroidUdpMinIntervalMs <= 4.0 &&
+    ReceiverServer.AndroidUdpMinIntervalMs >= 2.0,
+    "Android fast lane keeps smooth pacing and echoes interactive wireless keepalive");
+Console.WriteLine("PASS: Android wireless keepalive echo and smooth pacing verified.");
+
 internal sealed class RecordingInputSession : IInputSession
 {
     internal List<Packet> Packets { get; } = new();

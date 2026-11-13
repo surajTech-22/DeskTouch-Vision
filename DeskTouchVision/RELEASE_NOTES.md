@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.33 — Bidirectional Phone Radio Keepalive, High-Refresh Overlay & Instant Cursor Pacing
+
+DeskTouch Vision eliminates the remaining mobile pointer lag on phones with aggressive wireless power saving, boosts active pointer smoothness on high-refresh displays, and refines in-app Android update feedback.
+
+- **Bidirectional 20 ms interactive wireless keepalive:** While the phone screen is awake and DeskTouch is ready, the Android endpoint sends tiny interactive warm signals every 20 ms (stopping immediately when the screen sleeps or DeskTouch pauses) and the Windows hub immediately echoes a low-delay UDP keepalive back, preventing mobile radios from dropping into beacon sleep between movements or across long pauses on Windows.
+- **Unbuffered Android pointer pacing & full display refresh rate:** Lowered Android UDP move pacing from 7.5 ms back to 3.5 ms (while retaining low-delay queue scheduling that achieved zero TCP retransmissions), lowered Windows warm cadence from 35 ms to 20 ms, and requested the display's maximum supported refresh rate (`preferredRefreshRate`) while the remote cursor is active on screen (resetting to adaptive default when hidden).
+- **Clearer in-app Android update flow:** Added an in-app "Checking for DeskTouch update" progress dialog when tapping "Get updates" and safe installer launch handling so verified Android updates install cleanly inside DeskTouch without opening Chrome.
+
+---
+
 # DeskTouch Vision v0.3.32 — Smooth Switch-Back, Screen Keep-Awake, Safe App-Icon Scroll, and In-App Android Updates
 
 DeskTouch Vision eliminates switch-back stalls and wireless queue drops, keeps the phone screen awake while the remote pointer is active, restores the previous scroll direction while preventing scrolls over app icons from opening apps, and downloads/installs Android updates directly inside the app.

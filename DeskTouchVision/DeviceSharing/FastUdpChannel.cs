@@ -374,10 +374,11 @@ internal sealed class AdaptiveLinkTracker
             {
                 _seenMask = 1UL;
                 ulong skipped = diff >= 65 ? 64UL : diff - 1;
-                for (ulong i = 0; i < skipped; i++)
+                _lostPackets += (long)skipped;
+                ulong ewmaSteps = Math.Min(16UL, skipped);
+                for (ulong i = 0; i < ewmaSteps; i++)
                 {
-                    _ewmaLossRatio = _ewmaLossRatio * 0.975 + 0.025;
-                    _lostPackets++;
+                    _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
                 }
                 _settledSeq = seq;
             }
@@ -417,11 +418,11 @@ internal sealed class AdaptiveLinkTracker
             bool seen = back < 64 && ((_seenMask & (1UL << (int)back)) != 0);
             if (seen)
             {
-                _ewmaLossRatio *= 0.975;
+                _ewmaLossRatio *= 0.94;
             }
             else
             {
-                _ewmaLossRatio = _ewmaLossRatio * 0.975 + 0.025;
+                _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
                 _lostPackets++;
             }
         }

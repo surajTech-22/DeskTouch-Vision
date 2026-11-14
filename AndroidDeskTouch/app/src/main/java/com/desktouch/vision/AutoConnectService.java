@@ -193,10 +193,18 @@ public final class AutoConnectService extends Service {
         IntentFilter filter=new IntentFilter();
         filter.addAction(Intent.ACTION_SCREEN_ON);
         filter.addAction(Intent.ACTION_USER_PRESENT);
+        filter.addAction(Intent.ACTION_POWER_CONNECTED);
+        filter.addAction(Intent.ACTION_POWER_DISCONNECTED);
+        filter.addAction("android.hardware.usb.action.USB_STATE");
         filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
         wakeReceiver=new BroadcastReceiver() {
             @Override public void onReceive(Context context,Intent intent) {
                 triggerFastReconnect();
+                String action=intent!=null ? intent.getAction() : null;
+                if(Intent.ACTION_POWER_CONNECTED.equals(action) ||
+                    "android.hardware.usb.action.USB_STATE".equals(action)) {
+                    scheduleUsbCableFollowUp();
+                }
             }
         };
         try {
@@ -208,6 +216,17 @@ public final class AutoConnectService extends Service {
             wakeReceiver=null;
             Log.w("DeskTouch","Screen/Wi-Fi wake receiver unavailable",error);
         }
+    }
+
+    private volatile long lastUsbFollowUpMs;
+
+    private void scheduleUsbCableFollowUp() {
+        ScheduledExecutorService pool=scheduler;
+        if(pool==null || pool.isShutdown()) return;
+        long now=android.os.SystemClock.uptimeMillis();
+        if(now-lastUsbFollowUpMs<600L) return;
+        lastUsbFollowUpMs=now;
+        pool.schedule(this::autoConnect,1100,TimeUnit.MILLISECONDS);
     }
 
     private void triggerFastReconnect() {
@@ -245,6 +264,17 @@ public final class AutoConnectService extends Service {
             // Android device. Other Windows/phone members are authenticated
             // separately TO THAT HUB and routed by its environment roster.
             if(DeskTouchRuntime.connectedCount()>0) {
+                if(!DeskTouchRuntime.anyCableConnected() && !DeskTouchRuntime.anyInputLeaseActive()) {
+                    DesktopDiscovery.Device cable=DesktopDiscovery.probeLoopbackCable();
+                    if(cable!=null && cable.ready && eligible.contains(cable.fingerprint) &&
+                        DeskTouchRuntime.closeWirelessIfIdle(cable.fingerprint)) {
+                        DeskTouchSession selected=DeskTouchRuntime.select(this,cable.fingerprint);
+                        selected.connect(cable,display.x,display.y,false,()->{
+                            if(reconnectEnabled(this) && enabled(this))
+                                scheduleInteractiveFollowUp();
+                        });
+                    }
+                }
                 connectedNow=true;
                 return;
             }

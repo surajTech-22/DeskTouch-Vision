@@ -144,6 +144,7 @@ final class DeskTouchSession implements AutoCloseable {
     private ScheduledFuture<?> scheduledTrailingSync;
     private volatile FastUdpChannel udpChannel;
     private volatile InetAddress peerInetAddress;
+    private volatile boolean cableSession;
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
     private volatile DataOutputStream output;
@@ -195,6 +196,8 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isConnecting(){return connecting;}
     boolean isActive(){return active;}
     boolean hasClaim(){return claim>0||active;}
+    boolean isCableSession(){return running && cableSession;}
+    boolean isBusyInLease(){return running && (claim>0 || active || reverseLease>0);}
     String connectedFingerprint(){return running ? fingerprint : null;}
     java.util.List<EnvironmentTarget> environmentTargets(){
         return environmentTargets;
@@ -389,6 +392,7 @@ final class DeskTouchSession implements AutoCloseable {
                     DeskTouchAccessibilityService.setDisplayRefreshHz(info.refreshHz);
                 }
                 peerInetAddress=ssl.getInetAddress();
+                cableSession=device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress());
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
                 reverseDedup.reset();
                 registerDisplayListener();
@@ -397,7 +401,8 @@ final class DeskTouchSession implements AutoCloseable {
                 // Allow for transient Android CPU/Wi-Fi scheduling pauses.
                 // Heartbeats and the foreground auto-reconnect still detect real loss.
                 ssl.setSoTimeout(60000);
-                status("Connected to "+device.name+". Windows approved pairing.");
+                if(cableSession) DeskTouchAccessibilityService.setLinkMetrics(0.0,0.0);
+                status("Connected to "+device.name+(cableSession?" via data cable":"")+". Windows approved pairing.");
                 Thread heartbeat=new Thread(()->{
                     while(running){
                         try {
@@ -433,7 +438,9 @@ final class DeskTouchSession implements AutoCloseable {
             while(running){
                 Packet p=Packet.read(input);
                 if("udp-channel".equals(p.type)){
-                    setupUdpChannel(p);
+                    if(!cableSession) setupUdpChannel(p);
+                } else if("ping".equals(p.type)){
+                    send(new Packet("pong",p.a,p.b));
                 } else if("environment-roster".equals(p.type)){
                     acceptEnvironmentRoster(p);
                 } else if("environment-unavailable".equals(p.type)){
@@ -1088,7 +1095,7 @@ final class DeskTouchSession implements AutoCloseable {
         clearReverseControl(false);
         reverseDedup.reset();
         RemoteInputPower.end();
-        running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;
+        running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;cableSession=false;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         SSLSocket sock=socket;socket=null;

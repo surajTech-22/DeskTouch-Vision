@@ -1,5 +1,6 @@
 package com.desktouch.vision;
 
+import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -8,15 +9,19 @@ import java.util.*;
 final class DesktopDiscovery {
     static final class Device {
         final String name,address,fingerprint;
-        final boolean ready,android;
+        final boolean ready,android,cable;
         String groupId;
         boolean isHub;
         Device(String n,String a,String f,boolean ready,boolean android) {
-            name=n;address=a;fingerprint=f;this.ready=ready;this.android=android;
+            this(n,a,f,ready,android,false);
+        }
+        Device(String n,String a,String f,boolean ready,boolean android,boolean cable) {
+            name=n;address=a;fingerprint=f;this.ready=ready;this.android=android;this.cable=cable;
             groupId=f;
         }
         @Override public String toString() {
-            return name+" ("+address+")"+(ready?"":" • "+(android?"Android phone":"Busy"));
+            String via=cable ? "data cable" : address;
+            return name+" ("+via+")"+(ready?"":" • "+(android?"Android phone":"Busy"));
         }
     }
 
@@ -96,6 +101,54 @@ final class DesktopDiscovery {
         for(Device d:group)if(d.ready)return d;
         return group.isEmpty()?null:group.get(0);
     }
+    static Device probeLoopbackCable() {
+        return probeLoopbackCable(InetAddress.getLoopbackAddress(), 37378);
+    }
+
+    static Device probeLoopbackCable(InetAddress host, int port) {
+        if(host==null || port<=0 || port>65535) return null;
+        try(Socket socket=new Socket()) {
+            socket.connect(new InetSocketAddress(host,port),120);
+            socket.setSoTimeout(90);
+            BufferedReader reader=new BufferedReader(
+                new InputStreamReader(socket.getInputStream(),StandardCharsets.US_ASCII));
+            ArrayList<String> lines=new ArrayList<>(6);
+            String line;
+            while(lines.size()<12 && (line=reader.readLine())!=null) {
+                lines.add(line);
+            }
+            return parseLoopbackLines(lines);
+        } catch(Exception ignored) {
+            return null;
+        }
+    }
+
+    static Device parseLoopbackLines(List<String> lines) {
+        if(lines==null || lines.isEmpty()) return null;
+        Device primary=null;
+        String hubFingerprint=null;
+        for(String raw:lines) {
+            if(raw==null) continue;
+            String message=raw.trim();
+            if(message.isEmpty()) continue;
+            if(message.startsWith("DT1-HUB|")) {
+                String id=message.substring("DT1-HUB|".length());
+                if(id.matches("[A-Fa-f0-9]{64}"))
+                    hubFingerprint=id.toUpperCase(Locale.ROOT);
+                continue;
+            }
+            if(primary==null) {
+                Device parsed=parse(message,"127.0.0.1");
+                if(parsed!=null && !parsed.android)
+                    primary=new Device(parsed.name,"127.0.0.1",
+                        parsed.fingerprint,parsed.ready,false,true);
+            }
+        }
+        if(primary!=null && primary.fingerprint.equals(hubFingerprint))
+            primary.isHub=true;
+        return primary;
+    }
+
     static List<Device> scan() throws Exception {
         return scanInternal(null);
     }
@@ -118,6 +171,19 @@ final class DesktopDiscovery {
         try {ownAndroidIdentity=MobileDiscoveryResponder.mobileFingerprint();}
         catch(Exception ignored) { /* keep scanning other devices */ }
 
+        boolean matchedTarget=false;
+        long cableDeadlineBoostNs=0L;
+        Device cableDevice=probeLoopbackCable();
+        if(cableDevice!=null && isRemoteDevice(cableDevice,ownAndroidIdentity)) {
+            String key="windows:"+cableDevice.fingerprint;
+            devices.put(key,cableDevice);
+            sourceIpByFingerprint.put(cableDevice.fingerprint,"127.0.0.1");
+            if(cableDevice.ready && (!fastMode || quickTargetFingerprints.contains(cableDevice.fingerprint))) {
+                matchedTarget=true;
+                cableDeadlineBoostNs=120_000_000L;
+            }
+        }
+
         byte[] probe="DT1-DISCOVER".getBytes(StandardCharsets.US_ASCII);
         try(DatagramSocket socket=new DatagramSocket()) {
             socket.setBroadcast(true);
@@ -131,12 +197,12 @@ final class DesktopDiscovery {
                 for(InterfaceAddress addr:nic.getInterfaceAddresses())
                     if(addr.getBroadcast()!=null) destinations.add(addr.getBroadcast());
             }
-            long deadline=System.nanoTime()+(fastMode ? 1_400_000_000L : 2_200_000_000L);
+            long deadline=System.nanoTime()+(cableDeadlineBoostNs>0L ? cableDeadlineBoostNs
+                : (fastMode ? 1_400_000_000L : 2_200_000_000L));
             long retryNs=fastMode ? 250_000_000L : 350_000_000L;
             int maxSends=3;
             int sends=0;
             long nextSend=0;
-            boolean matchedTarget=false;
             while(System.nanoTime()<deadline){
                 long now=System.nanoTime();
                 if(!matchedTarget && sends<maxSends && now>=nextSend){
@@ -177,8 +243,10 @@ final class DesktopDiscovery {
                    result.getAddress().isAnyLocalAddress())continue;
                 String key=(device.android?"android:":"windows:")+device.fingerprint;
                 Device old=devices.get(key);
-                if(old==null||(!old.ready&&device.ready))devices.put(key,device);
-                if(!device.android)sourceIpByFingerprint.put(device.fingerprint,ip);
+                if(old==null || (!old.cable && (!old.ready && device.ready)))
+                    devices.put(key,device);
+                if(!device.android && (old==null || !old.cable))
+                    sourceIpByFingerprint.put(device.fingerprint,ip);
                 if(!matchedTarget && !device.android && device.ready &&
                     (!fastMode || quickTargetFingerprints.contains(device.fingerprint))) {
                     matchedTarget=true;

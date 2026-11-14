@@ -121,7 +121,7 @@ final class PhoneScreenGeometry {
                     continue;
                 }
                 float rate=mode.getRefreshRate();
-                if(rate>60.5f && rate<=144.5f && rate>best) {
+                if(rate>60.5f && rate<=240.5f && rate>best) {
                     best=rate;
                 }
             }

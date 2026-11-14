@@ -31,6 +31,9 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly Func<bool> _isEnvironmentHub;
     private UdpClient? _listener;
     private Task? _loop;
+    private TcpListener? _loopbackListener;
+    private Task? _loopbackLoop;
+    internal int LoopbackPort { get; private set; }
 
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
         Func<IEnumerable<string>>? connectedFingerprints = null,
@@ -59,11 +62,60 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             EnableBroadcast = true
         };
         _loop = Task.Run(ReplyLoopAsync);
+        TryStartLoopbackListener(DiscoveryPort);
+    }
+
+    internal void StartLoopbackOnly(int port = 0) => StartLoopbackListener(port);
+
+    private void TryStartLoopbackListener(int port)
+    {
+        try { StartLoopbackListener(port); }
+        catch (SocketException) { }
+    }
+
+    private void StartLoopbackListener(int port)
+    {
+        var tcp = new TcpListener(IPAddress.Loopback, port);
+        tcp.Start(8);
+        _loopbackListener = tcp;
+        LoopbackPort = ((IPEndPoint)tcp.LocalEndpoint).Port;
+        _loopbackLoop = Task.Run(LoopbackReplyLoopAsync);
+    }
+
+    internal IReadOnlyList<string> BuildPresenceMessages()
+    {
+        var name = Environment.MachineName.Replace("|", "-");
+        // IMPORTANT: discovery must survive a TCP session. While a PC
+        // controls another PC, report it as busy, not as a missing PC.
+        bool accepting = false;
+        try { accepting = _canAcceptConnections(); }
+        catch (ObjectDisposedException) { }
+        var prefix = accepting ? ReadyPrefix : BusyPrefix;
+        var messages = new List<string>(8) { prefix + name + "|" + _fingerprint };
+        // A member with an outgoing hub connection is a LEAF, even if
+        // it keeps its own incoming listener. Android should prefer a
+        // real environment hub instead of creating a split network.
+        if (_isEnvironmentHub())
+            messages.Add("DT1-HUB|" + _fingerprint);
+
+        // Optional second datagram announces connected PC membership.
+        // The original READY/BUSY packet is untouched for older apps.
+        // These hints are VISUAL only and never authorize pairing.
+        IEnumerable<string> related;
+        try { related = _connectedFingerprints(); }
+        catch { related = Array.Empty<string>(); }
+        foreach (string other in related.Distinct(StringComparer.OrdinalIgnoreCase).Take(6))
+        {
+            if (other.Length != 64 || !other.All(Uri.IsHexDigit) ||
+                other.Equals(_fingerprint, StringComparison.OrdinalIgnoreCase))
+                continue;
+            messages.Add("DT1-LINK|" + _fingerprint + "|" + other.ToUpperInvariant());
+        }
+        return messages;
     }
 
     private async Task ReplyLoopAsync()
     {
-        var name = Environment.MachineName.Replace("|", "-");
         while (!_stop.IsCancellationRequested)
         {
             try
@@ -73,41 +125,39 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 if (msg.Buffer.Length != Probe.Length ||
                     Encoding.ASCII.GetString(msg.Buffer) != Probe) continue;
 
-                // IMPORTANT: discovery must survive a TCP session. While a PC
-                // controls another PC, report it as busy, not as a missing PC.
-                bool accepting = false;
-                try { accepting = _canAcceptConnections(); }
-                catch (ObjectDisposedException) { }
-                var prefix = accepting ? ReadyPrefix : BusyPrefix;
-                byte[] reply = Encoding.ASCII.GetBytes(prefix + name + "|" + _fingerprint);
-                await _listener.SendAsync(reply,msg.RemoteEndPoint,_stop.Token);
-                // A member with an outgoing hub connection is a LEAF, even if
-                // it keeps its own incoming listener. Android should prefer a
-                // real environment hub instead of creating a split network.
-                if (_isEnvironmentHub())
+                foreach (string payload in BuildPresenceMessages())
                 {
-                    byte[] hubHint=Encoding.ASCII.GetBytes("DT1-HUB|"+_fingerprint);
-                    await _listener.SendAsync(hubHint,msg.RemoteEndPoint,_stop.Token);
-                }
-                // Optional second datagram announces connected PC membership.
-                // The original READY/BUSY packet is untouched for older apps.
-                // These hints are VISUAL only and never authorize pairing.
-                IEnumerable<string> related;
-                try { related=_connectedFingerprints(); }
-                catch { related=Array.Empty<string>(); }
-                foreach(string other in related.Distinct(StringComparer.OrdinalIgnoreCase).Take(6))
-                {
-                    if(other.Length!=64 || !other.All(Uri.IsHexDigit) ||
-                       other.Equals(_fingerprint,StringComparison.OrdinalIgnoreCase))
-                       continue;
-                    byte[] link=Encoding.ASCII.GetBytes("DT1-LINK|"+_fingerprint+
-                        "|"+other.ToUpperInvariant());
-                    await _listener.SendAsync(link,msg.RemoteEndPoint,_stop.Token);
+                    byte[] bytes = Encoding.ASCII.GetBytes(payload);
+                    await _listener.SendAsync(bytes, msg.RemoteEndPoint, _stop.Token);
                 }
             }
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
             catch (SocketException) { /* adapter may have changed */ }
+            catch (IOException) { }
+        }
+    }
+
+    private async Task LoopbackReplyLoopAsync()
+    {
+        while (!_stop.IsCancellationRequested)
+        {
+            try
+            {
+                TcpListener? listener = _loopbackListener;
+                if (listener == null) return;
+                using TcpClient client = await listener.AcceptTcpClientAsync(_stop.Token);
+                client.NoDelay = true;
+                byte[] bytes = Encoding.ASCII.GetBytes(string.Join('\n', BuildPresenceMessages()) + "\n");
+                using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                writeCts.CancelAfter(500);
+                NetworkStream stream = client.GetStream();
+                await stream.WriteAsync(bytes, writeCts.Token);
+                await stream.FlushAsync(writeCts.Token);
+            }
+            catch (OperationCanceledException) { return; }
+            catch (ObjectDisposedException) { return; }
+            catch (SocketException) { }
             catch (IOException) { }
         }
     }
@@ -278,6 +328,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     public void Dispose()
     {
         _stop.Cancel();
+        try { _loopbackListener?.Stop(); } catch (Exception) { }
         _listener?.Dispose();
     }
 }

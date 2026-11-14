@@ -78,14 +78,14 @@ public final class PointerSmoother {
 
         if (lastTargetNs > 0L && nowNs > lastTargetNs) {
             double gapMs = (nowNs - lastTargetNs) / 1_000_000.0;
-            if (gapMs < 1.8) {
+            if (gapMs < 1.1) {
                 // Compressed burst arrival indicates queued wireless packets catching up.
-                localArrivalJitterMs = Math.max(localArrivalJitterMs, 6.0);
+                localArrivalJitterMs = Math.max(localArrivalJitterMs, 4.5);
             } else if (gapMs <= 22.0) {
-                localArrivalJitterMs *= 0.85;
+                localArrivalJitterMs *= 0.72;
             } else {
                 // Idle pause or low-frequency tick: decay quickly so resume stays crisp.
-                localArrivalJitterMs *= 0.50;
+                localArrivalJitterMs *= 0.35;
             }
         }
         lastTargetNs = nowNs;
@@ -240,11 +240,14 @@ public final class PointerSmoother {
 
     private double computeTauMsLocked(double nominalFrameMs) {
         double jitter = Math.max(networkJitterMs, localArrivalJitterMs);
-        if (jitter <= 5.5 && lossPermille <= 2.0) {
+        if (jitter <= 6.5 && lossPermille <= 4.0) {
             return 0.0;
         }
-        double rawTau = Math.max(4.0, (jitter - 5.0) * 0.65 + lossPermille * 0.14 + nominalFrameMs * 0.35);
-        return Math.min(rawTau, Math.min(22.0, nominalFrameMs * 1.65));
+        double rawTau = Math.max(2.0,
+            Math.max(0.0, jitter - 6.0) * 0.35
+                + Math.max(0.0, lossPermille - 4.0) * 0.08
+                + nominalFrameMs * 0.14);
+        return Math.min(rawTau, Math.min(10.0, nominalFrameMs * 1.15));
     }
 
     private void recordLiveFrameMs(double rawFrameMs, long frameTimeNs) {

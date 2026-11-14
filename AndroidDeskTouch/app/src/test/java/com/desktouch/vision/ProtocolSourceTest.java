@@ -456,9 +456,14 @@ public final class ProtocolSourceTest {
         assertEquals(144, smoother.getMeasuredFrameHz());
 
         // 3. Congested wireless link: interpolates monotonically without overshooting,
-        // and snaps instantaneously right before clicks or scroll events.
+        // caps smoothing lag tightly even across 60Hz dips, and snaps before clicks/scrolls.
         smoother.setLinkMetrics(18.0, 25.0);
-        assertTrue(smoother.getCurrentTauMs() > 8.0);
+        double tau144 = smoother.getCurrentTauMs();
+        assertTrue(tau144 > 5.0 && tau144 <= 8.0);
+        smoother.setDisplayRefreshHz(60);
+        double tau60 = smoother.getCurrentTauMs();
+        assertTrue(tau60 > 5.0 && tau60 <= 10.0);
+        smoother.setDisplayRefreshHz(144);
         smoother.reset(100f, 100f, tNs);
         assertTrue(smoother.onTarget(500f, 300f, tNs + 7_000_000L));
         assertTrue(smoother.stepFrame(tNs + 14_000_000L, out));
@@ -469,6 +474,53 @@ public final class ProtocolSourceTest {
         assertEquals(500f, out[0], 0.01f);
         assertEquals(300f, out[1], 0.01f);
         assertTrue(smoother.isSettled());
+    }
+
+    @Test public void adaptiveLinkTrackerCapsPacingAndRecoversLossQuickly() {
+        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker();
+        tracker.recordInboundPacket(1L, true, 1000, 1000);
+        for (long s = 6L; s <= 15L; s++) {
+            tracker.recordInboundPacket(s, true, (int) (1000L + s * 7L), 1000L + s * 7L);
+        }
+        double spikeLoss = tracker.getInboundLossPermille();
+        for (long s = 16L; s <= 65L; s++) {
+            tracker.recordInboundPacket(s, true, (int) (1000L + s * 7L), 1000L + s * 7L);
+        }
+        double recovered = tracker.getInboundLossPermille();
+        assertTrue(spikeLoss > 40.0 && recovered < spikeLoss * 0.25 && recovered < 15.0);
+
+        tracker.recordRttSample(48.0, 2000L);
+        tracker.onFeedbackReceived(0, AdaptiveLinkTracker.packLossJitter(30.0, 22.0), -1, 2000L);
+        double p144 = tracker.computeAdaptiveSendIntervalMs(144);
+        double p90 = tracker.computeAdaptiveSendIntervalMs(90);
+        double p60 = tracker.computeAdaptiveSendIntervalMs(60);
+        assertTrue(p144 <= 14.0 && p90 <= 16.0 && p60 <= 18.5);
+    }
+
+    @Test public void loopbackCableDiscoveryParsesReadyHubOverSocket() throws Exception {
+        String fp = "ABCDEF0123456789".repeat(4);
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0, 1,
+                java.net.InetAddress.getLoopbackAddress())) {
+            Thread responder = new Thread(() -> {
+                try (java.net.Socket s = server.accept()) {
+                    String payload = "DT1-READY|DESKTOP-TEST|" + fp + "\nDT1-HUB|" + fp + "\n";
+                    s.getOutputStream().write(payload.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                    s.getOutputStream().flush();
+                } catch (Exception ignored) {}
+            });
+            responder.setDaemon(true);
+            responder.start();
+
+            DesktopDiscovery.Device cable = DesktopDiscovery.probeLoopbackCable(
+                    java.net.InetAddress.getLoopbackAddress(), server.getLocalPort());
+            assertNotNull(cable);
+            assertTrue(cable.cable);
+            assertTrue(cable.ready);
+            assertTrue(cable.isHub);
+            assertEquals("127.0.0.1", cable.address);
+            assertEquals("DESKTOP-TEST", cable.name);
+            assertTrue(cable.toString().contains("data cable"));
+        }
     }
 
     @Test public void adaptiveLinkTrackerMeasuresLossRttBloatAndReordering() {

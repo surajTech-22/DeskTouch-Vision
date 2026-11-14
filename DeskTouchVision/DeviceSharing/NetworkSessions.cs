@@ -82,6 +82,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal FastUdpHub.Peer? UdpPeer;
         internal FastMovePacer? MovePacer;
         internal long TcpFallbackMoves;
+        internal bool IsCableSession;
+        internal long CableMoves;
+        internal long LastTcpPingMs;
+        internal double TcpRttMs;
         internal readonly IDisposable HighResTimer = Win.EnterHighResolutionTimer();
         internal int ActiveReverseLease;
         internal int Lease;
@@ -408,12 +412,29 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int tick = 0;
             while (!token.IsCancellationRequested)
             {
-                await Task.Delay(200, token);
+                await Task.Delay(100, token);
                 long nowMs = Environment.TickCount64;
                 foreach (var session in _sessions.Values)
                 {
                     var peer = session.UdpPeer;
-                    if (peer is { Confirmed: true } && _udpHub != null)
+                    if (session.IsCableSession)
+                    {
+                        int activeLease = Volatile.Read(ref session.ActiveReverseLease);
+                        bool shouldMeasure = activeLease > 0 || session.Lease > 0 ||
+                            Volatile.Read(ref session.TcpRttMs) <= 0;
+                        if (shouldMeasure && nowMs - session.LastTcpPingMs >= 1500)
+                        {
+                            session.LastTcpPingMs = nowMs;
+                            int pingToken = unchecked((int)nowMs);
+                            if (pingToken == 0) pingToken = 1;
+                            _ = Task.Run(async () =>
+                            {
+                                try { await SendToAsync(session, new Packet("ping", pingToken), token); }
+                                catch (Exception) { }
+                            });
+                        }
+                    }
+                    else if (peer is { Confirmed: true } && _udpHub != null)
                     {
                         int activeLease = Volatile.Read(ref session.ActiveReverseLease);
                         long probeGapMs = (activeLease > 0 || session.Lease > 0) ? 100 : 600;
@@ -426,15 +447,25 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         }
                     }
 
-                    if ((tick % 15) != 14) continue;
+                    if ((tick % 30) != 29) continue;
+                    int liveHz = Volatile.Read(ref session.LiveRefreshHz);
+                    int effectiveHz = liveHz >= 24 ? liveHz : (session.Peer.RefreshHz ?? 0);
+                    if (session.IsCableSession)
+                    {
+                        long cableMoves = Interlocked.Exchange(ref session.CableMoves, 0);
+                        long cableFallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
+                        if (cableMoves == 0 && cableFallback == 0) continue;
+                        double cableRtt = Volatile.Read(ref session.TcpRttMs);
+                        DiagnosticLog?.Invoke(
+                            $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} transport=cable live_hz={effectiveHz} rtt_ms={cableRtt:F1} cable_moves={cableMoves} tcp_fallback={cableFallback}");
+                        continue;
+                    }
                     var pacer = session.MovePacer;
                     if (pacer == null) continue;
                     var s = pacer.TakeStats();
                     long fallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
                     if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && fallback == 0)
                         continue;
-                    int liveHz = Volatile.Read(ref session.LiveRefreshHz);
-                    int effectiveHz = liveHz >= 24 ? liveHz : (session.Peer.RefreshHz ?? 0);
                     double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
                     double jitter = peer?.LinkTracker.EffectiveJitterMs ?? 0;
                     double loss = peer?.LinkTracker.CombinedLossPermille ?? 0;
@@ -550,7 +581,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private static bool QueueTcpRelayMove(RelayLease relay, Packet packet,
         bool countAsFallback = true)
     {
-        if (countAsFallback)
+        if (relay.Target.IsCableSession)
+            Interlocked.Increment(ref relay.Target.CableMoves);
+        else if (countAsFallback)
             Interlocked.Increment(ref relay.Target.TcpFallbackMoves);
         relay.Target.SetLatestReverseMoveOrdered(ref relay.LatestMove, packet);
         if(Interlocked.CompareExchange(ref relay.MoveSignaled,1,0)==0 &&
@@ -583,7 +616,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Interlocked.Exchange(ref relay.LatestMove, null);
                 return true;
             }
-            return QueueTcpRelayMove(relay, packet, countAsFallback: true);
+            return QueueTcpRelayMove(relay, packet, countAsFallback: !relay.Target.IsCableSession);
         }
         if(packet.Type is "button" or "wheel")
             SendFastControlAndAssignSeq(relay.Target, relay.Claim, ref packet);
@@ -756,7 +789,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private static bool QueueTcpReverseMove(Session selected, Packet packet,
         bool countAsFallback = true)
     {
-        if (countAsFallback)
+        if (selected.IsCableSession)
+            Interlocked.Increment(ref selected.CableMoves);
+        else if (countAsFallback)
             Interlocked.Increment(ref selected.TcpFallbackMoves);
         selected.SetLatestReverseMoveOrdered(ref selected.LatestReverseMove, packet);
         if (Interlocked.CompareExchange(ref selected.ReverseMoveSignaled, 1, 0) == 0 &&
@@ -855,7 +890,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Interlocked.Exchange(ref selected.LatestReverseMove, null);
                 return true;
             }
-            return QueueTcpReverseMove(selected, packet, countAsFallback: true);
+            return QueueTcpReverseMove(selected, packet, countAsFallback: !selected.IsCableSession);
         }
         if (packet.Type is "button" or "wheel")
             SendFastControlAndAssignSeq(selected, fastClaimLease, ref packet);
@@ -1015,9 +1050,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // The authenticated hello carries the current Windows computer name.
         // A saved trusted-device alias may be stale after the PC was renamed;
         // keep the actual announced system name in the display diagram.
-        var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer};
-        session.UdpPeer = _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
-        session.MovePacer = new FastMovePacer(
+        bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
+            client.Client.RemoteEndPoint is IPEndPoint remoteEp &&
+            IPAddress.IsLoopback(remoteEp.Address);
+        var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable};
+        session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
+        session.MovePacer = isCable ? null : new FastMovePacer(
             canSendUdp: () => _udpHub != null && session.UdpPeer is { Confirmed: true } &&
                 Volatile.Read(ref session.ActiveReverseLease) > 0,
             sendUdp: move =>
@@ -1058,12 +1096,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var sendTask=Task.Run(()=>ReverseSendLoopAsync(session,linked.Token));
         try
         {
-            bool first;
-            lock(_authorityGate) first=_selected==null;
-            if(first) Select(session);
+            bool shouldSelect;
+            lock(_authorityGate)
+                shouldSelect = _selected==null ||
+                    (isCable && !_selected.IsCableSession &&
+                     Volatile.Read(ref _selected.ActiveReverseLease)==0 &&
+                     ((!string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
+                       string.Equals(_selected.Peer.DeviceFingerprint,peer.DeviceFingerprint,
+                           StringComparison.OrdinalIgnoreCase)) ||
+                      (string.Equals(_selected.Peer.Platform,peer.Platform,StringComparison.Ordinal) &&
+                       string.Equals(_selected.Peer.Name,peer.Name,StringComparison.OrdinalIgnoreCase))));
+            if(shouldSelect) Select(session);
             string versionSuffix = string.IsNullOrWhiteSpace(peer.AppVersion)
                 ? "" : " [v" + peer.AppVersion + "]";
-            _status("Connected: "+peer.Name+versionSuffix+" ("+ConnectedPeerCount+" simultaneous devices).");
+            string transportSuffix = isCable ? " via data cable" : "";
+            _status("Connected: "+peer.Name+versionSuffix+transportSuffix+" ("+ConnectedPeerCount+" simultaneous devices).");
             // The server advertises its CURRENT system name after successful
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
@@ -1409,7 +1456,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     // Answer authenticated heartbeats so Windows Wi-Fi roaming
                     // does not leave the input lease in an ambiguous state.
-                    await SendToAsync(session,new Packet("pong"),token);
+                    await SendToAsync(session,new Packet("pong",p.A,p.B),token);
+                    continue;
+                }
+                if(p.Type=="pong")
+                {
+                    if (p.A != 0)
+                    {
+                        int rttSample = unchecked((int)Environment.TickCount64 - p.A);
+                        if (rttSample is >= 0 and <= 5000)
+                        {
+                            double cur = Volatile.Read(ref session.TcpRttMs);
+                            Volatile.Write(ref session.TcpRttMs,
+                                cur <= 0 ? rttSample : cur * 0.75 + rttSample * 0.25);
+                        }
+                    }
                     continue;
                 }
                 if(p.Type=="warm")
@@ -1522,7 +1583,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(ReferenceEquals(_selected,session))
                 {
                     previous=session;
-                    next=_sessions.Values.OrderBy(s=>s.Id).FirstOrDefault();
+                    next=_sessions.Values.OrderByDescending(s=>s.IsCableSession)
+                        .ThenBy(s=>s.Id).FirstOrDefault();
                     _selected=next;
                 }
             }
@@ -1757,11 +1819,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
 
-        double rttPressure = Math.Max(0.0, rttMs - 14.0) * 0.14;
-        double bloatPressure = Math.Max(0.0, queueDelay - 6.0) * 0.30;
-        double jitterPressure = Math.Max(0.0, jitterMs - 5.0) * 0.24;
-        double lossPressure = Math.Max(0.0, lossPermille - 5.0) * 0.20;
-        return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, 32.0);
+        double rttPressure = Math.Max(0.0, rttMs - 18.0) * 0.08;
+        double bloatPressure = Math.Max(0.0, queueDelay - 8.0) * 0.16;
+        double jitterPressure = Math.Max(0.0, jitterMs - 8.0) * 0.11;
+        double lossPressure = Math.Max(0.0, lossPermille - 8.0) * 0.10;
+        double maxCap = !isAndroid
+            ? 12.0
+            : (liveRefreshHz is >= 115 ? 14.0
+                : liveRefreshHz is >= 85 ? 16.0
+                : liveRefreshHz is >= 55 ? 18.5
+                : 20.0);
+        maxCap = Math.Max(baseMs, maxCap);
+        return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, maxCap);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>
@@ -2482,7 +2551,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             bool loggedInitial = false;
             while (!_cancel.IsCancellationRequested)
             {
-                await Task.Delay(200, _cancel.Token);
+                await Task.Delay(100, _cancel.Token);
                 if (!loggedInitial)
                 {
                     loggedInitial = true;
@@ -2495,7 +2564,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                     long nowMs = Environment.TickCount64;
                     bool controlActive = Volatile.Read(ref _forwardClaimLease) > 0 ||
                         Volatile.Read(ref _reverseLease) > 0;
-                    long probeGap = controlActive ? 180 : 650;
+                    long probeGap = controlActive ? 100 : 600;
                     if (nowMs - client.LastLinkPingMs >= probeGap)
                     {
                         client.LastLinkPingMs = nowMs;
@@ -2508,13 +2577,13 @@ internal sealed class HostSession : IInputSession, IDisposable
                 }
 
                 tick++;
-                if ((tick % 8) == 7)
+                if ((tick % 15) == 14)
                 {
                     if (Interlocked.Read(ref _lastPingSentTicks) == 0)
                         Volatile.Write(ref _lastPingSentTicks, System.Diagnostics.Stopwatch.GetTimestamp());
                     if (!TrySend(new Packet("ping"))) break;
                 }
-                if ((tick % 15) == 14)
+                if ((tick % 30) == 29)
                     EmitTelemetryIfActive();
             }
         }

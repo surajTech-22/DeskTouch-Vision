@@ -78,6 +78,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private volatile bool _isHiddenInTray;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
+    private AdbCableBridge? _adbBridge;
     private PhysicalInputMonitor? _nativeInput;
     private HostSession? _host;
     private ConnectedPeer? _incomingPeer;
@@ -948,6 +949,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             return neighbours;
                         }, () => _host == null);
                     _discovery.Start();
+                    _adbBridge ??= new AdbCableBridge(LogDiagnostic);
                     BroadcastOnlinePresence();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
@@ -979,6 +981,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _discovery?.Dispose();
             _discovery = null;
+            _adbBridge?.Dispose();
+            _adbBridge = null;
         }
         if (_receiver != null)
         {
@@ -1778,6 +1782,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             try { BeginInvoke(OnDisplayChanged); }
             catch (InvalidOperationException) { }
+        }
+        if (message.Msg == 0x0219 && !_closing.IsCancellationRequested)
+        {
+            _adbBridge?.TriggerRefresh();
         }
         base.WndProc(ref message);
     }

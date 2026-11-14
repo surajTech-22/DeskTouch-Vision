@@ -242,13 +242,15 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         double cleanWifi144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, rttMs: 5.5, minRttMs: 3.5, jitterMs: 2.5, lossPermille: 0);
         double normal50 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 50, rttMs: 10.0, minRttMs: 9.0, jitterMs: 2.0, lossPermille: 0);
         double busyWiFi = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 120, rttMs: 46.0, minRttMs: 7.0, jitterMs: 19.0, lossPermille: 24.0);
+        double busy60Hz = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 60, rttMs: 55.0, minRttMs: 7.0, jitterMs: 25.0, lossPermille: 40.0);
         double winWired = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Windows", 144, rttMs: 1.8, minRttMs: 1.8, jitterMs: 0.4, lossPermille: 0);
         Check(wired144 is >= 4.2 and <= 6.0 &&
             cleanWifi144 is >= 4.2 and <= 5.5 &&
             normal50 >= 12.0 &&
-            busyWiFi > 15.0 && busyWiFi <= 38.0 &&
+            busyWiFi is > 8.0 and <= 14.0 &&
+            busy60Hz is >= 10.0 and <= 18.5 &&
             winWired is >= 1.8 and <= 2.5,
-            "ComputeAdaptiveUdpIntervalMs must adapt continuously to live display Hz, ping, queue bloat, jitter, and loss");
+            "ComputeAdaptiveUdpIntervalMs must adapt continuously without choking high-refresh wireless displays");
 
         // Verify transit-time jitter does NOT false-trigger during intermittent mouse pauses.
         var transitTracker = new AdaptiveLinkTracker();
@@ -273,6 +275,65 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         transitTracker.RecordInboundPacket(12, hasSenderTimestamp: true, txMs, rxMs);
         Check(transitTracker.InboundJitterMs > 8.0,
             "Transit jitter must detect real network buffering and catch-up bursts");
+
+        // Verify fast EWMA packet-loss recovery (~0.94 decay) recovers within ~50 clean frames
+        // once missing slots pass the 8-packet reorder slack window.
+        var lossRecovery = new AdaptiveLinkTracker();
+        lossRecovery.RecordInboundPacket(1, hasSenderTimestamp: true, 1000, 1000);
+        for (ulong s = 6; s <= 15; s++)
+            lossRecovery.RecordInboundPacket(s, hasSenderTimestamp: true, 1000 + (int)(s * 7), 1000 + (long)(s * 7));
+        double spikeLoss = lossRecovery.InboundLossPermille;
+        for (ulong s = 16; s <= 65; s++)
+            lossRecovery.RecordInboundPacket(s, hasSenderTimestamp: true, 1000 + (int)(s * 7), 1000 + (long)(s * 7));
+        double recoveredLoss = lossRecovery.InboundLossPermille;
+        Check(spikeLoss > 40.0 && recoveredLoss < spikeLoss * 0.25 && recoveredLoss < 15.0,
+            "AdaptiveLinkTracker EWMA loss must decay briskly after brief wireless burst drops");
+    }
+
+    // Verify AdbCableBridge wired-device parsing & reverse-rule verification.
+    {
+        string sampleAdbDevices = """
+            * daemon started successfully
+            List of devices attached
+            192.168.1.2:5555	device product:xagain model:22041216I
+            adb-UK9DYX4XF6KZSWGA-AbCdEf._adb-tls-connect._tcp	device
+            UNAUTHORIZED123	unauthorized
+            OFFLINE456	offline
+            UK9DYX4XF6KZSWGA	device usb:1-3 product:xagain model:22041216I
+            UK9DYX4XF6KZSWGA	device usb:1-3
+            SERIAL2ABC	device
+            """;
+        var serials = AdbCableBridge.ParseWiredAdbSerials(sampleAdbDevices);
+        Check(serials.Count == 2 &&
+            serials[0] == "UK9DYX4XF6KZSWGA" &&
+            serials[1] == "SERIAL2ABC",
+            "ParseWiredAdbSerials must select unique wired ADB serials and ignore wireless/unauthorized targets");
+
+        string sampleReverse = """
+            UsbFfs tcp:37377 tcp:37377
+            UsbFfs tcp:37378 tcp:37378
+            """;
+        Check(AdbCableBridge.HasReverseMappings(sampleReverse, 37377, 37378) &&
+            !AdbCableBridge.HasReverseMappings("UsbFfs tcp:37377 tcp:37377\n", 37377, 37378),
+            "HasReverseMappings must require both control (37377) and discovery (37378) loopback rules");
+    }
+
+    // Verify NearbyComputerDiscovery loopback TCP beacon for direct data-cable discovery.
+    {
+        string testFp = new string('C', 64);
+        using var cableBeacon = new NearbyComputerDiscovery(testFp,
+            canAcceptConnections: () => true,
+            isEnvironmentHub: () => true);
+        cableBeacon.StartLoopbackOnly(0);
+        using var probe = new System.Net.Sockets.TcpClient();
+        probe.Connect(System.Net.IPAddress.Loopback, cableBeacon.LoopbackPort);
+        using var reader = new StreamReader(probe.GetStream(), System.Text.Encoding.ASCII);
+        string? line1 = reader.ReadLine();
+        string? line2 = reader.ReadLine();
+        Check(line1 != null && line1.StartsWith("DT1-READY|", StringComparison.Ordinal) &&
+            line1.EndsWith("|" + testFp, StringComparison.Ordinal) &&
+            line2 == "DT1-HUB|" + testFp,
+            "NearbyComputerDiscovery loopback listener must advertise READY + HUB lines for data-cable Android clients");
     }
 
     // Verify 64-packet sliding anti-replay window + LinkPing/LinkFeedback + AdaptiveLinkTracker.

@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.39 — Responsive Pacing Caps, Automatic USB Data-Cable Routing & Low-Latency Tracking
+
+DeskTouch Vision cuts wireless frame-pacing caps in half on high-refresh phones, removes Android display-mode ceiling clamping above 144 Hz, doubles background probe responsiveness, and automatically upgrades plugged-in Android phones onto a direct USB data-cable tunnel with zero artificial pacing delay.
+
+- **Tighter wireless pacing caps & faster recovery:** Lowers maximum adaptive wireless intervals from 32 ms down to 14 ms on 120–144 Hz phones (16 ms at 90 Hz, 18.5 ms at 60 Hz) while softening jitter, queue-bloat, RTT, and packet-loss slopes and speeding EWMA loss recovery so brief wireless drops bounce back briskly.
+- **2x faster background health probes & lighter Android smoothing:** Cuts Windows active health/telemetry loop intervals from 200 ms to 100 ms (still logging every 3 s), trims Android cursor smoothing delay (under 10 ms at 60 Hz and under 8 ms at 144 Hz), and raises supported active refresh-rate detection up to 240 Hz.
+- **Automatic USB data-cable discovery & failover:** Automatically registers `adb reverse` loopback forwarding on wired Android devices (safely tolerating cold `adb` server startup), discovers and connects directly over localhost USB with zero UDP pacing delay and TCP ping tracking, auto-upgrades idle wireless sessions when plugged in, and seamlessly falls back to Wi-Fi if unplugged.
+
+---
+
 # DeskTouch Vision v0.3.38 — Keyboard Hook Self-Healing, Modifier Resync & Protected-Window Diagnostics
 
 DeskTouch Vision automatically recovers Windows keyboard capture if another utility preempts global input hooks, prevents stuck pre-handoff modifier keys from blocking phone typing, eliminates false unavailable warnings when pressing the Windows key while controlling an Android phone, and reports when Windows or security keyboard filters withhold keystrokes for an active protected window.

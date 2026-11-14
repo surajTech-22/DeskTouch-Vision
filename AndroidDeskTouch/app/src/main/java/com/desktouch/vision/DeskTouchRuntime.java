@@ -91,6 +91,30 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isConnected())count++;
         return count;
     }
+    static synchronized boolean anyCableConnected(){
+        for(DeskTouchSession s:sessions.values())if(s.isCableSession())return true;
+        return false;
+    }
+    static synchronized boolean anyInputLeaseActive(){
+        for(DeskTouchSession s:sessions.values())if(s.isBusyInLease())return true;
+        return false;
+    }
+    static synchronized boolean closeWirelessIfIdle(String fingerprint){
+        if(anyInputLeaseActive())return false;
+        String id=fingerprint==null?null:fingerprint.toUpperCase(Locale.ROOT);
+        boolean closedAny=false;
+        for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
+            DeskTouchSession s=entry.getValue();
+            if(!s.isConnected())continue;
+            if(s.isCableSession())return false;
+            if(id==null || id.equals(s.connectedFingerprint()) || sessions.size()==1){
+                s.close();
+                sessions.remove(entry.getKey(),s);
+                closedAny=true;
+            }
+        }
+        return closedAny;
+    }
     // Multiple trusted PCs remain connected, but only one may remotely
     // control Android at any moment. Switching needs a fresh lease handshake.
     static synchronized boolean claimAndroidControl(DeskTouchSession requester){

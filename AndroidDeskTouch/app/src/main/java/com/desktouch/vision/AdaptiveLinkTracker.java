@@ -170,9 +170,10 @@ public final class AdaptiveLinkTracker {
             if (Long.compareUnsigned(diff, 64L) >= 0) {
                 seenMask = 1L;
                 long skipped = Long.compareUnsigned(diff, 65L) >= 0 ? 64L : (diff - 1L);
-                for (long i = 0; i < skipped; i++) {
-                    ewmaLossRatio = ewmaLossRatio * 0.975 + 0.025;
-                    lostPackets++;
+                lostPackets += skipped;
+                long ewmaSteps = Math.min(16L, skipped);
+                for (long i = 0; i < ewmaSteps; i++) {
+                    ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
                 }
                 settledSeq = seq;
             } else {
@@ -209,9 +210,9 @@ public final class AdaptiveLinkTracker {
             long back = maxSeq - s;
             boolean seen = back >= 0L && back < 64L && ((seenMask & (1L << (int) back)) != 0L);
             if (seen) {
-                ewmaLossRatio *= 0.975;
+                ewmaLossRatio *= 0.94;
             } else {
-                ewmaLossRatio = ewmaLossRatio * 0.975 + 0.025;
+                ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
                 lostPackets++;
             }
         }
@@ -328,11 +329,16 @@ public final class AdaptiveLinkTracker {
         if (rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
             return Math.max(1.8, baseMs * 0.85);
         }
-        double penalty = Math.max(0.0, rtt - 14.0) * 0.14
-            + Math.max(0.0, queueDelay - 6.0) * 0.30
-            + Math.max(0.0, jitter - 5.0) * 0.24
-            + Math.max(0.0, lossP - 5.0) * 0.20;
-        return Math.max(baseMs, Math.min(32.0, baseMs + penalty));
+        double penalty = Math.max(0.0, rtt - 18.0) * 0.08
+            + Math.max(0.0, queueDelay - 8.0) * 0.16
+            + Math.max(0.0, jitter - 8.0) * 0.11
+            + Math.max(0.0, lossP - 8.0) * 0.10;
+        int effHz = targetRefreshHz > 0 ? targetRefreshHz : 90;
+        double maxCap = effHz >= 115 ? 14.0
+            : (effHz >= 85 ? 16.0
+            : (effHz >= 55 ? 18.5 : 20.0));
+        maxCap = Math.max(baseMs, maxCap);
+        return Math.max(baseMs, Math.min(maxCap, baseMs + penalty));
     }
 
     public static int packLossJitter(double lossPermille, double jitterMs) {

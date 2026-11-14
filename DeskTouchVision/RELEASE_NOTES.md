@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.35 — Continuous Phone Wireless Wake, Ordered Zero-Jump Pointer Motion & Clean 5 GHz Pacing
+
+DeskTouch Vision eliminates intermittent multi-hundred-millisecond wireless stalls and backward/diagonal cursor jumps while keeping phone battery sleep protection, scroll direction, app-icon scroll protection, trusted reconnection, and direct in-app Android updates intact.
+
+- **Continuous phone wireless radio wake during active control:** Fixed the root cause of 200–500+ ms stalls during active phone control where suppressing upstream keepalive signals (`reverseLease > 0` or recent move arrival) allowed Android phones to drop into 802.11 power-save buffering between upstream packets. Restored a lightweight 22 ms interactive keepalive whenever the phone screen is awake (still stopping immediately with the screen off while idle, without triggering Windows echo floods).
+- **Ordered zero-jump pointer sequence & tear-free UI coordinates:** Serialized multi-thread UDP pointer dispatches on Windows, attached monotonic move sequence numbers across both fast UDP and reliable TCP backup streams so delayed or retransmitted TCP packets can never overwrite newer cursor coordinates, and packed pending Android pointer X/Y coordinates atomically so UI vs receive threads never tear frames diagonally.
+- **Display-matched 5 GHz airtime pacing & responsive touchpad fallback:** Tuned Android pointer pacing to match the phone's refresh rate (`6.5 ms` for 120 Hz, `8 ms` for 90 Hz, `10 ms` for 60 Hz) instead of flooding 5 GHz airtime with redundant 3.5 ms frames, eliminated premature 2 ms pacing timer wakes, and tightened Windows touchpad entry delay (`28 ms` / 2 events).
+
+---
+
 # DeskTouch Vision v0.3.34 — Fast-Lane Clicks, Scrolls & Handoffs, Smooth Entry, and Congestion-Free 5 GHz Wireless
 
 DeskTouch Vision eliminates intermittent click, scroll, and edge-switch stalls on 5 GHz wireless connections, removes Android display-mode entry spikes, and stops idle keepalive congestion while keeping screen keep-awake, scroll direction, app-icon scroll protection, and in-app Android updates intact.

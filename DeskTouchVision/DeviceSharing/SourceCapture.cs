@@ -592,7 +592,7 @@ internal sealed class SourceCapture : IDisposable
                 {
                     int missingRaw = ++_hookMovesWithoutRaw;
                     long now = Environment.TickCount64;
-                    if (now - _lastRawMs > 60 && missingRaw >= 3)
+                    if (now - _lastRawMs > 28 && missingRaw >= 2)
                     {
                         _lastFallbackMs = now;
                         double sens = Volatile.Read(ref _pointerSensitivity);

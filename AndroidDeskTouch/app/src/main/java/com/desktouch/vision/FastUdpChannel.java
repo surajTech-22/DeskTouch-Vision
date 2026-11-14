@@ -167,7 +167,7 @@ final class FastUdpChannel implements Closeable {
 
     interface Listener {
         void onProbeConfirmed();
-        void onReverseMove(int x, int y, int lease);
+        void onReverseMove(int x, int y, int lease, int moveSeq);
         default void onReverseClaim(int claim, int dispatchSeq) {}
         default void onReverseButton(int button, int down, int lease, int actionSeq) {}
         default void onReverseWheel(int amount, int horizontal, int lease, int actionSeq) {}
@@ -270,7 +270,7 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_REVERSE_MOVE) {
                     markConfirmed();
-                    listener.onReverseMove(msg.a, msg.b, msg.lease);
+                    listener.onReverseMove(msg.a, msg.b, msg.lease, msg.timestampMs);
                 } else if (msg.op == OP_REVERSE_CLAIM) {
                     markConfirmed();
                     listener.onReverseClaim(msg.a, msg.timestampMs);

@@ -88,7 +88,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int AppliedLease;
         internal int KeyboardFailureReported;
         internal int EnvironmentTargetId; // 0 is the local Windows hub
+        internal readonly object ReverseMoveOrderLock = new();
         internal int ReverseActionSeq;
+        internal int ReverseMoveSeq;
         internal int ReverseClaimDispatchSeq;
         internal bool HubGrantedAcked;
         internal bool HubActiveAcked;
@@ -103,6 +105,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 return 1;
             }
             return seq;
+        }
+
+        internal int NextReverseMoveSeq()
+        {
+            int seq = Interlocked.Increment(ref ReverseMoveSeq);
+            if (seq <= 0)
+            {
+                Interlocked.Exchange(ref ReverseMoveSeq, 1);
+                return 1;
+            }
+            return seq;
+        }
+
+        internal void SetLatestReverseMoveOrdered(ref Packet? slot, Packet move)
+        {
+            lock (ReverseMoveOrderLock)
+            {
+                Packet stamped = move.C > 0 ? move : move with { C = NextReverseMoveSeq() };
+                if (slot == null || stamped.C >= slot.C)
+                    slot = stamped;
+            }
         }
 
         internal int NextReverseClaimDispatchSeq()
@@ -464,7 +487,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     {
         if (countAsFallback)
             Interlocked.Increment(ref relay.Target.TcpFallbackMoves);
-        Interlocked.Exchange(ref relay.LatestMove,packet);
+        relay.Target.SetLatestReverseMoveOrdered(ref relay.LatestMove, packet);
         if(Interlocked.CompareExchange(ref relay.MoveSignaled,1,0)==0 &&
             !relay.InputQueue.Writer.TryWrite(new Packet("move-flush")))
         {
@@ -481,9 +504,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         packet = packet with { C = actionSeq };
         if (_udpHub == null || target.UdpPeer is not { Confirmed: true } peerUdp || lease <= 0)
             return;
-        var flushedMove = target.MovePacer?.TakeThrottledUdpMove();
-        if (flushedMove != null)
-            _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, flushedMove.A, flushedMove.B, lease);
+        target.MovePacer?.FlushThrottledUdpMoveNow();
         var op = packet.Type == "button" ? FastUdpOp.ReverseButton : FastUdpOp.ReverseWheel;
         _udpHub.Send(peerUdp, op, packet.A, packet.B, lease, actionSeq);
     }
@@ -522,7 +543,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private async Task RevokeRelayAsync(RelayLease relay, bool notifySource,
         CancellationToken token)
     {
-        relay.Target.MovePacer?.SetMinIntervalMs(relay.Target.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 4.5);
+        relay.Target.MovePacer?.SetMinIntervalMs(
+            relay.Target.Peer.Platform == "Android"
+                ? RecommendedUdpMinIntervalMs(relay.Target.Peer.Platform, relay.Target.Peer.RefreshHz)
+                : 4.5);
         if (_sessions.ContainsKey(relay.Target.Id))
         {
             try { await SendToAsync(relay.Target,
@@ -668,7 +692,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     {
         if (countAsFallback)
             Interlocked.Increment(ref selected.TcpFallbackMoves);
-        Interlocked.Exchange(ref selected.LatestReverseMove, packet);
+        selected.SetLatestReverseMoveOrdered(ref selected.LatestReverseMove, packet);
         if (Interlocked.CompareExchange(ref selected.ReverseMoveSignaled, 1, 0) == 0 &&
             !selected.ReverseQueue.Writer.TryWrite(new Packet("move-flush")))
         {
@@ -928,7 +952,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var peerUdp = session.UdpPeer;
                 int lease = Volatile.Read(ref session.ActiveReverseLease);
                 return _udpHub != null && peerUdp != null && peerUdp.Confirmed && lease > 0 &&
-                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease);
+                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
+                        move.C > 0 ? move.C : null);
             },
             queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
             sendWarm: () =>
@@ -942,10 +967,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var peerUdp = session.UdpPeer;
                 int lease = Volatile.Read(ref session.ActiveReverseLease);
                 if (_udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
-                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease))
+                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
+                        move.C > 0 ? move.C : null))
                     return;
                 QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
-            });
+            },
+            nextSeq: session.NextReverseMoveSeq);
         if(!_sessions.TryAdd(id,session))
         {
             session.MovePacer?.Dispose();
@@ -986,7 +1013,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
                         session.MovePacer?.SetMinIntervalMs(
-                            session.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 2.5);
+                            RecommendedUdpMinIntervalMs(session.Peer.Platform, session.Peer.RefreshHz));
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1049,6 +1076,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         AppVersion=!string.IsNullOrWhiteSpace(primaryMon.AppVersion)
                             ? primaryMon.AppVersion : session.Peer.AppVersion
                     };
+                    session.MovePacer?.SetMinIntervalMs(
+                        RecommendedUdpMinIntervalMs(session.Peer.Platform, session.Peer.RefreshHz));
                     await PublishEnvironmentAsync(token);
                     PeerListChanged?.Invoke();
                     if(ReferenceEquals(Volatile.Read(ref _selected),session))
@@ -1189,7 +1218,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         // Relayed moves are already paced by the source PC; keep a short
                         // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
                         relay.Target.MovePacer?.SetMinIntervalMs(
-                            relay.Target.Peer.Platform == "Android" ? AndroidUdpMinIntervalMs : 2.0);
+                            relay.Target.Peer.Platform == "Android"
+                                ? RecommendedUdpMinIntervalMs(relay.Target.Peer.Platform, relay.Target.Peer.RefreshHz)
+                                : 2.0);
                         int dispatchSeq = relay.Target.NextReverseClaimDispatchSeq();
                         if (relay.Target.UdpPeer is { HasEndpoint: true } relayUdp && _udpHub != null)
                         {
@@ -1557,8 +1588,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
-    internal const double AndroidUdpMinIntervalMs = 3.5;
+    internal const double AndroidUdpMinIntervalMs = 7.0;
     internal const long AndroidWarmEchoMinIntervalMs = 240;
+
+    internal static double RecommendedUdpMinIntervalMs(string? platform, int? refreshHz)
+    {
+        if (!string.Equals(platform, "Android", StringComparison.Ordinal))
+            return 2.5;
+        if (refreshHz is >= 115) return 6.5;
+        if (refreshHz is >= 85) return 8.0;
+        if (refreshHz is > 0 and < 85) return 10.0;
+        return AndroidUdpMinIntervalMs;
+    }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>
         string.Equals(platform, "Android", StringComparison.Ordinal);

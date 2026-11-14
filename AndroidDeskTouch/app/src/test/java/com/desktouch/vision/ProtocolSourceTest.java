@@ -375,7 +375,37 @@ public final class ProtocolSourceTest {
         assertTrue(topIconScrollUp.sy>520 && topIconScrollUp.ey<topIconScrollUp.sy);
     }
     @Test public void interactiveKeepaliveIntervalStaysWithinWirelessWakeThreshold(){
-        assertTrue(DeskTouchSession.INTERACTIVE_KEEPALIVE_MS>=45 &&
-            DeskTouchSession.INTERACTIVE_KEEPALIVE_MS<=70);
+        assertTrue(DeskTouchSession.INTERACTIVE_KEEPALIVE_MS>=18 &&
+            DeskTouchSession.INTERACTIVE_KEEPALIVE_MS<=30);
+        // Active phone control must keep upstream TX keepalive running so the phone
+        // radio never enters power-save sleep while receiving downstream moves.
+        assertTrue(DeskTouchSession.shouldSendInteractiveKeepalive(
+            true,true,true,true,true,true));
+        assertTrue(DeskTouchSession.shouldSendInteractiveKeepalive(
+            true,true,true,true,false,true));
+        assertTrue(DeskTouchSession.shouldSendInteractiveKeepalive(
+            true,true,true,true,true,false));
+        assertFalse(DeskTouchSession.shouldSendInteractiveKeepalive(
+            true,true,true,true,false,false));
+        assertFalse(DeskTouchSession.shouldSendInteractiveKeepalive(
+            true,true,false,true,true,true));
+    }
+    @Test public void moveSequenceDedupAndPackedCoordsPreventStaleTcpAndTearing(){
+        DeskTouchSession.ReverseControlDeduplicator dedup=
+            new DeskTouchSession.ReverseControlDeduplicator();
+        assertTrue(dedup.tryAcceptMove(100));
+        assertTrue(dedup.tryAcceptMove(105));
+        assertFalse(dedup.tryAcceptMove(104)); // late TCP packet after newer UDP move
+        assertFalse(dedup.tryAcceptMove(105)); // duplicate sequence
+        assertTrue(dedup.tryAcceptMove(106));  // newer settle update
+        assertTrue(dedup.tryAcceptMove(0));    // unsequenced legacy hub fallback
+
+        long packed=DeskTouchAccessibilityService.packCoords(1079,2399);
+        assertEquals(1079,DeskTouchAccessibilityService.unpackX(packed));
+        assertEquals(2399,DeskTouchAccessibilityService.unpackY(packed));
+
+        long edge=DeskTouchAccessibilityService.packCoords(-12,0);
+        assertEquals(-12,DeskTouchAccessibilityService.unpackX(edge));
+        assertEquals(0,DeskTouchAccessibilityService.unpackY(edge));
     }
 }

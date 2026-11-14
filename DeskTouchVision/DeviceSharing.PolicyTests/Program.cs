@@ -208,6 +208,33 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
             "Clicks/scrolls must flush pending throttled UDP move once without re-sending over TCP");
     }
 
+    int seqCounter = 0;
+    var orderedUdpMoves = new List<Packet>();
+    using (var orderedPacer = new FastMovePacer(
+        canSendUdp: () => true,
+        sendUdp: pkt => { orderedUdpMoves.Add(pkt); return true; },
+        queueReliableTcp: _ => { },
+        nextSeq: () => Interlocked.Increment(ref seqCounter)))
+    {
+        orderedPacer.SetMinIntervalMs(6.5);
+        orderedPacer.TryHandleMove(new Packet("move", 100, 200));
+        orderedPacer.TryHandleMove(new Packet("move", 150, 260));
+        Check(orderedPacer.FlushThrottledUdpMoveNow(),
+            "Pre-click FlushThrottledUdpMoveNow must dispatch pending throttled move via ordered UDP gate");
+        Check(orderedUdpMoves.Count == 2 &&
+            orderedUdpMoves[0].C == 1 &&
+            orderedUdpMoves[1].C == 2 && orderedUdpMoves[1].A == 150 &&
+            orderedPacer.TakePendingReliableSync(skipIfUdpDelivered: true) == null,
+            "Ordered move pacing must stamp monotonic move sequences and drain throttled buffer");
+    }
+
+    Check(Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Android", 120) - 6.5) < 0.01 &&
+        Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Android", 90) - 8.0) < 0.01 &&
+        Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Android", 60) - 10.0) < 0.01 &&
+        Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Android", null) - ReceiverServer.AndroidUdpMinIntervalMs) < 0.01 &&
+        Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Windows", 144) - 2.5) < 0.01,
+        "RecommendedUdpMinIntervalMs must pace Android frames cleanly for display refresh rates without saturating 5 GHz airtime");
+
     byte[] extSrvKey = Enumerable.Range(21, 32).Select(x => (byte)x).ToArray();
     using (var srvCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: true))
     using (var cliCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: false))
@@ -240,9 +267,9 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
     Check(ReceiverServer.ShouldEchoAndroidWarm("Android") &&
         !ReceiverServer.ShouldEchoAndroidWarm("Windows") &&
         !ReceiverServer.ShouldEchoAndroidWarm(null) &&
-        ReceiverServer.AndroidUdpMinIntervalMs <= 4.0 &&
-        ReceiverServer.AndroidUdpMinIntervalMs >= 2.0,
-        "Android fast lane keeps smooth pacing and throttled interactive wireless echo");
+        ReceiverServer.AndroidUdpMinIntervalMs <= 10.0 &&
+        ReceiverServer.AndroidUdpMinIntervalMs >= 5.0,
+        "Android fast lane keeps display-paced 5 GHz timing and throttled interactive wireless echo");
 
     using var hub = new FastUdpHub();
     var tempPeer = hub.AddPeer(99, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0))!;

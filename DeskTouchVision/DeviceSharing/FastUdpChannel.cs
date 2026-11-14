@@ -413,12 +413,12 @@ internal sealed class FastUdpClient : IDisposable
             Send(FastUdpOp.Probe, LocalPort, 0, 0);
     }
 
-    internal bool Send(FastUdpOp op, int a, int b, int lease)
+    internal bool Send(FastUdpOp op, int a, int b, int lease, int? payloadTag = null)
     {
         if (_disposed) return false;
         lock (_sendBuffer)
         {
-            int len = _codec.Seal(op, a, b, lease, Environment.TickCount, _sendBuffer);
+            int len = _codec.Seal(op, a, b, lease, payloadTag ?? Environment.TickCount, _sendBuffer);
             if (len <= 0) return false;
             try
             {
@@ -499,20 +499,24 @@ internal sealed class FastUdpClient : IDisposable
 internal sealed class FastMovePacer : IDisposable
 {
     private const double MinUdpIntervalMs = 1.5;
-    private const int ThrottleFlushDelayMs = 2;
     private const int TrailingTcpSyncDelayMs = 130;
-    private const int WarmKeepaliveIntervalMs = 35;
+    private const int WarmKeepaliveIntervalMs = 22;
     private const int WarmCooldownSeconds = 4;
 
     private readonly object _gate = new();
+    private readonly object _udpSendGate = new();
     private readonly Func<bool> _canSendUdp;
     private readonly Func<Packet, bool> _sendUdp;
     private readonly Action<Packet> _queueReliableTcp;
     private readonly Action<Packet> _queueTrailingSync;
     private readonly Action? _sendWarm;
+    private readonly Func<int>? _nextSeq;
     private readonly System.Threading.Timer _timer;
     private Packet? _throttledUdp;
     private Packet? _pendingTcpSync;
+    private long _nextMoveOrder;
+    private long _throttledOrder;
+    private long _lastSentUdpOrder;
     private long _lastMoveUdpTicks;
     private long _lastMoveTicks;
     private long _lastWarmTicks;
@@ -525,25 +529,43 @@ internal sealed class FastMovePacer : IDisposable
         Func<Packet, bool> sendUdp,
         Action<Packet> queueReliableTcp,
         Action? sendWarm = null,
-        Action<Packet>? queueTrailingSync = null)
+        Action<Packet>? queueTrailingSync = null,
+        Func<int>? nextSeq = null)
     {
         _canSendUdp = canSendUdp;
         _sendUdp = sendUdp;
         _queueReliableTcp = queueReliableTcp;
         _queueTrailingSync = queueTrailingSync ?? queueReliableTcp;
         _sendWarm = sendWarm;
+        _nextSeq = nextSeq;
         _timer = new System.Threading.Timer(OnTimer, null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    private Packet StampSeq(Packet move) =>
+        _nextSeq != null && move.C <= 0 ? move with { C = _nextSeq() } : move;
+
+    private bool DispatchUdpMove(Packet move, long order)
+    {
+        lock (_udpSendGate)
+        {
+            if (_disposed || order <= _lastSentUdpOrder)
+                return false;
+            _lastSentUdpOrder = order;
+            return _sendUdp(StampSeq(move));
+        }
     }
 
     internal bool TryHandleMove(Packet move)
     {
         if (!_canSendUdp()) return false;
         bool sendNow = false;
+        long order;
         lock (_gate)
         {
             if (_disposed) return false;
             long now = Stopwatch.GetTimestamp();
             _lastMoveTicks = now;
+            order = ++_nextMoveOrder;
             double minInterval = ActiveMinIntervalMsLocked();
             double elapsedMs = _lastMoveUdpTicks == 0
                 ? double.MaxValue
@@ -551,6 +573,7 @@ internal sealed class FastMovePacer : IDisposable
             if (elapsedMs >= minInterval)
             {
                 _throttledUdp = null;
+                _throttledOrder = 0;
                 _pendingTcpSync = move;
                 _lastMoveUdpTicks = now;
                 sendNow = true;
@@ -558,15 +581,13 @@ internal sealed class FastMovePacer : IDisposable
             else
             {
                 _throttledUdp = move;
+                _throttledOrder = order;
                 _pendingTcpSync = move;
             }
             UpdateTimerLocked();
         }
-        if (sendNow)
-        {
-            if (_sendUdp(move))
-                Interlocked.Increment(ref _udpDirectCount);
-        }
+        if (sendNow && DispatchUdpMove(move, order))
+            Interlocked.Increment(ref _udpDirectCount);
         return true;
     }
 
@@ -594,24 +615,48 @@ internal sealed class FastMovePacer : IDisposable
             var packet = _throttledUdp;
             if (packet == null) return null;
             _throttledUdp = null;
+            _throttledOrder = 0;
             _lastMoveUdpTicks = Stopwatch.GetTimestamp();
             UpdateTimerLocked();
             return packet;
         }
     }
 
-    internal Packet? TakePendingReliableSync(bool skipIfUdpDelivered = false)
+    internal bool FlushThrottledUdpMoveNow()
     {
+        Packet? move;
+        long order;
         lock (_gate)
         {
-            var packet = skipIfUdpDelivered && _canSendUdp()
+            if (_disposed || !_canSendUdp() || _throttledUdp == null) return false;
+            move = _throttledUdp;
+            order = _throttledOrder;
+            _throttledUdp = null;
+            _throttledOrder = 0;
+            _lastMoveUdpTicks = Stopwatch.GetTimestamp();
+            UpdateTimerLocked();
+        }
+        if (!DispatchUdpMove(move, order)) return false;
+        Interlocked.Increment(ref _udpFlushedCount);
+        return true;
+    }
+
+    internal Packet? TakePendingReliableSync(bool skipIfUdpDelivered = false)
+    {
+        Packet? packet;
+        lock (_gate)
+        {
+            packet = skipIfUdpDelivered && _canSendUdp()
                 ? _throttledUdp
                 : (_throttledUdp ?? _pendingTcpSync);
             _throttledUdp = null;
+            _throttledOrder = 0;
             _pendingTcpSync = null;
             UpdateTimerLocked();
-            return packet;
         }
+        if (packet == null) return null;
+        lock (_udpSendGate)
+            return StampSeq(packet);
     }
 
     internal void ClearPending()
@@ -619,6 +664,7 @@ internal sealed class FastMovePacer : IDisposable
         lock (_gate)
         {
             _throttledUdp = null;
+            _throttledOrder = 0;
             _pendingTcpSync = null;
             UpdateTimerLocked();
         }
@@ -650,6 +696,7 @@ internal sealed class FastMovePacer : IDisposable
     private void OnTimer(object? state)
     {
         Packet? udpMove = null;
+        long udpOrder = 0;
         Packet? tcpSync = null;
         bool isTrailingSync = false;
         bool sendWarm = false;
@@ -670,7 +717,9 @@ internal sealed class FastMovePacer : IDisposable
                     if (udpElapsed >= minInterval - 0.5)
                     {
                         udpMove = _throttledUdp;
+                        udpOrder = _throttledOrder;
                         _throttledUdp = null;
+                        _throttledOrder = 0;
                         _lastMoveUdpTicks = now;
                     }
                 }
@@ -678,6 +727,7 @@ internal sealed class FastMovePacer : IDisposable
                 {
                     tcpSync = _throttledUdp;
                     _throttledUdp = null;
+                    _throttledOrder = 0;
                     _pendingTcpSync = null;
                 }
             }
@@ -708,19 +758,21 @@ internal sealed class FastMovePacer : IDisposable
             UpdateTimerLocked();
         }
 
-        if (udpMove != null && _sendUdp(udpMove))
+        if (udpMove != null && DispatchUdpMove(udpMove, udpOrder))
             Interlocked.Increment(ref _udpFlushedCount);
         if (tcpSync != null)
         {
+            Packet stampedSync;
+            lock (_udpSendGate)
+            {
+                stampedSync = StampSeq(tcpSync);
+                if (isTrailingSync)
+                    _queueTrailingSync(stampedSync);
+                else
+                    _queueReliableTcp(stampedSync);
+            }
             if (isTrailingSync)
-            {
-                _queueTrailingSync(tcpSync);
                 Interlocked.Increment(ref _trailingTcpSyncCount);
-            }
-            else
-            {
-                _queueReliableTcp(tcpSync);
-            }
         }
         if (sendWarm) _sendWarm!();
     }
@@ -735,8 +787,7 @@ internal sealed class FastMovePacer : IDisposable
             double elapsedMs = _lastMoveUdpTicks == 0
                 ? minInterval
                 : (Stopwatch.GetTimestamp() - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
-            int remainingMs = (int)Math.Ceiling(Math.Max(1.0, minInterval - elapsedMs));
-            dueMs = Math.Min(ThrottleFlushDelayMs, remainingMs);
+            dueMs = (int)Math.Ceiling(Math.Max(1.0, minInterval - elapsedMs));
         }
         else
         {

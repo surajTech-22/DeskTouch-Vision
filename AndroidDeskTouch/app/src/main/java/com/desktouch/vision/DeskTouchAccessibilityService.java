@@ -53,7 +53,13 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private WindowManager.LayoutParams compactPointerParams;
     private volatile int displayWidth=1,displayHeight=1;
     private volatile int x,y;
-    private volatile int pendingX,pendingY;
+    private final java.util.concurrent.atomic.AtomicLong pendingPos =
+        new java.util.concurrent.atomic.AtomicLong();
+    static long packCoords(int px,int py){
+        return (((long)px)<<32)|(py & 0xFFFFFFFFL);
+    }
+    static int unpackX(long packed){ return (int)(packed>>>32); }
+    static int unpackY(long packed){ return (int)packed; }
     private volatile long pendingArrivalNanos;
     private final java.util.concurrent.atomic.AtomicInteger coalescedMoves=
         new java.util.concurrent.atomic.AtomicInteger();
@@ -434,8 +440,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         service.remoteActive=true;
         // Retain the newest position on fast mice/touchpads instead of
         // filling Android's UI queue with hundreds of obsolete moves.
-        service.pendingX=px;
-        service.pendingY=py;
+        service.pendingPos.set(packCoords(px,py));
         service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true)){
@@ -447,7 +452,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         return true;
     }
     private void flushPointer(){
-        int px=pendingX,py=pendingY;
+        long packed=pendingPos.get();
+        int px=unpackX(packed),py=unpackY(packed);
         long arrival=pendingArrivalNanos;
         long now=SystemClock.elapsedRealtimeNanos();
         if(remoteActive&&ready(this))showPointer(px,py);
@@ -471,15 +477,19 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(remoteActive&&cursorRoot!=null&&ack!=null&&ready(this))ack.run();
         if(remoteActive&&ready(this)&&held&&activeStroke!=null&&!gestureRunning&&!pendingLift)
             continueDragIfReady();
-        if(remoteActive&&ready(this)&&(px!=pendingX||py!=pendingY) &&
+        long latestPacked=pendingPos.get();
+        if(remoteActive&&ready(this)&&
+            (unpackX(latestPacked)!=px||unpackY(latestPacked)!=py) &&
             moveScheduled.compareAndSet(false,true))
             schedulePointerFrame();
     }
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
         // pointer position, never the previous animation frame.
-        if(remoteActive && (pendingX!=x || pendingY!=y || !pointerVisible()))
-            showPointer(pendingX,pendingY);
+        long latest=pendingPos.get();
+        int lx=unpackX(latest),ly=unpackY(latest);
+        if(remoteActive && (lx!=x || ly!=y || !pointerVisible()))
+            showPointer(lx,ly);
         Runnable ack=pendingApplied;
         pendingApplied=null;
         if(cursorRoot!=null && ack!=null && remoteActive)ack.run();

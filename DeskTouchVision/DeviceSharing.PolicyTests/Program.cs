@@ -1819,6 +1819,24 @@ await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
 uiThread.Join();
 Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");
 
+Check(SourceCapture.NextKeyboardHealthAction(false, 0, 2, false, false) == SourceCapture.KeyboardHookAction.None,
+    "Inactive remote control must never refresh or warn about keyboard hooks");
+Check(SourceCapture.NextKeyboardHealthAction(true, 1, 5, false, false) == SourceCapture.KeyboardHookAction.None,
+    "Keyboard hook receiving events must never trigger preemption refresh");
+Check(SourceCapture.NextKeyboardHealthAction(true, 0, 1, false, false) == SourceCapture.KeyboardHookAction.None &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 2, false, false) == SourceCapture.KeyboardHookAction.RefreshHook &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 3, true, false) == SourceCapture.KeyboardHookAction.None &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 4, true, false) == SourceCapture.KeyboardHookAction.WarnBlocked &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 5, true, true) == SourceCapture.KeyboardHookAction.None,
+    "Keyboard health policy must refresh displaced hook once and warn once if still blocked");
+Check(SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5B) &&
+    SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5C) &&
+    !SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x41) &&
+    !SourceCapture.ShouldIgnoreRemoteWindowsKey(false, 0x5B) &&
+    !SourceCapture.ShouldIgnoreRemoteWindowsKey(false, 0x5C),
+    "Android target ignores local Windows meta keys while Windows target preserves them");
+Console.WriteLine("PASS: Keyboard hook self-healing and Windows meta key policies behave consistently.");
+
 internal sealed class RecordingInputSession : IInputSession
 {
     internal List<Packet> Packets { get; } = new();

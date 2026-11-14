@@ -88,9 +88,27 @@ internal sealed class SourceCapture : IDisposable
         bool alt,bool shift) =>
         down && vk == 0x4D && ctrl && alt && !shift;
 
+    internal enum KeyboardHookAction { None, RefreshHook, WarnBlocked }
+
+    internal static KeyboardHookAction NextKeyboardHealthAction(
+        bool remoteActive, int hookEvents, int rawKeyEvents,
+        bool alreadyRefreshed, bool alreadyWarned)
+    {
+        if (!remoteActive || hookEvents > 0) return KeyboardHookAction.None;
+        if (rawKeyEvents >= 2 && !alreadyRefreshed) return KeyboardHookAction.RefreshHook;
+        if (rawKeyEvents >= 4 && alreadyRefreshed && !alreadyWarned)
+            return KeyboardHookAction.WarnBlocked;
+        return KeyboardHookAction.None;
+    }
+
+    internal static bool ShouldIgnoreRemoteWindowsKey(bool destinationIsAndroid, uint vkCode) =>
+        destinationIsAndroid && (vkCode == 0x5B || vkCode == 0x5C);
+
     private System.Windows.Forms.Timer? _slowEdgeTimer;
     private bool _controlPressed, _altPressed, _shiftPressed;
     private int _remoteModifierDownMask;
+    private int _remoteKeyHookCount, _remoteRawKeyCount;
+    private bool _keyHookRefreshedThisLease, _keyHookBlockedWarnedThisLease;
     private bool _suppressMobileShortcutUp;
     private bool _directShortcutEntry;
     private double _remoteFracX, _remoteFracY;
@@ -265,6 +283,40 @@ internal sealed class SourceCapture : IDisposable
         }
     }
 
+    private void RefreshKeyboardHook()
+    {
+        if (!IsArmed) return;
+        IntPtr old = _keyHook;
+        _keyHook = IntPtr.Zero;
+        if (old != IntPtr.Zero) Win.UnhookWindowsHookEx(old);
+        IntPtr module = Win.GetModuleHandle(null);
+        _keyHook = Win.SetWindowsHookEx(Win.WH_KEYBOARD_LL, _keyboardDelegate, module, 0);
+        if (_keyHook == IntPtr.Zero)
+            _status("Unable to refresh Windows keyboard capture hook after another app preempted input.");
+        else
+            _status("Refreshed Windows keyboard capture after another app preempted key delivery.");
+    }
+
+    private void ObserveRemoteRawKeyboardSignal()
+    {
+        int rawCount = Interlocked.Increment(ref _remoteRawKeyCount);
+        int hookCount = Volatile.Read(ref _remoteKeyHookCount);
+        switch (NextKeyboardHealthAction(RemoteActive, hookCount, rawCount,
+            _keyHookRefreshedThisLease, _keyHookBlockedWarnedThisLease))
+        {
+            case KeyboardHookAction.RefreshHook:
+                _keyHookRefreshedThisLease = true;
+                RefreshKeyboardHook();
+                break;
+            case KeyboardHookAction.WarnBlocked:
+                _keyHookBlockedWarnedThisLease = true;
+                var (_, fgName) = Win.InspectForegroundProtection();
+                string appHint = string.IsNullOrWhiteSpace(fgName) ? "" : $" ({fgName})";
+                _status($"Windows or security software is blocking keyboard capture for the active app{appHint}. Focus a regular window or press the Windows key before typing.");
+                break;
+        }
+    }
+
     internal static IReadOnlyList<int> ModifiersForMask(int mask)
     {
         var vks = new List<int>(3);
@@ -427,11 +479,28 @@ internal sealed class SourceCapture : IDisposable
         _remoteFracX = 0;
         _remoteFracY = 0;
         _androidReturnPushPx = 0;
+        _controlPressed = (Win.GetAsyncKeyState(0x11) & 0x8000) != 0;
+        _altPressed = (Win.GetAsyncKeyState(0x12) & 0x8000) != 0;
+        _shiftPressed = (Win.GetAsyncKeyState(0x10) & 0x8000) != 0;
+        Interlocked.Exchange(ref _remoteModifierDownMask, 0);
+        _suppressMobileShortcutUp = false;
+        Interlocked.Exchange(ref _remoteKeyHookCount, 0);
+        Interlocked.Exchange(ref _remoteRawKeyCount, 0);
+        _keyHookRefreshedThisLease = false;
+        _keyHookBlockedWarnedThisLease = false;
+        if (_keyHook == IntPtr.Zero) RefreshKeyboardHook();
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
         long totalMs = Math.Max(0, now - Volatile.Read(ref _claimStarted));
         long applyMs = Math.Max(0, now - Volatile.Read(ref _claimGrantedAtMs));
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active ({totalMs}ms total, {applyMs}ms apply).");
+        var (fgProtected, fgName) = Win.InspectForegroundProtection();
+        if (fgProtected)
+        {
+            _keyHookBlockedWarnedThisLease = true;
+            string appHint = string.IsNullOrWhiteSpace(fgName) ? "administrator or protected app" : fgName;
+            _status($"Windows is protecting the active app ({appHint}), so keyboard handoff waits until you focus a regular window or press the Windows key.");
+        }
     }
 
     internal void ReceiverNativePriority(int lease)
@@ -693,6 +762,7 @@ internal sealed class SourceCapture : IDisposable
         }
         if (RemoteActive)
         {
+            Interlocked.Increment(ref _remoteKeyHookCount);
             int modMask = key.vkCode switch
             {
                 0x11 or 0xA2 or 0xA3 => 1,
@@ -711,12 +781,15 @@ internal sealed class SourceCapture : IDisposable
                 else
                     _remoteModifierDownMask &= ~modMask;
             }
+            bool targetIsAndroid = DestinationIsAndroid?.Invoke() == true;
+            if (ShouldIgnoreRemoteWindowsKey(targetIsAndroid, key.vkCode))
+                return (IntPtr)1;
             // Android's Accessibility API is an editable-field/IME API, not
             // raw hardware keyboard injection. Send printable characters
             // through the authenticated reverse-text route so Chrome/WebView
             // can commit them using the active Android InputConnection.
             // Modifier, Ctrl/Alt shortcuts, and navigation keys use reverse-key.
-            if (DestinationIsAndroid?.Invoke() == true && !_controlPressed && !_altPressed)
+            if (targetIsAndroid && !_controlPressed && !_altPressed)
             {
                 var printable = AndroidPrintableKey((int)key.vkCode, _shiftPressed);
                 if (printable != null)
@@ -743,9 +816,17 @@ internal sealed class SourceCapture : IDisposable
         uint headerSize = (uint)Marshal.SizeOf<Win.RAWINPUTHEADER>();
         uint size = RawBufferSize;
         uint read = Win.GetRawInputData(lParam, Win.RID_INPUT, memory, ref size, headerSize);
-        if (read == uint.MaxValue || read < (uint)Marshal.SizeOf<Win.RAWINPUT>()) return;
+        if (read == uint.MaxValue || read < headerSize) return;
+        var header = Marshal.PtrToStructure<Win.RAWINPUTHEADER>(memory);
+        if (header.Type == 1 && header.Device != IntPtr.Zero)
+        {
+            if (RemoteActive) ObserveRemoteRawKeyboardSignal();
+            return;
+        }
+        if (read < (uint)Marshal.SizeOf<Win.RAWINPUT>() || header.Type != 0)
+            return;
         var input = Marshal.PtrToStructure<Win.RAWINPUT>(memory);
-        if (input.Header.Type != 0 || (input.Mouse.Flags & 1) != 0) return;
+        if ((input.Mouse.Flags & 1) != 0) return;
         if (RemoteActive)
         {
             long now = Environment.TickCount64;

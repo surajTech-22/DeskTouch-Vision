@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.38 — Keyboard Hook Self-Healing, Modifier Resync & Protected-Window Diagnostics
+
+DeskTouch Vision automatically recovers Windows keyboard capture if another utility preempts global input hooks, prevents stuck pre-handoff modifier keys from blocking phone typing, eliminates false unavailable warnings when pressing the Windows key while controlling an Android phone, and reports when Windows or security keyboard filters withhold keystrokes for an active protected window.
+
+- **Automatic keyboard hook preemption recovery:** Detects when physical keyboard activity arrives in remote mode while DeskTouch's low-level keyboard hook receives zero events and automatically re-registers the hook to reclaim top-of-chain delivery without requiring a focus toggle.
+- **Pre-handoff modifier resync & clean Android meta handling:** Resynchronizes local `Ctrl`/`Alt`/`Shift` state from Windows when remote authority confirms so missed pre-handoff key-up events no longer block Android printable text routing, and suppresses unneeded Windows-key round trips that triggered false `Android keyboard input unavailable` warnings on Android targets.
+- **Clear protected-window and antivirus-shield diagnostics:** Inspects active foreground protection read-only on handoff and when key delivery remains blocked after hook refresh, surfacing actionable status and log notices naming the active protected window when Windows UIPI or a security keyboard filter withholds keyboard capture.
+
+---
+
 # DeskTouch Vision v0.3.37 — Instant Cursor Handoff Recovery, True Transit Jitter & Crisp High-Refresh Tracking
 
 DeskTouch Vision eliminates "Handoff acknowledgement timed out" failures across reconnects and single-packet wireless drops, separates genuine network transit jitter from normal cursor pauses, and preserves crisp native refresh-rate responsiveness across phones and Windows hosts.

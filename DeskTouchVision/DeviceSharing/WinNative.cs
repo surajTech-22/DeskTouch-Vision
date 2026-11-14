@@ -40,6 +40,70 @@ internal static class Win
     internal static extern IntPtr GetModuleHandle(string? moduleName);
     [DllImport("user32.dll")]
     internal static extern short GetAsyncKeyState(int vkCode);
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr processHandle,
+        uint desiredAccess, out IntPtr tokenHandle);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_ELEVATION { public uint TokenIsElevated; }
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(IntPtr tokenHandle,
+        int tokenInformationClass, out TOKEN_ELEVATION tokenInformation,
+        uint tokenInformationLength, out uint returnLength);
+
+    /// <summary>
+    /// Checks without modifying windows or bypassing UIPI whether the active
+    /// Windows foreground window is elevated/protected from standard hooks.
+    /// </summary>
+    internal static (bool Protected, string? ProcessName) InspectForegroundProtection()
+    {
+        const uint ProcessQueryLimitedInformation = 0x1000;
+        const uint TokenQuery = 0x0008;
+        const int TokenElevationClass = 20;
+        try
+        {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return (false, null);
+            _ = GetWindowThreadProcessId(hwnd, out uint pid);
+            if (pid == 0) return (false, null);
+            string? name = null;
+            try
+            {
+                using var procInfo = System.Diagnostics.Process.GetProcessById((int)pid);
+                name = procInfo.ProcessName;
+            }
+            catch { }
+            IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+            if (process == IntPtr.Zero) return (true, name);
+            try
+            {
+                if (!OpenProcessToken(process, TokenQuery, out IntPtr token))
+                    return (true, name);
+                try
+                {
+                    if (!GetTokenInformation(token, TokenElevationClass,
+                        out TOKEN_ELEVATION elevation,
+                        (uint)Marshal.SizeOf<TOKEN_ELEVATION>(), out _))
+                        return (true, name);
+                    return (elevation.TokenIsElevated != 0, name);
+                }
+                finally { CloseHandle(token); }
+            }
+            finally { CloseHandle(process); }
+        }
+        catch { return (false, null); }
+    }
     [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW",
         CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

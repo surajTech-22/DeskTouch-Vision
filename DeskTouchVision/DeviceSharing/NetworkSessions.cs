@@ -92,8 +92,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ReverseActionSeq;
         internal int ReverseMoveSeq;
         internal int ReverseClaimDispatchSeq;
-        internal bool HubGrantedAcked;
-        internal bool HubActiveAcked;
+        internal volatile bool HubGrantedAcked;
+        internal volatile bool HubActiveAcked;
+        internal int PendingFirstCursorAck;
         internal long LastAndroidWarmEchoTicks;
         internal int LiveRefreshHz;
         internal int LiveFrameTenthsMs;
@@ -415,7 +416,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if (peer is { Confirmed: true } && _udpHub != null)
                     {
                         int activeLease = Volatile.Read(ref session.ActiveReverseLease);
-                        long probeGapMs = (activeLease > 0 || session.Lease > 0) ? 180 : 650;
+                        long probeGapMs = (activeLease > 0 || session.Lease > 0) ? 100 : 600;
                         if (nowMs - peer.LastLinkPingMs >= probeGapMs)
                         {
                             peer.LastLinkPingMs = nowMs;
@@ -596,6 +597,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (!_relayBySource.Remove(sourceId, out var relay)) return null;
             _relayByTarget.Remove(relay.Target.Id);
             Volatile.Write(ref relay.Target.ActiveReverseLease, 0);
+            Volatile.Write(ref relay.Target.PendingFirstCursorAck, 0);
             relay.Target.MovePacer?.SetWarmActive(false);
             relay.Target.MovePacer?.ClearPending();
             Interlocked.Exchange(ref relay.LatestMove,null);
@@ -807,6 +809,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _hubClaims[id]=packet.A;
                 selected.HubGrantedAcked = false;
                 selected.HubActiveAcked = false;
+                Volatile.Write(ref selected.PendingFirstCursorAck, 1);
                 Volatile.Write(ref selected.ActiveReverseLease, packet.A);
                 selected.MovePacer?.SetWarmActive(true);
                 int dispatchSeq = selected.NextReverseClaimDispatchSeq();
@@ -832,6 +835,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _hubClaims.Remove(id);
                     selected.HubGrantedAcked = false;
                     selected.HubActiveAcked = false;
+                    Volatile.Write(ref selected.PendingFirstCursorAck, 0);
                     Volatile.Write(ref selected.ActiveReverseLease, 0);
                     selected.MovePacer?.SetWarmActive(false);
                     selected.MovePacer?.ClearPending();
@@ -1035,11 +1039,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 var peerUdp = session.UdpPeer;
                 int lease = Volatile.Read(ref session.ActiveReverseLease);
-                if (_udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
+                bool udpDelivered = _udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
                     _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
-                        move.C > 0 ? move.C : null))
-                    return;
-                QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
+                        move.C > 0 ? move.C : null);
+                if (!udpDelivered || Volatile.Read(ref session.PendingFirstCursorAck) != 0)
+                    QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
             },
             nextSeq: session.NextReverseMoveSeq);
         if(!_sessions.TryAdd(id,session))
@@ -1297,6 +1301,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                                 Target=destination,Claim=p.A };
                             _relayBySource.Add(session.Id,relay);
                             _relayByTarget.Add(destination.Id,relay);
+                            Volatile.Write(ref destination.PendingFirstCursorAck, 1);
                             _=Task.Run(()=>RelayForwardLoopAsync(relay,_cancel.Token));
                         }
                     }
@@ -1478,6 +1483,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 _hubClaims.Remove(id);
                 Volatile.Write(ref session.ActiveReverseLease, 0);
+                Volatile.Write(ref session.PendingFirstCursorAck, 0);
             }
             session.MovePacer?.Dispose();
             session.HighResTimer.Dispose();
@@ -1555,6 +1561,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     if (!relay.Granted || relay.ActiveAcked) return;
                     relay.ActiveAcked = true;
+                    Volatile.Write(ref session.PendingFirstCursorAck, 0);
                     forwardRelay = true;
                 }
                 else
@@ -1562,6 +1569,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     clearRelay = true;
                     forwardRelay = true;
                     Volatile.Write(ref session.ActiveReverseLease, 0);
+                    Volatile.Write(ref session.PendingFirstCursorAck, 0);
                     session.MovePacer?.SetWarmActive(false);
                     session.MovePacer?.ClearPending();
                     _relayBySource.Remove(relay.Source.Id);
@@ -1583,6 +1591,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     if (!matchesClaim || session.HubActiveAcked) return;
                     session.HubActiveAcked = true;
+                    Volatile.Write(ref session.PendingFirstCursorAck, 0);
                 }
                 else
                 {
@@ -1591,6 +1600,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         _hubClaims.Remove(session.Id);
                         session.HubGrantedAcked = false;
                         session.HubActiveAcked = false;
+                        Volatile.Write(ref session.PendingFirstCursorAck, 0);
                         Volatile.Write(ref session.ActiveReverseLease, 0);
                         session.MovePacer?.SetWarmActive(false);
                         session.MovePacer?.ClearPending();
@@ -1728,7 +1738,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (isAndroid)
         {
             if (liveRefreshHz is >= 24)
-                baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.45), 5.5, 13.0);
+                baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.55), 4.2, 13.0);
             else
                 baseMs = AndroidUdpMinIntervalMs;
         }
@@ -1744,14 +1754,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
         double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
         double floorMs = isAndroid ? 4.2 : 1.8;
-        if (rttMs <= 5.0 && queueDelay <= 2.0 && jitterMs <= 2.5 && lossPermille < 2.0)
-            return Math.Max(floorMs, baseMs * 0.82);
+        if (rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
+            return Math.Max(floorMs, baseMs * 0.85);
 
-        double rttPressure = Math.Max(0.0, rttMs - 14.0) * 0.16;
-        double bloatPressure = Math.Max(0.0, queueDelay - 6.0) * 0.34;
-        double jitterPressure = Math.Max(0.0, jitterMs - 4.0) * 0.28;
-        double lossPressure = Math.Max(0.0, lossPermille - 5.0) * 0.22;
-        return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, 38.0);
+        double rttPressure = Math.Max(0.0, rttMs - 14.0) * 0.14;
+        double bloatPressure = Math.Max(0.0, queueDelay - 6.0) * 0.30;
+        double jitterPressure = Math.Max(0.0, jitterMs - 5.0) * 0.24;
+        double lossPressure = Math.Max(0.0, lossPermille - 5.0) * 0.20;
+        return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, 32.0);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>

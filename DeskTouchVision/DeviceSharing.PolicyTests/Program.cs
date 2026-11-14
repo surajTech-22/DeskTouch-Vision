@@ -239,14 +239,40 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
     // and live network conditions (clean wired/fast link vs spiky/lossy wireless).
     {
         double wired144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, rttMs: 2.0, minRttMs: 2.0, jitterMs: 0.5, lossPermille: 0);
+        double cleanWifi144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, rttMs: 5.5, minRttMs: 3.5, jitterMs: 2.5, lossPermille: 0);
         double normal50 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 50, rttMs: 10.0, minRttMs: 9.0, jitterMs: 2.0, lossPermille: 0);
         double busyWiFi = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 120, rttMs: 46.0, minRttMs: 7.0, jitterMs: 19.0, lossPermille: 24.0);
         double winWired = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Windows", 144, rttMs: 1.8, minRttMs: 1.8, jitterMs: 0.4, lossPermille: 0);
         Check(wired144 is >= 4.2 and <= 6.0 &&
+            cleanWifi144 is >= 4.2 and <= 5.5 &&
             normal50 >= 12.0 &&
             busyWiFi > 15.0 && busyWiFi <= 38.0 &&
             winWired is >= 1.8 and <= 2.5,
             "ComputeAdaptiveUdpIntervalMs must adapt continuously to live display Hz, ping, queue bloat, jitter, and loss");
+
+        // Verify transit-time jitter does NOT false-trigger during intermittent mouse pauses.
+        var transitTracker = new AdaptiveLinkTracker();
+        long[] pauseGapsMs = { 7, 7, 130, 7, 7, 95, 7, 110, 7, 7 };
+        long rxMs = 1000;
+        int txMs = 5000;
+        for (ulong i = 1; i <= (ulong)pauseGapsMs.Length; i++)
+        {
+            long step = pauseGapsMs[i - 1];
+            rxMs += step;
+            txMs += (int)step;
+            transitTracker.RecordInboundPacket(i, hasSenderTimestamp: true, txMs, rxMs);
+        }
+        Check(transitTracker.InboundJitterMs < 1.5,
+            "Transit jitter must stay low across mouse pauses when transit latency is steady");
+
+        rxMs += 40;
+        txMs += 7; // +33ms real wireless transit delay spike
+        transitTracker.RecordInboundPacket(11, hasSenderTimestamp: true, txMs, rxMs);
+        rxMs += 2;
+        txMs += 25; // catch-up burst
+        transitTracker.RecordInboundPacket(12, hasSenderTimestamp: true, txMs, rxMs);
+        Check(transitTracker.InboundJitterMs > 8.0,
+            "Transit jitter must detect real network buffering and catch-up bursts");
     }
 
     // Verify 64-packet sliding anti-replay window + LinkPing/LinkFeedback + AdaptiveLinkTracker.

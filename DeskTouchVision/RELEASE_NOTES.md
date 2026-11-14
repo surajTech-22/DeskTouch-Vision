@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.37 — Instant Cursor Handoff Recovery, True Transit Jitter & Crisp High-Refresh Tracking
+
+DeskTouch Vision eliminates "Handoff acknowledgement timed out" failures across reconnects and single-packet wireless drops, separates genuine network transit jitter from normal cursor pauses, and preserves crisp native refresh-rate responsiveness across phones and Windows hosts.
+
+- **Instant reconnect & single-drop handoff reliability:** Cleared per-connection reverse handoff and pointer deduplication counters across Android session reconnects so resumed sessions never drop fresh Windows edge claims or initial cursor moves, moved Android fast-lane activation and grant replies off the UI main thread onto the background network worker, atomically handed off pointer timing/activation callbacks, and backed up initial post-handoff move delivery with reliable TCP until reverse activation is confirmed.
+- **True transit jitter & pause immunity on both endpoints:** Replaced raw inter-packet arrival-gap variance with RFC-3550 sender-timestamp transit-time jitter on both Windows and Android so brief hand pauses or pace adjustments are no longer misread as severe wireless jitter.
+- **Crisp high-refresh pointer responsiveness & accurate frame tracking:** Separated live display `Choreographer` ticks from asynchronous wakeups so pauses no longer depress reported live refresh rates, kept smoothing disabled (`tau = 0`) on clean normal home wireless links, tightened active probe cadence (`100 ms`), and reset Android UI frame latency measurement strictly per rendered frame.
+
+---
+
 # DeskTouch Vision v0.3.36 — Live Display Refresh-Rate Sync, Adaptive Speed/Ping Pacing & Smooth Reordered Motion
 
 DeskTouch Vision dynamically tracks each Android device's live screen refresh rate and real-time network speed, latency, jitter, and packet loss so cross-device mouse control stays smooth across everyday wireless and wired connections without device-specific workarounds.

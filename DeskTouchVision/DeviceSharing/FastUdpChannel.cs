@@ -213,8 +213,10 @@ internal sealed class AdaptiveLinkTracker
     private long _reorderedPackets;
     private long _lostPackets;
     private long _lastArriveMs;
-    private double _emaGapMs = 8.0;
     private double _inboundJitterMs;
+    private bool _hasLastTransit;
+    private int _lastTransitSenderMs;
+    private long _lastTransitRecvMs;
 
     private readonly object _rttGate = new();
     private readonly int[] _pingTokens = new int[PingRingSize];
@@ -230,8 +232,8 @@ internal sealed class AdaptiveLinkTracker
     private int _peerRefreshHz;
     private int _peerFrameTenthsMs;
 
-    internal static bool IsStreamTimingOp(FastUdpOp op) =>
-        op is FastUdpOp.Move or FastUdpOp.ReverseMove or FastUdpOp.Warm or FastUdpOp.LinkPing;
+    internal static bool HasSenderTimestamp(FastUdpOp op) =>
+        op is FastUdpOp.Move or FastUdpOp.Warm or FastUdpOp.LinkPing;
 
     internal int NextPingToken(long nowMs)
     {
@@ -308,39 +310,50 @@ internal sealed class AdaptiveLinkTracker
         else
         {
             double dev = Math.Abs(sampleRtt - _smoothedRttMs);
-            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.10) * (dev - _rttJitterMs);
-            double alpha = sampleRtt > _smoothedRttMs ? 0.28 : 0.16;
+            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.22) * (dev - _rttJitterMs);
+            double alpha = sampleRtt > _smoothedRttMs ? 0.24 : 0.22;
             _smoothedRttMs += alpha * (sampleRtt - _smoothedRttMs);
         }
     }
 
-    internal void RecordInboundPacket(ulong seq, bool streamTimingOp, long nowMs)
+    internal void RecordInboundPacket(ulong seq, bool streamTimingOp, long nowMs) =>
+        RecordInboundPacket(seq, false, 0, nowMs);
+
+    internal void RecordInboundPacket(ulong seq, bool hasSenderTimestamp, int senderTimestampMs, long nowMs)
     {
         lock (_recvGate)
         {
             RecordSeqLocked(seq);
-            if (streamTimingOp && nowMs > 0)
+            if (nowMs <= 0) return;
+            if (hasSenderTimestamp)
             {
-                if (_lastArriveMs > 0 && nowMs >= _lastArriveMs)
+                if (_hasLastTransit)
                 {
-                    long dt = nowMs - _lastArriveMs;
-                    if (dt is >= 2 and <= 160)
+                    long recvDelta = nowMs - _lastTransitRecvMs;
+                    long sendDelta = unchecked(senderTimestampMs - _lastTransitSenderMs);
+                    if (recvDelta is >= 0 and <= 400 && sendDelta is >= 0 and <= 400)
                     {
-                        double dev = Math.Abs(dt - _emaGapMs);
-                        _inboundJitterMs += (dev > _inboundJitterMs ? 0.25 : 0.06) * (dev - _inboundJitterMs);
-                        if (dt <= 45) _emaGapMs += 0.12 * (dt - _emaGapMs);
+                        double transitDiff = Math.Min(250.0, Math.Abs((double)recvDelta - (double)sendDelta));
+                        _inboundJitterMs += (transitDiff > _inboundJitterMs ? 0.28 : 0.22) * (transitDiff - _inboundJitterMs);
                     }
-                    else if (dt < 2)
+                    else if (recvDelta > 400)
                     {
-                        _inboundJitterMs = Math.Max(_inboundJitterMs, 4.5);
-                    }
-                    else if (dt > 300)
-                    {
-                        _inboundJitterMs *= 0.85;
+                        _inboundJitterMs *= 0.80;
                     }
                 }
+                _lastTransitSenderMs = senderTimestampMs;
+                _lastTransitRecvMs = nowMs;
+                _hasLastTransit = true;
                 _lastArriveMs = nowMs;
+                return;
             }
+            if (_lastArriveMs > 0 && nowMs >= _lastArriveMs)
+            {
+                long dt = nowMs - _lastArriveMs;
+                if (dt > 400)
+                    _inboundJitterMs *= 0.85;
+            }
+            _lastArriveMs = nowMs;
         }
     }
 
@@ -669,7 +682,7 @@ internal sealed class FastUdpHub : IDisposable
 
                 long nowMs = Environment.TickCount64;
                 peer.LinkTracker.RecordInboundPacket(
-                    msg.Seq, AdaptiveLinkTracker.IsStreamTimingOp(msg.Op), nowMs);
+                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs);
 
                 if (msg.Op == FastUdpOp.Probe)
                 {
@@ -801,7 +814,7 @@ internal sealed class FastUdpClient : IDisposable
                 if (!_codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
                 long nowMs = Environment.TickCount64;
                 LinkTracker.RecordInboundPacket(
-                    msg.Seq, AdaptiveLinkTracker.IsStreamTimingOp(msg.Op), nowMs);
+                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs);
                 if (msg.Op == FastUdpOp.Probe)
                 {
                     Send(FastUdpOp.ProbeAck, LocalPort, 0, 0);

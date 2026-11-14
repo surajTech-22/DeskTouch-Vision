@@ -23,12 +23,12 @@ public final class PointerSmoother {
     private int displayRefreshHz = 60;
     private int measuredFrameHz;
     private int frameSampleCount;
+    private int consecutiveActiveFrames;
     private double emaFrameMs = 1000.0 / 60.0;
     private long lastFrameNs;
     private long lastActiveFrameNs;
 
     private long lastTargetNs;
-    private double emaPacketGapMs = 8.0;
     private double localArrivalJitterMs;
     private double networkJitterMs;
     private double lossPermille;
@@ -53,6 +53,7 @@ public final class PointerSmoother {
         this.targetY = y;
         this.lastTargetNs = nowNs;
         this.lastFrameNs = nowNs;
+        this.consecutiveActiveFrames = 0;
     }
 
     public synchronized void clear() {
@@ -60,6 +61,7 @@ public final class PointerSmoother {
         this.settled = true;
         this.lastTargetNs = 0L;
         this.lastFrameNs = 0L;
+        this.consecutiveActiveFrames = 0;
         this.localArrivalJitterMs = 0.0;
     }
 
@@ -76,21 +78,14 @@ public final class PointerSmoother {
 
         if (lastTargetNs > 0L && nowNs > lastTargetNs) {
             double gapMs = (nowNs - lastTargetNs) / 1_000_000.0;
-            if (gapMs <= 160.0) {
-                if (gapMs >= 2.0) {
-                    double dev = Math.abs(gapMs - emaPacketGapMs);
-                    double devAlpha = dev > localArrivalJitterMs ? 0.30 : 0.08;
-                    localArrivalJitterMs = localArrivalJitterMs + devAlpha * (dev - localArrivalJitterMs);
-                    if (gapMs <= 45.0) {
-                        emaPacketGapMs = emaPacketGapMs + 0.15 * (gapMs - emaPacketGapMs);
-                    }
-                } else {
-                    // Sub-2ms back-to-back burst arrival indicates queued wireless packets catching up.
-                    localArrivalJitterMs = Math.max(localArrivalJitterMs, 6.0);
-                }
+            if (gapMs < 1.8) {
+                // Compressed burst arrival indicates queued wireless packets catching up.
+                localArrivalJitterMs = Math.max(localArrivalJitterMs, 6.0);
+            } else if (gapMs <= 22.0) {
+                localArrivalJitterMs *= 0.85;
             } else {
-                // Idle mouse pause: decay residual jitter so stationary start stays responsive.
-                localArrivalJitterMs *= 0.35;
+                // Idle pause or low-frequency tick: decay quickly so resume stays crisp.
+                localArrivalJitterMs *= 0.50;
             }
         }
         lastTargetNs = nowNs;
@@ -114,18 +109,30 @@ public final class PointerSmoother {
      * @return {@code true} if coordinates were updated into {@code outXY}.
      */
     public synchronized boolean stepFrame(long frameTimeNs, float[] outXY) {
+        return stepFrame(frameTimeNs, outXY, true);
+    }
+
+    /**
+     * Advances cursor position for the current display frame timestamp, optionally excluding
+     * non-vsync UI wakeups from the live display cadence estimator.
+     */
+    public synchronized boolean stepFrame(long frameTimeNs, float[] outXY, boolean measureRefreshRate) {
         if (!initialized) {
             return false;
         }
 
         double nominalFrameMs = 1000.0 / getEffectiveRefreshHz();
         double dtMs = nominalFrameMs;
-        if (lastFrameNs > 0L && frameTimeNs > lastFrameNs) {
+        if (measureRefreshRate && lastFrameNs > 0L && frameTimeNs > lastFrameNs) {
             double rawFrameMs = (frameTimeNs - lastFrameNs) / 1_000_000.0;
-            if (rawFrameMs >= 3.5 && rawFrameMs <= 45.0) {
+            if (rawFrameMs >= 3.5 && rawFrameMs <= 24.5) {
                 recordLiveFrameMs(rawFrameMs, frameTimeNs);
                 dtMs = rawFrameMs;
+            } else {
+                consecutiveActiveFrames = 0;
             }
+        } else if (!measureRefreshRate) {
+            consecutiveActiveFrames = 0;
         }
         lastFrameNs = frameTimeNs;
 
@@ -166,11 +173,19 @@ public final class PointerSmoother {
      * Observes a display vsync timestamp even when the cursor just became settled.
      */
     public synchronized void observeFrameTimestamp(long frameTimeNs) {
-        if (lastFrameNs > 0L && frameTimeNs > lastFrameNs) {
+        observeFrameTimestamp(frameTimeNs, true);
+    }
+
+    public synchronized void observeFrameTimestamp(long frameTimeNs, boolean measureRefreshRate) {
+        if (measureRefreshRate && lastFrameNs > 0L && frameTimeNs > lastFrameNs) {
             double rawFrameMs = (frameTimeNs - lastFrameNs) / 1_000_000.0;
-            if (rawFrameMs >= 3.5 && rawFrameMs <= 45.0) {
+            if (rawFrameMs >= 3.5 && rawFrameMs <= 24.5) {
                 recordLiveFrameMs(rawFrameMs, frameTimeNs);
+            } else {
+                consecutiveActiveFrames = 0;
             }
+        } else if (!measureRefreshRate) {
+            consecutiveActiveFrames = 0;
         }
         lastFrameNs = frameTimeNs;
     }
@@ -225,14 +240,18 @@ public final class PointerSmoother {
 
     private double computeTauMsLocked(double nominalFrameMs) {
         double jitter = Math.max(networkJitterMs, localArrivalJitterMs);
-        if (jitter <= 2.5 && lossPermille <= 1.0) {
+        if (jitter <= 5.5 && lossPermille <= 2.0) {
             return 0.0;
         }
-        double rawTau = Math.max(4.0, (jitter - 2.0) * 1.15 + lossPermille * 0.15 + nominalFrameMs * 0.45);
-        return Math.min(rawTau, Math.min(46.0, nominalFrameMs * 2.5));
+        double rawTau = Math.max(4.0, (jitter - 5.0) * 0.65 + lossPermille * 0.14 + nominalFrameMs * 0.35);
+        return Math.min(rawTau, Math.min(22.0, nominalFrameMs * 1.65));
     }
 
     private void recordLiveFrameMs(double rawFrameMs, long frameTimeNs) {
+        consecutiveActiveFrames++;
+        if (consecutiveActiveFrames < 2) {
+            return;
+        }
         if (frameSampleCount == 0) {
             emaFrameMs = rawFrameMs;
         } else {

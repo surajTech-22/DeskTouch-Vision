@@ -49,6 +49,14 @@ final class DeskTouchSession implements AutoCloseable {
         private int lastExecutedButtonSeq;
         private int highestReverseMoveSeq;
 
+        synchronized void reset(){
+            highestClaimDispatchSeq=0;
+            highestControlActionSeq=0;
+            seenControlActionMask=0L;
+            lastExecutedButtonSeq=0;
+            highestReverseMoveSeq=0;
+        }
+
         synchronized boolean tryAcceptMove(int moveSeq){
             if(moveSeq<=0) return true;
             if(moveSeq<=highestReverseMoveSeq) return false;
@@ -382,6 +390,7 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 peerInetAddress=ssl.getInetAddress();
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
+                reverseDedup.reset();
                 registerDisplayListener();
                 if(!DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
@@ -533,7 +542,12 @@ final class DeskTouchSession implements AutoCloseable {
         if(reverseLease==lease && reverseApplied!=lease){
             reverseApplied=lease;
             FastUdpChannel ch=udpChannel;
-            if(ch!=null && ch.confirmed) ch.sendReverseActive(lease);
+            if(ch!=null && ch.confirmed && !udpPacer.isShutdown()){
+                udpPacer.execute(()->{
+                    FastUdpChannel c=udpChannel;
+                    if(c!=null && c.confirmed && reverseLease==lease) c.sendReverseActive(lease);
+                });
+            }
             send(new Packet("reverse-active",lease));
         }
     }
@@ -560,7 +574,16 @@ final class DeskTouchSession implements AutoCloseable {
             }
         }
         FastUdpChannel ch=udpChannel;
-        if(ch!=null && ch.confirmed) ch.sendReverseGranted(claim,granted);
+        if(ch!=null && ch.confirmed){
+            if(Looper.myLooper()==Looper.getMainLooper() && !udpPacer.isShutdown()){
+                udpPacer.execute(()->{
+                    FastUdpChannel c=udpChannel;
+                    if(c!=null && c.confirmed) c.sendReverseGranted(claim,granted);
+                });
+            }else{
+                ch.sendReverseGranted(claim,granted);
+            }
+        }
         if(!granted){
             send(new Packet("reverse-busy",claim));
             return;
@@ -919,7 +942,7 @@ final class DeskTouchSession implements AutoCloseable {
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }
-                        if(now-lastUdpLinkPingMs>=180L){
+                        if(now-lastUdpLinkPingMs>=100L){
                             lastUdpLinkPingMs=now;
                             int paceTenths=(int)Math.round(lastAdaptiveMoveIntervalMs*10.0);
                             ch.sendLinkPing(ch.linkTracker.nextPingToken(now),paceTenths,claim>0?claim:reverseLease);
@@ -1063,6 +1086,7 @@ final class DeskTouchSession implements AutoCloseable {
         unregisterDisplayListener();
         closeUdpChannel();
         clearReverseControl(false);
+        reverseDedup.reset();
         RemoteInputPower.end();
         running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;
         environmentTargets=java.util.Collections.emptyList();

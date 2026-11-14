@@ -336,6 +336,13 @@ public final class ProtocolSourceTest {
         assertTrue(dedup.tryAcceptControlAction(4,true));   // newer button event
         assertTrue(dedup.tryAcceptControlAction(3,false));  // slightly out-of-order missing wheel still applies
         assertFalse(dedup.tryAcceptControlAction(3,false)); // wheel duplicate ignored
+        assertTrue(dedup.tryAcceptMove(4000));
+
+        // After disconnect/reconnect on a reused DeskTouchSession, reset() must
+        // allow a fresh host Session's claim #1 and move #1 without silent drops.
+        dedup.reset();
+        assertTrue(dedup.tryAcceptClaimDispatch(1,1,0));
+        assertTrue(dedup.tryAcceptMove(1));
     }
 
     @Test public void scrollWheelDirectionStaysInsideSafeScreenMargins(){
@@ -413,9 +420,9 @@ public final class ProtocolSourceTest {
         PointerSmoother smoother = new PointerSmoother();
         float[] out = new float[2];
 
-        // 1. Clean low-jitter link: zero smoothing lag (direct 1:1 coordinate tracking).
+        // 1. Clean low-jitter or typical quiet wireless link: zero smoothing lag.
         smoother.setDisplayRefreshHz(120);
-        smoother.setLinkMetrics(1.0, 0.0);
+        smoother.setLinkMetrics(4.0, 0.0);
         smoother.reset(100f, 200f, 1_000_000L);
         assertEquals(0.0, smoother.getCurrentTauMs(), 0.001);
         assertTrue(smoother.onTarget(260f, 360f, 9_300_000L));
@@ -424,7 +431,8 @@ public final class ProtocolSourceTest {
         assertEquals(360f, out[1], 0.01f);
         assertTrue(smoother.isSettled());
 
-        // 2. Live frame-rate estimator adapts generically across 50Hz / 90Hz / 120Hz / 144Hz.
+        // 2. Live frame-rate estimator adapts generically across 50Hz / 90Hz / 120Hz / 144Hz
+        // and ignores non-vsync UI posts / long pauses between cursor movements.
         long tNs = 20_000_000L;
         for (int i = 0; i < 10; i++) {
             tNs += 20_000_000L; // 50 Hz frames
@@ -439,6 +447,13 @@ public final class ProtocolSourceTest {
         }
         assertEquals(144, smoother.getMeasuredFrameHz());
         assertEquals(144, smoother.getEffectiveRefreshHz());
+
+        // Intermittent 30ms mouse pause + UI wakeup must NOT collapse 144 Hz cadence.
+        tNs += 30_000_000L;
+        smoother.observeFrameTimestamp(tNs, false);
+        tNs += 6_944_444L;
+        smoother.observeFrameTimestamp(tNs, true);
+        assertEquals(144, smoother.getMeasuredFrameHz());
 
         // 3. Congested wireless link: interpolates monotonically without overshooting,
         // and snaps instantaneously right before clicks or scroll events.
@@ -496,7 +511,27 @@ public final class ProtocolSourceTest {
         assertTrue(cleanTracker.onFeedbackReceived(t2, AdaptiveLinkTracker.packLossJitter(35.0, 20.0),
             AdaptiveLinkTracker.packDisplayRate(60, 167), ms + 255L));
         double busyPace = cleanTracker.computeAdaptiveSendIntervalMs(60);
-        assertTrue(busyPace > cleanPace + 5.0 && busyPace <= 35.0);
+        assertTrue(busyPace > cleanPace + 5.0 && busyPace <= 32.0);
+
+        // Verify RFC-3550 transit jitter ignores mouse pauses when network latency is steady,
+        // yet immediately detects real wireless queuing + burst catch-up.
+        AdaptiveLinkTracker transitTracker = new AdaptiveLinkTracker();
+        long[] pauseStepsMs = { 7L, 7L, 140L, 7L, 95L, 7L, 120L, 7L };
+        long rxMs = 2000L;
+        int txMs = 9000;
+        for (int i = 0; i < pauseStepsMs.length; i++) {
+            rxMs += pauseStepsMs[i];
+            txMs += (int) pauseStepsMs[i];
+            transitTracker.recordInboundPacket(i + 1L, true, txMs, rxMs);
+        }
+        assertTrue(transitTracker.getInboundJitterMs() < 1.5);
+        rxMs += 42L;
+        txMs += 7; // +35ms network stall
+        transitTracker.recordInboundPacket(9L, true, txMs, rxMs);
+        rxMs += 2L;
+        txMs += 28; // queued backlog catch-up
+        transitTracker.recordInboundPacket(10L, true, txMs, rxMs);
+        assertTrue(transitTracker.getInboundJitterMs() > 8.0);
     }
 
     @Test public void liveRefreshRateResolutionAndUdpSlidingReplayWindow() throws Exception {

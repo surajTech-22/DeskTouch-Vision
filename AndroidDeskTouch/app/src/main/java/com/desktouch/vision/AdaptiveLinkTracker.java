@@ -21,8 +21,10 @@ public final class AdaptiveLinkTracker {
     private long lostPackets;
 
     private long lastArriveMs;
-    private double emaGapMs = 8.0;
     private double inboundJitterMs;
+    private boolean hasLastTransit;
+    private int lastTransitSenderMs;
+    private long lastTransitRecvMs;
 
     private final Object rttGate = new Object();
     private final int[] pingTokens = new int[PING_RING_SIZE];
@@ -110,32 +112,46 @@ public final class AdaptiveLinkTracker {
             rttJitterMs = 0.0;
         } else {
             double dev = Math.abs(sampleRtt - smoothedRttMs);
-            rttJitterMs += (dev > rttJitterMs ? 0.25 : 0.10) * (dev - rttJitterMs);
-            double alpha = sampleRtt > smoothedRttMs ? 0.28 : 0.16;
+            rttJitterMs += (dev > rttJitterMs ? 0.25 : 0.22) * (dev - rttJitterMs);
+            double alpha = sampleRtt > smoothedRttMs ? 0.24 : 0.22;
             smoothedRttMs += alpha * (sampleRtt - smoothedRttMs);
         }
     }
 
     public void recordInboundPacket(long seq, boolean streamTimingOp, long nowMs) {
+        recordInboundPacket(seq, false, 0, nowMs);
+    }
+
+    public void recordInboundPacket(long seq, boolean hasSenderTimestamp, int senderTimestampMs, long nowMs) {
         synchronized (recvGate) {
             recordSeqLocked(seq);
-            if (streamTimingOp && nowMs > 0L) {
-                if (lastArriveMs > 0L && nowMs >= lastArriveMs) {
-                    long dt = nowMs - lastArriveMs;
-                    if (dt >= 2L && dt <= 160L) {
-                        double dev = Math.abs(dt - emaGapMs);
-                        inboundJitterMs += (dev > inboundJitterMs ? 0.25 : 0.06) * (dev - inboundJitterMs);
-                        if (dt <= 45L) {
-                            emaGapMs += 0.12 * (dt - emaGapMs);
-                        }
-                    } else if (dt < 2L) {
-                        inboundJitterMs = Math.max(inboundJitterMs, 4.5);
-                    } else if (dt > 300L) {
-                        inboundJitterMs *= 0.85;
+            if (nowMs <= 0L) {
+                return;
+            }
+            if (hasSenderTimestamp) {
+                if (hasLastTransit) {
+                    long recvDelta = nowMs - lastTransitRecvMs;
+                    long sendDelta = senderTimestampMs - lastTransitSenderMs;
+                    if (recvDelta >= 0L && recvDelta <= 400L && sendDelta >= 0L && sendDelta <= 400L) {
+                        double transitDiff = Math.min(250.0, Math.abs((double) recvDelta - (double) sendDelta));
+                        inboundJitterMs += (transitDiff > inboundJitterMs ? 0.28 : 0.22) * (transitDiff - inboundJitterMs);
+                    } else if (recvDelta > 400L) {
+                        inboundJitterMs *= 0.80;
                     }
                 }
+                lastTransitSenderMs = senderTimestampMs;
+                lastTransitRecvMs = nowMs;
+                hasLastTransit = true;
                 lastArriveMs = nowMs;
+                return;
             }
+            if (lastArriveMs > 0L && nowMs >= lastArriveMs) {
+                long dt = nowMs - lastArriveMs;
+                if (dt > 400L) {
+                    inboundJitterMs *= 0.85;
+                }
+            }
+            lastArriveMs = nowMs;
         }
     }
 
@@ -303,20 +319,20 @@ public final class AdaptiveLinkTracker {
 
         double baseMs = 2.5;
         if (targetRefreshHz > 0) {
-            baseMs = Math.max(2.0, Math.min(8.5, 1000.0 / (Math.min(240, Math.max(30, targetRefreshHz)) * 1.4)));
+            baseMs = Math.max(2.0, Math.min(8.5, 1000.0 / (Math.min(240, Math.max(30, targetRefreshHz)) * 1.55)));
         }
         if (rtt <= 0.0) {
             return baseMs;
         }
         double queueDelay = Math.max(0.0, rtt - minRtt);
-        if (rtt <= 5.0 && queueDelay <= 2.0 && jitter <= 2.5 && lossP < 2.0) {
+        if (rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
             return Math.max(1.8, baseMs * 0.85);
         }
         double penalty = Math.max(0.0, rtt - 14.0) * 0.14
             + Math.max(0.0, queueDelay - 6.0) * 0.30
-            + Math.max(0.0, jitter - 4.0) * 0.25
-            + Math.max(0.0, lossP - 5.0) * 0.18;
-        return Math.max(baseMs, Math.min(35.0, baseMs + penalty));
+            + Math.max(0.0, jitter - 5.0) * 0.24
+            + Math.max(0.0, lossP - 5.0) * 0.20;
+        return Math.max(baseMs, Math.min(32.0, baseMs + penalty));
     }
 
     public static int packLossJitter(double lossPermille, double jitterMs) {

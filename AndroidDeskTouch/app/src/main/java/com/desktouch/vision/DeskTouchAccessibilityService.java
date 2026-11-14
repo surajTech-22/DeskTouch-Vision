@@ -60,12 +60,14 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     static int unpackX(long packed){ return (int)(packed>>>32); }
     static int unpackY(long packed){ return (int)packed; }
-    private volatile long pendingArrivalNanos;
+    private final java.util.concurrent.atomic.AtomicLong pendingArrivalNanos=
+        new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicInteger coalescedMoves=
         new java.util.concurrent.atomic.AtomicInteger();
     private long lastPerfReportNanos;
     private int renderFrames,maxLocalFrameDelayMs;
-    private volatile Runnable pendingApplied;
+    private final java.util.concurrent.atomic.AtomicReference<Runnable> pendingApplied=
+        new java.util.concurrent.atomic.AtomicReference<>();
     private final java.util.concurrent.atomic.AtomicBoolean moveScheduled =
         new java.util.concurrent.atomic.AtomicBoolean();
     private int lastOverlayX=Integer.MIN_VALUE,lastOverlayY=Integer.MIN_VALUE;
@@ -84,7 +86,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private int lastReportedEffectiveHz;
     private volatile float cachedPreferredRefreshHz;
     private Choreographer choreographer;
-    private final Choreographer.FrameCallback frameCallback=this::flushPointer;
+    private final Choreographer.FrameCallback frameCallback=this::flushPointerVsync;
     private final ArrayDeque<TouchAction> pendingActions=new ArrayDeque<>();
     private static final class TouchAction {
         static final int TYPE_GESTURE = 1;
@@ -377,7 +379,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             }catch(RuntimeException ignored){}
         }
         remoteActive=false;
-        pendingApplied=null;
+        pendingApplied.set(null);
+        pendingArrivalNanos.set(0L);
         moveScheduled.set(false);
         lastFedTargetX=lastFedTargetY=Integer.MIN_VALUE;
         smoother.clear();
@@ -442,7 +445,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 return;
             }catch(RuntimeException ignored){}
         }
-        ui.post(()->flushPointer(System.nanoTime()));
+        ui.post(()->flushPointer(System.nanoTime(),false));
+    }
+
+    private void flushPointerVsync(long frameTimeNs){
+        flushPointer(frameTimeNs,true);
     }
 
     static void setLinkMetrics(double jitterMs,double lossPermille){
@@ -472,20 +479,20 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         // Retain the newest position on fast mice/touchpads instead of
         // filling Android's UI queue with hundreds of obsolete moves.
         service.pendingPos.set(packCoords(px,py));
-        service.pendingArrivalNanos=SystemClock.elapsedRealtimeNanos();
-        if(applied!=null)service.pendingApplied=applied;
+        service.pendingArrivalNanos.set(SystemClock.elapsedRealtimeNanos());
+        if(applied!=null)service.pendingApplied.set(applied);
         if(service.moveScheduled.compareAndSet(false,true)){
             if(!service.pointerVisible() || applied!=null)
-                service.ui.post(()->service.flushPointer(System.nanoTime()));
+                service.ui.post(()->service.flushPointer(System.nanoTime(),false));
             else service.schedulePointerFrame();
         }
         else service.coalescedMoves.incrementAndGet();
         return true;
     }
-    private void flushPointer(long frameTimeNs){
+    private void flushPointer(long frameTimeNs,boolean fromVsync){
         long packed=pendingPos.get();
         int px=unpackX(packed),py=unpackY(packed);
-        long arrival=pendingArrivalNanos;
+        long arrival=pendingArrivalNanos.getAndSet(0L);
         long now=SystemClock.elapsedRealtimeNanos();
         if(remoteActive&&ready(this)){
             int drawX=px,drawY=py;
@@ -499,11 +506,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                     lastFedTargetX=px;lastFedTargetY=py;
                     smoother.onTarget(px,py,frameTimeNs);
                 }
-                if(smoother.stepFrame(frameTimeNs,smoothedXY)){
+                if(smoother.stepFrame(frameTimeNs,smoothedXY,fromVsync)){
                     drawX=Math.round(smoothedXY[0]);
                     drawY=Math.round(smoothedXY[1]);
                 }else{
-                    smoother.observeFrameTimestamp(frameTimeNs);
+                    smoother.observeFrameTimestamp(frameTimeNs,fromVsync);
                 }
             }
             showPointer(drawX,drawY);
@@ -530,8 +537,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 maxLocalFrameDelayMs=renderFrames=0;
             }
         }
-        Runnable ack=pendingApplied;
-        pendingApplied=null;
+        Runnable ack=pendingApplied.getAndSet(null);
         moveScheduled.set(false);
         if(remoteActive&&cursorRoot!=null&&ack!=null&&ready(this))ack.run();
         if(remoteActive&&ready(this)&&held&&activeStroke!=null&&!gestureRunning&&!pendingLift)
@@ -551,8 +557,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         lastFedTargetX=lx;lastFedTargetY=ly;
         if(remoteActive && (lx!=x || ly!=y || !pointerVisible()))
             showPointer(lx,ly);
-        Runnable ack=pendingApplied;
-        pendingApplied=null;
+        Runnable ack=pendingApplied.getAndSet(null);
         if(cursorRoot!=null && ack!=null && remoteActive)ack.run();
     }
     static void endRemote(){

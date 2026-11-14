@@ -303,10 +303,10 @@ final class FastUdpChannel implements Closeable {
                 Message msg = codec.tryOpen(recvBuf, packet.getLength());
                 if (msg == null) continue;
                 long nowMs = SystemClock.uptimeMillis();
-                boolean streamTimingOp = msg.op == OP_REVERSE_MOVE
+                boolean hasSenderTimestamp = msg.op == OP_MOVE
                     || msg.op == OP_WARM
                     || msg.op == OP_LINK_PING;
-                linkTracker.recordInboundPacket(msg.seq, streamTimingOp, nowMs);
+                linkTracker.recordInboundPacket(msg.seq, hasSenderTimestamp, msg.timestampMs, nowMs);
                 if (msg.op == OP_PROBE) {
                     send(OP_PROBE_ACK, localPort(), 0, 0);
                     markConfirmed();

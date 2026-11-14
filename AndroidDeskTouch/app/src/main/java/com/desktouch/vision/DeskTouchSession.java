@@ -150,6 +150,15 @@ final class DeskTouchSession implements AutoCloseable {
     private int cursorX,cursorY;
     private int screenX,screenY,screenWidth,screenHeight;
     private volatile int announcedPhoneWidth,announcedPhoneHeight,announcedPhoneRotation;
+    private volatile int announcedPhoneRefreshHz;
+    private volatile int livePhoneRefreshHz,livePhoneFrameTenthsMs;
+    private volatile int peerTargetRefreshHz;
+    private volatile double lastAdaptiveMoveIntervalMs = 2.5;
+    private volatile long lastPingSentMs;
+    private volatile long lastTcpMetricsSentMs;
+    private volatile long lastUdpLinkPingMs;
+    private volatile long lastUdpFeedbackPushMs;
+    private volatile long lastWarmSentMs;
     private volatile long lastUdpReverseMoveAtMs;
     private ScheduledFuture<?> udpProbeRetryFuture;
     private ScheduledFuture<?> udpKeepAliveFuture;
@@ -365,6 +374,12 @@ final class DeskTouchSession implements AutoCloseable {
                 fingerprint=pinned;
                 announcedPhoneWidth=info.width;announcedPhoneHeight=info.height;
                 announcedPhoneRotation=info.rotationDegrees;
+                announcedPhoneRefreshHz=info.refreshHz;
+                if(info.refreshHz>0){
+                    livePhoneRefreshHz=info.refreshHz;
+                    livePhoneFrameTenthsMs=(int)Math.round(10000.0/info.refreshHz);
+                    DeskTouchAccessibilityService.setDisplayRefreshHz(info.refreshHz);
+                }
                 peerInetAddress=ssl.getInetAddress();
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
                 registerDisplayListener();
@@ -376,7 +391,13 @@ final class DeskTouchSession implements AutoCloseable {
                 status("Connected to "+device.name+". Windows approved pairing.");
                 Thread heartbeat=new Thread(()->{
                     while(running){
-                        try { Thread.sleep(1500);if(running)send(new Packet("ping")); }
+                        try {
+                            Thread.sleep(1500);
+                            if(running){
+                                lastPingSentMs=SystemClock.uptimeMillis();
+                                send(new Packet("ping"));
+                            }
+                        }
                         catch(InterruptedException e){Thread.currentThread().interrupt();return;}
                     }
                 },"DeskTouch heartbeat");
@@ -433,6 +454,22 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                 } else if("trust-denied".equals(p.type)){
                     pendingTrust=null;status("Windows declined trusted-device permission");
+                } else if("pong".equals(p.type)){
+                    long sentMs=lastPingSentMs;
+                    if(sentMs>0L){
+                        long rttMs=SystemClock.uptimeMillis()-sentMs;
+                        FastUdpChannel ch=udpChannel;
+                        if(ch!=null && rttMs>=1L && rttMs<=5000L){
+                            ch.linkTracker.recordRttSample(rttMs,SystemClock.uptimeMillis());
+                            syncAdaptiveMetrics(ch);
+                        }
+                    }
+                } else if("display-metrics".equals(p.type)){
+                    if(p.a>=24 && p.a<=360){
+                        peerTargetRefreshHz=p.a;
+                        FastUdpChannel ch=udpChannel;
+                        if(ch!=null) syncAdaptiveMetrics(ch);
+                    }
                 } else if(allowedWindowsControlType(p.type)){
                     handleWindowsControl(p);
                 } else if("goodbye".equals(p.type)) break;
@@ -626,9 +663,64 @@ final class DeskTouchSession implements AutoCloseable {
         send(new Packet("claim",claim));
         status("Requesting Windows mouse and keyboard authority");
     }
+    static int resolveLiveRefreshHz(int accessibilityHz, int displayHz){
+        if(accessibilityHz>=24 && accessibilityHz<=360) return accessibilityHz;
+        if(displayHz>=24 && displayHz<=360) return displayHz;
+        return 60;
+    }
+
+    private int packCurrentDisplayRate(){
+        int accHz=DeskTouchAccessibilityService.liveEffectiveRefreshHz();
+        int hz=resolveLiveRefreshHz(accHz, livePhoneRefreshHz>0 ? livePhoneRefreshHz : announcedPhoneRefreshHz);
+        int tenths=accHz>=24
+            ? DeskTouchAccessibilityService.liveEffectiveFrameTenthsMs()
+            : (livePhoneFrameTenthsMs>0 ? livePhoneFrameTenthsMs : (int)Math.round(10000.0/hz));
+        return AdaptiveLinkTracker.packDisplayRate(hz,tenths);
+    }
+
+    private void syncAdaptiveMetrics(FastUdpChannel ch){
+        if(ch==null) return;
+        if(ch.linkTracker.getPeerRefreshHz()>0){
+            peerTargetRefreshHz=ch.linkTracker.getPeerRefreshHz();
+        }
+        double jitter=ch.linkTracker.getEffectiveJitterMs();
+        double loss=ch.linkTracker.getInboundLossPermille();
+        DeskTouchAccessibilityService.setLinkMetrics(jitter,loss);
+        lastAdaptiveMoveIntervalMs=ch.linkTracker.computeAdaptiveSendIntervalMs(peerTargetRefreshHz);
+    }
+
+    void onLiveRefreshRateChanged(int refreshHz, int frameTenthsMs){
+        if(!running || refreshHz<24 || refreshHz>360) return;
+        int tenths=frameTenthsMs>0 ? frameTenthsMs : (int)Math.round(10000.0/refreshHz);
+        boolean changed=refreshHz!=livePhoneRefreshHz || Math.abs(tenths-livePhoneFrameTenthsMs)>=3;
+        livePhoneRefreshHz=refreshHz;
+        livePhoneFrameTenthsMs=tenths;
+        DeskTouchAccessibilityService.setDisplayRefreshHz(refreshHz);
+
+        long now=SystemClock.uptimeMillis();
+        FastUdpChannel ch=udpChannel;
+        if(ch!=null && ch.confirmed && (changed || now-lastUdpFeedbackPushMs>=120L)){
+            lastUdpFeedbackPushMs=now;
+            if(!udpPacer.isShutdown()){
+                int packedLj=ch.linkTracker.getInboundPackedLossJitter();
+                int packedDr=AdaptiveLinkTracker.packDisplayRate(refreshHz,tenths);
+                int leaseSnapshot=reverseLease;
+                udpPacer.execute(()->ch.sendLinkFeedback(0,packedLj,packedDr,leaseSnapshot));
+            }
+        }
+        if(changed || now-lastTcpMetricsSentMs>=400L){
+            lastTcpMetricsSentMs=now;
+            send(new Packet("display-metrics",refreshHz,tenths));
+        }
+    }
+
     void publishPhoneGeometry(){
         if(!running)return;
         PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(application);
+        if(info.refreshHz>0 && info.refreshHz!=announcedPhoneRefreshHz){
+            announcedPhoneRefreshHz=info.refreshHz;
+            onLiveRefreshRateChanged(info.refreshHz,(int)Math.round(10000.0/info.refreshHz));
+        }
         if(info.width==announcedPhoneWidth && info.height==announcedPhoneHeight &&
             info.rotationDegrees==announcedPhoneRotation)return;
         if(info.width<200||info.height<100)return;
@@ -782,6 +874,22 @@ final class DeskTouchSession implements AutoCloseable {
                     if(tryAcceptControlAction(actionSeq,false))
                         DeskTouchAccessibilityService.wheel(amount,horizontal!=0);
                 }
+                @Override public void onLinkPing(int pingToken,int senderPaceTenths,int lease,int ts){
+                    if(!running) return;
+                    FastUdpChannel activeCh=udpChannel;
+                    if(activeCh==null) return;
+                    activeCh.sendLinkFeedback(
+                        pingToken,
+                        activeCh.linkTracker.getInboundPackedLossJitter(),
+                        packCurrentDisplayRate(),
+                        reverseLease);
+                    syncAdaptiveMetrics(activeCh);
+                }
+                @Override public void onLinkFeedback(int echoToken,int packedLossJitter,int packedDisplayRate,int lease){
+                    if(!running) return;
+                    FastUdpChannel activeCh=udpChannel;
+                    if(activeCh!=null) syncAdaptiveMetrics(activeCh);
+                }
             });
             udpChannel=ch;
             send(new Packet("udp-ready",ch.localPort()));
@@ -798,12 +906,31 @@ final class DeskTouchSession implements AutoCloseable {
                 },180,180,TimeUnit.MILLISECONDS);
                 final PowerManager keepAlivePm=(PowerManager)application.getSystemService(Context.POWER_SERVICE);
                 udpKeepAliveFuture=udpPacer.scheduleWithFixedDelay(()->{
+                    if(!running || udpChannel!=ch || !ch.confirmed) return;
+                    long now=SystemClock.uptimeMillis();
                     boolean screenInteractive=keepAlivePm==null || keepAlivePm.isInteractive();
                     boolean activeSession=reverseLease>0 || hasClaim();
-                    if(!shouldSendInteractiveKeepalive(running,udpChannel==ch,ch.confirmed,
-                        DeskTouchAccessibilityService.ready(application),
-                        screenInteractive,activeSession)) return;
-                    ch.sendWarm();
+                    boolean serviceReady=DeskTouchAccessibilityService.ready(application);
+                    if(activeSession && shouldSendInteractiveKeepalive(
+                        running,true,true,serviceReady,screenInteractive,true)){
+                        int warmGapMs=(int)Math.min(44L,Math.max(INTERACTIVE_KEEPALIVE_MS,
+                            Math.round(20.0+ch.linkTracker.getQueueDelayMs()*0.6)));
+                        if(now-lastWarmSentMs>=warmGapMs){
+                            lastWarmSentMs=now;
+                            ch.sendWarm();
+                        }
+                        if(now-lastUdpLinkPingMs>=180L){
+                            lastUdpLinkPingMs=now;
+                            int paceTenths=(int)Math.round(lastAdaptiveMoveIntervalMs*10.0);
+                            ch.sendLinkPing(ch.linkTracker.nextPingToken(now),paceTenths,claim>0?claim:reverseLease);
+                        }
+                    }else{
+                        long idlePingGapMs=screenInteractive ? 450L : 2000L;
+                        if(now-lastUdpLinkPingMs>=idlePingGapMs){
+                            lastUdpLinkPingMs=now;
+                            ch.sendLinkPing(ch.linkTracker.nextPingToken(now),0,0);
+                        }
+                    }
                 },INTERACTIVE_KEEPALIVE_MS,INTERACTIVE_KEEPALIVE_MS,TimeUnit.MILLISECONDS);
             }
         } catch(Exception ignored) {
@@ -870,7 +997,8 @@ final class DeskTouchSession implements AutoCloseable {
                     long now=SystemClock.uptimeMillis();
                     lastAnyMoveMs=now;
                     pendingTcpSyncMove=p;
-                    if(now-lastUdpMoveMs>=2){
+                    long minMoveMs=Math.max(2L,Math.round(lastAdaptiveMoveIntervalMs));
+                    if(now-lastUdpMoveMs>=minMoveMs){
                         lastUdpMoveMs=now;
                         throttledUdpMove=null;
                         if(scheduledThrottleFlush!=null){
@@ -895,7 +1023,7 @@ final class DeskTouchSession implements AutoCloseable {
                                 FastUdpChannel c=udpChannel;
                                 if(deferred!=null && c!=null && c.confirmed && active && curClaim>0)
                                     c.send(FastUdpChannel.OP_MOVE,deferred.a,deferred.b,curClaim);
-                            },2,TimeUnit.MILLISECONDS);
+                            },minMoveMs,TimeUnit.MILLISECONDS);
                         }
                     }
                     scheduleUdpTrailingSyncLocked();

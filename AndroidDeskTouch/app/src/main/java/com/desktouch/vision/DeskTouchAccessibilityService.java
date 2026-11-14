@@ -78,8 +78,13 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private int pendingLiftX,pendingLiftY;
     private boolean dragFallbackPending;
     private int gestureGeneration;
+    private final PointerSmoother smoother=new PointerSmoother();
+    private final float[] smoothedXY=new float[2];
+    private int lastFedTargetX=Integer.MIN_VALUE,lastFedTargetY=Integer.MIN_VALUE;
+    private int lastReportedEffectiveHz;
+    private volatile float cachedPreferredRefreshHz;
     private Choreographer choreographer;
-    private final Choreographer.FrameCallback frameCallback = frameTimeNanos -> flushPointer();
+    private final Choreographer.FrameCallback frameCallback=this::flushPointer;
     private final ArrayDeque<TouchAction> pendingActions=new ArrayDeque<>();
     private static final class TouchAction {
         static final int TYPE_GESTURE = 1;
@@ -186,8 +191,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         DeskTouchRuntime.accessibilityPermissionChanged();
     }
     private void refreshDisplayGeometry(){
-        android.graphics.Point size=PhoneScreenGeometry.read(this);
-        displayWidth=Math.max(1,size.x);displayHeight=Math.max(1,size.y);
+        PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(this);
+        displayWidth=Math.max(1,info.width);displayHeight=Math.max(1,info.height);
+        cachedPreferredRefreshHz=PhoneScreenGeometry.readPreferredActiveRefreshRate(this);
+        if(info.refreshHz>0){
+            smoother.setDisplayRefreshHz(info.refreshHz);
+        }
     }
     @Override public void onConfigurationChanged(android.content.res.Configuration config){
         super.onConfigurationChanged(config);
@@ -223,22 +232,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     private int dp(float px){return Math.round(px*getResources().getDisplayMetrics().density);}
     private volatile boolean fullOverlayRejected;
-    private float maxRefreshRateHz;
     private float preferredActiveRefreshRate(){
-        if(Build.VERSION.SDK_INT<23)return 0f;
-        try{
-            android.hardware.display.DisplayManager dm=
-                (android.hardware.display.DisplayManager)getSystemService(DISPLAY_SERVICE);
-            android.view.Display display=dm!=null
-                ? dm.getDisplay(android.view.Display.DEFAULT_DISPLAY):null;
-            if(display==null)return 0f;
-            float best=0f;
-            for(android.view.Display.Mode mode:display.getSupportedModes()){
-                float hz=mode.getRefreshRate();
-                if(hz>best)best=hz;
-            }
-            return best>=85f?best:0f;
-        }catch(RuntimeException ignored){return 0f;}
+        float cached=cachedPreferredRefreshHz;
+        if(cached>0f)return cached;
+        cached=PhoneScreenGeometry.readPreferredActiveRefreshRate(this);
+        cachedPreferredRefreshHz=cached;
+        return cached;
     }
     private boolean tryAttachOverlay(FrameLayout root,WindowManager.LayoutParams params){
         try{
@@ -260,6 +259,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT);
         params.gravity=Gravity.TOP|Gravity.LEFT;
+        if(Build.VERSION.SDK_INT>=23){
+            params.preferredRefreshRate=preferredActiveRefreshRate();
+        }
         if(Build.VERSION.SDK_INT>=28)
             params.layoutInDisplayCutoutMode=
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -377,6 +379,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         remoteActive=false;
         pendingApplied=null;
         moveScheduled.set(false);
+        lastFedTargetX=lastFedTargetY=Integer.MIN_VALUE;
+        smoother.clear();
         if(choreographer!=null){
             try{choreographer.removeFrameCallback(frameCallback);}
             catch(Throwable ignored){}
@@ -395,6 +399,13 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             : (lp.flags & ~WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         boolean changed=nextFlags!=lp.flags;
         lp.flags=nextFlags;
+        if(Build.VERSION.SDK_INT>=23){
+            float nextRate=keepAwake ? preferredActiveRefreshRate() : 0f;
+            if(Math.abs(lp.preferredRefreshRate-nextRate)>0.5f){
+                lp.preferredRefreshRate=nextRate;
+                changed=true;
+            }
+        }
         if(changed || forceLayout){
             try{windows.updateViewLayout(cursorRoot,lp);}
             catch(RuntimeException rejected){return false;}
@@ -431,7 +442,27 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 return;
             }catch(RuntimeException ignored){}
         }
-        ui.post(this::flushPointer);
+        ui.post(()->flushPointer(System.nanoTime()));
+    }
+
+    static void setLinkMetrics(double jitterMs,double lossPermille){
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null)service.smoother.setLinkMetrics(jitterMs,lossPermille);
+    }
+
+    static void setDisplayRefreshHz(int refreshHz){
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null && refreshHz>0)service.smoother.setDisplayRefreshHz(refreshHz);
+    }
+
+    static int liveEffectiveRefreshHz(){
+        DeskTouchAccessibilityService service=instance;
+        return service!=null ? service.smoother.getEffectiveRefreshHz() : 0;
+    }
+
+    static int liveEffectiveFrameTenthsMs(){
+        DeskTouchAccessibilityService service=instance;
+        return service!=null ? service.smoother.getEffectiveFrameTenthsMs() : 0;
     }
 
     static boolean pointer(int px,int py,Runnable applied){
@@ -445,18 +476,44 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(applied!=null)service.pendingApplied=applied;
         if(service.moveScheduled.compareAndSet(false,true)){
             if(!service.pointerVisible() || applied!=null)
-                service.ui.post(service::flushPointer);
+                service.ui.post(()->service.flushPointer(System.nanoTime()));
             else service.schedulePointerFrame();
         }
         else service.coalescedMoves.incrementAndGet();
         return true;
     }
-    private void flushPointer(){
+    private void flushPointer(long frameTimeNs){
         long packed=pendingPos.get();
         int px=unpackX(packed),py=unpackY(packed);
         long arrival=pendingArrivalNanos;
         long now=SystemClock.elapsedRealtimeNanos();
-        if(remoteActive&&ready(this))showPointer(px,py);
+        if(remoteActive&&ready(this)){
+            int drawX=px,drawY=py;
+            if(!pointerVisible()){
+                int liveHz=PhoneScreenGeometry.readLiveRefreshHz(this);
+                if(liveHz>0)smoother.setDisplayRefreshHz(liveHz);
+                smoother.reset(px,py,frameTimeNs);
+                lastFedTargetX=px;lastFedTargetY=py;
+            }else{
+                if(px!=lastFedTargetX || py!=lastFedTargetY){
+                    lastFedTargetX=px;lastFedTargetY=py;
+                    smoother.onTarget(px,py,frameTimeNs);
+                }
+                if(smoother.stepFrame(frameTimeNs,smoothedXY)){
+                    drawX=Math.round(smoothedXY[0]);
+                    drawY=Math.round(smoothedXY[1]);
+                }else{
+                    smoother.observeFrameTimestamp(frameTimeNs);
+                }
+            }
+            showPointer(drawX,drawY);
+            int effectiveHz=smoother.getEffectiveRefreshHz();
+            if(effectiveHz>0 && effectiveHz!=lastReportedEffectiveHz){
+                lastReportedEffectiveHz=effectiveHz;
+                DeskTouchRuntime.liveRefreshRateChanged(
+                    effectiveHz,smoother.getEffectiveFrameTenthsMs());
+            }
+        }
         if(remoteActive && arrival>0 && now>=arrival){
             int ageMs=(int)Math.min(5000,(now-arrival)/1_000_000L);
             maxLocalFrameDelayMs=Math.max(maxLocalFrameDelayMs,ageMs);
@@ -466,7 +523,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 // No coordinates, text, keys, device identities or IPs.
                 Log.i("DeskTouchTiming","frames="+renderFrames+
                     " newest_moves_coalesced="+coalescedMoves.getAndSet(0)+
-                    " worst_local_ui_delay_ms="+maxLocalFrameDelayMs);
+                    " worst_local_ui_delay_ms="+maxLocalFrameDelayMs+
+                    " effective_hz="+smoother.getEffectiveRefreshHz()+
+                    " tau_ms="+(int)Math.round(smoother.getCurrentTauMs()));
                 lastPerfReportNanos=now;
                 maxLocalFrameDelayMs=renderFrames=0;
             }
@@ -479,15 +538,17 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             continueDragIfReady();
         long latestPacked=pendingPos.get();
         if(remoteActive&&ready(this)&&
-            (unpackX(latestPacked)!=px||unpackY(latestPacked)!=py) &&
+            (!smoother.isSettled() || unpackX(latestPacked)!=px || unpackY(latestPacked)!=py) &&
             moveScheduled.compareAndSet(false,true))
             schedulePointerFrame();
     }
     private void flushPointerBeforeAction(){
         // A click or scroll must operate at the most recently received
-        // pointer position, never the previous animation frame.
+        // pointer position, never an in-flight smoothed interpolation frame.
         long latest=pendingPos.get();
         int lx=unpackX(latest),ly=unpackY(latest);
+        smoother.reset(lx,ly,System.nanoTime());
+        lastFedTargetX=lx;lastFedTargetY=ly;
         if(remoteActive && (lx!=x || ly!=y || !pointerVisible()))
             showPointer(lx,ly);
         Runnable ack=pendingApplied;
@@ -530,21 +591,23 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             this.durationMs=durationMs;
         }
     }
-    private Rect findClickableBoundsAt(int px,int py){
+    private Rect findClickableBoundsAt(int px,int py,long budgetMs){
         int w=Math.max(100,displayWidth),h=Math.max(100,displayHeight);
-        Rect match=findClickableInTree(getRootInActiveWindow(),px,py,w,h);
-        if(match!=null)return match;
+        long deadlineMs=SystemClock.uptimeMillis()+Math.max(4L,budgetMs);
+        Rect match=findClickableInTree(getRootInActiveWindow(),px,py,w,h,deadlineMs);
+        if(match!=null || SystemClock.uptimeMillis()>=deadlineMs)return match;
         List<AccessibilityWindowInfo> windowsList=getWindows();
         if(windowsList==null)return null;
         for(AccessibilityWindowInfo win:windowsList){
             if(win==null)continue;
-            match=findClickableInTree(win.getRoot(),px,py,w,h);
+            if(SystemClock.uptimeMillis()>=deadlineMs)break;
+            match=findClickableInTree(win.getRoot(),px,py,w,h,deadlineMs);
             if(match!=null)return match;
         }
         return null;
     }
     private static Rect findClickableInTree(
-        AccessibilityNodeInfo root,int px,int py,int screenWidth,int screenHeight)
+        AccessibilityNodeInfo root,int px,int py,int screenWidth,int screenHeight,long deadlineMs)
     {
         if(root==null)return null;
         ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
@@ -553,7 +616,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         long bestArea=Long.MAX_VALUE;
         int visited=0;
         Rect bounds=new Rect();
-        while(!nodes.isEmpty() && ++visited<=120){
+        while(!nodes.isEmpty() && ++visited<=72){
+            if((visited & 7)==0 && SystemClock.uptimeMillis()>=deadlineMs)break;
             AccessibilityNodeInfo node=nodes.pop();
             node.getBoundsInScreen(bounds);
             if(!bounds.contains(px,py))continue;
@@ -654,12 +718,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         long now=android.os.SystemClock.uptimeMillis();
         TouchAction tail=pendingActions.peekLast();
         boolean sameSpot=lastWheelBoundsAtMs!=0L &&
-            Math.hypot(px-lastWheelBoundsX,py-lastWheelBoundsY)<=24.0;
+            Math.hypot(px-lastWheelBoundsX,py-lastWheelBoundsY)<=36.0;
         if(sameSpot && ((tail!=null && tail.kind==TouchAction.TYPE_SCROLL) ||
-            now-lastWheelBoundsAtMs<=180L)){
+            now-lastWheelBoundsAtMs<=240L)){
             return lastWheelBounds!=null ? new Rect(lastWheelBounds) : null;
         }
-        Rect found=findClickableBoundsAt(px,py);
+        Rect found=findClickableBoundsAt(px,py,12L);
         lastWheelBounds=found!=null ? new Rect(found) : null;
         lastWheelBoundsAtMs=now;
         lastWheelBoundsX=px;
@@ -723,12 +787,14 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private boolean performNativeClick(){
         AccessibilityNodeInfo root=getRootInActiveWindow();
         if(root==null)return false;
+        long deadlineMs=SystemClock.uptimeMillis()+24L;
         ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
         nodes.push(root);
         AccessibilityNodeInfo target=null,editor=null;
         int visited=0;
         Rect bounds=new Rect();
-        while(!nodes.isEmpty() && ++visited<=96){
+        while(!nodes.isEmpty() && ++visited<=72){
+            if((visited & 7)==0 && SystemClock.uptimeMillis()>=deadlineMs)break;
             AccessibilityNodeInfo node=nodes.pop();
             node.getBoundsInScreen(bounds);
             if(!bounds.contains(x,y))continue;
@@ -1017,14 +1083,16 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
 
     private AccessibilityNodeInfo focusEditableAtPoint(int px,int py){
+        long deadlineMs=SystemClock.uptimeMillis()+25L;
         AccessibilityNodeInfo root=getRootInActiveWindow();
-        AccessibilityNodeInfo match=findEditableAtPoint(root,px,py);
-        if(match==null){
+        AccessibilityNodeInfo match=findEditableAtPoint(root,px,py,deadlineMs);
+        if(match==null && SystemClock.uptimeMillis()<deadlineMs){
             List<AccessibilityWindowInfo> list=getWindows();
             if(list!=null){
                 for(AccessibilityWindowInfo w:list){
                     if(w==null)continue;
-                    match=findEditableAtPoint(w.getRoot(),px,py);
+                    if(SystemClock.uptimeMillis()>=deadlineMs)break;
+                    match=findEditableAtPoint(w.getRoot(),px,py,deadlineMs);
                     if(match!=null)break;
                 }
             }
@@ -1039,7 +1107,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
 
     private static AccessibilityNodeInfo findEditableAtPoint(
-        AccessibilityNodeInfo root,int px,int py)
+        AccessibilityNodeInfo root,int px,int py,long deadlineMs)
     {
         if(root==null)return null;
         ArrayDeque<AccessibilityNodeInfo> nodes=new ArrayDeque<>();
@@ -1048,7 +1116,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         long bestArea=Long.MAX_VALUE;
         int visited=0;
         Rect bounds=new Rect();
-        while(!nodes.isEmpty() && ++visited<=240){
+        while(!nodes.isEmpty() && ++visited<=96){
+            if((visited & 7)==0 && SystemClock.uptimeMillis()>=deadlineMs)break;
             AccessibilityNodeInfo node=nodes.pop();
             node.getBoundsInScreen(bounds);
             if(!bounds.contains(px,py))continue;

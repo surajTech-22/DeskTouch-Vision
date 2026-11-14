@@ -95,6 +95,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal bool HubGrantedAcked;
         internal bool HubActiveAcked;
         internal long LastAndroidWarmEchoTicks;
+        internal int LiveRefreshHz;
+        internal int LiveFrameTenthsMs;
 
         internal int NextReverseActionSeq()
         {
@@ -359,24 +361,86 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
+    private void UpdateSessionAdaptivePacing(Session session)
+    {
+        var pacer = session.MovePacer;
+        if (pacer == null) return;
+        int liveHz = Volatile.Read(ref session.LiveRefreshHz);
+        int? effectiveHz = liveHz >= 24 ? liveHz : session.Peer.RefreshHz;
+        var peer = session.UdpPeer;
+        double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
+        double minRtt = peer?.LinkTracker.MinRttMs ?? 0;
+        double jitter = peer?.LinkTracker.EffectiveJitterMs ?? 0;
+        double loss = peer?.LinkTracker.CombinedLossPermille ?? 0;
+        double queueDelay = peer?.LinkTracker.QueueDelayMs ?? 0;
+        double paceMs = ComputeAdaptiveUdpIntervalMs(
+            session.Peer.Platform, effectiveHz, rtt, minRtt, jitter, loss);
+        pacer.SetMinIntervalMs(paceMs);
+        int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
+        pacer.SetWarmIntervalMs(warmMs);
+    }
+
+    private void ScheduleReverseClaimUdpRetry(Session session, int claimLease, int dispatchSeq)
+    {
+        var hub = _udpHub;
+        var retryPeer = session.UdpPeer;
+        if (hub == null || retryPeer is not { Confirmed: true }) return;
+        double rtt = retryPeer.LinkTracker.SmoothedRttMs;
+        int delayMs = (int)Math.Clamp(Math.Round(rtt > 0 ? rtt * 1.4 : 60.0), 45, 220);
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(delayMs, _cancel.Token); }
+            catch (OperationCanceledException) { return; }
+            if (!session.HubGrantedAcked &&
+                Volatile.Read(ref session.ActiveReverseLease) == claimLease &&
+                retryPeer.Confirmed)
+            {
+                hub.Send(retryPeer, FastUdpOp.ReverseClaim, claimLease, 0, claimLease, dispatchSeq);
+            }
+        }, _cancel.Token);
+    }
+
     private async Task ReportTelemetryLoopAsync(CancellationToken token)
     {
         try
         {
+            int tick = 0;
             while (!token.IsCancellationRequested)
             {
-                await Task.Delay(3000, token);
+                await Task.Delay(200, token);
+                long nowMs = Environment.TickCount64;
                 foreach (var session in _sessions.Values)
                 {
+                    var peer = session.UdpPeer;
+                    if (peer is { Confirmed: true } && _udpHub != null)
+                    {
+                        int activeLease = Volatile.Read(ref session.ActiveReverseLease);
+                        long probeGapMs = (activeLease > 0 || session.Lease > 0) ? 180 : 650;
+                        if (nowMs - peer.LastLinkPingMs >= probeGapMs)
+                        {
+                            peer.LastLinkPingMs = nowMs;
+                            int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
+                            _udpHub.Send(peer, FastUdpOp.LinkPing,
+                                peer.LinkTracker.NextPingToken(nowMs), paceTenths, activeLease);
+                        }
+                    }
+
+                    if ((tick % 15) != 14) continue;
                     var pacer = session.MovePacer;
                     if (pacer == null) continue;
                     var s = pacer.TakeStats();
                     long fallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
                     if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && fallback == 0)
                         continue;
+                    int liveHz = Volatile.Read(ref session.LiveRefreshHz);
+                    int effectiveHz = liveHz >= 24 ? liveHz : (session.Peer.RefreshHz ?? 0);
+                    double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
+                    double jitter = peer?.LinkTracker.EffectiveJitterMs ?? 0;
+                    double loss = peer?.LinkTracker.CombinedLossPermille ?? 0;
                     DiagnosticLog?.Invoke(
-                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} fast_confirmed={session.UdpPeer?.Confirmed == true} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback}");
+                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} fast_confirmed={peer?.Confirmed == true} live_hz={effectiveHz} pace_ms={pacer.EffectiveMinIntervalMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback}");
                 }
+                tick++;
             }
         }
         catch (OperationCanceledException) { }
@@ -750,9 +814,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if (_udpHub != null && selected.UdpPeer is { HasEndpoint: true } udpPeer)
                 {
                     if (udpPeer.Confirmed)
+                    {
                         _udpHub.Send(udpPeer, FastUdpOp.ReverseClaim, packet.A, 0, packet.A, dispatchSeq);
+                        ScheduleReverseClaimUdpRetry(selected, packet.A, dispatchSeq);
+                    }
                     else
+                    {
                         _udpHub.Send(udpPeer, FastUdpOp.Probe, _udpHub.Port, 0, 0);
+                    }
                 }
             }
             else if(packet.Type is "reset" or "release")
@@ -1013,7 +1082,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
                         session.MovePacer?.SetMinIntervalMs(
-                            RecommendedUdpMinIntervalMs(session.Peer.Platform, session.Peer.RefreshHz));
+                            ComputeAdaptiveUdpIntervalMs(session.Peer.Platform, session.Peer.RefreshHz, 0, 0, 0, 0));
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1076,12 +1145,32 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         AppVersion=!string.IsNullOrWhiteSpace(primaryMon.AppVersion)
                             ? primaryMon.AppVersion : session.Peer.AppVersion
                     };
-                    session.MovePacer?.SetMinIntervalMs(
-                        RecommendedUdpMinIntervalMs(session.Peer.Platform, session.Peer.RefreshHz));
+                    if (primaryMon.RefreshHz is >= 24 and <= 360)
+                        Volatile.Write(ref session.LiveRefreshHz, primaryMon.RefreshHz.Value);
+                    UpdateSessionAdaptivePacing(session);
                     await PublishEnvironmentAsync(token);
                     PeerListChanged?.Invoke();
                     if(ReferenceEquals(Volatile.Read(ref _selected),session))
                         PeerTopologyChanged?.Invoke(session.Peer);
+                    continue;
+                }
+                if(p.Type=="display-metrics")
+                {
+                    if(p.A is >= 24 and <= 360)
+                    {
+                        Volatile.Write(ref session.LiveRefreshHz, p.A);
+                        if (p.B > 0) Volatile.Write(ref session.LiveFrameTenthsMs, p.B);
+                        session.Peer = session.Peer with { RefreshHz = p.A };
+                        UpdateSessionAdaptivePacing(session);
+                        RelayLease? upstream = null;
+                        lock (_authorityGate)
+                            _relayByTarget.TryGetValue(session.Id, out upstream);
+                        if (upstream != null)
+                        {
+                            try { await SendToAsync(upstream.Source, new Packet("display-metrics", p.A, p.B), token); }
+                            catch (Exception) { }
+                        }
+                    }
                     continue;
                 }
                 if(p.Type=="placement")
@@ -1218,16 +1307,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         // Relayed moves are already paced by the source PC; keep a short
                         // anti-burst cap on the hub so Wi-Fi jitter never double-stalls frames.
                         relay.Target.MovePacer?.SetMinIntervalMs(
-                            relay.Target.Peer.Platform == "Android"
-                                ? RecommendedUdpMinIntervalMs(relay.Target.Peer.Platform, relay.Target.Peer.RefreshHz)
-                                : 2.0);
+                            ComputeAdaptiveUdpIntervalMs(
+                                relay.Target.Peer.Platform,
+                                Volatile.Read(ref relay.Target.LiveRefreshHz) is >= 24 and var liveHz
+                                    ? liveHz
+                                    : relay.Target.Peer.RefreshHz,
+                                relay.Target.UdpPeer?.LinkTracker.SmoothedRttMs ?? 0,
+                                relay.Target.UdpPeer?.LinkTracker.MinRttMs ?? 0,
+                                relay.Target.UdpPeer?.LinkTracker.EffectiveJitterMs ?? 0,
+                                relay.Target.UdpPeer?.LinkTracker.CombinedLossPermille ?? 0));
                         int dispatchSeq = relay.Target.NextReverseClaimDispatchSeq();
                         if (relay.Target.UdpPeer is { HasEndpoint: true } relayUdp && _udpHub != null)
                         {
                             if (relayUdp.Confirmed)
+                            {
                                 _udpHub.Send(relayUdp, FastUdpOp.ReverseClaim, p.A, 0, p.A, dispatchSeq);
+                                ScheduleReverseClaimUdpRetry(relay.Target, p.A, dispatchSeq);
+                            }
                             else
+                            {
                                 _udpHub.Send(relayUdp, FastUdpOp.Warm, 0, 0, 0);
+                            }
                         }
                         try { await SendToAsync(relay.Target,
                             new Packet("reverse-claim", p.A, C: dispatchSeq), token); }
@@ -1519,6 +1619,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (!_sessions.TryGetValue(peer.SessionId, out var session)) return;
         if (peer.Confirmed && peer.TryMarkConfirmedLogged())
             _status($"Low-latency input confirmed for {session.Peer.Name}.");
+        if (msg.Op == FastUdpOp.LinkPing)
+        {
+            _udpHub?.Send(peer, FastUdpOp.LinkFeedback, msg.A,
+                peer.LinkTracker.GetInboundPackedLossJitter(), 0, payloadTag: 0);
+            UpdateSessionAdaptivePacing(session);
+            return;
+        }
+        if (msg.Op == FastUdpOp.LinkFeedback)
+        {
+            int reportedHz = peer.LinkTracker.PeerRefreshHz;
+            if (reportedHz is >= 24 and <= 360)
+            {
+                Volatile.Write(ref session.LiveRefreshHz, reportedHz);
+                Volatile.Write(ref session.LiveFrameTenthsMs, peer.LinkTracker.PeerFrameTenthsMs);
+            }
+            UpdateSessionAdaptivePacing(session);
+            return;
+        }
         if (msg.Op is FastUdpOp.ReverseGranted or FastUdpOp.ReverseActive)
         {
             if (msg.A > 0)
@@ -1599,6 +1717,41 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (refreshHz is >= 85) return 8.0;
         if (refreshHz is > 0 and < 85) return 10.0;
         return AndroidUdpMinIntervalMs;
+    }
+
+    internal static double ComputeAdaptiveUdpIntervalMs(
+        string? platform, int? liveRefreshHz, double rttMs, double minRttMs,
+        double jitterMs, double lossPermille)
+    {
+        bool isAndroid = string.Equals(platform, "Android", StringComparison.Ordinal);
+        double baseMs;
+        if (isAndroid)
+        {
+            if (liveRefreshHz is >= 24)
+                baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.45), 5.5, 13.0);
+            else
+                baseMs = AndroidUdpMinIntervalMs;
+        }
+        else
+        {
+            baseMs = liveRefreshHz is >= 24 and < 75
+                ? Math.Clamp(1000.0 / (liveRefreshHz.Value * 2.0), 2.5, 6.0)
+                : 2.5;
+        }
+
+        if (rttMs <= 0 || double.IsNaN(rttMs) || double.IsInfinity(rttMs))
+            return baseMs;
+
+        double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
+        double floorMs = isAndroid ? 4.2 : 1.8;
+        if (rttMs <= 5.0 && queueDelay <= 2.0 && jitterMs <= 2.5 && lossPermille < 2.0)
+            return Math.Max(floorMs, baseMs * 0.82);
+
+        double rttPressure = Math.Max(0.0, rttMs - 14.0) * 0.16;
+        double bloatPressure = Math.Max(0.0, queueDelay - 6.0) * 0.34;
+        double jitterPressure = Math.Max(0.0, jitterMs - 4.0) * 0.28;
+        double lossPressure = Math.Max(0.0, lossPermille - 5.0) * 0.22;
+        return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, 38.0);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>
@@ -1695,6 +1848,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private long _tcpFallbackMoves;
     private long _lastPingSentTicks;
     private double _lastRttMs;
+    private int _liveRemoteRefreshHz;
     private int _udpConfirmedLogged;
     private long _lastTcpWarmTicks;
     private string _lastLoggedVersions = "";
@@ -1725,9 +1879,38 @@ internal sealed class HostSession : IInputSession, IDisposable
         }
         Volatile.Write(ref _remoteMonitors,topology);
         Volatile.Write(ref _remoteSystemName,name);
+        Volatile.Write(ref _liveRemoteRefreshHz, 0);
+        UpdateAdaptivePacing();
         RemoteTopologyChanged?.Invoke(topology);
         RemoteNameChanged?.Invoke(name);
         return true;
+    }
+
+    private void UpdateAdaptivePacing()
+    {
+        var pacer = _movePacer;
+        if (pacer == null) return;
+        int targetId = SelectedEnvironmentTargetId;
+        var member = targetId == 0
+            ? null
+            : Volatile.Read(ref _environmentMembers).FirstOrDefault(m => m.Id == targetId);
+        string platform = member?.Platform ?? "Windows";
+        int? monHz = Volatile.Read(ref _remoteMonitors).Monitors.FirstOrDefault()?.RefreshHz;
+        int liveHz = Volatile.Read(ref _liveRemoteRefreshHz);
+        int? effectiveHz = liveHz >= 24 ? liveHz : monHz;
+
+        var client = Volatile.Read(ref _udpClient);
+        double udpRtt = client?.LinkTracker.SmoothedRttMs ?? 0;
+        double rtt = udpRtt > 0 ? udpRtt : Volatile.Read(ref _lastRttMs);
+        double minRtt = client?.LinkTracker.MinRttMs ?? 0;
+        double jitter = client?.LinkTracker.EffectiveJitterMs ?? 0;
+        double loss = client?.LinkTracker.CombinedLossPermille ?? 0;
+        double queueDelay = client?.LinkTracker.QueueDelayMs ?? 0;
+
+        pacer.SetMinIntervalMs(
+            ReceiverServer.ComputeAdaptiveUdpIntervalMs(platform, effectiveHz, rtt, minRtt, jitter, loss));
+        int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
+        pacer.SetWarmIntervalMs(warmMs);
     }
 
     internal void AttachReverseInput(LocalInputPriority priority, Func<bool> allowClaim)
@@ -2175,6 +2358,14 @@ internal sealed class HostSession : IInputSession, IDisposable
                 else if (p.Type == "placement" &&
                     Enum.TryParse<MonitorEdge>(p.Text, true, out var changedEdge))
                     RemotePlacementChanged?.Invoke(changedEdge);
+                else if (p.Type == "display-metrics")
+                {
+                    if (p.A is >= 24 and <= 360)
+                    {
+                        Volatile.Write(ref _liveRemoteRefreshHz, p.A);
+                        UpdateAdaptivePacing();
+                    }
+                }
                 else if (p.Type == "pong")
                 {
                     long sent = Interlocked.Exchange(ref _lastPingSentTicks, 0);
@@ -2183,6 +2374,8 @@ internal sealed class HostSession : IInputSession, IDisposable
                         double rtt = (System.Diagnostics.Stopwatch.GetTimestamp() - sent) * 1000.0
                             / System.Diagnostics.Stopwatch.Frequency;
                         Volatile.Write(ref _lastRttMs, rtt);
+                        Volatile.Read(ref _udpClient)?.LinkTracker.RecordRttSample(rtt, Environment.TickCount64);
+                        UpdateAdaptivePacing();
                     }
                     HeartbeatAcknowledged?.Invoke();
                 }
@@ -2256,30 +2449,62 @@ internal sealed class HostSession : IInputSession, IDisposable
         long tcpFallback = Interlocked.Exchange(ref _tcpFallbackMoves, 0);
         if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && tcpFallback == 0)
             return;
-        bool udpConfirmed = Volatile.Read(ref _udpClient)?.Confirmed == true;
-        double rtt = Volatile.Read(ref _lastRttMs);
+        var client = Volatile.Read(ref _udpClient);
+        bool udpConfirmed = client?.Confirmed == true;
+        double rtt = (client?.LinkTracker.SmoothedRttMs ?? 0) > 0
+            ? client!.LinkTracker.SmoothedRttMs
+            : Volatile.Read(ref _lastRttMs);
+        double jitter = client?.LinkTracker.EffectiveJitterMs ?? 0;
+        double loss = client?.LinkTracker.CombinedLossPermille ?? 0;
+        int liveHz = Volatile.Read(ref _liveRemoteRefreshHz);
+        if (liveHz < 24)
+            liveHz = Volatile.Read(ref _remoteMonitors).Monitors.FirstOrDefault()?.RefreshHz ?? 0;
+        double paceMs = pacer?.EffectiveMinIntervalMs ?? 2.5;
         DiagnosticLog?.Invoke(
-            $"Telemetry [out->{_remoteSystemName ?? "hub"}]: fast_confirmed={udpConfirmed} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={tcpFallback} rtt_ms={rtt:F1}");
+            $"Telemetry [out->{_remoteSystemName ?? "hub"}]: fast_confirmed={udpConfirmed} live_hz={liveHz} pace_ms={paceMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={tcpFallback}");
     }
 
     private async Task HeartbeatAsync()
     {
         try
         {
-            int beat = 0;
+            int tick = 0;
             bool loggedInitial = false;
             while (!_cancel.IsCancellationRequested)
             {
-                await Task.Delay(1500, _cancel.Token);
+                await Task.Delay(200, _cancel.Token);
                 if (!loggedInitial)
                 {
                     loggedInitial = true;
                     EmitEnvironmentVersionsDiagnostic();
                 }
-                if (Interlocked.Read(ref _lastPingSentTicks) == 0)
-                    Volatile.Write(ref _lastPingSentTicks, System.Diagnostics.Stopwatch.GetTimestamp());
-                if (!TrySend(new Packet("ping"))) break;
-                if ((++beat & 1) == 0)
+
+                var client = Volatile.Read(ref _udpClient);
+                if (client is { Confirmed: true })
+                {
+                    long nowMs = Environment.TickCount64;
+                    bool controlActive = Volatile.Read(ref _forwardClaimLease) > 0 ||
+                        Volatile.Read(ref _reverseLease) > 0;
+                    long probeGap = controlActive ? 180 : 650;
+                    if (nowMs - client.LastLinkPingMs >= probeGap)
+                    {
+                        client.LastLinkPingMs = nowMs;
+                        int paceTenths = (int)Math.Round((_movePacer?.EffectiveMinIntervalMs ?? 2.5) * 10.0);
+                        int lease = Volatile.Read(ref _forwardClaimLease);
+                        if (lease <= 0) lease = Volatile.Read(ref _reverseLease);
+                        client.Send(FastUdpOp.LinkPing,
+                            client.LinkTracker.NextPingToken(nowMs), paceTenths, lease);
+                    }
+                }
+
+                tick++;
+                if ((tick % 8) == 7)
+                {
+                    if (Interlocked.Read(ref _lastPingSentTicks) == 0)
+                        Volatile.Write(ref _lastPingSentTicks, System.Diagnostics.Stopwatch.GetTimestamp());
+                    if (!TrySend(new Packet("ping"))) break;
+                }
+                if ((tick % 15) == 14)
                     EmitTelemetryIfActive();
             }
         }
@@ -2340,6 +2565,18 @@ internal sealed class HostSession : IInputSession, IDisposable
                     if (Interlocked.CompareExchange(ref _udpAckSent, 1, 0) == 0)
                         TrySend(new Packet("udp-ack"));
                 }
+                else if (msg.Op == FastUdpOp.LinkPing)
+                {
+                    client.Send(FastUdpOp.LinkFeedback, msg.A,
+                        client.LinkTracker.GetInboundPackedLossJitter(), 0, payloadTag: 0);
+                    UpdateAdaptivePacing();
+                }
+                else if (msg.Op == FastUdpOp.LinkFeedback)
+                {
+                    if (client.LinkTracker.PeerRefreshHz is >= 24 and <= 360)
+                        Volatile.Write(ref _liveRemoteRefreshHz, client.LinkTracker.PeerRefreshHz);
+                    UpdateAdaptivePacing();
+                }
                 else if (msg.Op == FastUdpOp.ReverseClaim)
                 {
                     if (msg.A > 0 && msg.Lease == msg.A)
@@ -2365,7 +2602,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                 }
             };
             Interlocked.Exchange(ref _highResTimer, Win.EnterHighResolutionTimer())?.Dispose();
-            _movePacer?.SetMinIntervalMs(2.5);
+            UpdateAdaptivePacing();
             Interlocked.Exchange(ref _udpClient, client)?.Dispose();
             TrySend(new Packet("udp-ready", client.LocalPort));
             var probeCancel = _cancel.Token;

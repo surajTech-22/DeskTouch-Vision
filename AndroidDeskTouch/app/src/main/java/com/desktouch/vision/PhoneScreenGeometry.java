@@ -65,18 +65,75 @@ final class PhoneScreenGeometry {
         return mfg+" "+mdl;
     }
 
-    static Info readInfo(Context context) {
+    static Display getDefaultDisplay(Context context) {
+        if(context==null) return null;
         Display display=null;
         DisplayManager dm=(DisplayManager)context.getSystemService(Context.DISPLAY_SERVICE);
         if(dm!=null) {
             try { display=dm.getDisplay(Display.DEFAULT_DISPLAY); }
             catch(RuntimeException ignored) {}
         }
-        WindowManager manager=(WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
-        if(display==null && manager!=null) {
-            try { display=manager.getDefaultDisplay(); }
+        if(display==null) {
+            WindowManager manager=(WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
+            if(manager!=null) {
+                try { display=manager.getDefaultDisplay(); }
+                catch(RuntimeException ignored) {}
+            }
+        }
+        return display;
+    }
+
+    static int readDisplayRefreshHz(Display display) {
+        if(display==null) return 0;
+        float hz=0f;
+        if(Build.VERSION.SDK_INT>=Build.VERSION_CODES.M) {
+            try {
+                Display.Mode mode=display.getMode();
+                if(mode!=null) hz=mode.getRefreshRate();
+            } catch(RuntimeException ignored) {}
+        }
+        if(hz<20f || hz>360f) {
+            try { hz=display.getRefreshRate(); }
             catch(RuntimeException ignored) {}
         }
+        if(hz>=20f && hz<=360f) return PointerSmoother.snapNearestStandardHz(Math.round(hz));
+        return 0;
+    }
+
+    static int readLiveRefreshHz(Context context) {
+        return readDisplayRefreshHz(getDefaultDisplay(context));
+    }
+
+    static float readPreferredActiveRefreshRate(Context context) {
+        Display display=getDefaultDisplay(context);
+        if(display==null || Build.VERSION.SDK_INT<Build.VERSION_CODES.M) return 0f;
+        try {
+            Display.Mode active=display.getMode();
+            Display.Mode[] modes=display.getSupportedModes();
+            if(active==null || modes==null) return 0f;
+            int physW=active.getPhysicalWidth();
+            int physH=active.getPhysicalHeight();
+            float best=0f;
+            for(Display.Mode mode : modes) {
+                if(mode==null) continue;
+                if(physW>0 && physH>0 &&
+                        (mode.getPhysicalWidth()!=physW || mode.getPhysicalHeight()!=physH)) {
+                    continue;
+                }
+                float rate=mode.getRefreshRate();
+                if(rate>60.5f && rate<=144.5f && rate>best) {
+                    best=rate;
+                }
+            }
+            return best;
+        } catch(RuntimeException ignored) {
+            return 0f;
+        }
+    }
+
+    static Info readInfo(Context context) {
+        Display display=getDefaultDisplay(context);
+        WindowManager manager=(WindowManager)context.getSystemService(Context.WINDOW_SERVICE);
         DisplayMetrics resMetrics=context.getResources().getDisplayMetrics();
         int width=0,height=0,dpi=resMetrics.densityDpi,refreshHz=0,rotation=0;
         if(display!=null) {
@@ -98,10 +155,7 @@ final class PhoneScreenGeometry {
             }
             try { rotation=rotationDegrees(display.getRotation()); }
             catch(RuntimeException ignored) {}
-            try {
-                float hz=display.getRefreshRate();
-                if(hz>=20f && hz<=360f) refreshHz=Math.round(hz);
-            } catch(RuntimeException ignored) {}
+            refreshHz=readDisplayRefreshHz(display);
         }
         if((width<=0 || height<=0) && manager!=null && Build.VERSION.SDK_INT>=30) {
             try {

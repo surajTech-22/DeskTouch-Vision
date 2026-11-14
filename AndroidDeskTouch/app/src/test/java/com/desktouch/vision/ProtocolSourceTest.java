@@ -408,4 +408,129 @@ public final class ProtocolSourceTest {
         assertEquals(-12,DeskTouchAccessibilityService.unpackX(edge));
         assertEquals(0,DeskTouchAccessibilityService.unpackY(edge));
     }
+
+    @Test public void pointerSmootherTracksLiveRefreshRateAndAdaptsZeroDelayCleanVsJittery() {
+        PointerSmoother smoother = new PointerSmoother();
+        float[] out = new float[2];
+
+        // 1. Clean low-jitter link: zero smoothing lag (direct 1:1 coordinate tracking).
+        smoother.setDisplayRefreshHz(120);
+        smoother.setLinkMetrics(1.0, 0.0);
+        smoother.reset(100f, 200f, 1_000_000L);
+        assertEquals(0.0, smoother.getCurrentTauMs(), 0.001);
+        assertTrue(smoother.onTarget(260f, 360f, 9_300_000L));
+        assertTrue(smoother.stepFrame(10_000_000L, out));
+        assertEquals(260f, out[0], 0.01f);
+        assertEquals(360f, out[1], 0.01f);
+        assertTrue(smoother.isSettled());
+
+        // 2. Live frame-rate estimator adapts generically across 50Hz / 90Hz / 120Hz / 144Hz.
+        long tNs = 20_000_000L;
+        for (int i = 0; i < 10; i++) {
+            tNs += 20_000_000L; // 50 Hz frames
+            smoother.observeFrameTimestamp(tNs);
+        }
+        assertEquals(50, smoother.getMeasuredFrameHz());
+        assertEquals(50, smoother.getEffectiveRefreshHz());
+
+        for (int i = 0; i < 12; i++) {
+            tNs += 6_944_444L; // 144 Hz frames
+            smoother.observeFrameTimestamp(tNs);
+        }
+        assertEquals(144, smoother.getMeasuredFrameHz());
+        assertEquals(144, smoother.getEffectiveRefreshHz());
+
+        // 3. Congested wireless link: interpolates monotonically without overshooting,
+        // and snaps instantaneously right before clicks or scroll events.
+        smoother.setLinkMetrics(18.0, 25.0);
+        assertTrue(smoother.getCurrentTauMs() > 8.0);
+        smoother.reset(100f, 100f, tNs);
+        assertTrue(smoother.onTarget(500f, 300f, tNs + 7_000_000L));
+        assertTrue(smoother.stepFrame(tNs + 14_000_000L, out));
+        assertTrue(out[0] > 100f && out[0] < 500f);
+        assertTrue(out[1] > 100f && out[1] < 300f);
+        assertFalse(smoother.isSettled());
+        assertTrue(smoother.snapNow(out));
+        assertEquals(500f, out[0], 0.01f);
+        assertEquals(300f, out[1], 0.01f);
+        assertTrue(smoother.isSettled());
+    }
+
+    @Test public void adaptiveLinkTrackerMeasuresLossRttBloatAndReordering() {
+        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker();
+        int packedLj = AdaptiveLinkTracker.packLossJitter(12.0, 7.4);
+        assertEquals(12.0, AdaptiveLinkTracker.unpackLossPermille(packedLj), 0.1);
+        assertEquals(7.4, AdaptiveLinkTracker.unpackJitterMs(packedLj), 0.11);
+
+        int packedDr = AdaptiveLinkTracker.packDisplayRate(144, 69);
+        assertEquals(144, AdaptiveLinkTracker.unpackRefreshHz(packedDr));
+        assertEquals(69, AdaptiveLinkTracker.unpackFrameTenthsMs(packedDr));
+
+        // Harmless wireless reordering (seq 7 before seq 6) must NOT count as real packet loss.
+        long[] seqOrder = { 1, 2, 3, 4, 5, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        long ms = 1000L;
+        for (long s : seqOrder) {
+            ms += 8L;
+            tracker.recordInboundPacket(s, true, ms);
+        }
+        assertTrue(tracker.getReorderedPackets() >= 1);
+        assertEquals(0L, tracker.getLostPackets());
+
+        // Skipping seq 18 completely past REORDER_SLACK must detect genuine loss.
+        for (long s = 17; s <= 35; s++) {
+            if (s == 18) continue;
+            ms += 8L;
+            tracker.recordInboundPacket(s, true, ms);
+        }
+        assertEquals(1L, tracker.getLostPackets());
+
+        // Clean vs congested RTT pacing scales up cleanly under wireless bloat.
+        AdaptiveLinkTracker cleanTracker = new AdaptiveLinkTracker();
+        int t1 = cleanTracker.nextPingToken(ms);
+        assertTrue(cleanTracker.onFeedbackReceived(t1, AdaptiveLinkTracker.packLossJitter(0.0, 1.0),
+            AdaptiveLinkTracker.packDisplayRate(120, 83), ms + 3L));
+        double cleanPace = cleanTracker.computeAdaptiveSendIntervalMs(120);
+        assertTrue(cleanPace <= 6.5);
+
+        int t2 = cleanTracker.nextPingToken(ms + 200L);
+        assertTrue(cleanTracker.onFeedbackReceived(t2, AdaptiveLinkTracker.packLossJitter(35.0, 20.0),
+            AdaptiveLinkTracker.packDisplayRate(60, 167), ms + 255L));
+        double busyPace = cleanTracker.computeAdaptiveSendIntervalMs(60);
+        assertTrue(busyPace > cleanPace + 5.0 && busyPace <= 35.0);
+    }
+
+    @Test public void liveRefreshRateResolutionAndUdpSlidingReplayWindow() throws Exception {
+        assertEquals(120, DeskTouchSession.resolveLiveRefreshHz(120, 60));
+        assertEquals(50, DeskTouchSession.resolveLiveRefreshHz(50, 120));
+        assertEquals(90, DeskTouchSession.resolveLiveRefreshHz(0, 90));
+        assertEquals(60, DeskTouchSession.resolveLiveRefreshHz(0, 0));
+
+        byte[] key = new byte[FastUdpChannel.KEY_SIZE];
+        for (int i = 0; i < key.length; i++) key[i] = (byte) (i + 1);
+        FastUdpChannel.Codec srv = new FastUdpChannel.Codec(key, 5, true);
+        FastUdpChannel.Codec cli = new FastUdpChannel.Codec(key, 5, false);
+        byte[] f1 = new byte[FastUdpChannel.FRAME_SIZE];
+        byte[] f2 = new byte[FastUdpChannel.FRAME_SIZE];
+        byte[] f3 = new byte[FastUdpChannel.FRAME_SIZE];
+        byte[] f4 = new byte[FastUdpChannel.FRAME_SIZE];
+        srv.seal(FastUdpChannel.OP_LINK_PING, 11, 25, 0, 100, f1);
+        srv.seal(FastUdpChannel.OP_REVERSE_BUTTON, 1, 1, 9, 10, f2);
+        srv.seal(FastUdpChannel.OP_REVERSE_WHEEL, -120, 0, 9, 11, f3);
+        srv.seal(FastUdpChannel.OP_LINK_FEEDBACK, 11, 0, 0, (120 << 16) | 83, f4);
+
+        // Out-of-order delivery within 64-packet window succeeds without duplicate replay.
+        FastUdpChannel.Message m1 = cli.tryOpen(f1, f1.length);
+        FastUdpChannel.Message m3 = cli.tryOpen(f3, f3.length);
+        FastUdpChannel.Message m2 = cli.tryOpen(f2, f2.length);
+        FastUdpChannel.Message m4 = cli.tryOpen(f4, f4.length);
+        assertNotNull(m1);
+        assertNotNull(m2);
+        assertNotNull(m3);
+        assertNotNull(m4);
+        assertEquals(FastUdpChannel.OP_LINK_PING, m1.op);
+        assertEquals(FastUdpChannel.OP_REVERSE_BUTTON, m2.op);
+        assertEquals(FastUdpChannel.OP_REVERSE_WHEEL, m3.op);
+        assertEquals(FastUdpChannel.OP_LINK_FEEDBACK, m4.op);
+        assertNull(cli.tryOpen(f2, f2.length)); // replayed seq blocked
+    }
 }

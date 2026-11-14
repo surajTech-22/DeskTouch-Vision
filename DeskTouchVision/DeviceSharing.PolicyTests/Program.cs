@@ -235,6 +235,84 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         Math.Abs(ReceiverServer.RecommendedUdpMinIntervalMs("Windows", 144) - 2.5) < 0.01,
         "RecommendedUdpMinIntervalMs must pace Android frames cleanly for display refresh rates without saturating 5 GHz airtime");
 
+    // Verify generic adaptive pacing across live display refresh rates (50/60/90/120/144Hz)
+    // and live network conditions (clean wired/fast link vs spiky/lossy wireless).
+    {
+        double wired144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, rttMs: 2.0, minRttMs: 2.0, jitterMs: 0.5, lossPermille: 0);
+        double normal50 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 50, rttMs: 10.0, minRttMs: 9.0, jitterMs: 2.0, lossPermille: 0);
+        double busyWiFi = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 120, rttMs: 46.0, minRttMs: 7.0, jitterMs: 19.0, lossPermille: 24.0);
+        double winWired = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Windows", 144, rttMs: 1.8, minRttMs: 1.8, jitterMs: 0.4, lossPermille: 0);
+        Check(wired144 is >= 4.2 and <= 6.0 &&
+            normal50 >= 12.0 &&
+            busyWiFi > 15.0 && busyWiFi <= 38.0 &&
+            winWired is >= 1.8 and <= 2.5,
+            "ComputeAdaptiveUdpIntervalMs must adapt continuously to live display Hz, ping, queue bloat, jitter, and loss");
+    }
+
+    // Verify 64-packet sliding anti-replay window + LinkPing/LinkFeedback + AdaptiveLinkTracker.
+    {
+        byte[] reorderKey = Enumerable.Range(51, 32).Select(x => (byte)x).ToArray();
+        using var rsrv = new FastUdpCodec(reorderKey, 33, isServer: true);
+        using var rcli = new FastUdpCodec(reorderKey, 33, isServer: false);
+        byte[] p1 = new byte[FastUdpCodec.FrameSize];
+        byte[] p2 = new byte[FastUdpCodec.FrameSize];
+        byte[] p3 = new byte[FastUdpCodec.FrameSize];
+        byte[] p4 = new byte[FastUdpCodec.FrameSize];
+        byte[] p5 = new byte[FastUdpCodec.FrameSize];
+        rsrv.Seal(FastUdpOp.LinkPing, 99, 65, 0, 1000, p1);
+        rsrv.Seal(FastUdpOp.ReverseButton, 1, 1, 7, 1, p2);
+        rsrv.Seal(FastUdpOp.ReverseMove, 100, 200, 7, 2, p3);
+        rsrv.Seal(FastUdpOp.ReverseWheel, 120, 0, 7, 3, p4);
+        rsrv.Seal(FastUdpOp.LinkFeedback, 99, AdaptiveLinkTracker.PackLossJitter(15, 6.2), 0, AdaptiveLinkTracker.PackDisplayRate(50, 200), p5);
+
+        // Deliver seq 1, 3, 5, 4 (skipping 2 temporarily), then deliver reordered seq 2 cleanly.
+        Check(rcli.TryOpen(p1, out var o1) && o1.Op == FastUdpOp.LinkPing && o1.A == 99 &&
+            rcli.TryOpen(p3, out var o3) && o3.Seq == 3 &&
+            rcli.TryOpen(p5, out var o5) && o5.Op == FastUdpOp.LinkFeedback &&
+            rcli.TryOpen(p4, out var o4) && o4.Seq == 4 &&
+            rcli.TryOpen(p2, out var o2) && o2.Op == FastUdpOp.ReverseButton && o2.Seq == 2 &&
+            !rcli.TryOpen(p2, out _),
+            "FastUdpCodec 64-packet sliding window must accept reordered legitimate frames while rejecting duplicates");
+
+        var tracker = new AdaptiveLinkTracker();
+        int pingTok = tracker.NextPingToken(1000);
+        Check(tracker.OnFeedbackReceived(pingTok,
+                AdaptiveLinkTracker.PackLossJitter(12, 8.5),
+                AdaptiveLinkTracker.PackDisplayRate(144, 69),
+                1028) &&
+            tracker.PeerRefreshHz == 144 &&
+            tracker.PeerFrameTenthsMs == 69 &&
+            Math.Abs(tracker.SmoothedRttMs - 28.0) < 0.1,
+            "AdaptiveLinkTracker must round-trip live RTT, loss, jitter, and peer refresh rate");
+
+        ulong[] seqs = { 1, 2, 3, 4, 5, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15 };
+        long tickMs = 500;
+        foreach (ulong s in seqs)
+        {
+            tickMs += 7;
+            tracker.RecordInboundPacket(s, true, tickMs);
+        }
+        Check(tracker.ReorderedPackets >= 1 && tracker.LostPackets == 0,
+            "Brief wireless reordering must not inflate real packet-loss counts");
+        for (ulong s = 16; s <= 35; s++)
+        {
+            if (s == 18) continue;
+            tickMs += 7;
+            tracker.RecordInboundPacket(s, true, tickMs);
+        }
+        Check(tracker.LostPackets == 1,
+            "Truly dropped packet past reorder slack must count cleanly as packet loss");
+
+        using var dynPacer = new FastMovePacer(
+            canSendUdp: () => true,
+            sendUdp: _ => true,
+            queueReliableTcp: _ => { });
+        dynPacer.SetMinIntervalMs(14.5);
+        dynPacer.SetWarmIntervalMs(36);
+        Check(Math.Abs(dynPacer.EffectiveMinIntervalMs - 14.5) < 0.01,
+            "FastMovePacer must expose live adaptive pacing interval");
+    }
+
     byte[] extSrvKey = Enumerable.Range(21, 32).Select(x => (byte)x).ToArray();
     using (var srvCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: true))
     using (var cliCodec2 = new FastUdpCodec(extSrvKey, 12, isServer: false))

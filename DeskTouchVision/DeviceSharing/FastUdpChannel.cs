@@ -18,7 +18,9 @@ internal enum FastUdpOp : byte
     ReverseGranted = 7,
     ReverseActive = 8,
     ReverseButton = 9,
-    ReverseWheel = 10
+    ReverseWheel = 10,
+    LinkPing = 11,
+    LinkFeedback = 12
 }
 
 internal readonly record struct FastUdpMessage(
@@ -58,6 +60,7 @@ internal sealed class FastUdpCodec : IDisposable
     private readonly byte[] _recvNonce = new byte[12];
     private ulong _sendSeq;
     private ulong _lastRecvSeq;
+    private ulong _recvWindowMask;
     private bool _disposed;
 
     internal FastUdpCodec(byte[] key, ushort peerId, bool isServer)
@@ -119,7 +122,18 @@ internal sealed class FastUdpCodec : IDisposable
 
         lock (_recvLock)
         {
-            if (_disposed || seq <= _lastRecvSeq) return false;
+            if (_disposed) return false;
+            bool isCoordinateOp = rawOp is (byte)FastUdpOp.Move or (byte)FastUdpOp.ReverseMove;
+            bool isNewMax = _lastRecvSeq == 0 || seq > _lastRecvSeq;
+            ulong backBit = 0;
+            if (!isNewMax)
+            {
+                if (isCoordinateOp) return false;
+                ulong back = _lastRecvSeq - seq;
+                if (back >= 64) return false;
+                backBit = 1UL << (int)back;
+                if ((_recvWindowMask & backBit) != 0) return false;
+            }
             WriteNonceSeq(seq, _recvNonce);
             try
             {
@@ -134,7 +148,21 @@ internal sealed class FastUdpCodec : IDisposable
             {
                 return false;
             }
-            _lastRecvSeq = seq;
+            if (_lastRecvSeq == 0)
+            {
+                _lastRecvSeq = seq;
+                _recvWindowMask = 1UL;
+            }
+            else if (isNewMax)
+            {
+                ulong diff = seq - _lastRecvSeq;
+                _recvWindowMask = diff >= 64 ? 1UL : ((_recvWindowMask << (int)diff) | 1UL);
+                _lastRecvSeq = seq;
+            }
+            else
+            {
+                _recvWindowMask |= backBit;
+            }
             message = new FastUdpMessage(
                 (FastUdpOp)rawOp,
                 peerId,
@@ -171,6 +199,311 @@ internal sealed class FastUdpCodec : IDisposable
     }
 }
 
+internal sealed class AdaptiveLinkTracker
+{
+    private const int ReorderSlack = 8;
+    private const long MinRttWindowMs = 10_000;
+    private const int PingRingSize = 16;
+
+    private readonly object _recvGate = new();
+    private ulong _maxSeq;
+    private ulong _settledSeq;
+    private ulong _seenMask;
+    private double _ewmaLossRatio;
+    private long _reorderedPackets;
+    private long _lostPackets;
+    private long _lastArriveMs;
+    private double _emaGapMs = 8.0;
+    private double _inboundJitterMs;
+
+    private readonly object _rttGate = new();
+    private readonly int[] _pingTokens = new int[PingRingSize];
+    private readonly long[] _pingSentMs = new long[PingRingSize];
+    private int _pingCounter;
+    private double _smoothedRttMs;
+    private double _rttJitterMs;
+    private double _minRttWindowA = double.MaxValue;
+    private double _minRttWindowB = double.MaxValue;
+    private long _windowStartMs;
+    private double _peerLossPermille;
+    private double _peerJitterMs;
+    private int _peerRefreshHz;
+    private int _peerFrameTenthsMs;
+
+    internal static bool IsStreamTimingOp(FastUdpOp op) =>
+        op is FastUdpOp.Move or FastUdpOp.ReverseMove or FastUdpOp.Warm or FastUdpOp.LinkPing;
+
+    internal int NextPingToken(long nowMs)
+    {
+        lock (_rttGate)
+        {
+            _pingCounter = (_pingCounter + 1) & 0x3FFFFFFF;
+            if (_pingCounter == 0) _pingCounter = 1;
+            int token = _pingCounter;
+            int slot = token % PingRingSize;
+            _pingTokens[slot] = token;
+            _pingSentMs[slot] = nowMs;
+            return token;
+        }
+    }
+
+    internal bool OnFeedbackReceived(int echoToken, int packedLossJitter, int packedDisplayRate, long nowMs)
+    {
+        bool matched = false;
+        lock (_rttGate)
+        {
+            if (echoToken > 0)
+            {
+                int slot = echoToken % PingRingSize;
+                if (_pingTokens[slot] == echoToken && _pingSentMs[slot] > 0 && nowMs >= _pingSentMs[slot])
+                {
+                    _pingTokens[slot] = 0;
+                    double sample = Math.Max(0.5, nowMs - _pingSentMs[slot]);
+                    RecordRttSampleLocked(sample, nowMs);
+                    matched = true;
+                }
+            }
+            if (packedLossJitter >= 0)
+            {
+                _peerLossPermille = UnpackLossPermille(packedLossJitter);
+                _peerJitterMs = UnpackJitterMs(packedLossJitter);
+            }
+            if (packedDisplayRate > 0)
+            {
+                int hz = UnpackRefreshHz(packedDisplayRate);
+                int tenths = UnpackFrameTenthsMs(packedDisplayRate);
+                if (hz is >= 24 and <= 360) _peerRefreshHz = hz;
+                if (tenths is >= 25 and <= 420) _peerFrameTenthsMs = tenths;
+            }
+        }
+        return matched;
+    }
+
+    internal void RecordRttSample(double rttMs, long nowMs)
+    {
+        if (rttMs <= 0 || double.IsNaN(rttMs) || double.IsInfinity(rttMs)) return;
+        lock (_rttGate)
+            RecordRttSampleLocked(Math.Max(0.5, rttMs), nowMs);
+    }
+
+    private void RecordRttSampleLocked(double sampleRtt, long nowMs)
+    {
+        if (_windowStartMs == 0)
+        {
+            _windowStartMs = nowMs;
+        }
+        else if (nowMs - _windowStartMs >= MinRttWindowMs)
+        {
+            _minRttWindowB = _minRttWindowA;
+            _minRttWindowA = double.MaxValue;
+            _windowStartMs = nowMs;
+        }
+        if (sampleRtt < _minRttWindowA) _minRttWindowA = sampleRtt;
+
+        if (_smoothedRttMs <= 0)
+        {
+            _smoothedRttMs = sampleRtt;
+            _rttJitterMs = 0;
+        }
+        else
+        {
+            double dev = Math.Abs(sampleRtt - _smoothedRttMs);
+            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.10) * (dev - _rttJitterMs);
+            double alpha = sampleRtt > _smoothedRttMs ? 0.28 : 0.16;
+            _smoothedRttMs += alpha * (sampleRtt - _smoothedRttMs);
+        }
+    }
+
+    internal void RecordInboundPacket(ulong seq, bool streamTimingOp, long nowMs)
+    {
+        lock (_recvGate)
+        {
+            RecordSeqLocked(seq);
+            if (streamTimingOp && nowMs > 0)
+            {
+                if (_lastArriveMs > 0 && nowMs >= _lastArriveMs)
+                {
+                    long dt = nowMs - _lastArriveMs;
+                    if (dt is >= 2 and <= 160)
+                    {
+                        double dev = Math.Abs(dt - _emaGapMs);
+                        _inboundJitterMs += (dev > _inboundJitterMs ? 0.25 : 0.06) * (dev - _inboundJitterMs);
+                        if (dt <= 45) _emaGapMs += 0.12 * (dt - _emaGapMs);
+                    }
+                    else if (dt < 2)
+                    {
+                        _inboundJitterMs = Math.Max(_inboundJitterMs, 4.5);
+                    }
+                    else if (dt > 300)
+                    {
+                        _inboundJitterMs *= 0.85;
+                    }
+                }
+                _lastArriveMs = nowMs;
+            }
+        }
+    }
+
+    private void RecordSeqLocked(ulong seq)
+    {
+        if (seq == 0) return;
+        if (_maxSeq == 0)
+        {
+            _maxSeq = seq;
+            _settledSeq = seq;
+            _seenMask = 1UL;
+            return;
+        }
+        if (seq > _maxSeq)
+        {
+            ulong diff = seq - _maxSeq;
+            if (diff >= 64)
+            {
+                _seenMask = 1UL;
+                ulong skipped = diff >= 65 ? 64UL : diff - 1;
+                for (ulong i = 0; i < skipped; i++)
+                {
+                    _ewmaLossRatio = _ewmaLossRatio * 0.975 + 0.025;
+                    _lostPackets++;
+                }
+                _settledSeq = seq;
+            }
+            else
+            {
+                _seenMask = (_seenMask << (int)diff) | 1UL;
+            }
+            _maxSeq = seq;
+            SettleOldSlotsLocked();
+        }
+        else
+        {
+            ulong back = _maxSeq - seq;
+            if (back < 64)
+            {
+                ulong bit = 1UL << (int)back;
+                if ((_seenMask & bit) == 0)
+                {
+                    _seenMask |= bit;
+                    if (back >= 1) _reorderedPackets++;
+                }
+            }
+        }
+    }
+
+    private void SettleOldSlotsLocked()
+    {
+        if (_maxSeq <= ReorderSlack) return;
+        ulong targetSettle = _maxSeq - ReorderSlack;
+        if (targetSettle <= _settledSeq) return;
+        ulong step = Math.Min(64UL, targetSettle - _settledSeq);
+        ulong start = _settledSeq + 1;
+        for (ulong i = 0; i < step; i++)
+        {
+            ulong s = start + i;
+            ulong back = _maxSeq - s;
+            bool seen = back < 64 && ((_seenMask & (1UL << (int)back)) != 0);
+            if (seen)
+            {
+                _ewmaLossRatio *= 0.975;
+            }
+            else
+            {
+                _ewmaLossRatio = _ewmaLossRatio * 0.975 + 0.025;
+                _lostPackets++;
+            }
+        }
+        _settledSeq = targetSettle;
+    }
+
+    internal int GetInboundPackedLossJitter()
+    {
+        lock (_recvGate)
+            return PackLossJitter(Math.Clamp(_ewmaLossRatio * 1000.0, 0.0, 1000.0), _inboundJitterMs);
+    }
+
+    internal double InboundLossPermille
+    {
+        get { lock (_recvGate) return Math.Clamp(_ewmaLossRatio * 1000.0, 0.0, 1000.0); }
+    }
+
+    internal double InboundJitterMs
+    {
+        get { lock (_recvGate) return _inboundJitterMs; }
+    }
+
+    internal long ReorderedPackets { get { lock (_recvGate) return _reorderedPackets; } }
+    internal long LostPackets { get { lock (_recvGate) return _lostPackets; } }
+
+    internal double SmoothedRttMs { get { lock (_rttGate) return _smoothedRttMs; } }
+
+    internal double MinRttMs
+    {
+        get
+        {
+            lock (_rttGate)
+            {
+                double best = Math.Min(_minRttWindowA, _minRttWindowB);
+                return best == double.MaxValue ? 0.0 : best;
+            }
+        }
+    }
+
+    internal double QueueDelayMs
+    {
+        get
+        {
+            lock (_rttGate)
+            {
+                double min = Math.Min(_minRttWindowA, _minRttWindowB);
+                return _smoothedRttMs > 0 && min != double.MaxValue && _smoothedRttMs > min
+                    ? _smoothedRttMs - min
+                    : 0.0;
+            }
+        }
+    }
+
+    internal double EffectiveJitterMs
+    {
+        get
+        {
+            double inJ = InboundJitterMs;
+            lock (_rttGate) return Math.Max(inJ, Math.Max(_rttJitterMs, _peerJitterMs));
+        }
+    }
+
+    internal double CombinedLossPermille
+    {
+        get
+        {
+            double inL = InboundLossPermille;
+            lock (_rttGate) return Math.Max(inL, _peerLossPermille);
+        }
+    }
+
+    internal int PeerRefreshHz { get { lock (_rttGate) return _peerRefreshHz; } }
+    internal int PeerFrameTenthsMs { get { lock (_rttGate) return _peerFrameTenthsMs; } }
+
+    internal static int PackLossJitter(double lossPermille, double jitterMs)
+    {
+        int loss = Math.Clamp((int)Math.Round(lossPermille), 0, 65535);
+        int jitterTenths = Math.Clamp((int)Math.Round(jitterMs * 10.0), 0, 65535);
+        return (loss << 16) | jitterTenths;
+    }
+
+    internal static double UnpackLossPermille(int packed) => (uint)packed >> 16;
+    internal static double UnpackJitterMs(int packed) => (packed & 0xFFFF) / 10.0;
+
+    internal static int PackDisplayRate(int refreshHz, int frameTenthsMs)
+    {
+        int hz = Math.Clamp(refreshHz, 0, 65535);
+        int ft = Math.Clamp(frameTenthsMs, 0, 65535);
+        return (hz << 16) | ft;
+    }
+
+    internal static int UnpackRefreshHz(int packed) => (int)((uint)packed >> 16);
+    internal static int UnpackFrameTenthsMs(int packed) => packed & 0xFFFF;
+}
+
 internal static class FastUdpSocketOptions
 {
     private const int SioUdpConnReset = -1744830452;
@@ -198,11 +531,14 @@ internal sealed class FastUdpHub : IDisposable
         internal readonly IPAddress ExpectedAddress;
         internal readonly byte[] Key;
         internal readonly FastUdpCodec Codec;
+        internal readonly AdaptiveLinkTracker LinkTracker = new();
         private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
         private IPEndPoint? _remoteEndPoint;
         internal volatile bool Confirmed;
         private int _confirmedLogged;
         internal long LastMoveSentTicks;
+        internal long LastLinkPingMs;
+        internal ulong HighestMoveSeq;
 
         internal bool TryMarkConfirmedLogged() =>
             Interlocked.CompareExchange(ref _confirmedLogged, 1, 0) == 0;
@@ -331,6 +667,10 @@ internal sealed class FastUdpHub : IDisposable
                 if (peer.RemoteEndPoint == null)
                     peer.RemoteEndPoint = new IPEndPoint(normalized, srcIp.Port);
 
+                long nowMs = Environment.TickCount64;
+                peer.LinkTracker.RecordInboundPacket(
+                    msg.Seq, AdaptiveLinkTracker.IsStreamTimingOp(msg.Op), nowMs);
+
                 if (msg.Op == FastUdpOp.Probe)
                 {
                     peer.Send(_socket, FastUdpOp.ProbeAck, Port, 0, 0);
@@ -339,6 +679,18 @@ internal sealed class FastUdpHub : IDisposable
                 else if (msg.Op == FastUdpOp.ProbeAck)
                 {
                     peer.Confirmed = true;
+                    MessageReceived?.Invoke(peer, msg);
+                }
+                else if (msg.Op == FastUdpOp.LinkFeedback)
+                {
+                    peer.Confirmed = true;
+                    peer.LinkTracker.OnFeedbackReceived(msg.A, msg.B, msg.TimestampMs, nowMs);
+                    MessageReceived?.Invoke(peer, msg);
+                }
+                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove)
+                {
+                    if (msg.Seq <= peer.HighestMoveSeq) continue;
+                    peer.HighestMoveSeq = msg.Seq;
                     MessageReceived?.Invoke(peer, msg);
                 }
                 else
@@ -378,10 +730,13 @@ internal sealed class FastUdpClient : IDisposable
     private readonly Socket _socket;
     private readonly IPEndPoint _serverEndPoint;
     private readonly FastUdpCodec _codec;
+    internal readonly AdaptiveLinkTracker LinkTracker = new();
     private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
     private readonly Thread _recvThread;
     private volatile bool _disposed;
     internal volatile bool Confirmed;
+    private ulong _highestMoveSeq;
+    internal long LastLinkPingMs;
 
     internal int LocalPort { get; }
     internal event Action<FastUdpMessage>? MessageReceived;
@@ -444,6 +799,9 @@ internal sealed class FastUdpClient : IDisposable
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
                 if (!normalized.Equals(_serverEndPoint.Address) || srcIp.Port != _serverEndPoint.Port) continue;
                 if (!_codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
+                long nowMs = Environment.TickCount64;
+                LinkTracker.RecordInboundPacket(
+                    msg.Seq, AdaptiveLinkTracker.IsStreamTimingOp(msg.Op), nowMs);
                 if (msg.Op == FastUdpOp.Probe)
                 {
                     Send(FastUdpOp.ProbeAck, LocalPort, 0, 0);
@@ -459,6 +817,22 @@ internal sealed class FastUdpClient : IDisposable
                     Confirmed = true;
                     if (newlyConfirmed)
                         ConfirmedChanged?.Invoke();
+                    MessageReceived?.Invoke(msg);
+                }
+                else if (msg.Op == FastUdpOp.LinkFeedback)
+                {
+                    if (!Confirmed)
+                    {
+                        Confirmed = true;
+                        ConfirmedChanged?.Invoke();
+                    }
+                    LinkTracker.OnFeedbackReceived(msg.A, msg.B, msg.TimestampMs, nowMs);
+                    MessageReceived?.Invoke(msg);
+                }
+                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove)
+                {
+                    if (msg.Seq <= _highestMoveSeq) continue;
+                    _highestMoveSeq = msg.Seq;
                     MessageReceived?.Invoke(msg);
                 }
                 else
@@ -592,12 +966,33 @@ internal sealed class FastMovePacer : IDisposable
     }
 
     private double _effectiveMinIntervalMs = -1;
+    private int _effectiveWarmIntervalMs = WarmKeepaliveIntervalMs;
     private long _udpDirectCount, _udpFlushedCount, _trailingTcpSyncCount;
+
+    internal double EffectiveMinIntervalMs
+    {
+        get { lock (_gate) return ActiveMinIntervalMsLocked(); }
+    }
 
     internal void SetMinIntervalMs(double ms)
     {
         lock (_gate)
             _effectiveMinIntervalMs = ms > 0 ? ms : -1;
+    }
+
+    internal void SetWarmIntervalMs(int ms)
+    {
+        int clamped = Math.Clamp(ms, 18, 60);
+        lock (_gate)
+        {
+            if (_effectiveWarmIntervalMs == clamped) return;
+            _effectiveWarmIntervalMs = clamped;
+            if (!_disposed && _throttledUdp == null && _pendingTcpSync == null &&
+                IsWarmWindowOpenLocked(Stopwatch.GetTimestamp()) && _sendWarm != null)
+            {
+                UpdateTimerLocked();
+            }
+        }
     }
 
     internal (long UdpDirect, long UdpPacedFlush, long TrailingTcpSync) TakeStats() => (
@@ -748,7 +1143,7 @@ internal sealed class FastMovePacer : IDisposable
                 double idleWarmMs = lastActivityTicks == 0
                     ? double.MaxValue
                     : (now - lastActivityTicks) * 1000.0 / Stopwatch.Frequency;
-                if (idleWarmMs >= WarmKeepaliveIntervalMs - 2)
+                if (idleWarmMs >= _effectiveWarmIntervalMs - 2)
                 {
                     _lastWarmTicks = now;
                     sendWarm = true;
@@ -795,7 +1190,7 @@ internal sealed class FastMovePacer : IDisposable
             dueMs = _pendingTcpSync != null
                 ? TrailingTcpSyncDelayMs
                 : IsWarmWindowOpenLocked(now) && _sendWarm != null
-                    ? WarmKeepaliveIntervalMs
+                    ? _effectiveWarmIntervalMs
                     : Timeout.Infinite;
         }
         try { _timer.Change(dueMs, Timeout.Infinite); }

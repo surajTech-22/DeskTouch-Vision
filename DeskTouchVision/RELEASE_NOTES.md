@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.36 — Live Display Refresh-Rate Sync, Adaptive Speed/Ping Pacing & Smooth Reordered Motion
+
+DeskTouch Vision dynamically tracks each Android device's live screen refresh rate and real-time network speed, latency, jitter, and packet loss so cross-device mouse control stays smooth across everyday wireless and wired connections without device-specific workarounds.
+
+- **Live cross-device display refresh-rate sensing and streaming:** Android now monitors real-time `DisplayManager` mode shifts and active `Choreographer` frame cadence (while requesting smoother overlay refresh only during active pointer display), streaming live display rate updates continuously to Windows (`OP_LINK_FEEDBACK` and `"display-metrics"`) instead of relying on startup estimates.
+- **Dynamic network speed, ping, jitter & packet-loss pacing:** Continuous encrypted probes (`OP_LINK_PING` / `OP_LINK_FEEDBACK`) track round-trip ping, rolling min-RTT queuing delay, inter-arrival jitter, and real packet loss on both Windows and Android, scaling update cadence automatically down when wireless queues spike and back up to full speed on clean or wired links.
+- **Smooth jitter-compensated motion & UI-stall elimination:** Added zero-overshoot frame-paced cursor interpolation (zero added smoothing lag on clean links; click/scroll actions always snap immediately), widened the fast-lane codec with a 64-packet sliding anti-replay window for reordered non-coordinate control packets, bounded Accessibility node scans to prevent UI-thread hangs, and eliminated high-rate idle keepalive floods.
+
+---
+
 # DeskTouch Vision v0.3.35 — Continuous Phone Wireless Wake, Ordered Zero-Jump Pointer Motion & Clean 5 GHz Pacing
 
 DeskTouch Vision eliminates intermittent multi-hundred-millisecond wireless stalls and backward/diagonal cursor jumps while keeping phone battery sleep protection, scroll direction, app-icon scroll protection, trusted reconnection, and direct in-app Android updates intact.

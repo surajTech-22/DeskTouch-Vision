@@ -104,6 +104,10 @@ final class DeskTouchRuntime {
     static void publishPhoneGeometry(){
         for(DeskTouchSession session:sessions.values())session.publishPhoneGeometry();
     }
+    static void liveRefreshRateChanged(int refreshHz, int frameTenthsMs){
+        for(DeskTouchSession session:sessions.values())
+            session.onLiveRefreshRateChanged(refreshHz, frameTenthsMs);
+    }
     static void accessibilityPermissionChanged(){
         for(DeskTouchSession session:sessions.values())
             session.publishAccessibilityCapability();

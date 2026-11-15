@@ -326,7 +326,9 @@ public final class ShellInputDaemon {
                         } catch (InterruptedException ignored) {}
                     }
                     if (!daemonRunning) break;
-                    long minGapNs = ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz);
+                    long minGapNs = pendingMoveCoasting
+                        ? ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz)
+                        : 900_000L;
                     long waitNs = lastMouseWriteNs == 0L
                         ? 0L
                         : (lastMouseWriteNs + minGapNs - System.nanoTime());
@@ -435,13 +437,7 @@ public final class ShellInputDaemon {
         }
         if (have) {
             int outcome = moveTo(tx, ty, px, py, seq, coasting);
-            int extraSteps = 0;
-            while (outcome == MOVE_SENT_MORE && extraSteps < 8) {
-                LockSupport.parkNanos(ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz));
-                outcome = moveTo(tx, ty, 0, 0, seq, true);
-                extraSteps++;
-            }
-            if (outcome != MOVE_DONE_IDLE || extraSteps > 0) {
+            if (outcome != MOVE_DONE_IDLE) {
                 synchronized (mouseQueueLock) {
                     lastMouseWriteNs = System.nanoTime();
                 }
@@ -463,17 +459,9 @@ public final class ShellInputDaemon {
         }
         screenWidth = nextW;
         screenHeight = nextH;
-        ShellPointerMath.VelocityParams probed =
-            (speedChanged || !hasDumpsysVelocityParams) ? probeVelocityParamsBlocking(250) : null;
-        if (probed != null) {
-            hasDumpsysVelocityParams = true;
-        }
-        ShellPointerMath.VelocityParams initParams =
-            probed != null
-                ? probed
-                : ((!hasDumpsysVelocityParams || speedChanged)
-                    ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
-                    : null);
+        ShellPointerMath.VelocityParams initParams = (!hasDumpsysVelocityParams || speedChanged)
+            ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
+            : null;
         pointer.configure(nextW, nextH, initParams, configuredRefreshHz);
         try {
             boolean createdMouse = false;
@@ -494,14 +482,45 @@ public final class ShellInputDaemon {
                 createdKeyboard = true;
             }
             if (createdMouse || createdKeyboard) {
-                // Let EventHub/InputReader and hard-keyboard configuration transitions settle before mouse bursts arrive.
-                LockSupport.parkNanos(180_000_000L);
+                if (createdMouse && mouseFd != null) {
+                    writeMouseReport(1, 0, 0, 0);
+                    LockSupport.parkNanos(12_000_000L);
+                    writeMouseReport(-1, 0, 0, 0);
+                    mousePrimedForReader = true;
+                }
+                // Let EventHub/InputReader register CursorInputMapper and VelocityControl before probing.
+                LockSupport.parkNanos(140_000_000L);
+            }
+            if (createdMouse || speedChanged || !hasDumpsysVelocityParams) {
+                ShellPointerMath.VelocityParams probed = probeVelocityParamsBlocking(280);
+                if (probed != null) {
+                    hasDumpsysVelocityParams = true;
+                    pointer.updateVelocityParams(probed);
+                } else {
+                    scheduleDelayedVelocityProbe();
+                }
             }
             return mouseFd != null && keyboardFd != null;
         } catch (Exception ex) {
             destroyDevices();
             return false;
         }
+    }
+
+    private void scheduleDelayedVelocityProbe() {
+        Thread retry = new Thread(() -> {
+            LockSupport.parkNanos(450_000_000L);
+            if (!daemonRunning || mouseFd == null) return;
+            ShellPointerMath.VelocityParams probed = probeVelocityParamsBlocking(600);
+            if (probed != null) {
+                synchronized (this) {
+                    hasDumpsysVelocityParams = true;
+                    pointer.updateVelocityParams(probed);
+                }
+            }
+        }, "DeskTouch-VelRetry");
+        retry.setDaemon(true);
+        retry.start();
     }
 
     private ShellPointerMath.VelocityParams probeVelocityParamsBlocking(long timeoutMs) {
@@ -513,16 +532,13 @@ public final class ShellInputDaemon {
                 procRef[0] = proc;
                 try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
-                    ShellPointerMath.VelocityParams found = null;
+                    StringBuilder sb = new StringBuilder(8192);
                     String row;
                     while ((row = br.readLine()) != null) {
-                        if (row.contains("PointerVelocityControlParameters:")) {
-                            ShellPointerMath.VelocityParams parsed =
-                                ShellPointerMath.parseDumpsysVelocityParams(row);
-                            if (parsed != null) found = parsed;
-                        }
+                        sb.append(row).append('\n');
                     }
-                    foundRef[0] = found;
+                    foundRef[0] = ShellPointerMath.parseDumpsysVelocityParamsForDevice(
+                        sb.toString(), "DeskTouch USB Mouse");
                 }
             } catch (Throwable ignored) {
             } finally {
@@ -654,6 +670,7 @@ public final class ShellInputDaemon {
             LockSupport.parkNanos(400_000L);
             if (step.resetSignX != 0 || step.resetSignY != 0) {
                 writeMouseReport(step.resetSignX, step.resetSignY, 0, 0);
+                LockSupport.parkNanos(300_000L);
             }
         }
         if (step.rawX != 0 || step.rawY != 0) {

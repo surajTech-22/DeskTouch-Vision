@@ -91,6 +91,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int CablePingInFlight;
         internal AdaptiveLinkTracker CableTracker = new("cable");
         internal long LastPongTicks;
+        internal long LastWriteTicks;
         internal string LinkBand = "wireless";
         internal int LinkSpeedMbps;
         internal int NetworkEpoch;
@@ -695,7 +696,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             TryPromoteWirelessBackup(session);
                         }
                         int cableGapMs = session.CableTracker.ComputeProbeIntervalMs(controlActive);
-                        if (nowMs - session.LastTcpPingMs >= cableGapMs)
+                        long lastWriteTicks = Volatile.Read(ref session.LastWriteTicks);
+                        double sinceWriteMs = lastWriteTicks > 0
+                            ? (nowTicks - lastWriteTicks) * 1000.0 / Stopwatch.Frequency
+                            : double.MaxValue;
+                        bool busyStreaming = controlActive && sinceWriteMs < 28.0 && nowMs - session.LastTcpPingMs < 95;
+                        if (!busyStreaming && nowMs - session.LastTcpPingMs >= cableGapMs)
                         {
                             session.LastTcpPingMs = nowMs;
                             _ = SendCablePingAsync(session, token);
@@ -797,7 +803,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         CancellationToken token)
     {
         await session.Write.WaitAsync(token);
-        try { await Wire.WriteAsync(session.Stream, packet, token); }
+        try
+        {
+            await Wire.WriteAsync(session.Stream, packet, token);
+            Volatile.Write(ref session.LastWriteTicks, Stopwatch.GetTimestamp());
+        }
         finally { session.Write.Release(); }
     }
 
@@ -2227,12 +2237,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static double ComputeAdaptiveCableIntervalMs(int? liveRefreshHz, double tcpRttMs)
     {
         double baseMs = liveRefreshHz is >= 24
-            ? Math.Clamp(840.0 / Math.Min(240, liveRefreshHz.Value), 5.8, 12.0)
-            : 8.5;
+            ? Math.Clamp(340.0 / Math.Min(240, liveRefreshHz.Value), 2.0, 5.5)
+            : 3.0;
         if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
             return baseMs;
-        double rttPressure = Math.Max(0.0, tcpRttMs - 15.0) * 0.15;
-        double maxCap = Math.Max(baseMs, 12.0);
+        double rttPressure = Math.Max(0.0, tcpRttMs - 15.0) * 0.12;
+        double maxCap = Math.Max(baseMs, 5.5);
         return Math.Clamp(baseMs + rttPressure, baseMs, maxCap);
     }
 

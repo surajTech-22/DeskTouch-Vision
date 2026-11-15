@@ -974,4 +974,39 @@ public final class ProtocolSourceTest {
                 comp.hasRemainingMotion(corner[0], corner[1]));
         }
     }
+
+    @Test
+    public void deviceSpecificVelocityParamsExactBorderResetAndPrecisionStepsWork() {
+        String dumpsys =
+            "Event Hub State:\n" +
+            "  3: DeskTouch USB Mouse\n" +
+            "    Classes: CURSOR\n" +
+            "Input Reader State:\n" +
+            "  Device 2: Other Touchpad\n" +
+            "    PointerVelocityControlParameters: scale=2.000, lowThreshold=200.000, highThreshold=1000.000, acceleration=4.000\n" +
+            "  Device 3: DeskTouch USB Mouse\n" +
+            "    Cursor Input Mapper:\n" +
+            "      PointerVelocityControlParameters: scale=0.625, lowThreshold=450.000, highThreshold=2600.000, acceleration=2.500\n";
+        ShellPointerMath.VelocityParams matched =
+            ShellPointerMath.parseDumpsysVelocityParamsForDevice(dumpsys, "DeskTouch USB Mouse");
+        assertNotNull(matched);
+        assertEquals(0.625, matched.scale, 0.001);
+        assertEquals(2.500, matched.acceleration, 0.001);
+
+        ShellPointerMath.PointerCompensator borderComp = new ShellPointerMath.PointerCompensator();
+        borderComp.configure(1080, 2460, matched, 144);
+        long t = 6_000_000_000L;
+        ShellPointerMath.MoveStep exactCorner = borderComp.stepTo(1079, 2459, t);
+        assertTrue(exactCorner.needsAnchorReset);
+        assertTrue("Exact corner entry must emit 1-count opposite resetSign on X and Y",
+            exactCorner.resetSignX < 0 && exactCorner.resetSignY < 0);
+
+        // Slow 1px adjustment right after fast swipe must stay pending until settled cleanly.
+        t += 4_000_000L;
+        borderComp.stepTo(500, 1200, t);
+        t += 4_000_000L;
+        borderComp.stepTo(501, 1200, t);
+        assertTrue("Small 1px delta must remain pending whenever not within sub-count tolerance",
+            borderComp.hasRemainingMotion(503, 1200));
+    }
 }

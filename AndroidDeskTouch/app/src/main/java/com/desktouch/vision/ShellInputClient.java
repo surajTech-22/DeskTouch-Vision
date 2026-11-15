@@ -131,7 +131,7 @@ final class ShellInputClient {
                 connectedReady = false;
                 return false;
             }
-            s.setSoTimeout(800);
+            s.setSoTimeout(1100);
             socket = s;
             writer = w;
             reader = r;
@@ -223,7 +223,7 @@ final class ShellInputClient {
             done.complete(ok);
         });
         try {
-            return done.get(550, TimeUnit.MILLISECONDS);
+            return done.get(850, TimeUnit.MILLISECONDS);
         } catch (Exception ex) {
             return ready(app);
         }

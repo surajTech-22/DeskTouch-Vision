@@ -49,6 +49,30 @@ final class ShellPointerMath {
         return new VelocityParams(scale, 500.0, 3000.0, 3.0);
     }
 
+    static VelocityParams parseDumpsysVelocityParamsForDevice(String dumpsysText, String deviceName) {
+        if (dumpsysText == null || dumpsysText.isEmpty()) return null;
+        if (deviceName != null && !deviceName.isEmpty()) {
+            String[] lines = dumpsysText.split("\n");
+            for (int i = 0; i < lines.length; i++) {
+                if (!lines[i].contains(deviceName)) continue;
+                int limit = Math.min(lines.length, i + 50);
+                for (int j = i + 1; j < limit; j++) {
+                    String row = lines[j];
+                    if (row.contains("PointerVelocityControlParameters:")) {
+                        VelocityParams matched = parseDumpsysVelocityParams(row);
+                        if (matched != null) return matched;
+                    }
+                    String trimmed = row.trim();
+                    if ((trimmed.startsWith("Device ") || trimmed.matches("\\d+:\\s+.*"))
+                        && !trimmed.contains(deviceName)) {
+                        break;
+                    }
+                }
+            }
+        }
+        return parseDumpsysVelocityParams(dumpsysText);
+    }
+
     static VelocityParams parseDumpsysVelocityParams(String dumpsysText) {
         if (dumpsysText == null || dumpsysText.isEmpty()) return null;
         Matcher m = VELOCITY_PARAMS_PATTERN.matcher(dumpsysText);
@@ -244,9 +268,11 @@ final class ShellPointerMath {
                 double jumpDy = ty - cornerY;
                 int rawX = computeEntryCounts(jumpDx, minScale, highGain);
                 int rawY = computeEntryCounts(jumpDy, minScale, highGain);
+                int resetSignX = (rawX == 0 && pullX != 0) ? -Integer.signum(pullX) : 0;
+                int resetSignY = (rawY == 0 && pullY != 0) ? -Integer.signum(pullY) : 0;
 
-                cursorX = tx;
-                cursorY = ty;
+                cursorX = Math.max(0.0, Math.min(screenWidth - 1, tx + resetSignX * minScale));
+                cursorY = Math.max(0.0, Math.min(screenHeight - 1, ty + resetSignY * minScale));
                 lastTargetX = tx;
                 lastTargetY = ty;
                 anchored = true;
@@ -254,7 +280,7 @@ final class ShellPointerMath {
                 prevDx = 0.0;
                 prevDy = 0.0;
                 lastReportNs = nowNs;
-                return new MoveStep(true, pullX, pullY, 0, 0, rawX, rawY);
+                return new MoveStep(true, pullX, pullY, resetSignX, resetSignY, rawX, rawY);
             }
 
             double dx = tx - cursorX;
@@ -290,7 +316,7 @@ final class ShellPointerMath {
                 smoothedOutSpeed = 0.0;
             } else {
                 dtSec = (nowNs - lastReportNs) / 1_000_000_000.0;
-                if (dtSec > 0.090) {
+                if (dtSec > 0.080) {
                     smoothedOutSpeed = 0.0;
                     dtSec = 0.014;
                 }
@@ -303,10 +329,9 @@ final class ShellPointerMath {
 
             double dist = Math.hypot(dx, dy);
             double instSpeed = dist / effectiveDt;
-            double alpha = effectiveDt / (effectiveDt + 0.045);
+            double alpha = effectiveDt / (effectiveDt + 0.032);
             smoothedOutSpeed += alpha * (instSpeed - smoothedOutSpeed);
-            double modelGain = gainForOutputSpeed(smoothedOutSpeed, params);
-            double gain = params.scale + (modelGain - params.scale) * 0.70;
+            double gain = gainForOutputSpeed(smoothedOutSpeed, params);
 
             int rawX = clampRelative8((int) Math.round(dx / gain));
             int rawY = clampRelative8((int) Math.round(dy / gain));
@@ -375,7 +400,8 @@ final class ShellPointerMath {
             if (!anchored) return true;
             int tx = Math.max(0, Math.min(screenWidth - 1, targetX));
             int ty = Math.max(0, Math.min(screenHeight - 1, targetY));
-            return Math.abs(tx - cursorX) >= 1.5 || Math.abs(ty - cursorY) >= 1.5;
+            double tol = Math.max(0.55, Math.min(1.5, params.scale * 0.75));
+            return Math.abs(tx - cursorX) >= tol || Math.abs(ty - cursorY) >= tol;
         }
 
         private int edgeSnapCounts() {

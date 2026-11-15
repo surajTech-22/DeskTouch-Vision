@@ -2064,8 +2064,8 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     double cable144ModerateRtt = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 14.0);
     double cable60 = ReceiverServer.ComputeAdaptiveCableIntervalMs(60, 2.0);
     double cableBusy = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 28.0);
-    Check(cable144 >= 5.8 && cable144 <= 6.5 && cable144ModerateRtt == cable144 && cable60 <= 12.0 && cableBusy > cable144 && cableBusy <= 14.0,
-        "Cable pacing interval must target sub-frame 144Hz rate and tolerate brief minor RTT jitter");
+    Check(cable144 >= 2.0 && cable144 <= 3.0 && cable144ModerateRtt == cable144 && cable60 <= 6.0 && cableBusy > cable144 && cableBusy <= 6.0,
+        "Cable pacing interval must stay well under half a 144Hz frame while tolerating brief RTT jitter");
 
     int packed = FastMovePacer.PackEdgePush(-24, 37);
     var (unpackedX, unpackedY) = FastMovePacer.UnpackEdgePush(packed);
@@ -2327,7 +2327,28 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     }
     Check(udpReorderTracker.LostPackets == 0 && udpReorderTracker.ReorderedPackets == 1,
         "Out-of-order wireless coordinate packet must count as reordered rather than packet loss");
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, and 2.4 GHz backoff verified.");
+
+    // Verify v0.3.51: axis-independent coalesced edge push + zero-skip 144Hz cable pacing.
+    {
+        var slideY = FastMovePacer.MergeCoalescedMove(
+            new Packet("move", 1079, 500, 10, FastMovePacer.PackEdgePush(20, 0)),
+            new Packet("move", 1079, 502, 11, FastMovePacer.PackEdgePush(15, 0)));
+        var (spx, spy) = FastMovePacer.UnpackEdgePush(slideY.D);
+        Check(spx == 35 && spy == 0,
+            "Coalesced edge push along Y slide must preserve X edge-overflow delta");
+
+        var slideX = FastMovePacer.MergeCoalescedMove(
+            new Packet("move", 500, 2459, 12, FastMovePacer.PackEdgePush(0, 18)),
+            new Packet("move", 505, 2459, 13, FastMovePacer.PackEdgePush(0, 14)));
+        var (spx2, spy2) = FastMovePacer.UnpackEdgePush(slideX.D);
+        Check(spx2 == 0 && spy2 == 32,
+            "Coalesced edge push along X slide must preserve Y edge-overflow delta");
+
+        double cable144Fast = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 2.0);
+        Check(cable144Fast <= 3.0,
+            "Data cable interval at 144Hz must be <=3.0ms so every 6.94ms display VSYNC receives fresh pointer updates");
+    }
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, and v0.3.51 zero-skip UHID fixes verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

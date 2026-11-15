@@ -682,7 +682,7 @@ internal sealed class SourceCapture : IDisposable
                 {
                     int missingRaw = ++_hookMovesWithoutRaw;
                     long now = Environment.TickCount64;
-                    if (now - _lastRawMs > 28 && missingRaw >= 2)
+                    if (now - _lastRawMs > 14 && missingRaw >= 1)
                     {
                         _lastFallbackMs = now;
                         double sens = Volatile.Read(ref _pointerSensitivity);
@@ -957,7 +957,7 @@ internal sealed class SourceCapture : IDisposable
             _androidReturnPushPx = 0;
             return false;
         }
-        return (_androidReturnPushPx += overshoot) >= 36;
+        return (_androidReturnPushPx += overshoot) >= 96;
     }
 
     private void MoveRemote(int dx, int dy)
@@ -1019,11 +1019,14 @@ internal sealed class SourceCapture : IDisposable
                         Interlocked.Exchange(ref _switchPending,0);
                 }
                 var slid = _remoteMonitors.ClampToRealMonitor(new System.Drawing.Point(nextX, nextY));
-                if (slid.X != _remoteX || slid.Y != _remoteY)
+                int edgePushX = Math.Clamp(nextX - slid.X, -120, 120);
+                int edgePushY = Math.Clamp(nextY - slid.Y, -120, 120);
+                if (slid.X != _remoteX || slid.Y != _remoteY || edgePushX != 0 || edgePushY != 0)
                 {
                     _remoteX = slid.X;
                     _remoteY = slid.Y;
-                    _session.TrySend(new Packet("move", _remoteX, _remoteY));
+                    int packed = FastMovePacer.PackEdgePush(edgePushX, edgePushY);
+                    _session.TrySend(new Packet("move", _remoteX, _remoteY, 0, packed));
                 }
                 return;
             }

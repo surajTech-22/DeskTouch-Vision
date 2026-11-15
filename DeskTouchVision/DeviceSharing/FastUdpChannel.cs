@@ -1085,14 +1085,16 @@ internal sealed class FastMovePacer : IDisposable
 
     internal static Packet MergeCoalescedMove(Packet previous, Packet incoming)
     {
-        if (previous.A != incoming.A || previous.B != incoming.B)
-            return incoming;
         var (oldPx, oldPy) = UnpackEdgePush(previous.D);
         var (newPx, newPy) = UnpackEdgePush(incoming.D);
         if (oldPx == 0 && oldPy == 0)
             return incoming;
-        int mergedX = newPx == 0 ? 0 : Math.Clamp(oldPx + newPx, -240, 240);
-        int mergedY = newPy == 0 ? 0 : Math.Clamp(oldPy + newPy, -240, 240);
+        int mergedX = previous.A == incoming.A && newPx != 0
+            ? Math.Clamp(oldPx + newPx, -240, 240)
+            : newPx;
+        int mergedY = previous.B == incoming.B && newPy != 0
+            ? Math.Clamp(oldPy + newPy, -240, 240)
+            : newPy;
         return incoming with { D = PackEdgePush(mergedX, mergedY) };
     }
 
@@ -1112,7 +1114,7 @@ internal sealed class FastMovePacer : IDisposable
             double elapsedMs = _lastMoveUdpTicks == 0
                 ? double.MaxValue
                 : (now - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
-            if (elapsedMs >= minInterval)
+            if (elapsedMs >= minInterval - 0.45)
             {
                 if (_throttledUdp != null)
                     dispatchPacket = MergeCoalescedMove(_throttledUdp, move);

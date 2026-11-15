@@ -1941,23 +1941,80 @@ await uiCompletion.Task.WaitAsync(TimeSpan.FromSeconds(20));
 uiThread.Join();
 Console.WriteLine("PASS: Windows Displays UI renders at minimum and standard sizes without collapsed buttons.");
 
-Check(SourceCapture.NextKeyboardHealthAction(false, 0, 2, false, false) == SourceCapture.KeyboardHookAction.None,
+Check(SourceCapture.NextKeyboardHealthAction(false, 0, 1, false, false) == SourceCapture.KeyboardHookAction.None,
     "Inactive remote control must never refresh or warn about keyboard hooks");
 Check(SourceCapture.NextKeyboardHealthAction(true, 1, 5, false, false) == SourceCapture.KeyboardHookAction.None,
     "Keyboard hook receiving events must never trigger preemption refresh");
-Check(SourceCapture.NextKeyboardHealthAction(true, 0, 1, false, false) == SourceCapture.KeyboardHookAction.None &&
-    SourceCapture.NextKeyboardHealthAction(true, 0, 2, false, false) == SourceCapture.KeyboardHookAction.RefreshHook &&
-    SourceCapture.NextKeyboardHealthAction(true, 0, 3, true, false) == SourceCapture.KeyboardHookAction.None &&
-    SourceCapture.NextKeyboardHealthAction(true, 0, 4, true, false) == SourceCapture.KeyboardHookAction.WarnBlocked &&
-    SourceCapture.NextKeyboardHealthAction(true, 0, 5, true, true) == SourceCapture.KeyboardHookAction.None,
-    "Keyboard health policy must refresh displaced hook once and warn once if still blocked");
-Check(SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5B) &&
-    SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5C) &&
+Check(SourceCapture.NextKeyboardHealthAction(true, 0, 1, false, false) == SourceCapture.KeyboardHookAction.RefreshHook &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 2, true, false) == SourceCapture.KeyboardHookAction.None &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 3, true, false) == SourceCapture.KeyboardHookAction.WarnBlocked &&
+    SourceCapture.NextKeyboardHealthAction(true, 0, 4, true, true) == SourceCapture.KeyboardHookAction.None,
+    "Keyboard health policy must refresh displaced hook on the first raw key and warn at 3 if still blocked");
+Check(!SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5B) &&
+    !SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x5C) &&
     !SourceCapture.ShouldIgnoreRemoteWindowsKey(true, 0x41) &&
     !SourceCapture.ShouldIgnoreRemoteWindowsKey(false, 0x5B) &&
     !SourceCapture.ShouldIgnoreRemoteWindowsKey(false, 0x5C),
-    "Android target ignores local Windows meta keys while Windows target preserves them");
-Console.WriteLine("PASS: Keyboard hook self-healing and Windows meta key policies behave consistently.");
+    "Both Android and Windows targets must preserve Windows/Meta keys for external-keyboard shortcuts");
+Check(SourceCapture.ModifiersForMask(1 | 8 | 16).SequenceEqual(new[] { 0x11, 0x5B, 0x5C }),
+    "Release modifier mask must release Ctrl and both Windows/Meta keys");
+Console.WriteLine("PASS: Keyboard hook immediate self-healing and Windows/Meta key passthrough behave consistently.");
+
+// Verify AdaptiveLinkTracker band shift resets stale 280ms baseline & adapts cadence by band.
+var linkTracker = new AdaptiveLinkTracker("2.4GHz");
+Check(linkTracker.ComputeProbeIntervalMs(true) >= 300,
+    "2.4 GHz link must avoid 5 GHz high-frequency probe bursts");
+linkTracker.RecordRttSample(280.0, 1000);
+linkTracker.RecordRttSample(260.0, 1100);
+Check(linkTracker.SmoothedRttMs > 200.0,
+    "Slow 2.4 GHz spike establishes initial baseline");
+Check(linkTracker.OnLinkProfileChanged("5GHz", 866, 2),
+    "Band transition from 2.4 GHz to 5 GHz must signal profile change");
+Check(linkTracker.SmoothedRttMs == 0 && linkTracker.ComputeProbeIntervalMs(true) < 200,
+    "Roam to 5 GHz must clear stale 280ms baseline immediately and switch to fast cadence");
+linkTracker.RecordRttSample(6.5, 1300);
+Check(linkTracker.SmoothedRttMs < 15.0,
+    "First 5 GHz sample after band shift must reflect live fast latency immediately");
+Check(linkTracker.OnLinkProfileChanged("cable", 480, 3),
+    "Transition to data cable must update band profile cleanly");
+double pace5G = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 120, 6.0, 5.0, 1.5, 0.0, "5GHz");
+double pace24G = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 120, 45.0, 18.0, 10.0, 5.0, "2.4GHz");
+Check(pace5G <= 7.0 && pace24G >= 11.0 && pace24G <= 24.0,
+    "Adaptive UDP pacing must keep 5 GHz crisp while spacing 2.4 GHz frames to prevent bufferbloat");
+Console.WriteLine("PASS: Band-adaptive RTT tracking and pacing prevent 2.4 GHz bufferbloat and clear stale baselines.");
+
+// Verify KeyboardLayoutHelper parsing and Windows UI live link status / Shortcuts button.
+Check(KeyboardLayoutHelper.DescribeKlid("00000409") == "US QWERTY",
+    "KeyboardLayoutHelper must recognize US QWERTY KLID");
+var parsedKb = KeyboardLayoutHelper.TryParseWireSummary(
+    """{"keyboard":"USB Keyboard","external":true,"fullUsb":true,"pcLayout":"English (India)","mode":"Full USB","bindings":[{"action":"Home","keys":"Meta+H","status":"Supported","ready":true}]}""");
+Check(parsedKb != null && parsedKb.Keyboard == "USB Keyboard" && parsedKb.Bindings.Count == 1 && parsedKb.Bindings[0].Ready,
+    "KeyboardLayoutHelper must parse valid Android keyboard binding metadata");
+Check(KeyboardLayoutHelper.TryParseWireSummary("not-json") == null,
+    "KeyboardLayoutHelper must reject invalid metadata cleanly");
+var uiCheck2 = new TaskCompletionSource();
+var uiThread2 = new Thread(() =>
+{
+    try
+    {
+        using var view = new DisplaySettingsForm();
+        view.CreateControl();
+        var actionRow = view.Controls.Find("ConnectionActions", true)
+            .OfType<System.Windows.Forms.FlowLayoutPanel>().Single();
+        var liveLink = view.Controls.Find("LiveLinkStatus", true)
+            .OfType<System.Windows.Forms.Label>().Single();
+        Check(actionRow.Controls.OfType<System.Windows.Forms.Button>().Any(b => b.Text == "Shortcuts") &&
+            !string.IsNullOrWhiteSpace(liveLink.Text),
+            "Windows UI must expose Shortcuts dialog button and live link readout");
+        uiCheck2.SetResult();
+    }
+    catch (Exception ex) { uiCheck2.TrySetException(ex); }
+});
+uiThread2.SetApartmentState(ApartmentState.STA);
+uiThread2.Start();
+await uiCheck2.Task.WaitAsync(TimeSpan.FromSeconds(15));
+uiThread2.Join();
+Console.WriteLine("PASS: Keyboard binding metadata helper and Windows UI shortcuts/live-link controls verified.");
 
 internal sealed class RecordingInputSession : IInputSession
 {

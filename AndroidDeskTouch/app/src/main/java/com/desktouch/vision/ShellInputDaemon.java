@@ -207,8 +207,14 @@ public final class ShellInputDaemon {
                     writer.flush();
                     return false;
                 }
-                if ("END".equals(line)) {
+                if ("DESTROY".equals(line)) {
                     destroyDevices();
+                    writer.write("OK\n");
+                    writer.flush();
+                    continue;
+                }
+                if ("END".equals(line)) {
+                    releaseInputs();
                     writer.write("OK\n");
                     writer.flush();
                     continue;
@@ -223,13 +229,27 @@ public final class ShellInputDaemon {
                     continue;
                 }
                 if (line.startsWith("MOVETO ")) {
-                    String[] parts = line.split(" ");
-                    if (parts.length >= 3) {
-                        int x = parseBoundedInt(parts[1], 0, screenWidth - 1, 0);
-                        int y = parseBoundedInt(parts[2], 0, screenHeight - 1, 0);
-                        moveTo(x, y);
+                    // Coalesce any already-buffered MOVETO frames so bursty
+                    // cable/Wi-Fi input jumps straight to the newest coordinate.
+                    String latestMove = line;
+                    while (reader.ready()) {
+                        String nextLine = reader.readLine();
+                        if (nextLine == null) break;
+                        if (nextLine.startsWith("MOVETO ")) {
+                            latestMove = nextLine;
+                        } else {
+                            // Process the newest buffered MOVETO first, then break
+                            // cleanly after handling this non-move command below.
+                            applyMoveLine(latestMove);
+                            latestMove = null;
+                            line = nextLine;
+                            break;
+                        }
                     }
-                    continue;
+                    if (latestMove != null) {
+                        applyMoveLine(latestMove);
+                        continue;
+                    }
                 }
                 if (line.startsWith("BTN ")) {
                     String[] parts = line.split(" ");
@@ -266,15 +286,30 @@ public final class ShellInputDaemon {
             return true;
         } catch (IOException ignored) {
             return true;
+        } finally {
+            releaseInputs();
+        }
+    }
+
+    private void applyMoveLine(String line) {
+        String[] parts = line.split(" ");
+        if (parts.length >= 3) {
+            int x = parseBoundedInt(parts[1], 0, screenWidth - 1, 0);
+            int y = parseBoundedInt(parts[2], 0, screenHeight - 1, 0);
+            moveTo(x, y);
         }
     }
 
     private synchronized boolean ensureDevices(int width, int height) {
-        screenWidth = Math.max(100, width);
-        screenHeight = Math.max(100, height);
+        int nextW = Math.max(100, width);
+        int nextH = Math.max(100, height);
+        boolean resized = nextW != screenWidth || nextH != screenHeight;
+        screenWidth = nextW;
+        screenHeight = nextH;
+        if (resized) anchoredCursor = false;
         try {
             if (mouseFd == null) {
-                mouseFd = createUhidDevice("DeskTouch Virtual Mouse", 0x3741, MOUSE_DESC);
+                mouseFd = createUhidDevice("DeskTouch USB Mouse", 0x3741, MOUSE_DESC);
                 anchoredCursor = false;
                 cursorX = 0;
                 cursorY = 0;
@@ -283,7 +318,7 @@ public final class ShellInputDaemon {
                 hWheelCarry = 0;
             }
             if (keyboardFd == null) {
-                keyboardFd = createUhidDevice("DeskTouch Virtual Keyboard", 0x3742, KEYBOARD_DESC);
+                keyboardFd = createUhidDevice("DeskTouch USB Keyboard", 0x3742, KEYBOARD_DESC);
                 keyModifierMask = 0;
                 for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
             }
@@ -304,7 +339,7 @@ public final class ShellInputDaemon {
             buf.put(nameBytes, 0, Math.min(nameBytes.length, 127));
             buf.position(4 + 128 + 64 + 64);
             buf.putShort((short) desc.length);
-            buf.putShort((short) 0x06); // BUS_VIRTUAL
+            buf.putShort((short) 0x03); // BUS_USB so Android treats keyboard shortcuts as standard USB hardware keyboard
             buf.putInt(0x18D1);
             buf.putInt(productId);
             buf.putInt(1);
@@ -341,7 +376,7 @@ public final class ShellInputDaemon {
         }
     }
 
-    private synchronized void destroyDevices() {
+    private synchronized void releaseInputs() {
         if (buttonMask != 0 && mouseFd != null) {
             buttonMask = 0;
             writeMouseReport(0, 0, 0, 0);
@@ -351,11 +386,17 @@ public final class ShellInputDaemon {
             for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
             writeKeyboardReport(0, activeUsages);
         }
+        vWheelCarry = 0;
+        hWheelCarry = 0;
+        anchoredCursor = false;
+    }
+
+    private synchronized void destroyDevices() {
+        releaseInputs();
         closeUhid(mouseFd);
         mouseFd = null;
         closeUhid(keyboardFd);
         keyboardFd = null;
-        anchoredCursor = false;
     }
 
     private static void closeUhid(FileDescriptor fd) {

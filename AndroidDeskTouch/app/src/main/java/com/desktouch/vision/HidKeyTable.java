@@ -103,6 +103,7 @@ final class HidKeyTable {
         if (vk >= 0x31 && vk <= 0x39) return 0x1E + (vk - 0x31);
         if (vk == 0x30) return 0x27;
         if (vk >= 0x70 && vk <= 0x7B) return 0x3A + (vk - 0x70); // F1..F12
+        if (vk >= 0x7C && vk <= 0x87) return 0x68 + (vk - 0x7C); // F13..F24
         if (vk >= 0x61 && vk <= 0x69) return 0x59 + (vk - 0x61); // Numpad 1..9
         switch (vk) {
             case 0x0D: return 0x28; // VK_RETURN
@@ -115,6 +116,7 @@ final class HidKeyTable {
             case 0xDB: return 0x2F; // VK_OEM_4 '['
             case 0xDD: return 0x30; // VK_OEM_6 ']'
             case 0xDC: return 0x31; // VK_OEM_5 '\'
+            case 0xE2: return 0x64; // VK_OEM_102 (ISO <>|)
             case 0xBA: return 0x33; // VK_OEM_1 ';'
             case 0xDE: return 0x34; // VK_OEM_7 '\''
             case 0xC0: return 0x35; // VK_OEM_3 '`'
@@ -124,6 +126,7 @@ final class HidKeyTable {
             case 0x14: return 0x39; // VK_CAPITAL
             case 0x2C: return 0x46; // VK_SNAPSHOT
             case 0x91: return 0x47; // VK_SCROLL
+            case 0x90: return 0x53; // VK_NUMLOCK
             case 0x13: return 0x48; // VK_PAUSE
             case 0x2D: return 0x49; // VK_INSERT
             case 0x24: return 0x4A; // VK_HOME

@@ -95,14 +95,14 @@ internal sealed class SourceCapture : IDisposable
         bool alreadyRefreshed, bool alreadyWarned)
     {
         if (!remoteActive || hookEvents > 0) return KeyboardHookAction.None;
-        if (rawKeyEvents >= 2 && !alreadyRefreshed) return KeyboardHookAction.RefreshHook;
-        if (rawKeyEvents >= 4 && alreadyRefreshed && !alreadyWarned)
+        if (rawKeyEvents >= 1 && !alreadyRefreshed) return KeyboardHookAction.RefreshHook;
+        if (rawKeyEvents >= 3 && alreadyRefreshed && !alreadyWarned)
             return KeyboardHookAction.WarnBlocked;
         return KeyboardHookAction.None;
     }
 
     internal static bool ShouldIgnoreRemoteWindowsKey(bool destinationIsAndroid, uint vkCode) =>
-        destinationIsAndroid && (vkCode == 0x5B || vkCode == 0x5C);
+        false;
 
     private System.Windows.Forms.Timer? _slowEdgeTimer;
     private bool _controlPressed, _altPressed, _shiftPressed;
@@ -283,7 +283,10 @@ internal sealed class SourceCapture : IDisposable
         }
     }
 
-    private void RefreshKeyboardHook()
+    private IntPtr _lastHealthForegroundHwnd;
+    private long _lastHookRefreshMs;
+
+    private void RefreshKeyboardHook(bool quiet = false)
     {
         if (!IsArmed) return;
         IntPtr old = _keyHook;
@@ -291,9 +294,10 @@ internal sealed class SourceCapture : IDisposable
         if (old != IntPtr.Zero) Win.UnhookWindowsHookEx(old);
         IntPtr module = Win.GetModuleHandle(null);
         _keyHook = Win.SetWindowsHookEx(Win.WH_KEYBOARD_LL, _keyboardDelegate, module, 0);
+        _lastHookRefreshMs = Environment.TickCount64;
         if (_keyHook == IntPtr.Zero)
             _status("Unable to refresh Windows keyboard capture hook after another app preempted input.");
-        else
+        else if (!quiet)
             _status("Refreshed Windows keyboard capture after another app preempted key delivery.");
     }
 
@@ -301,6 +305,17 @@ internal sealed class SourceCapture : IDisposable
     {
         int rawCount = Interlocked.Increment(ref _remoteRawKeyCount);
         int hookCount = Volatile.Read(ref _remoteKeyHookCount);
+        IntPtr fg = Win.GetForegroundWindow();
+        if (fg != IntPtr.Zero && fg != _lastHealthForegroundHwnd)
+        {
+            _lastHealthForegroundHwnd = fg;
+            _keyHookRefreshedThisLease = false;
+            _keyHookBlockedWarnedThisLease = false;
+        }
+        else if (_keyHookRefreshedThisLease && Environment.TickCount64 - _lastHookRefreshMs >= 2000)
+        {
+            _keyHookRefreshedThisLease = false;
+        }
         switch (NextKeyboardHealthAction(RemoteActive, hookCount, rawCount,
             _keyHookRefreshedThisLease, _keyHookBlockedWarnedThisLease))
         {
@@ -319,10 +334,12 @@ internal sealed class SourceCapture : IDisposable
 
     internal static IReadOnlyList<int> ModifiersForMask(int mask)
     {
-        var vks = new List<int>(3);
+        var vks = new List<int>(5);
         if ((mask & 1) != 0) vks.Add(0x11); // Ctrl
         if ((mask & 2) != 0) vks.Add(0x12); // Alt
         if ((mask & 4) != 0) vks.Add(0x10); // Shift
+        if ((mask & 8) != 0) vks.Add(0x5B); // Left Win
+        if ((mask & 16) != 0) vks.Add(0x5C); // Right Win
         return vks;
     }
 
@@ -488,13 +505,17 @@ internal sealed class SourceCapture : IDisposable
         Interlocked.Exchange(ref _remoteRawKeyCount, 0);
         _keyHookRefreshedThisLease = false;
         _keyHookBlockedWarnedThisLease = false;
-        if (_keyHook == IntPtr.Zero) RefreshKeyboardHook();
+        _lastHealthForegroundHwnd = Win.GetForegroundWindow();
+        // Proactively place our keyboard hook at the front of the non-elevated
+        // Windows hook chain on entry so competing hooks do not swallow the first key.
+        var (fgProtected, fgName) = Win.InspectForegroundProtection();
+        if (!fgProtected)
+            RefreshKeyboardHook(quiet: true);
         Interlocked.Exchange(ref _active, 1);
         _continuingAcrossDevices=false;
         long totalMs = Math.Max(0, now - Volatile.Read(ref _claimStarted));
         long applyMs = Math.Max(0, now - Volatile.Read(ref _claimGrantedAtMs));
         _status($"Authority handoff confirmed #{request}: remote pointer, keyboard and mouse are active ({totalMs}ms total, {applyMs}ms apply).");
-        var (fgProtected, fgName) = Win.InspectForegroundProtection();
         if (fgProtected)
         {
             _keyHookBlockedWarnedThisLease = true;
@@ -768,6 +789,8 @@ internal sealed class SourceCapture : IDisposable
                 0x11 or 0xA2 or 0xA3 => 1,
                 0x12 or 0xA4 or 0xA5 => 2,
                 0x10 or 0xA0 or 0xA1 => 4,
+                0x5B => 8,
+                0x5C => 16,
                 _ => 0
             };
             if (modMask != 0)
@@ -784,12 +807,14 @@ internal sealed class SourceCapture : IDisposable
             bool targetIsAndroid = DestinationIsAndroid?.Invoke() == true;
             if (ShouldIgnoreRemoteWindowsKey(targetIsAndroid, key.vkCode))
                 return (IntPtr)1;
-            // Android's Accessibility API is an editable-field/IME API, not
-            // raw hardware keyboard injection. Send printable characters
-            // through the authenticated reverse-text route so Chrome/WebView
-            // can commit them using the active Android InputConnection.
-            // Modifier, Ctrl/Alt shortcuts, and navigation keys use reverse-key.
-            if (targetIsAndroid && !_controlPressed && !_altPressed)
+            bool ctrlNow = _controlPressed || (Win.GetAsyncKeyState(0x11) & 0x8000) != 0;
+            bool altNow = _altPressed || (Win.GetAsyncKeyState(0x12) & 0x8000) != 0;
+            bool winNow = (_remoteModifierDownMask & (8 | 16)) != 0
+                || (Win.GetAsyncKeyState(0x5B) & 0x8000) != 0
+                || (Win.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+            // Forward modifier shortcuts (Ctrl, Alt, Win) and navigation/system
+            // keys as hardware reverse-key events so Android handles real shortcuts.
+            if (targetIsAndroid && !ctrlNow && !altNow && !winNow)
             {
                 var printable = AndroidPrintableKey((int)key.vkCode, _shiftPressed);
                 if (printable != null)

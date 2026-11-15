@@ -201,8 +201,8 @@ final class FastUdpChannel implements Closeable {
     }
 
     private final DatagramSocket socket;
-    private final InetAddress serverAddress;
-    private final int serverPort;
+    private volatile InetAddress serverAddress;
+    private volatile int serverPort;
     private final Codec codec;
     private final Listener listener;
     final AdaptiveLinkTracker linkTracker = new AdaptiveLinkTracker();
@@ -297,11 +297,18 @@ final class FastUdpChannel implements Closeable {
                 packet.setLength(recvBuf.length);
                 socket.receive(packet);
                 if (packet.getLength() != FRAME_SIZE) continue;
-                if (!serverAddress.equals(packet.getAddress()) || packet.getPort() != serverPort) {
-                    continue;
-                }
                 Message msg = codec.tryOpen(recvBuf, packet.getLength());
                 if (msg == null) continue;
+                InetAddress srcAddr = packet.getAddress();
+                int srcPort = packet.getPort();
+                if (srcAddr != null && (!srcAddr.equals(serverAddress) || srcPort != serverPort)) {
+                    synchronized (sendBuffer) {
+                        serverAddress = srcAddr;
+                        serverPort = srcPort;
+                        sendPacket.setAddress(srcAddr);
+                        sendPacket.setPort(srcPort);
+                    }
+                }
                 long nowMs = SystemClock.uptimeMillis();
                 boolean hasSenderTimestamp = msg.op == OP_MOVE
                     || msg.op == OP_WARM

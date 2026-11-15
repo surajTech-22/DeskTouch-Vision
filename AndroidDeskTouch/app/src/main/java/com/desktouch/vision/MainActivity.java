@@ -21,8 +21,21 @@ public final class MainActivity extends Activity {
     private TextView status,devices;
     private LinearLayout deviceList,environmentList;
     private TextView connectionSummary;
+    private TextView liveLinkView;
+    private TextView keyboardBindingsView;
     private TextView permissionState;
     private TextView trustSummary;
+    private final Handler liveUiHandler=new Handler(Looper.getMainLooper());
+    private boolean liveUiRunning;
+    private android.hardware.input.InputManager inputManager;
+    private android.hardware.input.InputManager.InputDeviceListener inputDeviceListener;
+    private final Runnable liveUiTick=new Runnable(){
+        @Override public void run(){
+            if(!liveUiRunning)return;
+            refreshLiveLinkAndKeyboard();
+            liveUiHandler.postDelayed(this,750L);
+        }
+    };
     private CheckBox autoStartCheck;
     private CheckBox allowWindowsCheck,allowShellBridgeCheck,autoPausePaymentsCheck,autoPauseDisconnectCheck;
     private Button pauseBankingButton;
@@ -100,9 +113,14 @@ public final class MainActivity extends Activity {
         });
         connectionSummary=new TextView(this);
         connectionSummary.setTextColor(Color.rgb(171,216,188));
-        connectionSummary.setPadding(0,dp(5),0,dp(9));
+        connectionSummary.setPadding(0,dp(5),0,dp(4));
         connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
         page.addView(connectionSummary);
+        liveLinkView=new TextView(this);
+        liveLinkView.setTextColor(Color.rgb(138,208,255));
+        liveLinkView.setPadding(0,0,0,dp(8));
+        liveLinkView.setText("Live link: waiting for connection");
+        page.addView(liveLinkView);
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
@@ -146,8 +164,16 @@ public final class MainActivity extends Activity {
         page.addView(allowShellBridgeCheck);
         permissionState=new TextView(this);
         permissionState.setTextColor(Color.rgb(243,208,145));
-        permissionState.setPadding(0,dp(5),0,dp(8));
+        permissionState.setPadding(0,dp(5),0,dp(6));
         page.addView(permissionState);
+        keyboardBindingsView=new TextView(this);
+        keyboardBindingsView.setTextColor(Color.rgb(188,214,238));
+        keyboardBindingsView.setPadding(0,dp(2),0,dp(6));
+        keyboardBindingsView.setTextSize(12.5f);
+        page.addView(keyboardBindingsView);
+        addButton(page,"Show connected keyboard shortcuts",this::showKeyboardShortcutsDialog);
+        DeskTouchRuntime.setLiveStatusListener(()->runOnUiThread(this::refreshLiveLinkAndKeyboard));
+        registerKeyboardDeviceListener();
         addButton(page,"Open Android Accessibility settings",()->
             DeskTouchAccessibilityService.openAccessibilitySettings(
                 this,!PermissionContinuity.systemAccessibilityEnabled(this)));
@@ -499,8 +525,99 @@ public final class MainActivity extends Activity {
         updateVisibleScreenAwake();
         refreshPermissionState();
         refreshTrustSummary();
+        refreshLiveLinkAndKeyboard();
+        startLiveUiTicker();
         if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+    }
+    @Override protected void onPause(){
+        stopLiveUiTicker();
+        super.onPause();
+    }
+    private void startLiveUiTicker(){
+        if(liveUiRunning)return;
+        liveUiRunning=true;
+        liveUiHandler.removeCallbacks(liveUiTick);
+        liveUiHandler.postDelayed(liveUiTick,750L);
+    }
+    private void stopLiveUiTicker(){
+        liveUiRunning=false;
+        liveUiHandler.removeCallbacks(liveUiTick);
+    }
+    private void registerKeyboardDeviceListener(){
+        inputManager=(android.hardware.input.InputManager)getSystemService(Context.INPUT_SERVICE);
+        if(inputManager==null)return;
+        inputDeviceListener=new android.hardware.input.InputManager.InputDeviceListener(){
+            @Override public void onInputDeviceAdded(int deviceId){
+                DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
+                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+            }
+            @Override public void onInputDeviceRemoved(int deviceId){
+                DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
+                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+            }
+            @Override public void onInputDeviceChanged(int deviceId){
+                DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
+                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+            }
+        };
+        inputManager.registerInputDeviceListener(inputDeviceListener,liveUiHandler);
+    }
+    private void refreshLiveLinkAndKeyboard(){
+        DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+        if(connectionSummary!=null){
+            connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
+        }
+        if(liveLinkView!=null){
+            if(snap==null){
+                liveLinkView.setText("Live link: waiting for connection");
+            }else if(!snap.connected){
+                WifiLinkMonitor.LinkSnapshot local=WifiLinkMonitor.inspect(this,false,0);
+                liveLinkView.setText("Live link: Disconnected • Phone network: "+local.describePlainLabel());
+            }else{
+                String path=snap.cable ? "Data cable" : formatBandPlain(snap.band,snap.speedMbps);
+                String ping=snap.rttMs>0.0
+                    ? String.format(java.util.Locale.US,"ping %.1f ms",snap.rttMs)
+                    : "measuring ping...";
+                String extra="";
+                if(!snap.cable && (snap.jitterMs>=0.2 || snap.lossPermille>=0.5)){
+                    extra=String.format(java.util.Locale.US," • jitter %.1f ms • loss %.1f‰",
+                        snap.jitterMs,snap.lossPermille);
+                }
+                liveLinkView.setText("Live link: "+snap.peerName+" via "+path+" • "+ping+extra);
+            }
+        }
+        if(keyboardBindingsView!=null && snap!=null && snap.keyboardReport!=null){
+            KeyboardBindingInspector.KeyboardReport kb=snap.keyboardReport;
+            String pcTag=(kb.pcLayoutName!=null && !kb.pcLayoutName.isEmpty())
+                ? " • PC layout: "+kb.pcLayoutName : "";
+            int readyCount=0;
+            for(KeyboardBindingInspector.ShortcutBinding b:kb.bindings)if(b.activeNow)readyCount++;
+            keyboardBindingsView.setText("Keyboard: "+kb.connectedKeyboardName
+                +" • Mode: "+kb.activeModeLabel
+                +" • Ready bindings: "+readyCount+"/"+kb.bindings.size()+pcTag);
+        }
+    }
+    private static String formatBandPlain(String band, int speedMbps){
+        String base;
+        if(WifiLinkMonitor.BAND_24_GHZ.equals(band)) base="2.4 GHz wireless";
+        else if(WifiLinkMonitor.BAND_5_GHZ.equals(band)) base="5 GHz wireless";
+        else if(WifiLinkMonitor.BAND_6_GHZ.equals(band)) base="6 GHz wireless";
+        else base="Wireless";
+        return speedMbps>0 ? base+" ("+speedMbps+" Mbps)" : base;
+    }
+    private void showKeyboardShortcutsDialog(){
+        DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+        KeyboardBindingInspector.KeyboardReport kb=snap!=null ? snap.keyboardReport : null;
+        if(kb==null){
+            kb=KeyboardBindingInspector.inspect(
+                this,ShellInputClient.ready(this),DeskTouchAccessibilityService.ready(this),"");
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Connected keyboard & supported bindings")
+            .setMessage(kb.formatSummaryLines())
+            .setPositiveButton("Close",null)
+            .show();
     }
     private void refreshTrustSummary(){
         if(trustSummary==null)return;
@@ -699,7 +816,7 @@ public final class MainActivity extends Activity {
         }
         return super.dispatchKeyEvent(e);
     }
-    private static int toWindowsKey(int c){
+    static int toWindowsKey(int c){
         if(c>=KeyEvent.KEYCODE_A&&c<=KeyEvent.KEYCODE_Z)
             return 0x41+c-KeyEvent.KEYCODE_A;
         if(c>=KeyEvent.KEYCODE_0&&c<=KeyEvent.KEYCODE_9)
@@ -709,6 +826,12 @@ public final class MainActivity extends Activity {
         switch(c){
             case KeyEvent.KEYCODE_ENTER:return 0x0D;
             case KeyEvent.KEYCODE_DEL:return 0x08;
+            case KeyEvent.KEYCODE_FORWARD_DEL:return 0x2E;
+            case KeyEvent.KEYCODE_INSERT:return 0x2D;
+            case KeyEvent.KEYCODE_MOVE_HOME:return 0x24;
+            case KeyEvent.KEYCODE_MOVE_END:return 0x23;
+            case KeyEvent.KEYCODE_PAGE_UP:return 0x21;
+            case KeyEvent.KEYCODE_PAGE_DOWN:return 0x22;
             case KeyEvent.KEYCODE_TAB:return 0x09;
             case KeyEvent.KEYCODE_ESCAPE:return 0x1B;
             case KeyEvent.KEYCODE_SPACE:return 0x20;
@@ -722,6 +845,25 @@ public final class MainActivity extends Activity {
             case KeyEvent.KEYCODE_CTRL_RIGHT:return 0xA3;
             case KeyEvent.KEYCODE_ALT_LEFT:return 0xA4;
             case KeyEvent.KEYCODE_ALT_RIGHT:return 0xA5;
+            case KeyEvent.KEYCODE_META_LEFT:return 0x5B;
+            case KeyEvent.KEYCODE_META_RIGHT:return 0x5C;
+            case KeyEvent.KEYCODE_MENU:return 0x5D;
+            case KeyEvent.KEYCODE_CAPS_LOCK:return 0x14;
+            case KeyEvent.KEYCODE_NUM_LOCK:return 0x90;
+            case KeyEvent.KEYCODE_SCROLL_LOCK:return 0x91;
+            case KeyEvent.KEYCODE_SYSRQ:return 0x2C;
+            case KeyEvent.KEYCODE_BREAK:return 0x13;
+            case KeyEvent.KEYCODE_MINUS:return 0xBD;
+            case KeyEvent.KEYCODE_EQUALS:return 0xBB;
+            case KeyEvent.KEYCODE_LEFT_BRACKET:return 0xDB;
+            case KeyEvent.KEYCODE_RIGHT_BRACKET:return 0xDD;
+            case KeyEvent.KEYCODE_BACKSLASH:return 0xDC;
+            case KeyEvent.KEYCODE_SEMICOLON:return 0xBA;
+            case KeyEvent.KEYCODE_APOSTROPHE:return 0xDE;
+            case KeyEvent.KEYCODE_COMMA:return 0xBC;
+            case KeyEvent.KEYCODE_PERIOD:return 0xBE;
+            case KeyEvent.KEYCODE_SLASH:return 0xBF;
+            case KeyEvent.KEYCODE_GRAVE:return 0xC0;
             default:return 0;
         }
     }
@@ -733,6 +875,13 @@ public final class MainActivity extends Activity {
         // and physical Windows input still revoke that lease.
     }
     @Override protected void onDestroy(){
+        stopLiveUiTicker();
+        if(inputManager!=null && inputDeviceListener!=null){
+            try{inputManager.unregisterInputDeviceListener(inputDeviceListener);}
+            catch(RuntimeException ignored){}
+            inputDeviceListener=null;
+        }
+        DeskTouchRuntime.setLiveStatusListener(null);
         DeskTouchRuntime.setListener(null);
         // The foreground reconnect service owns the authenticated TLS sessions.
         // Closing this setup screen must not disconnect the selected phone.

@@ -16,10 +16,13 @@ internal sealed class AdbCableBridge : IDisposable
     private const string ShellPortFile = "/data/local/tmp/dt_s.port";
     private const string ShellPidFile = "/data/local/tmp/dt_s.pid";
     private const string ShellTokenFile = "/data/local/tmp/dt_s.tok";
-    private const long BridgeRecheckIntervalMs = 15000;
+    private const long BridgeRecheckIntervalMs = 12000;
+    private const long HealthyShellVerifyIntervalMs = 45000;
 
     private readonly Action<string>? _log;
     private readonly Action<int, string>? _onShellBridgeReady;
+    private readonly Action? _onBridgeDetached;
+    private readonly Action? _onCableBridgeReady;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly Dictionary<string, long> _bridgedSerials = new(StringComparer.Ordinal);
@@ -31,10 +34,16 @@ internal sealed class AdbCableBridge : IDisposable
     private readonly Task _loop;
     private int _disposed;
 
-    internal AdbCableBridge(Action<string>? log = null, Action<int, string>? onShellBridgeReady = null)
+    internal AdbCableBridge(
+        Action<string>? log = null,
+        Action<int, string>? onShellBridgeReady = null,
+        Action? onBridgeDetached = null,
+        Action? onCableBridgeReady = null)
     {
         _log = log;
         _onShellBridgeReady = onShellBridgeReady;
+        _onBridgeDetached = onBridgeDetached;
+        _onCableBridgeReady = onCableBridgeReady;
         _loop = Task.Run(RunAsync);
     }
 
@@ -248,13 +257,21 @@ internal sealed class AdbCableBridge : IDisposable
 
         IReadOnlyList<string> wiredSerials = ParseWiredAdbSerials(devicesOut);
         var present = new HashSet<string>(wiredSerials, StringComparer.Ordinal);
+        bool anyDetached = false;
         foreach (string gone in _bridgedSerials.Keys.Where(s => !present.Contains(s)).ToList())
         {
             _bridgedSerials.Remove(gone);
+            anyDetached = true;
             _log?.Invoke($"Data cable bridge disconnected for USB device ({gone}).");
+        }
+        if (anyDetached)
+        {
+            lock (_shellGate) _currentShellBridge = null;
+            _onBridgeDetached?.Invoke();
         }
 
         long nowMs = Environment.TickCount64;
+        bool wiredBecameReady = false;
         foreach (string serial in wiredSerials)
         {
             bool newlyAttached = !_bridgedSerials.TryGetValue(serial, out long lastCheckedMs);
@@ -266,7 +283,10 @@ internal sealed class AdbCableBridge : IDisposable
             {
                 _bridgedSerials[serial] = nowMs;
                 if (newlyAttached)
+                {
+                    wiredBecameReady = true;
                     _log?.Invoke($"Data cable bridge active for USB device ({serial}) on ports {Wire.Port}/{NearbyComputerDiscovery.DiscoveryPort}.");
+                }
                 continue;
             }
 
@@ -279,11 +299,16 @@ internal sealed class AdbCableBridge : IDisposable
             {
                 _bridgedSerials[serial] = nowMs;
                 if (newlyAttached)
+                {
+                    wiredBecameReady = true;
                     _log?.Invoke($"Data cable bridge ready for USB device ({serial}) on ports {Wire.Port}/{NearbyComputerDiscovery.DiscoveryPort}.");
+                }
             }
         }
 
         await SyncShellInputDaemonsAsync(adbPath, devicesOut, nowMs, token);
+        if (wiredBecameReady)
+            _onCableBridgeReady?.Invoke();
     }
 
     private async Task SyncShellInputDaemonsAsync(
@@ -300,7 +325,9 @@ internal sealed class AdbCableBridge : IDisposable
         foreach (string serial in connectedSerials)
         {
             bool hasKnown = _shellBridges.TryGetValue(serial, out var existing);
-            if (hasKnown && nowMs - existing.LastCheckedMs < BridgeRecheckIntervalMs)
+            // Avoid polling `pm path` and spawning heavy binder queries every 15s
+            // over USB while the Virtual Bridge daemon is already confirmed alive.
+            if (hasKnown && nowMs - existing.LastCheckedMs < HealthyShellVerifyIntervalMs)
                 continue;
 
             int expectedPort = hasKnown ? existing.Port : 0;
@@ -319,6 +346,17 @@ internal sealed class AdbCableBridge : IDisposable
             if (hasKnown && ParsePortOutput(checkOut) == existing.Port)
             {
                 _shellBridges[serial] = (existing.Port, existing.Secret, nowMs);
+                bool restored = false;
+                lock (_shellGate)
+                {
+                    if (_currentShellBridge == null)
+                    {
+                        _currentShellBridge = (existing.Port, existing.Secret);
+                        restored = true;
+                    }
+                }
+                if (restored)
+                    _onShellBridgeReady?.Invoke(existing.Port, existing.Secret);
                 continue;
             }
 

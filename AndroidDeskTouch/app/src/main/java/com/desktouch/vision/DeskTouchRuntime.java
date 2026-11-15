@@ -12,12 +12,31 @@ import java.util.function.Consumer;
  */
 final class DeskTouchRuntime {
     private static final Map<String,DeskTouchSession> sessions=new ConcurrentHashMap<>();
+    private static final Map<String,DeskTouchSession> pendingCableUpgrades=new ConcurrentHashMap<>();
+    private static final Map<String,String> lastKnownPeerHosts=new ConcurrentHashMap<>();
     private static volatile Consumer<String> listener;
+    private static volatile Runnable liveStatusListener;
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
     private static volatile Context appContext;
     private static DeskTouchSession androidController;
     private DeskTouchRuntime(){}
+
+    static void rememberPeerHost(String fingerprint, String host){
+        if(fingerprint==null || host==null || host.isBlank() || "127.0.0.1".equals(host))return;
+        lastKnownPeerHosts.put(fingerprint.toUpperCase(Locale.ROOT),host);
+    }
+    static String getLastKnownPeerHost(String fingerprint){
+        if(fingerprint==null)return null;
+        return lastKnownPeerHosts.get(fingerprint.toUpperCase(Locale.ROOT));
+    }
+    static void setLiveStatusListener(Runnable observer){
+        liveStatusListener=observer;
+    }
+    static void notifyLiveStatusChanged(){
+        Runnable current=liveStatusListener;
+        if(current!=null)current.run();
+    }
 
     private static DeskTouchSession newSession(Context context,String id) {
         appContext=context.getApplicationContext();
@@ -102,6 +121,65 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isBusyInLease())return true;
         return false;
     }
+    static boolean upgradeToCableMakeBeforeBreak(
+            Context context, DesktopDiscovery.Device cableDevice,
+            int width, int height, Runnable onFailure){
+        if(context==null || cableDevice==null || cableDevice.fingerprint==null)return false;
+        String id=cableDevice.fingerprint.toUpperCase(Locale.ROOT);
+        DeskTouchSession candidate;
+        synchronized(DeskTouchRuntime.class){
+            if(anyInputLeaseActive())return false;
+            DeskTouchSession current=sessions.get(id);
+            if(current!=null && current.isConnected() && current.isCableSession())return false;
+            DeskTouchSession pending=pendingCableUpgrades.get(id);
+            if(pending!=null && pending.isConnecting())return false;
+            candidate=newSession(context,id);
+            pendingCableUpgrades.put(id,candidate);
+        }
+        candidate.connect(cableDevice,width,height,false,()->{
+            synchronized(DeskTouchRuntime.class){
+                pendingCableUpgrades.remove(id,candidate);
+                DeskTouchSession previous=sessions.get(id);
+                if(previous!=null && previous!=candidate){
+                    if(previous.isBusyInLease()){
+                        // Lease became active mid-handshake; defer drop so active input is not torn mid-stroke.
+                        sessions.put(id,candidate);
+                        selectedFingerprint=id;
+                        previous.releaseControl();
+                        previous.close();
+                    }else{
+                        sessions.put(id,candidate);
+                        selectedFingerprint=id;
+                        previous.close();
+                    }
+                }else{
+                    sessions.put(id,candidate);
+                    selectedFingerprint=id;
+                }
+            }
+            notifyLiveStatusChanged();
+        },()->{
+            synchronized(DeskTouchRuntime.class){
+                pendingCableUpgrades.remove(id,candidate);
+            }
+            candidate.close();
+            if(onFailure!=null)onFailure.run();
+        });
+        return true;
+    }
+    static synchronized boolean closeCableSessions(){
+        boolean closedAny=false;
+        for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
+            DeskTouchSession s=entry.getValue();
+            if(s.isCableSession()){
+                s.close();
+                sessions.remove(entry.getKey(),s);
+                closedAny=true;
+            }
+        }
+        if(closedAny)notifyLiveStatusChanged();
+        return closedAny;
+    }
     static synchronized boolean closeWirelessIfIdle(String fingerprint){
         if(anyInputLeaseActive())return false;
         String id=fingerprint==null?null:fingerprint.toUpperCase(Locale.ROOT);
@@ -117,6 +195,44 @@ final class DeskTouchRuntime {
             }
         }
         return closedAny;
+    }
+    static void notifyNetworkProfile(Context context, WifiLinkMonitor.LinkSnapshot snapshot){
+        if(snapshot==null)return;
+        for(DeskTouchSession session:sessions.values()){
+            if(session.isConnected() && !session.isCableSession()){
+                session.publishLinkProfile(snapshot);
+            }
+        }
+        notifyLiveStatusChanged();
+    }
+    static void refreshKeyboardBindings(Context context){
+        if(context!=null)appContext=context.getApplicationContext();
+        for(DeskTouchSession session:sessions.values()){
+            if(session.isConnected())session.publishKeyboardBindings();
+        }
+        notifyLiveStatusChanged();
+    }
+    static synchronized DeskTouchSession.LiveStatusSnapshot liveSnapshot(Context context){
+        if(context!=null)appContext=context.getApplicationContext();
+        DeskTouchSession chosen=null;
+        String sel=selectedFingerprint;
+        if(sel!=null){
+            DeskTouchSession s=sessions.get(sel);
+            if(s!=null && s.isConnected())chosen=s;
+        }
+        if(chosen==null){
+            for(DeskTouchSession s:sessions.values()){
+                if(s.isConnected()){ chosen=s; break; }
+            }
+        }
+        if(chosen!=null)return chosen.getLiveSnapshot();
+        Context ctx=appContext;
+        if(ctx==null)return null;
+        WifiLinkMonitor.LinkSnapshot link=WifiLinkMonitor.inspect(ctx,false,0);
+        KeyboardBindingInspector.KeyboardReport kb=KeyboardBindingInspector.inspect(
+            ctx,ShellInputClient.ready(ctx),DeskTouchAccessibilityService.ready(ctx),"");
+        return new DeskTouchSession.LiveStatusSnapshot(
+            false,"",null,false,link.band,link.linkSpeedMbps,0.0,0.0,0.0,"",kb);
     }
     // Multiple trusted PCs remain connected, but only one may remotely
     // control Android at any moment. Switching needs a fresh lease handshake.
@@ -141,10 +257,13 @@ final class DeskTouchRuntime {
     static void accessibilityPermissionChanged(Context context){
         if(context!=null)appContext=context.getApplicationContext();
         Context ctx=appContext;
-        for(DeskTouchSession session:sessions.values())
+        for(DeskTouchSession session:sessions.values()){
             session.publishAccessibilityCapability();
+            session.publishKeyboardBindings();
+        }
         AutoConnectService.refreshNotification();
         AutoConnectService.onAccessibilityStateChanged(ctx);
+        notifyLiveStatusChanged();
         if(ctx!=null){
             PaymentPauseWidgetProvider.updateAll(ctx);
             BankingPauseTileService.requestRefresh(ctx);
@@ -171,6 +290,8 @@ final class DeskTouchRuntime {
         if(observer!=null)observer.accept(lastStatus);
     }
     static synchronized void clear(){
+        for(DeskTouchSession s:pendingCableUpgrades.values())s.close();
+        pendingCableUpgrades.clear();
         for(DeskTouchSession s:sessions.values())s.close();
         sessions.clear();
         selectedFingerprint=null;androidController=null;listener=null;

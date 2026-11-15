@@ -105,6 +105,32 @@ final class DesktopDiscovery {
         return probeLoopbackCable(InetAddress.getLoopbackAddress(), 37378);
     }
 
+    static Device probeDirectHost(String host, Set<String> eligibleFingerprints) {
+        if(host==null || host.isBlank() || "127.0.0.1".equals(host)) return null;
+        try(DatagramSocket socket=new DatagramSocket()) {
+            socket.setSoTimeout(180);
+            InetAddress dest=InetAddress.getByName(host);
+            byte[] probe="DT1-DISCOVER".getBytes(StandardCharsets.US_ASCII);
+            socket.send(new DatagramPacket(probe,probe.length,dest,37378));
+            byte[] buf=new byte[512];
+            long deadline=System.nanoTime()+260_000_000L;
+            while(System.nanoTime()<deadline) {
+                DatagramPacket pkt=new DatagramPacket(buf,buf.length);
+                try { socket.receive(pkt); }
+                catch(SocketTimeoutException e) { break; }
+                String msg=new String(pkt.getData(),0,pkt.getLength(),StandardCharsets.US_ASCII);
+                Device d=parse(msg,pkt.getAddress().getHostAddress());
+                if(d==null) d=parseOnline(msg,pkt.getAddress().getHostAddress());
+                if(d!=null && !d.android && d.ready &&
+                    (eligibleFingerprints==null || eligibleFingerprints.isEmpty()
+                        || eligibleFingerprints.contains(d.fingerprint))) {
+                    return d;
+                }
+            }
+        } catch(Exception ignored) {}
+        return null;
+    }
+
     static Device probeLoopbackCable(InetAddress host, int port) {
         if(host==null || port<=0 || port>65535) return null;
         try(Socket socket=new Socket()) {

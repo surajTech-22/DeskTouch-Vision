@@ -9,7 +9,8 @@ package com.desktouch.vision;
  */
 public final class AdaptiveLinkTracker {
     private static final int REORDER_SLACK = 8;
-    private static final long MIN_RTT_WINDOW_MS = 10_000L;
+    private static final long FAST_MIN_RTT_WINDOW_MS = 3_000L;
+    private static final long SLOW_BAND_MIN_RTT_WINDOW_MS = 5_000L;
     private static final int PING_RING_SIZE = 16;
 
     private final Object recvGate = new Object();
@@ -41,6 +42,76 @@ public final class AdaptiveLinkTracker {
     private double peerJitterMs;
     private int peerRefreshHz;
     private int peerFrameTenthsMs;
+    private String linkBand = "wireless";
+    private int linkSpeedMbps;
+    private int networkEpoch;
+
+    public AdaptiveLinkTracker() {}
+
+    public AdaptiveLinkTracker(String initialBand) {
+        this.linkBand = normalizeBand(initialBand);
+    }
+
+    public static String normalizeBand(String raw) {
+        if (raw == null) return "wireless";
+        String b = raw.trim();
+        if (b.isEmpty()) return "wireless";
+        if ("cable".equalsIgnoreCase(b)) return "cable";
+        if ("2.4GHz".equalsIgnoreCase(b)) return "2.4GHz";
+        if ("5GHz".equalsIgnoreCase(b)) return "5GHz";
+        if ("6GHz".equalsIgnoreCase(b)) return "6GHz";
+        return "wireless";
+    }
+
+    public String getBand() {
+        synchronized (rttGate) {
+            return linkBand;
+        }
+    }
+
+    public int getLinkSpeedMbps() {
+        synchronized (rttGate) {
+            return linkSpeedMbps;
+        }
+    }
+
+    public boolean onLinkProfileChanged(String band, int speedMbps, int epoch) {
+        String normalized = normalizeBand(band);
+        boolean changed;
+        synchronized (rttGate) {
+            changed = !linkBand.equals(normalized) || (epoch > 0 && epoch != networkEpoch);
+            linkBand = normalized;
+            if (speedMbps >= 0) linkSpeedMbps = speedMbps;
+            if (epoch > 0) networkEpoch = epoch;
+            if (changed) {
+                java.util.Arrays.fill(pingTokens, 0);
+                java.util.Arrays.fill(pingSentMs, 0L);
+                smoothedRttMs = 0.0;
+                rttJitterMs *= 0.25;
+                minRttWindowA = Double.MAX_VALUE;
+                minRttWindowB = Double.MAX_VALUE;
+                windowStartMs = 0L;
+                peerLossPermille = 0.0;
+                peerJitterMs = 0.0;
+            }
+        }
+        if (changed) {
+            synchronized (recvGate) {
+                ewmaLossRatio *= 0.20;
+                inboundJitterMs *= 0.25;
+                hasLastTransit = false;
+            }
+        }
+        return changed;
+    }
+
+    public int computeProbeIntervalMs(boolean controlActive) {
+        String band = getBand();
+        if ("cable".equals(band)) return controlActive ? 150 : 600;
+        if ("5GHz".equals(band) || "6GHz".equals(band)) return controlActive ? 120 : 500;
+        if ("2.4GHz".equals(band)) return controlActive ? 350 : 900;
+        return controlActive ? 220 : 750;
+    }
 
     public int nextPingToken(long nowMs) {
         synchronized (rttGate) {
@@ -96,9 +167,10 @@ public final class AdaptiveLinkTracker {
     }
 
     private void recordRttSampleLocked(double sampleRtt, long nowMs) {
+        long windowLimit = "2.4GHz".equals(linkBand) ? SLOW_BAND_MIN_RTT_WINDOW_MS : FAST_MIN_RTT_WINDOW_MS;
         if (windowStartMs == 0L) {
             windowStartMs = nowMs;
-        } else if (nowMs - windowStartMs >= MIN_RTT_WINDOW_MS) {
+        } else if (nowMs - windowStartMs >= windowLimit) {
             minRttWindowB = minRttWindowA;
             minRttWindowA = Double.MAX_VALUE;
             windowStartMs = nowMs;
@@ -112,8 +184,11 @@ public final class AdaptiveLinkTracker {
             rttJitterMs = 0.0;
         } else {
             double dev = Math.abs(sampleRtt - smoothedRttMs);
-            rttJitterMs += (dev > rttJitterMs ? 0.25 : 0.22) * (dev - rttJitterMs);
-            double alpha = sampleRtt > smoothedRttMs ? 0.24 : 0.22;
+            rttJitterMs += 0.25 * (dev - rttJitterMs);
+            // Adapt down fast when a better band/link arrives; damp isolated upward spikes.
+            double alpha = sampleRtt < smoothedRttMs
+                ? (sampleRtt < smoothedRttMs * 0.65 ? 0.55 : 0.42)
+                : 0.20;
             smoothedRttMs += alpha * (sampleRtt - smoothedRttMs);
         }
     }
@@ -306,6 +381,10 @@ public final class AdaptiveLinkTracker {
      * queue delay, jitter, loss, and target display cadence.
      */
     public double computeAdaptiveSendIntervalMs(int targetRefreshHz) {
+        return computeAdaptiveSendIntervalMs(targetRefreshHz, getBand());
+    }
+
+    public double computeAdaptiveSendIntervalMs(int targetRefreshHz, String bandHint) {
         double rtt;
         double minRtt;
         double lossP;
@@ -318,15 +397,19 @@ public final class AdaptiveLinkTracker {
             jitter = Math.max(inboundJitterMs, Math.max(rttJitterMs, peerJitterMs));
         }
 
+        String normalized = normalizeBand(bandHint);
+        boolean slow24 = "2.4GHz".equals(normalized);
         double baseMs = 2.5;
-        if (targetRefreshHz > 0) {
+        if (slow24) {
+            baseMs = targetRefreshHz > 0 && targetRefreshHz < 65 ? 13.0 : 11.0;
+        } else if (targetRefreshHz > 0) {
             baseMs = Math.max(2.0, Math.min(8.5, 1000.0 / (Math.min(240, Math.max(30, targetRefreshHz)) * 1.55)));
         }
         if (rtt <= 0.0) {
             return baseMs;
         }
         double queueDelay = Math.max(0.0, rtt - minRtt);
-        if (rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
+        if (!slow24 && rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
             return Math.max(1.8, baseMs * 0.85);
         }
         double penalty = Math.max(0.0, rtt - 18.0) * 0.08
@@ -334,9 +417,10 @@ public final class AdaptiveLinkTracker {
             + Math.max(0.0, jitter - 8.0) * 0.11
             + Math.max(0.0, lossP - 8.0) * 0.10;
         int effHz = targetRefreshHz > 0 ? targetRefreshHz : 90;
-        double maxCap = effHz >= 115 ? 14.0
+        double maxCap = slow24 ? 24.0
+            : (effHz >= 115 ? 14.0
             : (effHz >= 85 ? 16.0
-            : (effHz >= 55 ? 18.5 : 20.0));
+            : (effHz >= 55 ? 18.5 : 20.0)));
         maxCap = Math.max(baseMs, maxCap);
         return Math.max(baseMs, Math.min(maxCap, baseMs + penalty));
     }

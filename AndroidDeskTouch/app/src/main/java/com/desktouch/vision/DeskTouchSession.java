@@ -143,8 +143,38 @@ final class DeskTouchSession implements AutoCloseable {
     private long lastAnyMoveMs;
     private ScheduledFuture<?> scheduledThrottleFlush;
     private ScheduledFuture<?> scheduledTrailingSync;
+    static final class LiveStatusSnapshot {
+        final boolean connected;
+        final String peerName;
+        final String fingerprint;
+        final boolean cable;
+        final String band;
+        final int speedMbps;
+        final double rttMs;
+        final double jitterMs;
+        final double lossPermille;
+        final String pcLayout;
+        final KeyboardBindingInspector.KeyboardReport keyboardReport;
+        LiveStatusSnapshot(boolean connected, String peerName, String fingerprint, boolean cable,
+                String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
+                String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport) {
+            this.connected = connected;
+            this.peerName = peerName != null ? peerName : "";
+            this.fingerprint = fingerprint;
+            this.cable = cable;
+            this.band = band != null ? band : WifiLinkMonitor.BAND_WIRELESS;
+            this.speedMbps = speedMbps;
+            this.rttMs = rttMs;
+            this.jitterMs = jitterMs;
+            this.lossPermille = lossPermille;
+            this.pcLayout = pcLayout != null ? pcLayout : "";
+            this.keyboardReport = keyboardReport;
+        }
+    }
     private volatile FastUdpChannel udpChannel;
     private volatile InetAddress peerInetAddress;
+    private volatile String peerName;
+    private volatile String peerHostAddress;
     private volatile boolean cableSession;
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
@@ -165,6 +195,18 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile int peerTargetRefreshHz;
     private volatile double lastAdaptiveMoveIntervalMs = 2.5;
     private volatile long lastPingSentMs;
+    private volatile long lastPongReceivedMs;
+    private volatile long connectedAtMs;
+    private volatile int missedPings;
+    private final AdaptiveLinkTracker cableTracker = new AdaptiveLinkTracker(WifiLinkMonitor.BAND_CABLE);
+    private final int[] tcpPingTokens = new int[16];
+    private final long[] tcpPingSentNanos = new long[16];
+    private int tcpPingSeq;
+    private volatile String pcKeyboardLayout = "";
+    private volatile String liveLinkBand = WifiLinkMonitor.BAND_WIRELESS;
+    private volatile int liveLinkSpeedMbps;
+    private volatile double liveRttMs;
+    private volatile KeyboardBindingInspector.KeyboardReport lastKeyboardReport;
     private volatile long lastTcpMetricsSentMs;
     private volatile long lastUdpLinkPingMs;
     private volatile long lastUdpFeedbackPushMs;
@@ -182,6 +224,40 @@ final class DeskTouchSession implements AutoCloseable {
     DeskTouchSession(Context context,TrustedWindows trust,Events events) {
         this.application=context.getApplicationContext();
         this.trust=trust; this.events=events;
+    }
+
+    String peerHostAddress() { return peerHostAddress; }
+    static long computeHeartbeatIntervalMs(boolean cable, boolean activeSession, String band) {
+        if (cable) return activeSession ? 450L : 850L;
+        if (WifiLinkMonitor.BAND_24_GHZ.equals(band)) return activeSession ? 1100L : 1700L;
+        return activeSession ? 750L : 1200L;
+    }
+    static boolean shouldFastFailDeadSession(long nowMs, long lastPongMs, long connectedAtMs,
+            int missedPings, boolean cable) {
+        if (missedPings < 3) return false;
+        long baseline = lastPongMs > 0L ? lastPongMs : connectedAtMs;
+        if (baseline <= 0L) return false;
+        long limitMs = cable ? 3600L : 5200L;
+        return (nowMs - baseline) >= limitMs;
+    }
+    LiveStatusSnapshot getLiveSnapshot() {
+        FastUdpChannel ch = udpChannel;
+        String band = cableSession ? WifiLinkMonitor.BAND_CABLE : liveLinkBand;
+        double jitter = 0.0;
+        double loss = 0.0;
+        double rtt = liveRttMs;
+        if (cableSession) {
+            if (cableTracker.getSmoothedRttMs() > 0) rtt = cableTracker.getSmoothedRttMs();
+        } else if (ch != null) {
+            if (ch.linkTracker.getSmoothedRttMs() > 0) rtt = ch.linkTracker.getSmoothedRttMs();
+            jitter = ch.linkTracker.getEffectiveJitterMs();
+            loss = ch.linkTracker.getInboundLossPermille();
+            String trackerBand = ch.linkTracker.getBand();
+            if (trackerBand != null && !trackerBand.isEmpty()) band = trackerBand;
+        }
+        return new LiveStatusSnapshot(running, peerName, fingerprint, cableSession,
+            band, cableSession ? 0 : liveLinkSpeedMbps, rtt, jitter, loss,
+            pcKeyboardLayout, lastKeyboardReport);
     }
     static boolean allowedInputType(String type) {
         return "move".equals(type)||"button".equals(type)||"key".equals(type)||
@@ -284,10 +360,14 @@ final class DeskTouchSession implements AutoCloseable {
 
     private void status(String message) { events.status(message); }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight) {
-        connect(device,androidWidth,androidHeight,false,null);
+        connect(device,androidWidth,androidHeight,false,null,null);
     }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
             boolean interactiveUser,Runnable onFailure) {
+        connect(device,androidWidth,androidHeight,interactiveUser,null,onFailure);
+    }
+    void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
+            boolean interactiveUser,Runnable onConnected,Runnable onFailure) {
         sender.execute(()->{
             if(running || connecting) {status("Already connected or connecting");return;}
             connecting=true;
@@ -393,26 +473,52 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 peerInetAddress=ssl.getInetAddress();
                 cableSession=device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress());
+                peerName=device.name;
+                peerHostAddress=peerInetAddress!=null ? peerInetAddress.getHostAddress() : device.address;
+                if(!cableSession && peerHostAddress!=null && !peerHostAddress.isEmpty()
+                    && !"127.0.0.1".equals(peerHostAddress)) {
+                    DeskTouchRuntime.rememberPeerHost(pinned,peerHostAddress);
+                }
+                liveLinkBand=cableSession ? WifiLinkMonitor.BAND_CABLE : WifiLinkMonitor.BAND_WIRELESS;
+                liveLinkSpeedMbps=0;
+                liveRttMs=0.0;
+                missedPings=0;
+                cableTracker.onLinkProfileChanged(WifiLinkMonitor.BAND_CABLE,0,0);
+                java.util.Arrays.fill(tcpPingTokens,0);
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
+                long nowUp=SystemClock.uptimeMillis();
+                connectedAtMs=nowUp;
+                lastPongReceivedMs=nowUp;
                 reverseDedup.reset();
                 AutoConnectService.onConnectionCountChanged(application);
                 registerDisplayListener();
                 if(canAcceptRemoteInput() ||
                     !DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
-                // Allow for transient Android CPU/Wi-Fi scheduling pauses.
-                // Heartbeats and the foreground auto-reconnect still detect real loss.
-                ssl.setSoTimeout(60000);
+                // Keep TLS timeout moderate (~15s); heartbeat fast-fail catches dead cable/Wi-Fi in ~4s.
+                ssl.setSoTimeout(15000);
                 if(cableSession) DeskTouchAccessibilityService.setLinkMetrics(0.0,0.0);
                 status("Connected to "+device.name+(cableSession?" via data cable":"")+". Windows approved pairing.");
+                if(!cableSession) {
+                    WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(application,false,0);
+                    publishLinkProfile(snap);
+                }
+                publishKeyboardBindings();
+                if(onConnected!=null) onConnected.run();
+                DeskTouchRuntime.notifyLiveStatusChanged();
                 Thread heartbeat=new Thread(()->{
                     while(running){
                         try {
-                            Thread.sleep(1500);
-                            if(running){
-                                lastPingSentMs=SystemClock.uptimeMillis();
-                                send(new Packet("ping"));
+                            long sleepMs=computeHeartbeatIntervalMs(cableSession,reverseLease>0||hasClaim(),liveLinkBand);
+                            Thread.sleep(sleepMs);
+                            if(!running) return;
+                            long nowMs=SystemClock.uptimeMillis();
+                            if(shouldFastFailDeadSession(nowMs,lastPongReceivedMs,connectedAtMs,missedPings,cableSession)){
+                                status("Connection timed out ("+(cableSession?"data cable":"wireless")+")");
+                                closeConnection();
+                                return;
                             }
+                            sendTrackedPing(nowMs);
                         }
                         catch(InterruptedException e){Thread.currentThread().interrupt();return;}
                     }
@@ -439,6 +545,8 @@ final class DeskTouchSession implements AutoCloseable {
         try {
             while(running){
                 Packet p=Packet.read(input);
+                lastPongReceivedMs=SystemClock.uptimeMillis();
+                missedPings=0;
                 if("udp-channel".equals(p.type)){
                     if(!cableSession) setupUdpChannel(p);
                 } else if("ping".equals(p.type)){
@@ -473,14 +581,38 @@ final class DeskTouchSession implements AutoCloseable {
                 } else if("trust-denied".equals(p.type)){
                     pendingTrust=null;status("Windows declined trusted-device permission");
                 } else if("pong".equals(p.type)){
-                    long sentMs=lastPingSentMs;
-                    if(sentMs>0L){
-                        long rttMs=SystemClock.uptimeMillis()-sentMs;
-                        FastUdpChannel ch=udpChannel;
-                        if(ch!=null && rttMs>=1L && rttMs<=5000L){
-                            ch.linkTracker.recordRttSample(rttMs,SystemClock.uptimeMillis());
-                            syncAdaptiveMetrics(ch);
+                    long nowMs=SystemClock.uptimeMillis();
+                    double rttMs=-1.0;
+                    int token=p.a;
+                    if(token>0){
+                        int slot=token%tcpPingTokens.length;
+                        if(tcpPingTokens[slot]==token){
+                            tcpPingTokens[slot]=0;
+                            long elapsedNs=System.nanoTime()-tcpPingSentNanos[slot];
+                            if(elapsedNs>0L && elapsedNs<10_000_000_000L){
+                                rttMs=Math.max(0.2,elapsedNs/1_000_000.0);
+                            }
                         }
+                    }
+                    if(rttMs<0.0 && lastPingSentMs>0L){
+                        long diffMs=nowMs-lastPingSentMs;
+                        if(diffMs>=0L && diffMs<=5000L) rttMs=Math.max(0.5,diffMs);
+                    }
+                    if(rttMs>0.0 && rttMs<=5000.0){
+                        if(cableSession){
+                            cableTracker.recordRttSample(rttMs,nowMs);
+                            double smoothed=cableTracker.getSmoothedRttMs();
+                            liveRttMs=smoothed>0.0 ? smoothed : rttMs;
+                        } else {
+                            FastUdpChannel ch=udpChannel;
+                            if(ch!=null){
+                                ch.linkTracker.recordRttSample(rttMs,nowMs);
+                                syncAdaptiveMetrics(ch);
+                            } else {
+                                liveRttMs=rttMs;
+                            }
+                        }
+                        DeskTouchRuntime.notifyLiveStatusChanged();
                     }
                 } else if("display-metrics".equals(p.type)){
                     if(p.a>=24 && p.a<=360){
@@ -492,6 +624,14 @@ final class DeskTouchSession implements AutoCloseable {
                     handleWindowsControl(p);
                 } else if("shell-input-bridge".equals(p.type)){
                     ShellInputClient.configure(application,p.a,p.text);
+                    publishKeyboardBindings();
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("cable-bridge-ready".equals(p.type)){
+                    AutoConnectService.onCableBridgeReadyHint(application,fingerprint);
+                } else if("keyboard-layout".equals(p.type)){
+                    pcKeyboardLayout=p.text!=null ? p.text : "";
+                    publishKeyboardBindings();
+                    DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("pause-accessibility".equals(p.type)){
                     handlePauseAccessibilityFromWindows();
                 } else if("goodbye".equals(p.type)) break;
@@ -745,15 +885,79 @@ final class DeskTouchSession implements AutoCloseable {
         return AdaptiveLinkTracker.packDisplayRate(hz,tenths);
     }
 
+    private synchronized void sendTrackedPing(long nowMs){
+        if(!running) return;
+        int token=(++tcpPingSeq)&0x7FFF;
+        if(token==0) token=(++tcpPingSeq)&0x7FFF;
+        int slot=token%tcpPingTokens.length;
+        tcpPingTokens[slot]=token;
+        tcpPingSentNanos[slot]=System.nanoTime();
+        lastPingSentMs=nowMs;
+        missedPings++;
+        send(new Packet("ping",token));
+    }
+
     private void syncAdaptiveMetrics(FastUdpChannel ch){
         if(ch==null) return;
         if(ch.linkTracker.getPeerRefreshHz()>0){
             peerTargetRefreshHz=ch.linkTracker.getPeerRefreshHz();
         }
+        double rtt=ch.linkTracker.getSmoothedRttMs();
+        if(rtt>0.0) liveRttMs=rtt;
         double jitter=ch.linkTracker.getEffectiveJitterMs();
         double loss=ch.linkTracker.getInboundLossPermille();
         DeskTouchAccessibilityService.setLinkMetrics(jitter,loss);
-        lastAdaptiveMoveIntervalMs=ch.linkTracker.computeAdaptiveSendIntervalMs(peerTargetRefreshHz);
+        lastAdaptiveMoveIntervalMs=ch.linkTracker.computeAdaptiveSendIntervalMs(
+            peerTargetRefreshHz,liveLinkBand);
+    }
+
+    void publishLinkProfile(WifiLinkMonitor.LinkSnapshot snap){
+        if(!running || snap==null) return;
+        if(cableSession){
+            liveLinkBand=WifiLinkMonitor.BAND_CABLE;
+            liveLinkSpeedMbps=0;
+            DeskTouchRuntime.notifyLiveStatusChanged();
+            return;
+        }
+        String newBand=AdaptiveLinkTracker.normalizeBand(snap.band);
+        boolean wasDifferent=!newBand.equals(liveLinkBand);
+        liveLinkBand=newBand;
+        liveLinkSpeedMbps=Math.max(0,snap.linkSpeedMbps);
+        FastUdpChannel ch=udpChannel;
+        boolean shifted=false;
+        if(ch!=null){
+            shifted=ch.linkTracker.onLinkProfileChanged(newBand,liveLinkSpeedMbps,snap.epoch);
+            if(shifted || wasDifferent){
+                liveRttMs=0.0;
+                syncAdaptiveMetrics(ch);
+                long now=SystemClock.uptimeMillis();
+                if(ch.confirmed && !udpPacer.isShutdown()){
+                    int pace=(int)Math.round(lastAdaptiveMoveIntervalMs*10.0);
+                    int lease=claim>0 ? claim : reverseLease;
+                    udpPacer.execute(()->ch.sendLinkPing(
+                        ch.linkTracker.nextPingToken(SystemClock.uptimeMillis()),pace,lease));
+                    lastUdpLinkPingMs=now;
+                }
+            }
+        } else if(wasDifferent){
+            liveRttMs=0.0;
+        }
+        send(new Packet("link-info",liveLinkSpeedMbps,snap.rssiDbm,snap.epoch,snap.frequencyMhz,newBand));
+        if(shifted || wasDifferent){
+            sendTrackedPing(SystemClock.uptimeMillis());
+        }
+        DeskTouchRuntime.notifyLiveStatusChanged();
+    }
+
+    void publishKeyboardBindings(){
+        boolean shellReady=ShellInputClient.ready(application);
+        boolean accReady=DeskTouchAccessibilityService.ready(application);
+        KeyboardBindingInspector.KeyboardReport report=KeyboardBindingInspector.inspect(
+            application,shellReady,accReady,pcKeyboardLayout);
+        lastKeyboardReport=report;
+        if(running){
+            send(new Packet("keyboard-info",0,0,0,0,report.toWireJson().toString()));
+        }
     }
 
     void onLiveRefreshRateChanged(int refreshHz, int frameTenthsMs){
@@ -957,13 +1161,18 @@ final class DeskTouchSession implements AutoCloseable {
                         packCurrentDisplayRate(),
                         reverseLease);
                     syncAdaptiveMetrics(activeCh);
+                    DeskTouchRuntime.notifyLiveStatusChanged();
                 }
                 @Override public void onLinkFeedback(int echoToken,int packedLossJitter,int packedDisplayRate,int lease){
                     if(!running) return;
                     FastUdpChannel activeCh=udpChannel;
-                    if(activeCh!=null) syncAdaptiveMetrics(activeCh);
+                    if(activeCh!=null){
+                        syncAdaptiveMetrics(activeCh);
+                        DeskTouchRuntime.notifyLiveStatusChanged();
+                    }
                 }
             });
+            ch.linkTracker.onLinkProfileChanged(liveLinkBand,liveLinkSpeedMbps,0);
             udpChannel=ch;
             send(new Packet("udp-ready",ch.localPort()));
             ch.sendProbe();
@@ -986,19 +1195,25 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        int warmGapMs=(int)Math.min(44L,Math.max(INTERACTIVE_KEEPALIVE_MS,
-                            Math.round(20.0+ch.linkTracker.getQueueDelayMs()*0.6)));
+                        boolean slow24=WifiLinkMonitor.BAND_24_GHZ.equals(ch.linkTracker.getBand())
+                            || WifiLinkMonitor.BAND_24_GHZ.equals(liveLinkBand);
+                        long baseWarm=slow24 ? 60L : INTERACTIVE_KEEPALIVE_MS;
+                        int warmGapMs=(int)Math.min(slow24 ? 95L : 44L,Math.max(baseWarm,
+                            Math.round((slow24 ? 50.0 : 20.0)+ch.linkTracker.getQueueDelayMs()*0.6)));
                         if(now-lastWarmSentMs>=warmGapMs){
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }
-                        if(now-lastUdpLinkPingMs>=100L){
+                        long probeGapMs=ch.linkTracker.computeProbeIntervalMs(true);
+                        if(now-lastUdpLinkPingMs>=probeGapMs){
                             lastUdpLinkPingMs=now;
                             int paceTenths=(int)Math.round(lastAdaptiveMoveIntervalMs*10.0);
                             ch.sendLinkPing(ch.linkTracker.nextPingToken(now),paceTenths,claim>0?claim:reverseLease);
                         }
                     }else{
-                        long idlePingGapMs=screenInteractive ? 450L : 2000L;
+                        long idlePingGapMs=screenInteractive
+                            ? ch.linkTracker.computeProbeIntervalMs(false)
+                            : Math.max(2200L,ch.linkTracker.computeProbeIntervalMs(false));
                         if(now-lastUdpLinkPingMs>=idlePingGapMs){
                             lastUdpLinkPingMs=now;
                             ch.sendLinkPing(ch.linkTracker.nextPingToken(now),0,0);
@@ -1139,9 +1354,12 @@ final class DeskTouchSession implements AutoCloseable {
         reverseDedup.reset();
         RemoteInputPower.end();
         running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;cableSession=false;
+        peerName=null;peerHostAddress=null;liveRttMs=0.0;liveLinkSpeedMbps=0;missedPings=0;
+        lastPongReceivedMs=0L;connectedAtMs=0L;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         AutoConnectService.onConnectionCountChanged(application);
+        DeskTouchRuntime.notifyLiveStatusChanged();
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}
     }

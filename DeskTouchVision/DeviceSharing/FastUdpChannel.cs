@@ -202,7 +202,8 @@ internal sealed class FastUdpCodec : IDisposable
 internal sealed class AdaptiveLinkTracker
 {
     private const int ReorderSlack = 8;
-    private const long MinRttWindowMs = 10_000;
+    private const long FastMinRttWindowMs = 3_000;
+    private const long SlowBandMinRttWindowMs = 5_000;
     private const int PingRingSize = 16;
 
     private readonly object _recvGate = new();
@@ -221,6 +222,8 @@ internal sealed class AdaptiveLinkTracker
     private readonly object _rttGate = new();
     private readonly int[] _pingTokens = new int[PingRingSize];
     private readonly long[] _pingSentMs = new long[PingRingSize];
+    private readonly long[] _pingSentTicks = new long[PingRingSize];
+    private readonly bool[] _pingRealClock = new bool[PingRingSize];
     private int _pingCounter;
     private double _smoothedRttMs;
     private double _rttJitterMs;
@@ -231,12 +234,87 @@ internal sealed class AdaptiveLinkTracker
     private double _peerJitterMs;
     private int _peerRefreshHz;
     private int _peerFrameTenthsMs;
+    private string _band = "wireless";
+    private int _linkSpeedMbps;
+    private int _networkEpoch;
+
+    internal AdaptiveLinkTracker(string initialBand = "wireless")
+    {
+        _band = NormalizeBand(initialBand);
+    }
+
+    internal string Band { get { lock (_rttGate) return _band; } }
+    internal int LinkSpeedMbps { get { lock (_rttGate) return _linkSpeedMbps; } }
+    internal int NetworkEpoch { get { lock (_rttGate) return _networkEpoch; } }
+
+    internal static string NormalizeBand(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "wireless";
+        string b = raw.Trim();
+        if (b.Equals("cable", StringComparison.OrdinalIgnoreCase)) return "cable";
+        if (b.Equals("2.4GHz", StringComparison.OrdinalIgnoreCase)) return "2.4GHz";
+        if (b.Equals("5GHz", StringComparison.OrdinalIgnoreCase)) return "5GHz";
+        if (b.Equals("6GHz", StringComparison.OrdinalIgnoreCase)) return "6GHz";
+        return "wireless";
+    }
+
+    internal bool OnLinkProfileChanged(string? band, int linkSpeedMbps, int epoch)
+    {
+        string normalized = NormalizeBand(band);
+        bool changed;
+        lock (_rttGate)
+        {
+            changed = !string.Equals(_band, normalized, StringComparison.Ordinal)
+                || (epoch > 0 && epoch != _networkEpoch);
+            _band = normalized;
+            if (linkSpeedMbps >= 0) _linkSpeedMbps = linkSpeedMbps;
+            if (epoch > 0) _networkEpoch = epoch;
+            if (changed)
+            {
+                Array.Clear(_pingTokens);
+                Array.Clear(_pingSentMs);
+                Array.Clear(_pingSentTicks);
+                Array.Clear(_pingRealClock);
+                _smoothedRttMs = 0;
+                _rttJitterMs *= 0.25;
+                _minRttWindowA = double.MaxValue;
+                _minRttWindowB = double.MaxValue;
+                _windowStartMs = 0;
+                _peerLossPermille = 0;
+                _peerJitterMs = 0;
+            }
+        }
+        if (changed)
+        {
+            lock (_recvGate)
+            {
+                _ewmaLossRatio *= 0.20;
+                _inboundJitterMs *= 0.25;
+                _hasLastTransit = false;
+            }
+        }
+        return changed;
+    }
+
+    internal int ComputeProbeIntervalMs(bool controlActive)
+    {
+        string band = Band;
+        return band switch
+        {
+            "cable" => controlActive ? 150 : 600,
+            "5GHz" or "6GHz" => controlActive ? 120 : 500,
+            "2.4GHz" => controlActive ? 350 : 900,
+            _ => controlActive ? 220 : 750
+        };
+    }
 
     internal static bool HasSenderTimestamp(FastUdpOp op) =>
         op is FastUdpOp.Move or FastUdpOp.Warm or FastUdpOp.LinkPing;
 
     internal int NextPingToken(long nowMs)
     {
+        long nowTicks = Stopwatch.GetTimestamp();
+        bool isRealClock = Math.Abs(nowMs - Environment.TickCount64) < 5_000;
         lock (_rttGate)
         {
             _pingCounter = (_pingCounter + 1) & 0x3FFFFFFF;
@@ -245,6 +323,8 @@ internal sealed class AdaptiveLinkTracker
             int slot = token % PingRingSize;
             _pingTokens[slot] = token;
             _pingSentMs[slot] = nowMs;
+            _pingSentTicks[slot] = nowTicks;
+            _pingRealClock[slot] = isRealClock;
             return token;
         }
     }
@@ -252,17 +332,31 @@ internal sealed class AdaptiveLinkTracker
     internal bool OnFeedbackReceived(int echoToken, int packedLossJitter, int packedDisplayRate, long nowMs)
     {
         bool matched = false;
+        long nowTicks = Stopwatch.GetTimestamp();
         lock (_rttGate)
         {
             if (echoToken > 0)
             {
                 int slot = echoToken % PingRingSize;
-                if (_pingTokens[slot] == echoToken && _pingSentMs[slot] > 0 && nowMs >= _pingSentMs[slot])
+                if (_pingTokens[slot] == echoToken)
                 {
-                    _pingTokens[slot] = 0;
-                    double sample = Math.Max(0.5, nowMs - _pingSentMs[slot]);
-                    RecordRttSampleLocked(sample, nowMs);
-                    matched = true;
+                    double sample = -1;
+                    long elapsedMs = nowMs - _pingSentMs[slot];
+                    if (_pingRealClock[slot] && _pingSentTicks[slot] > 0 && nowTicks >= _pingSentTicks[slot])
+                    {
+                        double swMs = (nowTicks - _pingSentTicks[slot]) * 1000.0 / Stopwatch.Frequency;
+                        sample = (elapsedMs >= 0 && Math.Abs(swMs - elapsedMs) <= 25.0) ? swMs : elapsedMs;
+                    }
+                    else if (_pingSentMs[slot] > 0 && elapsedMs >= 0)
+                    {
+                        sample = elapsedMs;
+                    }
+                    if (sample >= 0)
+                    {
+                        _pingTokens[slot] = 0;
+                        RecordRttSampleLocked(Math.Max(0.2, sample), nowMs);
+                        matched = true;
+                    }
                 }
             }
             if (packedLossJitter >= 0)
@@ -290,11 +384,14 @@ internal sealed class AdaptiveLinkTracker
 
     private void RecordRttSampleLocked(double sampleRtt, long nowMs)
     {
+        long windowLimit = string.Equals(_band, "2.4GHz", StringComparison.Ordinal)
+            ? SlowBandMinRttWindowMs
+            : FastMinRttWindowMs;
         if (_windowStartMs == 0)
         {
             _windowStartMs = nowMs;
         }
-        else if (nowMs - _windowStartMs >= MinRttWindowMs)
+        else if (nowMs - _windowStartMs >= windowLimit)
         {
             _minRttWindowB = _minRttWindowA;
             _minRttWindowA = double.MaxValue;
@@ -310,8 +407,12 @@ internal sealed class AdaptiveLinkTracker
         else
         {
             double dev = Math.Abs(sampleRtt - _smoothedRttMs);
-            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.22) * (dev - _rttJitterMs);
-            double alpha = sampleRtt > _smoothedRttMs ? 0.24 : 0.22;
+            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.25) * (dev - _rttJitterMs);
+            // Adapt down rapidly when a faster link/band becomes available,
+            // while damping isolated upward Wi-Fi retry spikes.
+            double alpha = sampleRtt < _smoothedRttMs
+                ? (sampleRtt < _smoothedRttMs * 0.65 ? 0.55 : 0.42)
+                : 0.20;
             _smoothedRttMs += alpha * (sampleRtt - _smoothedRttMs);
         }
     }
@@ -542,7 +643,7 @@ internal sealed class FastUdpHub : IDisposable
     {
         internal readonly int SessionId;
         internal readonly ushort WirePeerId;
-        internal readonly IPAddress ExpectedAddress;
+        private IPAddress _expectedAddress;
         internal readonly byte[] Key;
         internal readonly FastUdpCodec Codec;
         internal readonly AdaptiveLinkTracker LinkTracker = new();
@@ -557,13 +658,25 @@ internal sealed class FastUdpHub : IDisposable
         internal bool TryMarkConfirmedLogged() =>
             Interlocked.CompareExchange(ref _confirmedLogged, 1, 0) == 0;
 
+        internal IPAddress ExpectedAddress => Volatile.Read(ref _expectedAddress);
+
         internal Peer(int sessionId, IPAddress expectedAddress)
         {
             SessionId = sessionId;
             WirePeerId = unchecked((ushort)sessionId);
-            ExpectedAddress = FastUdpSocketOptions.NormalizeAddress(expectedAddress);
+            _expectedAddress = FastUdpSocketOptions.NormalizeAddress(expectedAddress);
             Key = RandomNumberGenerator.GetBytes(FastUdpCodec.KeySize);
             Codec = new FastUdpCodec(Key, WirePeerId, isServer: true);
+        }
+
+        internal void UpdateEndpointOnAuthenticatedPacket(IPAddress normalized, int port)
+        {
+            var prevExpected = Volatile.Read(ref _expectedAddress);
+            if (!normalized.Equals(prevExpected))
+                Volatile.Write(ref _expectedAddress, normalized);
+            var currentEp = Volatile.Read(ref _remoteEndPoint);
+            if (currentEp == null || !currentEp.Address.Equals(normalized) || currentEp.Port != port)
+                Volatile.Write(ref _remoteEndPoint, new IPEndPoint(normalized, port));
         }
 
         internal IPEndPoint? RemoteEndPoint
@@ -675,11 +788,9 @@ internal sealed class FastUdpHub : IDisposable
                 ushort wireId = (ushort)((buffer[6] << 8) | buffer[7]);
                 if (!_peers.TryGetValue(wireId, out var peer)) continue;
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
-                if (!normalized.Equals(peer.ExpectedAddress)) continue;
                 if (!peer.Codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
 
-                if (peer.RemoteEndPoint == null)
-                    peer.RemoteEndPoint = new IPEndPoint(normalized, srcIp.Port);
+                peer.UpdateEndpointOnAuthenticatedPacket(normalized, srcIp.Port);
 
                 long nowMs = Environment.TickCount64;
                 peer.LinkTracker.RecordInboundPacket(
@@ -742,7 +853,7 @@ internal sealed class FastUdpHub : IDisposable
 internal sealed class FastUdpClient : IDisposable
 {
     private readonly Socket _socket;
-    private readonly IPEndPoint _serverEndPoint;
+    private volatile IPEndPoint _serverEndPoint;
     private readonly FastUdpCodec _codec;
     internal readonly AdaptiveLinkTracker LinkTracker = new();
     private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
@@ -811,8 +922,10 @@ internal sealed class FastUdpClient : IDisposable
                 int received = _socket.ReceiveFrom(buffer, 0, buffer.Length, SocketFlags.None, ref remote);
                 if (received != FastUdpCodec.FrameSize || remote is not IPEndPoint srcIp) continue;
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
-                if (!normalized.Equals(_serverEndPoint.Address) || srcIp.Port != _serverEndPoint.Port) continue;
                 if (!_codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
+                var currentEp = _serverEndPoint;
+                if (!normalized.Equals(currentEp.Address) || srcIp.Port != currentEp.Port)
+                    _serverEndPoint = new IPEndPoint(normalized, srcIp.Port);
                 long nowMs = Environment.TickCount64;
                 LinkTracker.RecordInboundPacket(
                     msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs);

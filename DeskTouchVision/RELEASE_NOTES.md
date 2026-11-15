@@ -1,3 +1,15 @@
+# DeskTouch Vision v0.3.43 — Zero-Delay Cable, Band-Adaptive Wireless Ping, Dynamic Cable↔Wireless Shifting & Keyboard Binding Live Inspector
+
+Delivers instant USB data-cable input and seamless switching between wireless bands (5 GHz ↔ 2.4 GHz ↔ 6 GHz) and the USB data cable, instant keyboard handoff across edges without waiting for Windows key recovery, real Android shortcut transparency backed by the connected keyboard layout, and live ping metrics across both Windows and Android.
+
+- **Instant data-cable Virtual Bridge (`BUS_USB` + persistent virtual hardware + move coalescing):** Keeps the virtual mouse and keyboard devices mounted across screen crossings while releasing held inputs on handoff, coalesces queued pointer bursts cleanly, eliminates periodic 15-second package queries while healthy, and tracks live sub-millisecond cable RTT.
+- **Immediate keyboard handoff across screen edges:** Proactively refreshes keyboard capture on handoff arrival, recovers on the very first missed raw keystroke, and passes supported modifier and Windows-key combinations without stalling until manual key recovery.
+- **Online-game-style band & network-shift adaptive ping:** Automatically detects wireless band changes (2.4 GHz / 5 GHz / 6 GHz) and network transitions, clears stale congestion baselines (e.g. 280 ms carryover), adapts probe/pacing cadences to the active band, authenticates UDP roaming endpoints securely, and fails dead links in ~4 seconds.
+- **Dynamic make-before-break Wireless ↔ Data Cable shifting:** Promotes USB data-cable sessions only after the encrypted connection completes (never dropping wireless prematurely), triggers fast multi-probe attach sweeps, and fails back immediately over cached-host wireless when the data cable is unplugged.
+- **Connected keyboard & supported Android shortcuts view:** Inspects your Windows keyboard layout and connected Android/Virtual keyboard capabilities directly, surfacing supported bindings live in both Windows (`Shortcuts`) and Android without fabricating unsupported OS shortcuts.
+
+---
+
 # DeskTouch Vision v0.3.42 — Reliable Window Activation, Foreground Reopen & Tray Upgrades
 
 Fixes cases where launching DeskTouch Vision again while running in the system tray failed to pop the Displays window into view, adds a Start Menu app shortcut alongside Desktop launch, and ensures installer upgrades stop tray instances gracefully.

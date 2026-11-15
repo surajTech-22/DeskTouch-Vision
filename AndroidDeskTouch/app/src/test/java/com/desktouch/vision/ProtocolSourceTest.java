@@ -691,4 +691,80 @@ public final class ProtocolSourceTest {
         assertFalse(DeskTouchSession.shouldUseShellBridge(false, true));
         assertFalse(DeskTouchSession.shouldUseShellBridge(false, false));
     }
+
+    @Test
+    public void bandShiftAdaptiveTrackerClearsStaleBaselineAndScalesProbes() {
+        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker("5GHz");
+        tracker.recordRttSample(280.0, 1000L);
+        assertTrue(tracker.getSmoothedRttMs() > 200.0);
+        int active5 = tracker.computeProbeIntervalMs(true);
+        double pace5 = tracker.computeAdaptiveSendIntervalMs(90, "5GHz");
+
+        assertTrue(tracker.onLinkProfileChanged("2.4GHz", 144, 1));
+        assertEquals(0.0, tracker.getSmoothedRttMs(), 0.001);
+        assertEquals("2.4GHz", tracker.getBand());
+        int active24 = tracker.computeProbeIntervalMs(true);
+        assertTrue("2.4 GHz probe gap should be wider than 5 GHz", active24 > active5);
+
+        tracker.recordRttSample(12.0, 2000L);
+        assertTrue("Fresh RTT should populate immediately after band shift",
+            tracker.getSmoothedRttMs() < 30.0);
+        double pace24 = tracker.computeAdaptiveSendIntervalMs(90, "2.4GHz");
+        assertTrue("Clearing stale 280ms congestion should recover from max 5GHz slowdown",
+            pace24 <= pace5);
+        double pace5Clean = new AdaptiveLinkTracker("5GHz").computeAdaptiveSendIntervalMs(90, "5GHz");
+        assertTrue("Equal-load 2.4 GHz send interval should be gentler than 5 GHz",
+            pace24 > pace5Clean);
+    }
+
+    @Test
+    public void wifiBandClassificationMatchesRealFrequencies() {
+        assertEquals("2.4GHz", WifiLinkMonitor.classifyBand(2437));
+        assertEquals("5GHz", WifiLinkMonitor.classifyBand(5805));
+        assertEquals("6GHz", WifiLinkMonitor.classifyBand(6175));
+        assertEquals("wireless", WifiLinkMonitor.classifyBand(0));
+    }
+
+    @Test
+    public void keyboardBindingsAndExtendedKeysMatchSupportedModes() {
+        java.util.List<KeyboardBindingInspector.ShortcutBinding> usbBindings =
+            KeyboardBindingInspector.buildShortcutTable(
+                true, false, true, true, true, true, true, true, true, true, true, true, true);
+        assertTrue(usbBindings.size() >= 6);
+        for (KeyboardBindingInspector.ShortcutBinding b : usbBindings) {
+            assertTrue("USB full keyboard binding should be ready: " + b.action, b.activeNow);
+        }
+
+        java.util.List<KeyboardBindingInspector.ShortcutBinding> accBindings =
+            KeyboardBindingInspector.buildShortcutTable(
+                false, true, false, false, false, false, false, false, false, false, true, false, false);
+        assertFalse(accBindings.isEmpty());
+        boolean foundNeedCable = false;
+        for (KeyboardBindingInspector.ShortcutBinding b : accBindings) {
+            if (!b.activeNow && b.status.contains("data cable")) foundNeedCable = true;
+        }
+        assertTrue("Non-USB mode should explain cable requirement rather than faking bindings", foundNeedCable);
+
+        assertEquals(0x53, HidKeyTable.usageForVk(0x90)); // NumLock
+        assertEquals(0x64, HidKeyTable.usageForVk(0xE2)); // OEM 102
+        assertEquals(0x68, HidKeyTable.usageForVk(0x7C)); // F13
+        assertEquals(0x5B, MainActivity.toWindowsKey(android.view.KeyEvent.KEYCODE_META_LEFT));
+        assertEquals(0x2E, MainActivity.toWindowsKey(android.view.KeyEvent.KEYCODE_FORWARD_DEL));
+        assertEquals(0x90, MainActivity.toWindowsKey(android.view.KeyEvent.KEYCODE_NUM_LOCK));
+        assertEquals(0xBA, MainActivity.toWindowsKey(android.view.KeyEvent.KEYCODE_SEMICOLON));
+    }
+
+    @Test
+    public void heartbeatFastFailAndIntervalScaleByTransport() {
+        long cableGap = DeskTouchSession.computeHeartbeatIntervalMs(true, true, "cable");
+        long wifi5Gap = DeskTouchSession.computeHeartbeatIntervalMs(false, true, "5GHz");
+        long wifi24Gap = DeskTouchSession.computeHeartbeatIntervalMs(false, true, "2.4GHz");
+        assertTrue(cableGap < wifi5Gap);
+        assertTrue(wifi5Gap < wifi24Gap);
+
+        assertFalse(DeskTouchSession.shouldFastFailDeadSession(5000L, 1000L, 500L, 2, true));
+        assertTrue(DeskTouchSession.shouldFastFailDeadSession(5000L, 1000L, 500L, 3, true));
+        assertFalse(DeskTouchSession.shouldFastFailDeadSession(5000L, 1000L, 500L, 3, false));
+        assertTrue(DeskTouchSession.shouldFastFailDeadSession(7000L, 1000L, 500L, 3, false));
+    }
 }

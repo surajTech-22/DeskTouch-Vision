@@ -44,6 +44,9 @@ public final class AutoConnectService extends Service {
     private volatile boolean pendingWake;
     private volatile boolean retryScheduled;
     private volatile boolean hadConnectedWithAccessibility;
+    private volatile WifiLinkMonitor.LinkSnapshot lastLinkSnapshot;
+    private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
+        new java.util.concurrent.atomic.AtomicInteger();
     private ScheduledFuture<?> disconnectAutoPauseFuture;
 
     static boolean enabled(Context context) {
@@ -307,6 +310,45 @@ public final class AutoConnectService extends Service {
             30,2*60*60,TimeUnit.SECONDS);
     }
 
+    static void onCableBridgeReadyHint(Context context, String fingerprint) {
+        AutoConnectService service=activeInstance;
+        if(service!=null)service.scheduleCableAttachSweep();
+    }
+
+    private void handleNetworkTransition(String reason) {
+        int nextEpoch=networkEpoch.incrementAndGet();
+        WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(
+            this,DeskTouchRuntime.anyCableConnected(),nextEpoch);
+        WifiLinkMonitor.LinkSnapshot prev=lastLinkSnapshot;
+        lastLinkSnapshot=snap;
+        if(prev==null || !snap.sameRadioPath(prev) || snap.significantlyDifferentForReporting(prev)) {
+            DeskTouchRuntime.notifyNetworkProfile(this,snap);
+        }
+        triggerFastReconnect();
+    }
+
+    private void handleNetworkCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+        WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(
+            this,DeskTouchRuntime.anyCableConnected(),networkEpoch.get());
+        WifiLinkMonitor.LinkSnapshot prev=lastLinkSnapshot;
+        if(prev!=null && snap.sameRadioPath(prev) && !snap.significantlyDifferentForReporting(prev))
+            return;
+        if(prev==null || !snap.band.equals(prev.band) || snap.networkHash!=prev.networkHash) {
+            snap=WifiLinkMonitor.inspect(this,DeskTouchRuntime.anyCableConnected(),
+                networkEpoch.incrementAndGet());
+        }
+        lastLinkSnapshot=snap;
+        DeskTouchRuntime.notifyNetworkProfile(this,snap);
+    }
+
+    private void handleNetworkLost() {
+        WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(
+            this,DeskTouchRuntime.anyCableConnected(),networkEpoch.incrementAndGet());
+        lastLinkSnapshot=snap;
+        DeskTouchRuntime.notifyNetworkProfile(this,snap);
+        triggerFastReconnect();
+    }
+
     private void registerWifiReconnectCallback() {
         connectivityManager=getSystemService(ConnectivityManager.class);
         if(connectivityManager==null)return;
@@ -316,13 +358,23 @@ public final class AutoConnectService extends Service {
                 .build();
             wifiCallback=new ConnectivityManager.NetworkCallback() {
                 @Override public void onAvailable(Network network) {
-                    triggerFastReconnect();
+                    handleNetworkTransition("available");
+                }
+                @Override public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                    handleNetworkCapabilitiesChanged(network, caps);
+                }
+                @Override public void onLinkPropertiesChanged(Network network, android.net.LinkProperties props) {
+                    handleNetworkTransition("link-properties");
+                }
+                @Override public void onLost(Network network) {
+                    handleNetworkLost();
                 }
             };
             connectivityManager.registerNetworkCallback(request,wifiCallback);
         } catch(Exception error) {
             Log.w("DeskTouch","Wi-Fi change callback unavailable",error);
         }
+        lastLinkSnapshot=WifiLinkMonitor.inspect(this,DeskTouchRuntime.anyCableConnected(),networkEpoch.get());
     }
 
     private void registerWakeReceivers() {
@@ -335,12 +387,30 @@ public final class AutoConnectService extends Service {
         filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
         wakeReceiver=new BroadcastReceiver() {
             @Override public void onReceive(Context context,Intent intent) {
-                triggerFastReconnect();
                 String action=intent!=null ? intent.getAction() : null;
-                if(Intent.ACTION_POWER_CONNECTED.equals(action) ||
-                    "android.hardware.usb.action.USB_STATE".equals(action)) {
-                    scheduleUsbCableFollowUp();
+                if("android.hardware.usb.action.USB_STATE".equals(action)) {
+                    boolean connected=intent.getBooleanExtra("connected",false);
+                    boolean configured=intent.getBooleanExtra("configured",false);
+                    if(!connected && !configured) {
+                        if(DeskTouchRuntime.closeCableSessions()) {
+                            triggerCableDetachRecovery();
+                            return;
+                        }
+                    } else {
+                        scheduleCableAttachSweep();
+                    }
+                } else if(Intent.ACTION_POWER_DISCONNECTED.equals(action)) {
+                    if(DeskTouchRuntime.anyCableConnected()) {
+                        verifyCableOrFailover();
+                        return;
+                    }
+                } else if(Intent.ACTION_POWER_CONNECTED.equals(action)) {
+                    scheduleCableAttachSweep();
+                } else if(WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(action)) {
+                    handleNetworkTransition("wifi-state");
+                    return;
                 }
+                triggerFastReconnect();
             }
         };
         try {
@@ -356,13 +426,36 @@ public final class AutoConnectService extends Service {
 
     private volatile long lastUsbFollowUpMs;
 
-    private void scheduleUsbCableFollowUp() {
+    private void scheduleCableAttachSweep() {
         ScheduledExecutorService pool=scheduler;
         if(pool==null || pool.isShutdown()) return;
         long now=android.os.SystemClock.uptimeMillis();
-        if(now-lastUsbFollowUpMs<600L) return;
+        if(now-lastUsbFollowUpMs<400L) return;
         lastUsbFollowUpMs=now;
-        pool.schedule(this::autoConnect,1100,TimeUnit.MILLISECONDS);
+        int[] delaysMs={150,600,1300,2400};
+        for(int delay:delaysMs) {
+            pool.schedule(()->{
+                if(!DeskTouchRuntime.anyCableConnected()) autoConnect();
+            },delay,TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void verifyCableOrFailover() {
+        ScheduledExecutorService pool=scheduler;
+        if(pool==null || pool.isShutdown()) return;
+        pool.schedule(()->{
+            if(!DeskTouchRuntime.anyCableConnected()) return;
+            DesktopDiscovery.Device loopback=DesktopDiscovery.probeLoopbackCable();
+            if(loopback==null && DeskTouchRuntime.closeCableSessions()) {
+                triggerCableDetachRecovery();
+            }
+        },180,TimeUnit.MILLISECONDS);
+    }
+
+    private void triggerCableDetachRecovery() {
+        ScheduledExecutorService pool=scheduler;
+        if(pool==null || pool.isShutdown()) return;
+        pool.execute(this::autoConnect);
     }
 
     private void triggerFastReconnect() {
@@ -402,17 +495,54 @@ public final class AutoConnectService extends Service {
             if(DeskTouchRuntime.connectedCount()>0) {
                 if(!DeskTouchRuntime.anyCableConnected() && !DeskTouchRuntime.anyInputLeaseActive()) {
                     DesktopDiscovery.Device cable=DesktopDiscovery.probeLoopbackCable();
-                    if(cable!=null && cable.ready && eligible.contains(cable.fingerprint) &&
-                        DeskTouchRuntime.closeWirelessIfIdle(cable.fingerprint)) {
-                        DeskTouchSession selected=DeskTouchRuntime.select(this,cable.fingerprint);
-                        selected.connect(cable,display.x,display.y,false,()->{
-                            if(reconnectEnabled(this) && enabled(this))
-                                scheduleInteractiveFollowUp();
-                        });
+                    if(cable!=null && cable.ready && eligible.contains(cable.fingerprint)) {
+                        DeskTouchRuntime.upgradeToCableMakeBeforeBreak(
+                            this,cable,display.x,display.y,()->{
+                                if(reconnectEnabled(this) && enabled(this))
+                                    scheduleInteractiveFollowUp();
+                            });
                     }
                 }
                 connectedNow=true;
                 return;
+            }
+            DesktopDiscovery.Device cableDirect=DesktopDiscovery.probeLoopbackCable();
+            if(cableDirect!=null && cableDirect.ready && eligible.contains(cableDirect.fingerprint)
+                && !DeskTouchRuntime.isConnecting(cableDirect.fingerprint)) {
+                DeskTouchSession selected=DeskTouchRuntime.select(this,cableDirect.fingerprint);
+                selected.connect(cableDirect,display.x,display.y,false,()->{
+                    if(reconnectEnabled(this) && enabled(this))
+                        scheduleInteractiveFollowUp();
+                });
+                connectedNow=true;
+                return;
+            }
+            String preferred=DeskTouchRuntime.selectedIdentity();
+            if(preferred!=null && eligible.contains(preferred)) {
+                String cachedIp=DeskTouchRuntime.getLastKnownPeerHost(preferred);
+                DesktopDiscovery.Device direct=DesktopDiscovery.probeDirectHost(cachedIp,eligible);
+                if(direct!=null && !DeskTouchRuntime.isConnecting(direct.fingerprint)) {
+                    DeskTouchSession selected=DeskTouchRuntime.select(this,direct.fingerprint);
+                    selected.connect(direct,display.x,display.y,false,()->{
+                        if(reconnectEnabled(this) && enabled(this))
+                            scheduleInteractiveFollowUp();
+                    });
+                    connectedNow=true;
+                    return;
+                }
+            }
+            for(String fp:eligible) {
+                String cachedIp=DeskTouchRuntime.getLastKnownPeerHost(fp);
+                DesktopDiscovery.Device direct=DesktopDiscovery.probeDirectHost(cachedIp,eligible);
+                if(direct!=null && !DeskTouchRuntime.isConnecting(direct.fingerprint)) {
+                    DeskTouchSession selected=DeskTouchRuntime.select(this,direct.fingerprint);
+                    selected.connect(direct,display.x,display.y,false,()->{
+                        if(reconnectEnabled(this) && enabled(this))
+                            scheduleInteractiveFollowUp();
+                    });
+                    connectedNow=true;
+                    return;
+                }
             }
             java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
                 DesktopDiscovery.windowsGroups(DesktopDiscovery.scanFast(eligible));

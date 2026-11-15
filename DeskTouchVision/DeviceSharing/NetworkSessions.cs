@@ -86,6 +86,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal long CableMoves;
         internal long LastTcpPingMs;
         internal double TcpRttMs;
+        internal int CableDetachedOrUnresponsive;
+        internal AdaptiveLinkTracker CableTracker = new("cable");
+        internal long LastPongTicks;
+        internal string LinkBand = "wireless";
+        internal int LinkSpeedMbps;
+        internal int NetworkEpoch;
+        internal string? KeyboardInfoJson;
         internal readonly IDisposable HighResTimer = Win.EnterHighResolutionTimer();
         internal int ActiveReverseLease;
         internal int Lease;
@@ -209,6 +216,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action? PeerDisconnected;
     internal event Action<ConnectedPeer>? PeerTopologyChanged;
     internal event Action<MonitorEdge>? PeerPlacementChanged;
+    internal event Action? PeerKeyboardInfoChanged;
     internal string Fingerprint { get; }
     internal string Secret { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     internal int ConnectedPeerCount => _sessions.Count;
@@ -288,6 +296,47 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static bool CanPauseAndroidForPayments(ConnectedPeer? peer) =>
         peer != null && peer.Platform == "Android" && peer.SupportsReverseInput;
 
+    internal sealed record ActiveLinkSnapshot(
+        bool Connected,
+        string PeerName,
+        string TransportBand,
+        int LinkSpeedMbps,
+        double RttMs,
+        double JitterMs,
+        double LossPermille,
+        string? KeyboardInfoJson);
+
+    internal ActiveLinkSnapshot GetActiveLinkSummary()
+    {
+        var session = Volatile.Read(ref _selected) ?? _sessions.Values.OrderBy(s => s.Id).FirstOrDefault();
+        if (session == null)
+            return new ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
+        if (session.IsCableSession)
+        {
+            double cableRtt = session.CableTracker.SmoothedRttMs;
+            if (cableRtt <= 0) cableRtt = Volatile.Read(ref session.TcpRttMs);
+            return new ActiveLinkSnapshot(
+                true,
+                session.Peer.Name,
+                "cable",
+                Volatile.Read(ref session.LinkSpeedMbps),
+                cableRtt,
+                session.CableTracker.EffectiveJitterMs,
+                0,
+                Volatile.Read(ref session.KeyboardInfoJson));
+        }
+        var peer = session.UdpPeer;
+        return new ActiveLinkSnapshot(
+            true,
+            session.Peer.Name,
+            peer?.LinkTracker.Band ?? session.LinkBand,
+            Volatile.Read(ref session.LinkSpeedMbps),
+            peer?.LinkTracker.SmoothedRttMs ?? 0,
+            peer?.LinkTracker.EffectiveJitterMs ?? 0,
+            peer?.LinkTracker.CombinedLossPermille ?? 0,
+            Volatile.Read(ref session.KeyboardInfoJson));
+    }
+
     internal void SetShellBridgeAuth(int port, string secret)
     {
         if (port <= 0 || port > 65535 || string.IsNullOrWhiteSpace(secret)) return;
@@ -312,6 +361,65 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 catch (Exception) { /* peer may disconnect concurrently */ }
             }
         });
+    }
+
+    internal void NotifyCableBridgeReady()
+    {
+        _ = Task.Run(async () =>
+        {
+            foreach (var session in _sessions.Values)
+            {
+                if (session.Peer.Platform != "Android" || session.IsCableSession) continue;
+                try
+                {
+                    await SendToAsync(session, new Packet("cable-bridge-ready"), _cancel.Token);
+                }
+                catch (Exception) { /* peer may disconnect concurrently */ }
+            }
+        });
+    }
+
+    internal void NotifyCableDetached()
+    {
+        foreach (var session in _sessions.Values)
+        {
+            if (!session.IsCableSession) continue;
+            Interlocked.Exchange(ref session.CableDetachedOrUnresponsive, 1);
+            TryPromoteWirelessBackup(session);
+        }
+    }
+
+    internal void BroadcastKeyboardLayoutAsync()
+    {
+        string layout = KeyboardLayoutHelper.DescribeCurrentWindowsLayout();
+        _ = Task.Run(async () =>
+        {
+            foreach (var session in _sessions.Values)
+            {
+                if (session.Peer.Platform != "Android") continue;
+                try
+                {
+                    await SendToAsync(session, new Packet("keyboard-layout", Text: layout), _cancel.Token);
+                }
+                catch (Exception) { }
+            }
+        });
+    }
+
+    private static bool IsSameDevicePeer(ConnectedPeer a, ConnectedPeer b) =>
+        (!string.IsNullOrWhiteSpace(a.DeviceFingerprint) &&
+         string.Equals(a.DeviceFingerprint, b.DeviceFingerprint, StringComparison.OrdinalIgnoreCase)) ||
+        (string.Equals(a.Platform, b.Platform, StringComparison.Ordinal) &&
+         string.Equals(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+
+    private bool TryPromoteWirelessBackup(Session cableSession)
+    {
+        Session? backup = _sessions.Values.FirstOrDefault(other =>
+            !other.IsCableSession &&
+            other.Id != cableSession.Id &&
+            IsSameDevicePeer(other.Peer, cableSession.Peer));
+        if (backup == null) return false;
+        return Select(backup);
     }
 
     internal bool HasReadyAndroidPeer =>
@@ -427,7 +535,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double loss = peer?.LinkTracker.CombinedLossPermille ?? 0;
         double queueDelay = peer?.LinkTracker.QueueDelayMs ?? 0;
         double paceMs = ComputeAdaptiveUdpIntervalMs(
-            session.Peer.Platform, effectiveHz, rtt, minRtt, jitter, loss);
+            session.Peer.Platform, effectiveHz, rtt, minRtt, jitter, loss, session.LinkBand);
         pacer.SetMinIntervalMs(paceMs);
         int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
         pacer.SetWarmIntervalMs(warmMs);
@@ -465,16 +573,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 foreach (var session in _sessions.Values)
                 {
                     var peer = session.UdpPeer;
+                    bool controlActive = Volatile.Read(ref session.ActiveReverseLease) > 0 || session.Lease > 0;
                     if (session.IsCableSession)
                     {
-                        int activeLease = Volatile.Read(ref session.ActiveReverseLease);
-                        bool shouldMeasure = activeLease > 0 || session.Lease > 0 ||
-                            Volatile.Read(ref session.TcpRttMs) <= 0;
-                        if (shouldMeasure && nowMs - session.LastTcpPingMs >= 1500)
+                        long nowTicks = Stopwatch.GetTimestamp();
+                        if (session.LastPongTicks > 0 &&
+                            (nowTicks - session.LastPongTicks) * 1000.0 / Stopwatch.Frequency >= 4000.0 &&
+                            Interlocked.CompareExchange(ref session.CableDetachedOrUnresponsive, 1, 0) == 0)
+                        {
+                            TryPromoteWirelessBackup(session);
+                        }
+                        int cableGapMs = session.CableTracker.ComputeProbeIntervalMs(controlActive);
+                        if (nowMs - session.LastTcpPingMs >= cableGapMs)
                         {
                             session.LastTcpPingMs = nowMs;
-                            int pingToken = unchecked((int)nowMs);
-                            if (pingToken == 0) pingToken = 1;
+                            int pingToken = session.CableTracker.NextPingToken(nowMs);
                             _ = Task.Run(async () =>
                             {
                                 try { await SendToAsync(session, new Packet("ping", pingToken), token); }
@@ -484,14 +597,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     else if (peer is { Confirmed: true } && _udpHub != null)
                     {
-                        int activeLease = Volatile.Read(ref session.ActiveReverseLease);
-                        long probeGapMs = (activeLease > 0 || session.Lease > 0) ? 100 : 600;
+                        long probeGapMs = peer.LinkTracker.ComputeProbeIntervalMs(controlActive);
                         if (nowMs - peer.LastLinkPingMs >= probeGapMs)
                         {
                             peer.LastLinkPingMs = nowMs;
                             int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
                             _udpHub.Send(peer, FastUdpOp.LinkPing,
-                                peer.LinkTracker.NextPingToken(nowMs), paceTenths, activeLease);
+                                peer.LinkTracker.NextPingToken(nowMs), paceTenths,
+                                Volatile.Read(ref session.ActiveReverseLease));
                         }
                     }
 
@@ -1101,7 +1214,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
             client.Client.RemoteEndPoint is IPEndPoint remoteEp &&
             IPAddress.IsLoopback(remoteEp.Address);
-        var session=new Session{Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable};
+        var session=new Session{
+            Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable,
+            LinkBand=isCable ? "cable" : "wireless",
+            LastPongTicks=Stopwatch.GetTimestamp()
+        };
         session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
         session.MovePacer = isCable ? null : new FastMovePacer(
             canSendUdp: () => _udpHub != null && session.UdpPeer is { Confirmed: true } &&
@@ -1148,7 +1265,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock(_authorityGate)
                 shouldSelect = _selected==null ||
                     (isCable && !_selected.IsCableSession &&
-                     Volatile.Read(ref _selected.ActiveReverseLease)==0 &&
+                     ((!string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
+                       string.Equals(_selected.Peer.DeviceFingerprint,peer.DeviceFingerprint,
+                           StringComparison.OrdinalIgnoreCase)) ||
+                      (string.Equals(_selected.Peer.Platform,peer.Platform,StringComparison.Ordinal) &&
+                       string.Equals(_selected.Peer.Name,peer.Name,StringComparison.OrdinalIgnoreCase)))) ||
+                    (!isCable && _selected.IsCableSession &&
+                     Volatile.Read(ref _selected.CableDetachedOrUnresponsive) != 0 &&
                      ((!string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
                        string.Equals(_selected.Peer.DeviceFingerprint,peer.DeviceFingerprint,
                            StringComparison.OrdinalIgnoreCase)) ||
@@ -1178,6 +1301,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         new Packet("shell-input-bridge", auth.Port, Text: auth.Secret),
                         token);
                 }
+                await SendToAsync(session,
+                    new Packet("keyboard-layout", Text: KeyboardLayoutHelper.DescribeCurrentWindowsLayout()),
+                    token);
             }
             await PublishEnvironmentAsync(token);
             while(!token.IsCancellationRequested)
@@ -1192,7 +1318,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         _udpHub.ConfigurePeerPort(session.UdpPeer, p.A);
                         session.MovePacer?.SetMinIntervalMs(
-                            ComputeAdaptiveUdpIntervalMs(session.Peer.Platform, session.Peer.RefreshHz, 0, 0, 0, 0));
+                            ComputeAdaptiveUdpIntervalMs(session.Peer.Platform, session.Peer.RefreshHz, 0, 0, 0, 0, session.LinkBand));
                         var retryPeer = session.UdpPeer;
                         var hub = _udpHub;
                         _ = Task.Run(async () =>
@@ -1340,6 +1466,39 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _status(canReceive
                         ? "Android Accessibility active on an existing secure connection."
                         : "Android Accessibility turned off for payments or paused; phone stays connected.");
+                    continue;
+                }
+                if(p.Type=="link-info")
+                {
+                    if(!session.IsCableSession)
+                    {
+                        string band = AdaptiveLinkTracker.NormalizeBand(p.Text);
+                        int speedMbps = p.A > 0 ? p.A : 0;
+                        int epoch = p.C > 0 ? p.C : 0;
+                        session.LinkBand = band;
+                        session.LinkSpeedMbps = speedMbps;
+                        if (epoch > 0) session.NetworkEpoch = epoch;
+                        bool changed = session.UdpPeer?.LinkTracker.OnLinkProfileChanged(band, speedMbps, epoch) ?? false;
+                        UpdateSessionAdaptivePacing(session);
+                        if (changed)
+                        {
+                            string desc = speedMbps > 0 ? $"{band} ({speedMbps} Mbps)" : band;
+                            DiagnosticLog?.Invoke($"Peer link profile changed [{session.Peer.Name}]: {desc} freq={p.B}MHz epoch={epoch}");
+                        }
+                    }
+                    else if (p.A > 0)
+                    {
+                        session.LinkSpeedMbps = p.A;
+                    }
+                    continue;
+                }
+                if(p.Type=="keyboard-info")
+                {
+                    if (p.Text is { Length: > 1 and <= 8192 })
+                    {
+                        Volatile.Write(ref session.KeyboardInfoJson, p.Text);
+                        PeerKeyboardInfoChanged?.Invoke();
+                    }
                     continue;
                 }
                 if(p.Type=="environment-placement-update")
@@ -1515,20 +1674,22 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     // Answer authenticated heartbeats so Windows Wi-Fi roaming
                     // does not leave the input lease in an ambiguous state.
+                    session.LastPongTicks = Stopwatch.GetTimestamp();
                     await SendToAsync(session,new Packet("pong",p.A,p.B),token);
                     continue;
                 }
                 if(p.Type=="pong")
                 {
-                    if (p.A != 0)
+                    session.LastPongTicks = Stopwatch.GetTimestamp();
+                    if (session.IsCableSession)
                     {
-                        int rttSample = unchecked((int)Environment.TickCount64 - p.A);
-                        if (rttSample is >= 0 and <= 5000)
+                        bool wasDetached = Interlocked.Exchange(ref session.CableDetachedOrUnresponsive, 0) != 0;
+                        if (session.CableTracker.OnFeedbackReceived(p.A, -1, -1, Environment.TickCount64))
                         {
-                            double cur = Volatile.Read(ref session.TcpRttMs);
-                            Volatile.Write(ref session.TcpRttMs,
-                                cur <= 0 ? rttSample : cur * 0.75 + rttSample * 0.25);
+                            Volatile.Write(ref session.TcpRttMs, session.CableTracker.SmoothedRttMs);
                         }
+                        if (wasDetached && !ReferenceEquals(Volatile.Read(ref _selected), session))
+                            Select(session);
                     }
                     continue;
                 }
@@ -1852,13 +2013,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal static double ComputeAdaptiveUdpIntervalMs(
         string? platform, int? liveRefreshHz, double rttMs, double minRttMs,
-        double jitterMs, double lossPermille)
+        double jitterMs, double lossPermille) =>
+        ComputeAdaptiveUdpIntervalMs(platform, liveRefreshHz, rttMs, minRttMs, jitterMs, lossPermille, null);
+
+    internal static double ComputeAdaptiveUdpIntervalMs(
+        string? platform, int? liveRefreshHz, double rttMs, double minRttMs,
+        double jitterMs, double lossPermille, string? linkBand)
     {
         bool isAndroid = string.Equals(platform, "Android", StringComparison.Ordinal);
+        string? normalizedBand = string.IsNullOrWhiteSpace(linkBand)
+            ? null
+            : AdaptiveLinkTracker.NormalizeBand(linkBand);
+        bool isSlow24Ghz = isAndroid && string.Equals(normalizedBand, "2.4GHz", StringComparison.Ordinal);
         double baseMs;
         if (isAndroid)
         {
-            if (liveRefreshHz is >= 24)
+            if (isSlow24Ghz)
+                baseMs = liveRefreshHz is >= 24 and < 65 ? 13.0 : 11.0;
+            else if (liveRefreshHz is >= 24)
                 baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.55), 4.2, 13.0);
             else
                 baseMs = AndroidUdpMinIntervalMs;
@@ -1874,8 +2046,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return baseMs;
 
         double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
-        double floorMs = isAndroid ? 4.2 : 1.8;
-        if (rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
+        double floorMs = isSlow24Ghz ? 10.0 : (isAndroid ? 4.2 : 1.8);
+        if (!isSlow24Ghz && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
 
         double rttPressure = Math.Max(0.0, rttMs - 18.0) * 0.08;
@@ -1884,10 +2056,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double lossPressure = Math.Max(0.0, lossPermille - 8.0) * 0.10;
         double maxCap = !isAndroid
             ? 12.0
-            : (liveRefreshHz is >= 115 ? 14.0
-                : liveRefreshHz is >= 85 ? 16.0
-                : liveRefreshHz is >= 55 ? 18.5
-                : 20.0);
+            : (isSlow24Ghz
+                ? 24.0
+                : (liveRefreshHz is >= 115 ? 14.0
+                    : liveRefreshHz is >= 85 ? 16.0
+                    : liveRefreshHz is >= 55 ? 18.5
+                    : 20.0));
         maxCap = Math.Max(baseMs, maxCap);
         return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, maxCap);
     }
@@ -2046,7 +2220,8 @@ internal sealed class HostSession : IInputSession, IDisposable
         double queueDelay = client?.LinkTracker.QueueDelayMs ?? 0;
 
         pacer.SetMinIntervalMs(
-            ReceiverServer.ComputeAdaptiveUdpIntervalMs(platform, effectiveHz, rtt, minRtt, jitter, loss));
+            ReceiverServer.ComputeAdaptiveUdpIntervalMs(
+                platform, effectiveHz, rtt, minRtt, jitter, loss, client?.LinkTracker.Band));
         int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
         pacer.SetWarmIntervalMs(warmMs);
     }
@@ -2623,7 +2798,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                     long nowMs = Environment.TickCount64;
                     bool controlActive = Volatile.Read(ref _forwardClaimLease) > 0 ||
                         Volatile.Read(ref _reverseLease) > 0;
-                    long probeGap = controlActive ? 100 : 600;
+                    long probeGap = client.LinkTracker.ComputeProbeIntervalMs(controlActive);
                     if (nowMs - client.LastLinkPingMs >= probeGap)
                     {
                         client.LastLinkPingMs = nowMs;

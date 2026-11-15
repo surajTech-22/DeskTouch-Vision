@@ -6,8 +6,8 @@ android {
         applicationId 'com.desktouch.vision'
         minSdk 26
         targetSdk 35
-        versionCode 43
-        versionName '0.3.42'
+        versionCode 44
+        versionName '0.3.43'
         testInstrumentationRunner 'android.test.InstrumentationTestRunner'
     }
     compileOptions {

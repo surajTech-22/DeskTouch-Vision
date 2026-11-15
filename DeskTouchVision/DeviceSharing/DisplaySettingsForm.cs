@@ -41,11 +41,22 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     }
     private readonly Label _status = new();
     private readonly Label _summary = new();
+    private readonly Label _liveLinkLabel = new()
+    {
+        Name = "LiveLinkStatus",
+        Dock = DockStyle.Top,
+        Height = 20,
+        Font = new Font("Segoe UI Semibold", 9),
+        ForeColor = Color.FromArgb(148, 214, 178),
+        AutoEllipsis = true,
+        Text = "Live link: Waiting for connected phone or computer"
+    };
     private readonly Button _add = Button("Add devices", true);
     private readonly Button _copyCode = Button("Copy pairing code");
     private readonly Button _disconnect = Button("Disconnect");
     private readonly Button _pausePhonePayments = Button("Pause phone for payments");
     private readonly ToolStripMenuItem _pausePhonePaymentsTray = new("Pause phone for payments");
+    private readonly Button _shortcuts = Button("Shortcuts");
     private readonly Button _trustDevice = Button("Trust device");
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
@@ -66,6 +77,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly TrustedDeviceStore? _trusted;
     private readonly string? _trustLoadError;
     private System.Windows.Forms.Timer? _trustedScanTimer;
+    private System.Windows.Forms.Timer? _liveLinkTimer;
     private bool _scanningTrusted;
     private bool _manualPairDialogOpen;
     private DateTime _retryTrustedAfter = DateTime.MinValue;
@@ -165,7 +177,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 248,
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 266,
             Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52,
             Name = "ConnectionActions",
@@ -175,7 +187,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             WrapContents = false, AutoScroll = true };
         _pausePhonePayments.Click += (_, _) => PausePhoneForPayments();
         _pausePhonePaymentsTray.Click += (_, _) => PausePhoneForPayments();
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _pausePhonePayments, _disconnect, _nativeDisplaySettings, _androidDownload })
+        _shortcuts.Click += (_, _) => ShowConnectedShortcuts();
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _shortcuts, _pausePhonePayments, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -217,8 +230,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                    "Phone toggle: Ctrl + Alt + M  •  Emergency return: Ctrl + Alt + Shift + F12.",
             ForeColor = Color.FromArgb(179, 184, 193) };
         // WinForms docks in reverse z-order: add Fill before Top to give
-        // the title its own space instead of covering the explanation.
+        // the title and live link status their own space instead of covering the explanation.
         deviceInfo.Controls.Add(explanation);
+        deviceInfo.Controls.Add(_liveLinkLabel);
         deviceInfo.Controls.Add(_summary);
         _status.Dock = DockStyle.Bottom;
         _status.Height = 43;
@@ -286,6 +300,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 5000 };
             _trustedScanTimer.Tick += async (_, _) => await ScanTrustedAsync();
             _trustedScanTimer.Start();
+            _liveLinkTimer = new System.Windows.Forms.Timer { Interval = 750 };
+            _liveLinkTimer.Tick += (_, _) => UpdateLiveLinkDisplay();
+            _liveLinkTimer.Start();
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
             if (_startInTray && !_showRequestedBeforeShown) HideToTray(showBalloon: false);
@@ -482,6 +499,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         _closing.Cancel();
         _trustedScanTimer?.Stop();
+        _liveLinkTimer?.Stop();
         // Revoke remote control and close the TLS peer before destroying
         // Windows input hooks or receiver listening state.
         DisconnectHost();
@@ -638,6 +656,48 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         else
             _summary.Text = $"{Environment.MachineName}  ·  {localDesc}" +
                             (_receiver != null ? "     •     Ready to pair" : "     •     Not available to other PCs");
+        UpdateLiveLinkDisplay();
+    }
+
+    private void UpdateLiveLinkDisplay()
+    {
+        if (IsDisposed) return;
+        var snap = _receiver?.GetActiveLinkSummary();
+        if (snap is not { Connected: true })
+        {
+            _liveLinkLabel.ForeColor = Color.FromArgb(172, 184, 198);
+            _liveLinkLabel.Text = "Live link: Waiting for connection  •  Keyboard: " +
+                KeyboardLayoutHelper.DescribeCurrentWindowsLayout();
+            return;
+        }
+        string bandText = snap.TransportBand switch
+        {
+            "cable" => "Data cable",
+            "5GHz" => "5 GHz wireless",
+            "6GHz" => "6 GHz wireless",
+            "2.4GHz" => "2.4 GHz wireless",
+            _ => "Wireless"
+        };
+        string speedText = snap.LinkSpeedMbps > 0 ? $" ({snap.LinkSpeedMbps} Mbps)" : "";
+        string pingText = snap.RttMs > 0 ? $"{snap.RttMs:F1} ms ping" : "measuring ping...";
+        var kb = KeyboardLayoutHelper.TryParseWireSummary(snap.KeyboardInfoJson);
+        string kbText = kb != null ? $"  •  Keyboard: {kb.Keyboard}" : "";
+        _liveLinkLabel.ForeColor = snap.RttMs is > 0 and <= 20
+            ? Color.FromArgb(136, 224, 168)
+            : (snap.RttMs > 60 ? Color.FromArgb(245, 200, 120) : Color.FromArgb(170, 212, 245));
+        _liveLinkLabel.Text = $"Live link [{snap.PeerName}]: {bandText}{speedText}  •  {pingText}  •  jitter {snap.JitterMs:F1} ms{kbText}";
+    }
+
+    private void ShowConnectedShortcuts()
+    {
+        var snap = _receiver?.GetActiveLinkSummary();
+        var phoneSummary = KeyboardLayoutHelper.TryParseWireSummary(snap?.KeyboardInfoJson);
+        using var dialog = new KeyboardShortcutsDialog(
+            snap is { Connected: true } ? snap.PeerName : null,
+            KeyboardLayoutHelper.DescribeCurrentWindowsLayout(),
+            phoneSummary,
+            _liveLinkLabel.Text);
+        dialog.ShowDialog(this);
     }
 
     private void RefreshDisplays()
@@ -1031,6 +1091,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
             _receiver.PeerTopologyChanged += OnIncomingPeerTopologyChanged;
             _receiver.PeerPlacementChanged += OnIncomingPeerPlacementChanged;
+            _receiver.PeerKeyboardInfoChanged += () => PostToUi(UpdateLiveLinkDisplay);
             _receiver.ReverseControlMessage += HandleReverseState;
             _receiver.DiagnosticLog += LogDiagnostic;
             _receiver.AllowForwardClaim = () =>
@@ -1056,8 +1117,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             return neighbours;
                         }, () => _host == null);
                     _discovery.Start();
-                    _adbBridge ??= new AdbCableBridge(LogDiagnostic,
-                        (port, secret) => Volatile.Read(ref _receiver)?.SetShellBridgeAuth(port, secret));
+                    _adbBridge ??= new AdbCableBridge(
+                        LogDiagnostic,
+                        onShellBridgeReady: (port, secret) =>
+                            Volatile.Read(ref _receiver)?.SetShellBridgeAuth(port, secret),
+                        onBridgeDetached: () =>
+                        {
+                            Volatile.Read(ref _receiver)?.NotifyCableDetached();
+                            BroadcastOnlinePresence();
+                        },
+                        onCableBridgeReady: () =>
+                            Volatile.Read(ref _receiver)?.NotifyCableBridgeReady());
                     BroadcastOnlinePresence();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
@@ -1889,6 +1959,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _adbBridge?.TriggerRefresh();
         }
+        if (message.Msg == 0x0051 && !_closing.IsCancellationRequested)
+        {
+            _receiver?.BroadcastKeyboardLayoutAsync();
+            PostToUi(UpdateLiveLinkDisplay);
+        }
         base.WndProc(ref message);
     }
 
@@ -1958,6 +2033,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _logChannel.Writer.TryComplete();
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;
+            _liveLinkTimer?.Dispose();
+            _liveLinkTimer = null;
             _showWait?.Unregister(null);
             _showWait = null;
             _exitWait?.Unregister(null);

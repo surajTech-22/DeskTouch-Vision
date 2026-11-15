@@ -308,7 +308,7 @@ internal sealed class AdaptiveLinkTracker
         string band = Band;
         return band switch
         {
-            "cable" => controlActive ? 750 : 900,
+            "cable" => controlActive ? 38 : 120,
             "5GHz" or "6GHz" => controlActive ? 120 : 500,
             "2.4GHz" => controlActive ? 350 : 900,
             _ => controlActive ? 220 : 750

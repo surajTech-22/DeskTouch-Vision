@@ -2291,8 +2291,10 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         "2.4 GHz keepalive interval and v0.3.50 edge-push version gate must behave safely");
 
     var cableProbeTracker = new AdaptiveLinkTracker("cable");
-    Check(cableProbeTracker.ComputeProbeIntervalMs(true) >= 750,
-        "Data cable keepalive must never flood every 38ms during active cursor movement");
+    cableProbeTracker.OnLinkProfileChanged("cable", 480, 0);
+    Check(cableProbeTracker.ComputeProbeIntervalMs(true) <= 45 &&
+          cableProbeTracker.ComputeProbeIntervalMs(false) <= 140,
+        "Data cable internal USB keepalive cadence must stay tight without exposing UI ping");
 
     byte[] reorderKey = Enumerable.Range(10, FastUdpCodec.KeySize).Select(x => (byte)x).ToArray();
     using var sCodec = new FastUdpCodec(reorderKey, peerId: 21, isServer: true);

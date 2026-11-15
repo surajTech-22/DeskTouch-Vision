@@ -124,6 +124,7 @@ final class DeskTouchSession implements AutoCloseable {
     private final TrustedWindows trust;
     private final Context application;
     private volatile int reverseLease,reverseApplied,reportedMissingKeyboard;
+    private volatile boolean reverseUsingShell;
     private final ExecutorService sender=Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService udpPacer=Executors.newSingleThreadScheduledExecutor(r->{
         Thread t=new Thread(r,"DeskTouch UdpSend");
@@ -368,8 +369,7 @@ final class DeskTouchSession implements AutoCloseable {
                 JSONArray myLayout=buildLayoutArray(info);
                 JSONObject hello=new JSONObject().put("Name",info.deviceName)
                     .put("Layout",myLayout.toString())
-                    .put("ReverseInputSupported",
-                        DeskTouchAccessibilityService.ready(application))
+                    .put("ReverseInputSupported",canAcceptRemoteInput())
                     .put("ForwardInputSupported",true)
                     .put("Platform","Android")
                     .put("OsVersion",info.osVersion)
@@ -395,8 +395,10 @@ final class DeskTouchSession implements AutoCloseable {
                 cableSession=device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress());
                 socket=ssl;input=in;output=out;running=true;active=false;claim=0;
                 reverseDedup.reset();
+                AutoConnectService.onConnectionCountChanged(application);
                 registerDisplayListener();
-                if(!DeskTouchAccessibilityService.isPausedForBanking(application))
+                if(canAcceptRemoteInput() ||
+                    !DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
                 // Allow for transient Android CPU/Wi-Fi scheduling pauses.
                 // Heartbeats and the foreground auto-reconnect still detect real loss.
@@ -488,6 +490,10 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                 } else if(allowedWindowsControlType(p.type)){
                     handleWindowsControl(p);
+                } else if("shell-input-bridge".equals(p.type)){
+                    ShellInputClient.configure(application,p.a,p.text);
+                } else if("pause-accessibility".equals(p.type)){
+                    handlePauseAccessibilityFromWindows();
                 } else if("goodbye".equals(p.type)) break;
             }
         } catch(Exception e){if(running)status("Windows disconnected: "+e.getMessage());}
@@ -565,15 +571,20 @@ final class DeskTouchSession implements AutoCloseable {
             return;
         }
         boolean granted;
+        boolean chosenShell=false;
         synchronized(reverseDedup){
             if(!reverseDedup.tryAcceptClaimDispatch(claim,dispatchSeq,reverseLease)) return;
+            boolean shellReady=ShellInputClient.ready(application);
+            boolean accReady=DeskTouchAccessibilityService.ready(application);
+            chosenShell=shouldUseShellBridge(shellReady,accReady);
             if(hasClaim() ||
-                !DeskTouchAccessibilityService.ready(application) ||
+                (!shellReady && !accReady) ||
                 (reverseLease>0 && reverseLease!=claim) ||
                 !DeskTouchRuntime.claimAndroidControl(this)){
                 granted=false;
             }else{
                 reverseLease=claim;
+                reverseUsingShell=chosenShell;
                 reverseApplied=0;
                 reportedMissingKeyboard=0;
                 lastUdpReverseMoveAtMs=0;
@@ -595,6 +606,7 @@ final class DeskTouchSession implements AutoCloseable {
             send(new Packet("reverse-busy",claim));
             return;
         }
+        if(chosenShell) ShellInputClient.beginRemote(application);
         send(new Packet("reverse-granted",claim));
         if(!fromUdp) warmOrProbeUdp();
         RemoteInputPower.begin(application);
@@ -611,7 +623,7 @@ final class DeskTouchSession implements AutoCloseable {
                 clearReverseControl(false);
             return;
         }
-        if(reverseLease<=0 || !DeskTouchAccessibilityService.ready(application)){
+        if(reverseLease<=0 || !isActiveBackendReady()){
             clearReverseControl(false);
             return;
         }
@@ -623,57 +635,82 @@ final class DeskTouchSession implements AutoCloseable {
             }
             applyReversePointerMove(p.a,p.b,reverseLease,p.c,false);
         }else if("reverse-button".equals(p.type)){
-            if(tryAcceptControlAction(p.c,true))
-                DeskTouchAccessibilityService.mouseButton(p.a,p.b!=0);
+            dispatchReverseButton(p.a,p.b!=0,p.c,false);
         }else if("reverse-wheel".equals(p.type)){
-            if(tryAcceptControlAction(p.c,false))
-                DeskTouchAccessibilityService.wheel(p.a,p.b!=0);
+            dispatchReverseWheel(p.a,p.b!=0,p.c,false);
         }else if("reverse-key".equals(p.type)){
             final int activeLease=reverseLease;
-            DeskTouchAccessibilityService.key(p.d,p.c!=0,()->{
-                if(reverseLease==activeLease)reportedMissingKeyboard=0;
-            },()->{
-                // No typed characters/scan codes are exposed to the hub.
-                if(reverseLease==activeLease && reportedMissingKeyboard!=activeLease){
-                    reportedMissingKeyboard=activeLease;
-                    send(new Packet("reverse-key-unavailable",activeLease));
-                }
-            });
+            Runnable accepted=onReverseInputAccepted(activeLease);
+            Runnable rejected=onReverseInputRejected(activeLease);
+            if(reverseUsingShell) ShellInputClient.key(p.d,p.c!=0,accepted,rejected);
+            else DeskTouchAccessibilityService.key(p.d,p.c!=0,accepted,rejected);
         }else if("reverse-text".equals(p.type) && p.text!=null &&
             p.text.length()>0 && p.text.length()<=512){
             final int activeLease=reverseLease;
-            DeskTouchAccessibilityService.text(p.text,()->{
-                if(reverseLease==activeLease)reportedMissingKeyboard=0;
-            },()->{
-                // Never send text, character values or typed data back to
-                // the hub; report only the failed authority lease number.
-                if(reverseLease==activeLease &&
-                    reportedMissingKeyboard!=activeLease){
-                    reportedMissingKeyboard=activeLease;
-                    send(new Packet("reverse-key-unavailable",activeLease));
-                }
-            });
+            Runnable accepted=onReverseInputAccepted(activeLease);
+            Runnable rejected=onReverseInputRejected(activeLease);
+            if(reverseUsingShell) ShellInputClient.text(p.text,accepted,rejected);
+            else DeskTouchAccessibilityService.text(p.text,accepted,rejected);
         }
+    }
+    static boolean shouldUseShellBridge(boolean shellReady, boolean accessibilityReady){
+        return shellReady;
+    }
+    private boolean canAcceptRemoteInput(){
+        return ShellInputClient.ready(application) || DeskTouchAccessibilityService.ready(application);
+    }
+    private boolean isActiveBackendReady(){
+        return reverseUsingShell
+            ? ShellInputClient.ready(application)
+            : DeskTouchAccessibilityService.ready(application);
+    }
+    private void dispatchReverseButton(int button,boolean down,int actionSeq,boolean fromUdp){
+        if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
+        if(!tryAcceptControlAction(actionSeq,true)) return;
+        if(reverseUsingShell) ShellInputClient.mouseButton(button,down);
+        else DeskTouchAccessibilityService.mouseButton(button,down);
+    }
+    private void dispatchReverseWheel(int amount,boolean horizontal,int actionSeq,boolean fromUdp){
+        if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
+        if(!tryAcceptControlAction(actionSeq,false)) return;
+        if(reverseUsingShell) ShellInputClient.wheel(amount,horizontal);
+        else DeskTouchAccessibilityService.wheel(amount,horizontal);
+    }
+    private Runnable onReverseInputAccepted(int activeLease){
+        return ()->{ if(reverseLease==activeLease)reportedMissingKeyboard=0; };
+    }
+    private Runnable onReverseInputRejected(int activeLease){
+        return ()->{
+            // Never send text, character values or typed data back to
+            // the hub; report only the failed authority lease number.
+            if(reverseLease==activeLease && reportedMissingKeyboard!=activeLease){
+                reportedMissingKeyboard=activeLease;
+                send(new Packet("reverse-key-unavailable",activeLease));
+            }
+        };
     }
     private void applyReversePointerMove(int x,int y,int lease,int moveSeq,boolean fromUdp){
         final boolean posted;
         synchronized(reverseDedup){
             if(!running || lease<=0 || lease!=reverseLease
-                || !DeskTouchAccessibilityService.ready(application)) return;
+                || !isActiveBackendReady()) return;
             if(!reverseDedup.tryAcceptMove(moveSeq)) return;
             if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
             Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
-            posted=DeskTouchAccessibilityService.pointer(x,y,ack);
+            posted=reverseUsingShell
+                ? ShellInputClient.movePointer(x,y,ack)
+                : DeskTouchAccessibilityService.pointer(x,y,ack);
         }
         if(!posted)revokeRemoteFromNative();
     }
     private void clearReverseControl(boolean notifyWindows){
         int lease;
         synchronized(reverseDedup){
-            lease=reverseLease;reverseLease=0;reverseApplied=0;
+            lease=reverseLease;reverseLease=0;reverseApplied=0;reverseUsingShell=false;
         }
         DeskTouchRuntime.releaseAndroidControl(this);
         if(!running && lease>0)RemoteInputPower.end();
+        ShellInputClient.endRemote();
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
@@ -760,6 +797,8 @@ final class DeskTouchSession implements AutoCloseable {
             announcedPhoneRotation=info.rotationDegrees;
             // Publish rotations on the existing authenticated TLS link.
             send(new Packet("topology",0,0,0,0,layout.toString()));
+            if(reverseLease>0 && reverseUsingShell)
+                ShellInputClient.beginRemote(application);
         }catch(org.json.JSONException ignored){}
     }
     void publishAccessibilityCapability(){
@@ -767,7 +806,15 @@ final class DeskTouchSession implements AutoCloseable {
         // visible on the SAME authenticated environment connection, without
         // asking the user to disconnect or pair the phone again.
         if(running)send(new Packet("android-capability",
-            DeskTouchAccessibilityService.ready(application)?1:0));
+            canAcceptRemoteInput()?1:0));
+    }
+
+    private void handlePauseAccessibilityFromWindows(){
+        boolean disabled=DeskTouchAccessibilityService.pauseForBanking(
+            application,"Turned off from Windows");
+        status(disabled
+            ? "Windows turned off Android Accessibility for payment apps. Connection stays open."
+            : "Pause requested from Windows; finish turning off DeskTouch in Accessibility settings.");
     }
 
     void releaseControl(){
@@ -892,17 +939,13 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 @Override public void onReverseButton(int button,int down,int lease,int actionSeq){
                     if(!running || lease<=0 || lease!=reverseLease
-                        || !DeskTouchAccessibilityService.ready(application)) return;
-                    lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
-                    if(tryAcceptControlAction(actionSeq,true))
-                        DeskTouchAccessibilityService.mouseButton(button,down!=0);
+                        || !isActiveBackendReady()) return;
+                    dispatchReverseButton(button,down!=0,actionSeq,true);
                 }
                 @Override public void onReverseWheel(int amount,int horizontal,int lease,int actionSeq){
                     if(!running || lease<=0 || lease!=reverseLease
-                        || !DeskTouchAccessibilityService.ready(application)) return;
-                    lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
-                    if(tryAcceptControlAction(actionSeq,false))
-                        DeskTouchAccessibilityService.wheel(amount,horizontal!=0);
+                        || !isActiveBackendReady()) return;
+                    dispatchReverseWheel(amount,horizontal!=0,actionSeq,true);
                 }
                 @Override public void onLinkPing(int pingToken,int senderPaceTenths,int lease,int ts){
                     if(!running) return;
@@ -940,7 +983,7 @@ final class DeskTouchSession implements AutoCloseable {
                     long now=SystemClock.uptimeMillis();
                     boolean screenInteractive=keepAlivePm==null || keepAlivePm.isInteractive();
                     boolean activeSession=reverseLease>0 || hasClaim();
-                    boolean serviceReady=DeskTouchAccessibilityService.ready(application);
+                    boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
                         int warmGapMs=(int)Math.min(44L,Math.max(INTERACTIVE_KEEPALIVE_MS,
@@ -1098,6 +1141,7 @@ final class DeskTouchSession implements AutoCloseable {
         running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;cableSession=false;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
+        AutoConnectService.onConnectionCountChanged(application);
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}
     }

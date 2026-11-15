@@ -620,4 +620,75 @@ public final class ProtocolSourceTest {
         assertEquals(FastUdpChannel.OP_LINK_FEEDBACK, m4.op);
         assertNull(cli.tryOpen(f2, f2.length)); // replayed seq blocked
     }
+
+    @Test public void paymentAppDetectorMatchesPaymentAndBankingPackagesSafely() {
+        String[] paymentApps = {
+            "com.google.android.apps.nbu.paisa.user",
+            "com.phonepe.app",
+            "net.one97.paytm",
+            "in.org.npci.upiapp",
+            "com.dreamplug.androidapp",
+            "com.mobikwik_new",
+            "com.sbi.lotusintouch",
+            "com.snapwork.hdfc",
+            "com.csam.icici.bank.imobile",
+            "com.axis.mobile",
+            "com.msf.kbank.mobile",
+            "com.kotak811mobilebankingapp",
+            "com.nextbillion.groww",
+            "com.zerodha.kite3",
+            "in.example.custom.upi",
+            "com.example.bank.mobilebanking"
+        };
+        for (String pkg : paymentApps) {
+            assertTrue("Expected payment/banking match for " + pkg,
+                PaymentAppDetector.isPaymentOrBankingPackage(pkg));
+        }
+
+        String[] regularApps = {
+            "com.desktouch.vision",
+            "com.android.chrome",
+            "com.android.settings",
+            "com.android.systemui",
+            "com.miui.securitycenter",
+            "com.xiaomi.market",
+            "com.whatsapp",
+            "com.google.android.youtube",
+            "com.instagram.android",
+            "com.google.android.gms",
+            "",
+            null,
+            "invalidpackage"
+        };
+        for (String pkg : regularApps) {
+            assertFalse("Expected non-payment result for " + pkg,
+                PaymentAppDetector.isPaymentOrBankingPackage(pkg));
+        }
+    }
+
+    @Test
+    public void shellBridgeInputAndHidKeyTableWorkWithoutAccessibility() {
+        assertEquals(0x04, HidKeyTable.forAsciiChar('a').usage);
+        assertEquals(0, HidKeyTable.forAsciiChar('a').modifier);
+        assertEquals(0x04, HidKeyTable.forAsciiChar('A').usage);
+        assertEquals(HidKeyTable.MOD_LEFT_SHIFT, HidKeyTable.forAsciiChar('A').modifier);
+        assertEquals(0x27, HidKeyTable.forAsciiChar('0').usage);
+        assertEquals(0x1E, HidKeyTable.forAsciiChar('!').usage);
+        assertEquals(HidKeyTable.MOD_LEFT_SHIFT, HidKeyTable.forAsciiChar('!').modifier);
+        assertEquals(0x28, HidKeyTable.forAsciiChar('\n').usage);
+        assertEquals(0x2B, HidKeyTable.forAsciiChar('\t').usage);
+        assertNull(HidKeyTable.forAsciiChar('\u20B9')); // INR symbol not pure ASCII HID
+
+        assertEquals(HidKeyTable.MOD_LEFT_CTRL, HidKeyTable.modifierBitForVk(0x11));
+        assertEquals(HidKeyTable.MOD_RIGHT_SHIFT, HidKeyTable.modifierBitForVk(0xA1));
+        assertEquals(HidKeyTable.MOD_LEFT_ALT, HidKeyTable.modifierBitForVk(0xA4));
+        assertEquals(0x28, HidKeyTable.usageForVk(0x0D));
+        assertEquals(0x4F, HidKeyTable.usageForVk(0x27));
+        assertEquals(0x3A, HidKeyTable.usageForVk(0x70));
+
+        assertTrue(DeskTouchSession.shouldUseShellBridge(true, false));
+        assertTrue(DeskTouchSession.shouldUseShellBridge(true, true));
+        assertFalse(DeskTouchSession.shouldUseShellBridge(false, true));
+        assertFalse(DeskTouchSession.shouldUseShellBridge(false, false));
+    }
 }

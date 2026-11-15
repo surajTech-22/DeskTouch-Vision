@@ -24,6 +24,8 @@ public final class MainActivity extends Activity {
     private TextView permissionState;
     private TextView trustSummary;
     private CheckBox autoStartCheck;
+    private CheckBox allowWindowsCheck,allowShellBridgeCheck,autoPausePaymentsCheck,autoPauseDisconnectCheck;
+    private Button pauseBankingButton;
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
@@ -44,6 +46,7 @@ public final class MainActivity extends Activity {
             runOnUiThread(()->{
                 if(status!=null)status.setText(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
+                refreshPermissionState();
                 refreshTrustSummary();
                 updateVisibleScreenAwake();
             }));
@@ -107,32 +110,47 @@ public final class MainActivity extends Activity {
         environmentList.setOrientation(LinearLayout.VERTICAL);
         page.addView(environmentList);
         refreshEnvironmentMembers();
-        android.widget.CheckBox allowWindows=new android.widget.CheckBox(this);
-        allowWindows.setText("Allow approved Windows PCs to control this Android screen");
-        allowWindows.setTextColor(Color.WHITE);
-        allowWindows.setChecked(DeskTouchAccessibilityService.allowed(this));
-        allowWindows.setOnCheckedChangeListener((v,enabled)->{
+        allowWindowsCheck=new android.widget.CheckBox(this);
+        allowWindowsCheck.setText("Allow approved Windows PCs to control this Android screen");
+        allowWindowsCheck.setTextColor(Color.WHITE);
+        allowWindowsCheck.setChecked(DeskTouchAccessibilityService.allowed(this));
+        allowWindowsCheck.setOnClickListener(v->{
+            boolean enabled=allowWindowsCheck.isChecked();
             DeskTouchAccessibilityService.setAllowed(this,enabled);
-            DeskTouchRuntime.accessibilityPermissionChanged();
+            DeskTouchRuntime.accessibilityPermissionChanged(this);
             refreshPermissionState();
             updateVisibleScreenAwake();
             if(enabled && !DeskTouchAccessibilityService.ready(this)){
-                status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings, then reconnect.");
-                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings.");
+                DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
             }else status.setText(enabled
-                ? "Windows control enabled. Reconnect this phone so Windows detects the new capability."
+                ? "Windows control enabled."
                 : "Windows control disabled. Android touch has priority.");
         });
-        page.addView(allowWindows);
+        page.addView(allowWindowsCheck);
+        allowShellBridgeCheck=new CheckBox(this);
+        allowShellBridgeCheck.setText("Allow Accessibility-free Virtual Bridge from connected Windows PC (recommended for payment apps)");
+        allowShellBridgeCheck.setTextColor(Color.WHITE);
+        allowShellBridgeCheck.setChecked(ShellInputClient.allowed(this));
+        allowShellBridgeCheck.setOnClickListener(v->{
+            boolean enabled=allowShellBridgeCheck.isChecked();
+            ShellInputClient.setAllowed(this,enabled);
+            refreshPermissionState();
+            updateVisibleScreenAwake();
+            status.setText(enabled
+                ? (ShellInputClient.ready(this)
+                    ? "Accessibility-free Virtual Bridge enabled and ready."
+                    : "Virtual Bridge enabled. Plug in the data cable while DeskTouch is running on Windows to start it without Accessibility.")
+                : "Virtual Bridge disabled in DeskTouch.");
+        });
+        page.addView(allowShellBridgeCheck);
         permissionState=new TextView(this);
         permissionState.setTextColor(Color.rgb(243,208,145));
         permissionState.setPadding(0,dp(5),0,dp(8));
         page.addView(permissionState);
-        refreshPermissionState();
-        addButton(page,"Restore Android Accessibility permission",()->
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         addButton(page,"Open Android Accessibility settings",()->
-            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+            DeskTouchAccessibilityService.openAccessibilitySettings(
+                this,!PermissionContinuity.systemAccessibilityEnabled(this)));
         // A dedicated input method improves editor typing (including WebViews)
         // without requiring root, developer mode or a Bluetooth pairing.
         // Android always requires the user to enable/select a third-party IME.
@@ -148,19 +166,62 @@ public final class MainActivity extends Activity {
             DeskTouchRuntime.remoteNativeTouch();
             status.setText("Windows input authority returned to Android.");
         });
-        addButton(page,"Pause for Banking (1 tap)",()->{
-            if(DeskTouchAccessibilityService.isPausedForBanking(this)){
+        pauseBankingButton=new Button(this);
+        pauseBankingButton.setAllCaps(false);
+        pauseBankingButton.setOnClickListener(v->{
+            if(!PermissionContinuity.systemAccessibilityEnabled(this)){
                 DeskTouchAccessibilityService.setAllowed(this,true);
+                DeskTouchRuntime.accessibilityPermissionChanged(this);
                 refreshPermissionState();
-                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
                 status.setText("Turn DeskTouch Windows control back on in Accessibility settings.");
             }else{
-                DeskTouchAccessibilityService.pauseForBanking(this);
+                boolean selfDisabled=DeskTouchAccessibilityService.pauseForBanking(
+                    this,"Turned off from app");
                 refreshPermissionState();
                 updateVisibleScreenAwake();
-                status.setText("Paused for banking. Wi-Fi connection stays ready; tap Resume later.");
+                if(selfDisabled){
+                    status.setText("Android Accessibility turned off. Payment apps work normally; connections stay ready.");
+                }else{
+                    DeskTouchAccessibilityService.openAccessibilitySettings(this,false);
+                    status.setText("Tap DeskTouch Windows control in Accessibility settings to turn it off.");
+                }
             }
         });
+        page.addView(pauseBankingButton,new LinearLayout.LayoutParams(-1,-2));
+        autoPausePaymentsCheck=new CheckBox(this);
+        autoPausePaymentsCheck.setText("Auto-turn off Accessibility when opening payment/banking apps");
+        autoPausePaymentsCheck.setTextColor(Color.WHITE);
+        autoPausePaymentsCheck.setChecked(
+            DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this));
+        autoPausePaymentsCheck.setOnClickListener(v->{
+            boolean checked=autoPausePaymentsCheck.isChecked();
+            DeskTouchAccessibilityService.setAutoPausePaymentApps(this,checked);
+            status.setText(checked
+                ? "DeskTouch will automatically turn off Accessibility when you open UPI/payment or bank apps."
+                : "Automatic payment-app pause turned off; use the notification, widget, or Quick Tile instead.");
+        });
+        page.addView(autoPausePaymentsCheck);
+        autoPauseDisconnectCheck=new CheckBox(this);
+        autoPauseDisconnectCheck.setText("Auto-turn off Accessibility 15s after Windows disconnects");
+        autoPauseDisconnectCheck.setTextColor(Color.WHITE);
+        autoPauseDisconnectCheck.setChecked(
+            DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this));
+        autoPauseDisconnectCheck.setOnClickListener(v->{
+            boolean checked=autoPauseDisconnectCheck.isChecked();
+            DeskTouchAccessibilityService.setAutoPauseOnDisconnect(this,checked);
+            status.setText(checked
+                ? "Accessibility will automatically turn off 15 seconds after leaving your Windows PC."
+                : "Accessibility will remain on after Windows disconnects until you turn it off.");
+        });
+        page.addView(autoPauseDisconnectCheck);
+        addButton(page,"Add 1-tap Pay Mode button to Home screen",()->{
+            boolean requested=PaymentPauseWidgetProvider.requestPin(this);
+            status.setText(requested
+                ? "Confirm adding the DeskTouch Pay Mode button on your home screen."
+                : "Long-press your Home screen -> Widgets -> add DeskTouch Pay Mode.");
+        });
+        refreshPermissionState();
         addButton(page,"Trust connected PC (auto reconnect identity)",()->{
             DeskTouchSession current=DeskTouchRuntime.session(this);
             session=current;
@@ -429,7 +490,7 @@ public final class MainActivity extends Activity {
         // this setup/control screen is visible. Android owns this Activity
         // flag; system/third-party app power policies remain authoritative.
         boolean keep=DeskTouchRuntime.connectedCount()>0 &&
-            DeskTouchAccessibilityService.ready(this);
+            (ShellInputClient.ready(this) || DeskTouchAccessibilityService.ready(this));
         if(keep)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
@@ -469,12 +530,34 @@ public final class MainActivity extends Activity {
         if(start<added.length())target.text(added.substring(start));
     }
     private void refreshPermissionState(){
+        boolean sysEnabled=PermissionContinuity.systemAccessibilityEnabled(this);
+        if(allowWindowsCheck!=null)
+            allowWindowsCheck.setChecked(DeskTouchAccessibilityService.allowed(this));
+        if(allowShellBridgeCheck!=null)
+            allowShellBridgeCheck.setChecked(ShellInputClient.allowed(this));
+        if(autoPausePaymentsCheck!=null)
+            autoPausePaymentsCheck.setChecked(
+                DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this));
+        if(autoPauseDisconnectCheck!=null)
+            autoPauseDisconnectCheck.setChecked(
+                DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this));
+        if(pauseBankingButton!=null)
+            pauseBankingButton.setText(sysEnabled
+                ? "Turn Off Accessibility for Payment Apps (1 tap)"
+                : "Resume Accessibility Control (after payments)");
         if(permissionState==null)return;
+        boolean shellReady=ShellInputClient.ready(this);
+        String bridgeLine=shellReady
+            ? "active (works with Accessibility OFF)"
+            : (ShellInputClient.allowed(this)
+                ? "standby (starts automatically when data cable is connected to Windows)"
+                : "disabled in DeskTouch");
         permissionState.setText(PermissionContinuity.state(this) +
+            "\nVirtual Bridge: " + bridgeLine +
             "\nDeskTouch keyboard: " +
             (DeskTouchInputMethod.isSelected(this)
                 ? "selected for focused-field typing."
-                : "not selected (optional; use Enable and Select above)."));
+                : "not selected (optional when Accessibility is used)."));
     }
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
     private void addCompactButton(LinearLayout parent,String label,Runnable action){

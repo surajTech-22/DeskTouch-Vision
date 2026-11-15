@@ -60,7 +60,16 @@ Check(!ReceiverServer.AllowsAndroidCapability(
     new ConnectedPeer("Xiaomi",testDisplay,Platform:"Android"),
     new Packet("android-capability",3)),
     "Unknown Android capability flags cannot grant keyboard authority");
-Console.WriteLine("PASS: Android handshake, Accessibility toggle, and input opt-in enforced.");
+Check(ReceiverServer.CanPauseAndroidForPayments(
+    new ConnectedPeer("Xiaomi", testDisplay, Platform: "Android", SupportsReverseInput: true)) &&
+    !ReceiverServer.CanPauseAndroidForPayments(
+        new ConnectedPeer("Xiaomi", testDisplay, Platform: "Android", SupportsReverseInput: false)) &&
+    !ReceiverServer.CanPauseAndroidForPayments(
+        new ConnectedPeer("Desktop", testDisplay, Platform: "Windows", SupportsReverseInput: true)) &&
+    !ReceiverServer.CanPauseAndroidForPayments(null) &&
+    new Packet("pause-accessibility").Type == "pause-accessibility",
+    "Windows payment-safe pause targets only active Android peers with Accessibility enabled");
+Console.WriteLine("PASS: Android handshake, Accessibility toggle, payment-safe pause, and input opt-in enforced.");
 
 var fpOne = new string('A', 64);
 var fpTwo = new string('B', 64);
@@ -647,6 +656,35 @@ Console.WriteLine("PASS: clipped-pointer raw edge handoff, four outward directio
 
 Console.WriteLine("PASS: Windows native priority, two-monitor seams, all four outer edges, and nonrectangular monitor layouts.");
 
+// --- Shell Bridge daemon parsing and script hygiene invariants ---
+string mixedAdbOutput = """
+    List of devices attached
+    UK9DYX4XF6KZSWGA       device product:xaga model:22041216I transport_id:4
+    192.168.1.50:5555      device product:xaga transport_id:7
+    offline_dev            offline
+    unauth_dev             unauthorized
+    """;
+IReadOnlyList<string> wiredOnly = AdbCableBridge.ParseWiredAdbSerials(mixedAdbOutput);
+IReadOnlyList<string> allConnected = AdbCableBridge.ParseConnectedAdbSerials(mixedAdbOutput);
+Check(wiredOnly.Count == 1 && wiredOnly[0] == "UK9DYX4XF6KZSWGA",
+    "Wired ADB serial filter must still exclude wireless targets");
+Check(allConnected.Count == 2 && allConnected.Contains("192.168.1.50:5555"),
+    "Connected ADB serial parser must include authorized wireless or USB devices for daemon launch");
+Check(AdbCableBridge.ParsePortOutput("PORT=41234\n") == 41234 &&
+    AdbCableBridge.ParsePortOutput("NO_PORT\n") == 0 &&
+    AdbCableBridge.ParsePortOutput("NO_APP\n") == 0 &&
+    AdbCableBridge.ParsePortOutput("PORT=99999\n") == 0,
+    "Shell daemon port parser must validate TCP port bounds");
+string daemonScript = AdbCableBridge.BuildShellDaemonScript();
+string checkScript = AdbCableBridge.BuildShellCheckScript(41234);
+Check(daemonScript.Contains("umask 077", StringComparison.Ordinal) &&
+    daemonScript.Contains("IFS= read -r TK", StringComparison.Ordinal) &&
+    daemonScript.Contains("com.desktouch.vision.ShellInputDaemon", StringComparison.Ordinal) &&
+    daemonScript.Contains("rm -f /data/local/tmp/dt_s.tok", StringComparison.Ordinal) &&
+    !checkScript.Contains("NO_PORT", StringComparison.Ordinal) &&
+    checkScript.Contains("41234", StringComparison.Ordinal),
+    "Shell Bridge launcher script must pass token only via stdin 077 file unlinked before exec");
+Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch scripts enforce safety invariants.");
 
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
 {

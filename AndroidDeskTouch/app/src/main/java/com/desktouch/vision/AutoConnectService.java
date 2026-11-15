@@ -11,6 +11,7 @@ import android.net.wifi.WifiManager;
 import android.os.*;
 import android.provider.Settings;
 import android.util.Log;
+import android.widget.Toast;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.concurrent.*;
@@ -28,7 +29,10 @@ public final class AutoConnectService extends Service {
     static final String ACTION_PAUSE_BANKING="com.desktouch.vision.ACTION_PAUSE_BANKING";
     static final String ACTION_RESUME_CONTROL="com.desktouch.vision.ACTION_RESUME_CONTROL";
     private static final String CHANNEL="desktouch_connected_devices";
+    private static final String PAYMENT_NOTICE_CHANNEL="desktouch_payment_mode";
     private static final int NOTIFICATION_ID=37377;
+    private static final int PAYMENT_NOTICE_ID=37378;
+    private static final long DISCONNECT_AUTO_PAUSE_DELAY_MS=15_000L;
     private static volatile AutoConnectService activeInstance;
     private ScheduledExecutorService scheduler;
     private MobileDiscoveryResponder responder;
@@ -39,6 +43,8 @@ public final class AutoConnectService extends Service {
     private volatile boolean scanning;
     private volatile boolean pendingWake;
     private volatile boolean retryScheduled;
+    private volatile boolean hadConnectedWithAccessibility;
+    private ScheduledFuture<?> disconnectAutoPauseFuture;
 
     static boolean enabled(Context context) {
         return context.getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -99,31 +105,154 @@ public final class AutoConnectService extends Service {
         }
     }
 
+    static void onConnectionCountChanged(Context context) {
+        AutoConnectService service=activeInstance;
+        if(service!=null) service.evaluateDisconnectAutoPause();
+        refreshNotification();
+    }
+
+    static void onAccessibilityStateChanged(Context context) {
+        AutoConnectService service=activeInstance;
+        if(service!=null) service.evaluateDisconnectAutoPause();
+    }
+
+    static void cancelPaymentNotice(Context context) {
+        if(context==null) return;
+        NotificationManager manager=context.getSystemService(NotificationManager.class);
+        if(manager!=null) {
+            try { manager.cancel(PAYMENT_NOTICE_ID); }
+            catch(RuntimeException ignored) {}
+        }
+    }
+
+    static void notifyAutoPausedForPayment(Context context, String appName) {
+        if(context==null) return;
+        Context app=context.getApplicationContext();
+        String safeName=(appName!=null && !appName.isEmpty()) ? appName : "payment app";
+        AutoConnectService service=activeInstance;
+        if(service!=null) {
+            service.postPaymentModeNotice(
+                "DeskTouch Accessibility turned off",
+                "Stepped aside for " + safeName + " • Tap Resume when back at Windows");
+        } else {
+            new Handler(Looper.getMainLooper()).post(()->
+                Toast.makeText(app,
+                    "DeskTouch Accessibility turned off for " + safeName,
+                    Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    private synchronized void cancelDisconnectAutoPauseLocked() {
+        if(disconnectAutoPauseFuture!=null) {
+            disconnectAutoPauseFuture.cancel(false);
+            disconnectAutoPauseFuture=null;
+        }
+    }
+
+    private synchronized void evaluateDisconnectAutoPause() {
+        int connected=DeskTouchRuntime.connectedCount();
+        boolean sysEnabled=PermissionContinuity.systemAccessibilityEnabled(this);
+        if(!sysEnabled) {
+            cancelDisconnectAutoPauseLocked();
+            hadConnectedWithAccessibility=false;
+            return;
+        }
+        if(connected>0) {
+            hadConnectedWithAccessibility=true;
+            cancelDisconnectAutoPauseLocked();
+            return;
+        }
+        if(!hadConnectedWithAccessibility ||
+            !DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this)) {
+            cancelDisconnectAutoPauseLocked();
+            return;
+        }
+        ScheduledExecutorService pool=scheduler;
+        if(pool==null || pool.isShutdown()) return;
+        if(disconnectAutoPauseFuture!=null && !disconnectAutoPauseFuture.isDone()) return;
+        disconnectAutoPauseFuture=pool.schedule(()->{
+            synchronized(AutoConnectService.this) {
+                disconnectAutoPauseFuture=null;
+            }
+            if(DeskTouchRuntime.connectedCount()>0) return;
+            if(!DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this)) return;
+            if(!PermissionContinuity.systemAccessibilityEnabled(this)) {
+                hadConnectedWithAccessibility=false;
+                return;
+            }
+            hadConnectedWithAccessibility=false;
+            Log.i("DeskTouch","Auto-turning off Accessibility 15s after Windows disconnected");
+            DeskTouchAccessibilityService.pauseForBanking(
+                this,"Auto-turned off after Windows disconnected");
+            postPaymentModeNotice(
+                "DeskTouch Accessibility turned off",
+                "Windows disconnected • Payment apps work normally");
+        },DISCONNECT_AUTO_PAUSE_DELAY_MS,TimeUnit.MILLISECONDS);
+    }
+
+    private void postPaymentModeNotice(String title,String body) {
+        if(Build.VERSION.SDK_INT>=33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                !=android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            new Handler(Looper.getMainLooper()).post(()->
+                Toast.makeText(getApplicationContext(),title + " • " + body,Toast.LENGTH_SHORT).show());
+            return;
+        }
+        NotificationManager manager=getSystemService(NotificationManager.class);
+        if(manager==null) return;
+        Intent resume=new Intent(this,AutoConnectService.class)
+            .setAction(ACTION_RESUME_CONTROL);
+        PendingIntent resumePending=PendingIntent.getService(this,3,resume,
+            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        Intent openUi=new Intent(this,MainActivity.class);
+        PendingIntent openPending=PendingIntent.getActivity(this,4,openUi,
+            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        Notification notice=new Notification.Builder(this,PAYMENT_NOTICE_CHANNEL)
+            .setSmallIcon(com.desktouch.vision.R.drawable.ic_desktouch)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setContentIntent(openPending)
+            .setAutoCancel(true)
+            .addAction(new Notification.Action.Builder(
+                null,"Resume Control",resumePending).build())
+            .build();
+        try { manager.notify(PAYMENT_NOTICE_ID,notice); }
+        catch(RuntimeException ignored) {}
+    }
+
     private Notification buildNotification() {
         Intent ui=new Intent(this,MainActivity.class);
         PendingIntent open=PendingIntent.getActivity(this,0,ui,
             PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
-        boolean active=DeskTouchAccessibilityService.ready(this);
+        boolean sysEnabled=PermissionContinuity.systemAccessibilityEnabled(this);
+        boolean shellReady=ShellInputClient.ready(this);
+        boolean active=shellReady || DeskTouchAccessibilityService.ready(this);
         boolean paused=DeskTouchAccessibilityService.isPausedForBanking(this);
-        String subtitle=active
-            ? "Connected & ready • Tap Pause before opening bank apps"
+        String subtitle=shellReady
+            ? (sysEnabled
+                ? "Virtual Bridge ACTIVE • Accessibility still ON (tap Turn Off for Payments)"
+                : "Accessibility OFF • Virtual Bridge ACTIVE (mouse & keyboard ready)")
+            : sysEnabled
+            ? (active
+                ? "Accessibility ON • Auto-turns off for payment apps & on disconnect"
+                : "Accessibility ON in Android Settings • Tap Turn Off for Payments")
             : paused
-                ? "Paused for banking • Wi-Fi stays ready"
-                : "Discovering and reconnecting trusted devices on your LAN";
+                ? "Payment-safe mode (Accessibility OFF) • Connections stay ready"
+                : "Accessibility OFF (payment apps work) • Connections stay ready";
         Notification.Builder builder=new Notification.Builder(this,CHANNEL)
             .setSmallIcon(com.desktouch.vision.R.drawable.ic_desktouch)
             .setContentTitle("DeskTouch Vision")
             .setContentText(subtitle)
             .setContentIntent(open)
             .setOngoing(true);
-        if(active) {
+        if(sysEnabled) {
             Intent pause=new Intent(this,AutoConnectService.class)
                 .setAction(ACTION_PAUSE_BANKING);
             PendingIntent pausePending=PendingIntent.getService(this,1,pause,
                 PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
             builder.addAction(new Notification.Action.Builder(
-                null,"Pause for Banking",pausePending).build());
-        } else if(paused || !DeskTouchAccessibilityService.allowed(this)) {
+                null,"Turn Off for Payments",pausePending).build());
+        } else if(!shellReady) {
             Intent resume=new Intent(this,AutoConnectService.class)
                 .setAction(ACTION_RESUME_CONTROL);
             PendingIntent resumePending=PendingIntent.getService(this,2,resume,
@@ -138,10 +267,17 @@ public final class AutoConnectService extends Service {
         super.onCreate();
         activeInstance=this;
         trust=new TrustedWindows(this);
+        hadConnectedWithAccessibility=
+            DeskTouchRuntime.connectedCount()>0 &&
+            PermissionContinuity.systemAccessibilityEnabled(this);
         NotificationManager manager=getSystemService(NotificationManager.class);
         NotificationChannel channel=new NotificationChannel(CHANNEL,
             "DeskTouch device sharing", NotificationManager.IMPORTANCE_LOW);
         manager.createNotificationChannel(channel);
+        NotificationChannel paymentChannel=new NotificationChannel(PAYMENT_NOTICE_CHANNEL,
+            "DeskTouch payment-safe mode", NotificationManager.IMPORTANCE_LOW);
+        paymentChannel.setShowBadge(false);
+        manager.createNotificationChannel(paymentChannel);
         Notification notification=buildNotification();
         if(Build.VERSION.SDK_INT>=29)
             startForeground(NOTIFICATION_ID,notification,
@@ -316,14 +452,17 @@ public final class AutoConnectService extends Service {
     @Override public int onStartCommand(Intent intent,int flags,int startId) {
         String action=intent!=null ? intent.getAction() : null;
         if(ACTION_PAUSE_BANKING.equals(action)) {
-            DeskTouchAccessibilityService.pauseForBanking(this);
+            boolean selfDisabled=DeskTouchAccessibilityService.pauseForBanking(
+                this,"Turned off from notification");
             refreshNotification();
+            if(!selfDisabled) {
+                DeskTouchAccessibilityService.openAccessibilitySettings(this,false);
+            }
         } else if(ACTION_RESUME_CONTROL.equals(action)) {
+            cancelPaymentNotice(this);
             DeskTouchAccessibilityService.setAllowed(this,true);
-            refreshNotification();
-            Intent settings=new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            try { startActivity(settings); } catch(RuntimeException ignored) {}
+            DeskTouchRuntime.accessibilityPermissionChanged(this);
+            DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
         }
         if(!enabled(this)) { stopSelf();return START_NOT_STICKY; }
         return START_STICKY;
@@ -331,6 +470,7 @@ public final class AutoConnectService extends Service {
     @Override public android.os.IBinder onBind(Intent intent) {return null;}
     @Override public void onDestroy() {
         if(activeInstance==this)activeInstance=null;
+        cancelDisconnectAutoPauseLocked();
         if(connectivityManager!=null && wifiCallback!=null) {
             try { connectivityManager.unregisterNetworkCallback(wifiCallback); }
             catch(Exception ignored) {}

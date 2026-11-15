@@ -44,6 +44,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _add = Button("Add devices", true);
     private readonly Button _copyCode = Button("Copy pairing code");
     private readonly Button _disconnect = Button("Disconnect");
+    private readonly Button _pausePhonePayments = Button("Pause phone for payments");
+    private readonly ToolStripMenuItem _pausePhonePaymentsTray = new("Pause phone for payments");
     private readonly Button _trustDevice = Button("Trust device");
     private readonly Button _manageTrusted = Button("Trusted devices");
     private readonly Button _nativeDisplaySettings = Button("Windows display settings");
@@ -166,7 +168,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Wrapping creates a hidden second row beneath the fixed-height
             // action bar at high Windows DPI. Keep one stable visible row.
             WrapContents = false, AutoScroll = true };
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _disconnect, _nativeDisplaySettings, _androidDownload })
+        _pausePhonePayments.Click += (_, _) => PausePhoneForPayments();
+        _pausePhonePaymentsTray.Click += (_, _) => PausePhoneForPayments();
+        foreach (var b in new[] { _add, _trustDevice, _copyCode, _pausePhonePayments, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -307,6 +311,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             using var view = new AndroidDownloadDialog();
             view.ShowDialog(this);
         });
+        _trayMenu.Items.Add(_pausePhonePaymentsTray);
         _trayMenu.Items.Add("Disconnect", null, (_, _) => DisconnectByUser());
         _startupMenu = new ToolStripMenuItem("Launch in tray when Windows starts")
         {
@@ -502,6 +507,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
         _copyCode.Enabled = _receiver?.CanAcceptNewPeer == true &&
             !_connecting && _host == null;
+        bool canPausePhone = _receiver?.HasReadyAndroidPeer ?? false;
+        _pausePhonePayments.Enabled = canPausePhone;
+        _pausePhonePaymentsTray.Enabled = canPausePhone;
         _disconnect.Enabled = _host != null ||
             _receiver?.ConnectedPeerCount > 0 || _connecting;
         var localScreens = _display.Local?.Monitors.Count ?? 0;
@@ -932,6 +940,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
                     _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
             _receiver.Start();
+            if (_adbBridge?.CurrentShellBridge is { } existingBridge)
+                _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret);
             try
             {
                 // Preserve UDP discovery even when the PC becomes an outgoing
@@ -949,7 +959,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             return neighbours;
                         }, () => _host == null);
                     _discovery.Start();
-                    _adbBridge ??= new AdbCableBridge(LogDiagnostic);
+                    _adbBridge ??= new AdbCableBridge(LogDiagnostic,
+                        (port, secret) => Volatile.Read(ref _receiver)?.SetShellBridgeAuth(port, secret));
                     BroadcastOnlinePresence();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
@@ -1822,6 +1833,22 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _retryTrustedAfter = DateTime.MinValue;
             _ = ScanTrustedAsync();
         });
+    }
+
+    private void PausePhoneForPayments()
+    {
+        if (_receiver == null) return;
+        int sent = _receiver.PauseConnectedAndroidForPayments();
+        if (sent > 0)
+        {
+            _pausePhonePayments.Enabled = false;
+            _pausePhonePaymentsTray.Enabled = false;
+            Status("Sent payment-safe pause request to your phone so payment apps work normally.");
+        }
+        else
+        {
+            Status("Phone Accessibility is already turned off or no ready phone is connected.");
+        }
     }
 
     protected override void Dispose(bool disposing)

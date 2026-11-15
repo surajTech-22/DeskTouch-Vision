@@ -178,6 +178,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly ConcurrentDictionary<int,Session> _sessions = new();
     private readonly object _authorityGate = new();
     private readonly object _layoutGate=new();
+    private readonly object _shellAuthGate = new();
+    private (int Port, string Secret)? _shellBridgeAuth;
     private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
         new(StringComparer.Ordinal);
     internal event Action<IReadOnlyDictionary<string,System.Drawing.PointF>>?
@@ -283,6 +285,52 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static bool AllowsAndroidCapability(ConnectedPeer source, Packet packet) =>
         source.Platform=="Android" && packet.Type=="android-capability" &&
         packet.A is 0 or 1;
+    internal static bool CanPauseAndroidForPayments(ConnectedPeer? peer) =>
+        peer != null && peer.Platform == "Android" && peer.SupportsReverseInput;
+
+    internal void SetShellBridgeAuth(int port, string secret)
+    {
+        if (port <= 0 || port > 65535 || string.IsNullOrWhiteSpace(secret)) return;
+        lock (_shellAuthGate)
+        {
+            if (_shellBridgeAuth is { } cur && cur.Port == port &&
+                string.Equals(cur.Secret, secret, StringComparison.Ordinal))
+                return;
+            _shellBridgeAuth = (port, secret);
+        }
+        _ = Task.Run(async () =>
+        {
+            foreach (var session in _sessions.Values)
+            {
+                if (session.Peer.Platform != "Android") continue;
+                try
+                {
+                    await SendToAsync(session,
+                        new Packet("shell-input-bridge", port, Text: secret),
+                        _cancel.Token);
+                }
+                catch (Exception) { /* peer may disconnect concurrently */ }
+            }
+        });
+    }
+
+    internal bool HasReadyAndroidPeer =>
+        _sessions.Values.Any(s => CanPauseAndroidForPayments(s.Peer));
+
+    internal int PauseConnectedAndroidForPayments()
+    {
+        int sent = 0;
+        foreach (var session in _sessions.Values)
+        {
+            if (!CanPauseAndroidForPayments(session.Peer)) continue;
+            TrySendReverseTo(session.Id, new Packet("reset"));
+            if (TrySendReverseTo(session.Id, new Packet("pause-accessibility")))
+                sent++;
+        }
+        if (sent > 0)
+            _status("Asked connected Android phone to turn off Accessibility for payments.");
+        return sent;
+    }
 
     internal static bool CanRoute(ConnectedPeer source, ConnectedPeer target,
         bool differentPeers, int claim) =>
@@ -1120,6 +1168,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 await SendToAsync(session, new Packet("udp-channel",
                     _udpHub.Port, session.Id, Text: session.UdpPeer.Base64Key), token);
             }
+            if (peer.Platform == "Android")
+            {
+                (int Port, string Secret)? shellAuth;
+                lock (_shellAuthGate) shellAuth = _shellBridgeAuth;
+                if (shellAuth is { } auth)
+                {
+                    await SendToAsync(session,
+                        new Packet("shell-input-bridge", auth.Port, Text: auth.Secret),
+                        token);
+                }
+            }
             await PublishEnvironmentAsync(token);
             while(!token.IsCancellationRequested)
             {
@@ -1280,7 +1339,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     PeerListChanged?.Invoke();
                     _status(canReceive
                         ? "Android Accessibility active on an existing secure connection."
-                        : "Android control paused for banking or helper turned off; phone stays connected.");
+                        : "Android Accessibility turned off for payments or paused; phone stays connected.");
                     continue;
                 }
                 if(p.Type=="environment-placement-update")

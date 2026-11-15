@@ -15,12 +15,14 @@ final class DeskTouchRuntime {
     private static volatile Consumer<String> listener;
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
+    private static volatile Context appContext;
     private static DeskTouchSession androidController;
     private DeskTouchRuntime(){}
 
     private static DeskTouchSession newSession(Context context,String id) {
-        return new DeskTouchSession(context.getApplicationContext(),
-            new TrustedWindows(context.getApplicationContext()),message->{
+        appContext=context.getApplicationContext();
+        return new DeskTouchSession(appContext,
+            new TrustedWindows(appContext),message->{
             lastStatus=message;
             Consumer<String> current=listener;
             if(current!=null)current.accept(message);
@@ -28,6 +30,7 @@ final class DeskTouchRuntime {
     }
 
     static synchronized DeskTouchSession session(Context context) {
+        appContext=context.getApplicationContext();
         // A reconnect service can establish the hub before the UI opens.
         if(selectedFingerprint==null ||
            (!sessions.containsKey(selectedFingerprint) &&
@@ -133,9 +136,19 @@ final class DeskTouchRuntime {
             session.onLiveRefreshRateChanged(refreshHz, frameTenthsMs);
     }
     static void accessibilityPermissionChanged(){
+        accessibilityPermissionChanged(appContext);
+    }
+    static void accessibilityPermissionChanged(Context context){
+        if(context!=null)appContext=context.getApplicationContext();
+        Context ctx=appContext;
         for(DeskTouchSession session:sessions.values())
             session.publishAccessibilityCapability();
         AutoConnectService.refreshNotification();
+        AutoConnectService.onAccessibilityStateChanged(ctx);
+        if(ctx!=null){
+            PaymentPauseWidgetProvider.updateAll(ctx);
+            BankingPauseTileService.requestRefresh(ctx);
+        }
     }
     static void pointerOverlayUnavailable(){
         // Report an actionable status without leaking pointer coordinates,

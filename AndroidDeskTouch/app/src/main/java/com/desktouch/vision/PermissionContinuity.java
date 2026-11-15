@@ -50,16 +50,31 @@ final class PermissionContinuity {
     }
 
     static String state(Context context){
-        if(DeskTouchAccessibilityService.isPausedForBanking(context))
-            return "Paused for banking. Tap Resume when finished opening your bank app.";
-        if(!DeskTouchAccessibilityService.allowed(context))
-            return "Windows control disabled in DeskTouch (user preference retained).";
-        if(!systemAccessibilityEnabled(context))
-            return "Android Accessibility is OFF. Xiaomi/Android may disable it after an update. " +
-                "Re-enable DeskTouch Windows control in Android Accessibility settings.";
+        boolean sysEnabled=systemAccessibilityEnabled(context);
+        boolean shellReady=ShellInputClient.ready(context);
+        if(shellReady){
+            return sysEnabled
+                ? "Accessibility-free Virtual Bridge is ACTIVE (Accessibility is also ON; turn it off anytime for payment apps)."
+                : "Accessibility-free Virtual Bridge is ACTIVE (Accessibility is OFF — full mouse & keyboard ready).";
+        }
+        if(DeskTouchAccessibilityService.isPausedForBanking(context)){
+            if(sysEnabled)
+                return "Turning off Android Accessibility for payment apps... Tap Turn Off for Payments if it stays on.";
+            String reason=DeskTouchAccessibilityService.lastPauseReason(context);
+            return (reason!=null && !reason.isEmpty() ? reason + ". " : "Accessibility is OFF for payment/banking apps. ")
+                + "Tap Resume Control when back at your computer.";
+        }
+        if(!DeskTouchAccessibilityService.allowed(context)){
+            if(sysEnabled)
+                return "Remote control unchecked in DeskTouch, but Android Accessibility is still ON in system settings (turn off for payment apps).";
+            return "Windows control disabled in DeskTouch (Android Accessibility is OFF).";
+        }
+        if(!sysEnabled)
+            return "Android Accessibility is OFF (payment apps work normally). " +
+                "Re-enable DeskTouch Windows control when you want remote mouse/keyboard.";
         if(!DeskTouchAccessibilityService.ready(context))
             return "Android Accessibility is enabled; waiting for the system to bind the service.";
-        return "Windows control approved; Android Accessibility is active.";
+        return "Android Accessibility is ACTIVE (auto-turns off when opening payment apps or after disconnect).";
     }
 
     static void checkpointBeforeInstaller(Context context){

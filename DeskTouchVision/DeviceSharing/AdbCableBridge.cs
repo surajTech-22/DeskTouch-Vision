@@ -1,26 +1,45 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace DeskTouch.DeviceShare;
 
 /// <summary>
 /// Automatically configures localhost USB data-cable forwarding (`adb reverse`)
-/// for discovery (TCP 37378) and TLS control/input (TCP 37377) whenever an
-/// authorized Android device is attached over USB. Fails closed and never
-/// bridges wireless ADB targets or alters firewall/pairing rules.
+/// for discovery (TCP 37378) and TLS control/input (TCP 37377), and launches
+/// DeskTouch's Accessibility-free `/dev/uhid` `ShellInputDaemon` over authorized
+/// ADB (`app_process`) with one-time stdin credentials.
 /// </summary>
 internal sealed class AdbCableBridge : IDisposable
 {
+    private const string AndroidAppPackage = "com.desktouch.vision";
+    private const string ShellPortFile = "/data/local/tmp/dt_s.port";
+    private const string ShellTokenFile = "/data/local/tmp/dt_s.tok";
+    private const long BridgeRecheckIntervalMs = 15000;
+
     private readonly Action<string>? _log;
+    private readonly Action<int, string>? _onShellBridgeReady;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _wake = new(0, 1);
     private readonly Dictionary<string, long> _bridgedSerials = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (int Port, string Secret, long LastCheckedMs)> _shellBridges =
+        new(StringComparer.Ordinal);
+    private readonly HashSet<string> _loggedMissingAppSerials = new(StringComparer.Ordinal);
+    private readonly object _shellGate = new();
+    private (int Port, string Secret)? _currentShellBridge;
     private readonly Task _loop;
     private int _disposed;
 
-    internal AdbCableBridge(Action<string>? log = null)
+    internal AdbCableBridge(Action<string>? log = null, Action<int, string>? onShellBridgeReady = null)
     {
         _log = log;
+        _onShellBridgeReady = onShellBridgeReady;
         _loop = Task.Run(RunAsync);
+    }
+
+    internal (int Port, string Secret)? CurrentShellBridge
+    {
+        get { lock (_shellGate) return _currentShellBridge; }
     }
 
     internal void TriggerRefresh()
@@ -92,7 +111,13 @@ internal sealed class AdbCableBridge : IDisposable
         return null;
     }
 
-    internal static IReadOnlyList<string> ParseWiredAdbSerials(string adbDevicesOutput)
+    internal static IReadOnlyList<string> ParseWiredAdbSerials(string adbDevicesOutput) =>
+        ParseAdbSerials(adbDevicesOutput, wiredOnly: true);
+
+    internal static IReadOnlyList<string> ParseConnectedAdbSerials(string adbDevicesOutput) =>
+        ParseAdbSerials(adbDevicesOutput, wiredOnly: false);
+
+    private static IReadOnlyList<string> ParseAdbSerials(string adbDevicesOutput, bool wiredOnly)
     {
         if (string.IsNullOrWhiteSpace(adbDevicesOutput))
             return Array.Empty<string>();
@@ -114,9 +139,8 @@ internal sealed class AdbCableBridge : IDisposable
                 continue;
 
             string serial = parts[0];
-            // Never install a reverse loop over wireless ADB (ip:port or mDNS TLS).
-            if (serial.Contains(':') ||
-                serial.Contains("_adb-tls", StringComparison.OrdinalIgnoreCase))
+            if (wiredOnly && (serial.Contains(':') ||
+                serial.Contains("_adb-tls", StringComparison.OrdinalIgnoreCase)))
                 continue;
 
             if (seen.Add(serial))
@@ -124,6 +148,41 @@ internal sealed class AdbCableBridge : IDisposable
         }
         return result;
     }
+
+    internal static int ParsePortOutput(string output)
+    {
+        if (string.IsNullOrWhiteSpace(output)) return 0;
+        using var reader = new StringReader(output);
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            string trimmed = line.Trim();
+            if (trimmed.StartsWith("PORT=", StringComparison.Ordinal))
+                trimmed = trimmed["PORT=".Length..].Trim();
+            if (int.TryParse(trimmed, out int port) && port > 0 && port <= 65535)
+                return port;
+        }
+        return 0;
+    }
+
+    internal static string BuildShellCheckScript(int expectedPort) =>
+        $"APK=$(pm path {AndroidAppPackage} 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\\r'); " +
+        "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
+        "PID=$(pgrep -f 'com\\.desktouch\\.vision\\.[S]hellInputDaemon' | head -n 1 | tr -d '\\r'); " +
+        $"PORT=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); " +
+        $"if [ -n \"$PID\" ] && [ \"$PORT\" = \"{expectedPort}\" ]; then echo \"PORT=$PORT\"; else echo NEEDED; fi";
+
+    internal static string BuildShellDaemonScript() =>
+        $"umask 077; rm -f {ShellPortFile} {ShellTokenFile}; " +
+        $"APK=$(pm path {AndroidAppPackage} 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\\r'); " +
+        "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
+        "IFS= read -r TK || exit 2; " +
+        $"printf '%s\\n' \"$TK\" > {ShellTokenFile}; unset TK; " +
+        "pkill -f 'com\\.desktouch\\.vision\\.[S]hellInputDaemon' >/dev/null 2>&1 || true; " +
+        $"{{ exec < {ShellTokenFile}; rm -f {ShellTokenFile}; CLASSPATH=\"$APK\" exec setsid /system/bin/app_process /system/bin com.desktouch.vision.ShellInputDaemon --port-file {ShellPortFile} >/dev/null 2>&1; }} </dev/null >/dev/null 2>&1 & " +
+        "i=0; while [ \"$i\" -lt 40 ]; do " +
+        $"[ -s {ShellPortFile} ] && {{ P=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); [ -n \"$P\" ] && {{ echo \"PORT=$P\"; exit 0; }}; }}; " +
+        "sleep 0.05 2>/dev/null || sleep 1; i=$((i+1)); done; echo NO_PORT";
 
     internal static bool HasReverseMappings(string reverseListOutput, params int[] ports)
     {
@@ -198,7 +257,7 @@ internal sealed class AdbCableBridge : IDisposable
         foreach (string serial in wiredSerials)
         {
             bool newlyAttached = !_bridgedSerials.TryGetValue(serial, out long lastCheckedMs);
-            if (!newlyAttached && nowMs - lastCheckedMs < 15000)
+            if (!newlyAttached && nowMs - lastCheckedMs < BridgeRecheckIntervalMs)
                 continue;
 
             var (listOk, listOut) = await RunAdbAsync(adbPath, token, "-s", serial, "reverse", "--list");
@@ -222,10 +281,72 @@ internal sealed class AdbCableBridge : IDisposable
                     _log?.Invoke($"Data cable bridge ready for USB device ({serial}) on ports {Wire.Port}/{NearbyComputerDiscovery.DiscoveryPort}.");
             }
         }
+
+        await SyncShellInputDaemonsAsync(adbPath, devicesOut, nowMs, token);
     }
 
-    private static async Task<(bool Ok, string StdOut)> RunAdbAsync(
-        string adbPath, CancellationToken token, params string[] arguments)
+    private async Task SyncShellInputDaemonsAsync(
+        string adbPath, string devicesOut, long nowMs, CancellationToken token)
+    {
+        IReadOnlyList<string> connectedSerials = ParseConnectedAdbSerials(devicesOut);
+        var present = new HashSet<string>(connectedSerials, StringComparer.Ordinal);
+        foreach (string gone in _shellBridges.Keys.Where(s => !present.Contains(s)).ToList())
+        {
+            _shellBridges.Remove(gone);
+            _loggedMissingAppSerials.Remove(gone);
+        }
+
+        foreach (string serial in connectedSerials)
+        {
+            bool hasKnown = _shellBridges.TryGetValue(serial, out var existing);
+            if (hasKnown && nowMs - existing.LastCheckedMs < BridgeRecheckIntervalMs)
+                continue;
+
+            int expectedPort = hasKnown ? existing.Port : 0;
+            var (checkOk, checkOut) = await RunAdbAsync(
+                adbPath, token, "-s", serial, "shell", BuildShellCheckScript(expectedPort));
+            if (!checkOk) continue;
+
+            if (checkOut.Contains("NO_APP", StringComparison.Ordinal))
+            {
+                if (_loggedMissingAppSerials.Add(serial))
+                    _log?.Invoke($"Virtual Bridge waiting: DeskTouch Vision app is not installed yet on device ({serial}).");
+                continue;
+            }
+            _loggedMissingAppSerials.Remove(serial);
+
+            if (hasKnown && ParsePortOutput(checkOut) == existing.Port)
+            {
+                _shellBridges[serial] = (existing.Port, existing.Secret, nowMs);
+                continue;
+            }
+
+            string secret = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+            var (launchOk, launchOut) = await RunAdbWithStdinAsync(
+                adbPath, secret + "\n", token, "-s", serial, "shell", BuildShellDaemonScript());
+            if (!launchOk) continue;
+
+            int port = ParsePortOutput(launchOut);
+            if (port <= 0)
+            {
+                _log?.Invoke($"Virtual Bridge launch on device ({serial}) did not report a loopback port.");
+                continue;
+            }
+
+            _shellBridges[serial] = (port, secret, nowMs);
+            lock (_shellGate)
+                _currentShellBridge = (port, secret);
+            _log?.Invoke($"Accessibility-free Virtual Bridge ready on device ({serial}) loopback port {port}.");
+            _onShellBridgeReady?.Invoke(port, secret);
+        }
+    }
+
+    private static Task<(bool Ok, string StdOut)> RunAdbAsync(
+        string adbPath, CancellationToken token, params string[] arguments) =>
+        RunAdbWithStdinAsync(adbPath, null, token, arguments);
+
+    private static async Task<(bool Ok, string StdOut)> RunAdbWithStdinAsync(
+        string adbPath, string? stdInText, CancellationToken token, params string[] arguments)
     {
         try
         {
@@ -236,6 +357,7 @@ internal sealed class AdbCableBridge : IDisposable
                     FileName = adbPath,
                     UseShellExecute = false,
                     CreateNoWindow = true,
+                    RedirectStandardInput = stdInText != null,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 }
@@ -245,6 +367,14 @@ internal sealed class AdbCableBridge : IDisposable
 
             if (!process.Start())
                 return (false, string.Empty);
+
+            if (stdInText != null)
+            {
+                byte[] inputBytes = Encoding.ASCII.GetBytes(stdInText);
+                await process.StandardInput.BaseStream.WriteAsync(inputBytes, token);
+                await process.StandardInput.BaseStream.FlushAsync(token);
+                process.StandardInput.Close();
+            }
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
             // Cold-starting the adb server on Windows can take ~5s before `devices` returns.

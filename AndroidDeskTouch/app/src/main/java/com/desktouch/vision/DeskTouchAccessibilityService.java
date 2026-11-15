@@ -7,7 +7,9 @@ import android.text.InputType;
 import android.view.inputmethod.EditorInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.os.Build;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Canvas;
@@ -16,6 +18,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -28,6 +31,7 @@ import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.FrameLayout;
+import android.widget.Toast;
 import java.util.ArrayDeque;
 import java.util.List;
 
@@ -40,9 +44,13 @@ import java.util.List;
 public final class DeskTouchAccessibilityService extends AccessibilityService {
     private static volatile DeskTouchAccessibilityService instance;
     private static volatile Boolean cachedAllowed;
+    private static volatile boolean unbinding;
     private static final String PREFS="desktouch_android_control";
     private static final String ALLOWED="user_allowed_windows_control";
     private static final String PAUSED_FOR_BANKING="paused_for_banking";
+    private static final String AUTO_PAUSE_PAYMENT_APPS="auto_pause_payment_apps";
+    private static final String AUTO_PAUSE_ON_DISCONNECT="auto_pause_on_disconnect";
+    private static final String LAST_PAUSE_REASON="last_pause_reason";
     private final Handler ui=new Handler(Looper.getMainLooper());
     private WindowManager windows;
     private FrameLayout cursorRoot;
@@ -136,6 +144,56 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
             .getBoolean(PAUSED_FOR_BANKING,false);
     }
+    static boolean autoPausePaymentAppsEnabled(Context context){
+        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+            .getBoolean(AUTO_PAUSE_PAYMENT_APPS,true);
+    }
+    static void setAutoPausePaymentApps(Context context,boolean enabled){
+        context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+            .putBoolean(AUTO_PAUSE_PAYMENT_APPS,enabled).apply();
+    }
+    static boolean autoPauseOnDisconnectEnabled(Context context){
+        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+            .getBoolean(AUTO_PAUSE_ON_DISCONNECT,true);
+    }
+    static void setAutoPauseOnDisconnect(Context context,boolean enabled){
+        context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+            .putBoolean(AUTO_PAUSE_ON_DISCONNECT,enabled).apply();
+        AutoConnectService.onAccessibilityStateChanged(context);
+    }
+    static String lastPauseReason(Context context){
+        return context.getSharedPreferences(PREFS,Context.MODE_PRIVATE)
+            .getString(LAST_PAUSE_REASON,"");
+    }
+    static Intent accessibilitySettingsIntent(Context context){
+        Context app=context.getApplicationContext();
+        Intent intent=new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        String component=new ComponentName(app,DeskTouchAccessibilityService.class)
+            .flattenToString();
+        Bundle args=new Bundle();
+        args.putString(":settings:fragment_args_key",component);
+        intent.putExtra(":settings:fragment_args_key",component);
+        intent.putExtra(":settings:show_fragment_args",args);
+        return intent;
+    }
+    static void openAccessibilitySettings(Context context,boolean turningOn){
+        if(context==null)return;
+        Context app=context.getApplicationContext();
+        try{
+            context.startActivity(accessibilitySettingsIntent(app));
+        }catch(RuntimeException ignored){
+            try{
+                context.startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            }catch(RuntimeException ignoredAgain){}
+        }
+        final String hint=turningOn
+            ? "Open Downloaded apps -> DeskTouch Windows control -> Turn ON"
+            : "Open Downloaded apps -> DeskTouch Windows control -> Turn OFF";
+        new Handler(Looper.getMainLooper()).post(()->
+            Toast.makeText(app,hint,Toast.LENGTH_LONG).show());
+    }
     static void setAllowed(Context context,boolean allowed){
         // Persist the user's app-level approval synchronously BEFORE the
         // package installer can kill this process. In-place signed upgrades
@@ -143,7 +201,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         android.content.SharedPreferences.Editor editor=
             context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
                 .putBoolean(ALLOWED,allowed);
-        if(allowed)editor.putBoolean(PAUSED_FOR_BANKING,false);
+        if(allowed){
+            editor.putBoolean(PAUSED_FOR_BANKING,false);
+            editor.remove(LAST_PAUSE_REASON);
+        }
         if(!editor.commit())
             throw new IllegalStateException("Cannot save Android control preference");
         cachedAllowed=allowed;
@@ -156,30 +217,44 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             DeskTouchRuntime.remoteNativeTouch();
         }
     }
-    static void pauseForBanking(Context context){
-        if(!context.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
+    static boolean pauseForBanking(Context context){
+        return pauseForBanking(context,"Turned off for payment/banking apps");
+    }
+    static boolean pauseForBanking(Context context,String reason){
+        Context app=context.getApplicationContext();
+        if(!app.getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
             .putBoolean(ALLOWED,false)
             .putBoolean(PAUSED_FOR_BANKING,true)
+            .putString(LAST_PAUSE_REASON,reason==null ? "" : reason)
             .commit())
             throw new IllegalStateException("Cannot save banking pause preference");
         cachedAllowed=false;
         RemoteInputPower.end();
         DeskTouchAccessibilityService service=instance;
+        boolean selfDisableRequested=false;
         if(service!=null){
+            unbinding=true;
             service.remoteActive=false;
             service.ui.post(()->{
                 service.removePointer();
                 service.disableSelf();
             });
+            service.ui.postDelayed(()->{
+                unbinding=false;
+                DeskTouchRuntime.accessibilityPermissionChanged(app);
+            },450);
+            selfDisableRequested=true;
         }
         DeskTouchRuntime.remoteNativeTouch();
-        DeskTouchRuntime.accessibilityPermissionChanged();
+        DeskTouchRuntime.accessibilityPermissionChanged(app);
+        return selfDisableRequested || !PermissionContinuity.systemAccessibilityEnabled(app);
     }
     static boolean ready(Context context){
         return instance!=null && allowed(context);
     }
     @Override public void onServiceConnected(){
         super.onServiceConnected();
+        unbinding=false;
         instance=this;
         cachedAllowed=null;
         fullOverlayRejected=false;
@@ -187,10 +262,12 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         catch(RuntimeException ignored) { choreographer=null; }
         if(isPausedForBanking(this))
             getSharedPreferences(PREFS,Context.MODE_PRIVATE).edit()
-                .putBoolean(PAUSED_FOR_BANKING,false).apply();
+                .putBoolean(PAUSED_FOR_BANKING,false)
+                .remove(LAST_PAUSE_REASON).apply();
+        AutoConnectService.cancelPaymentNotice(this);
         windows=(WindowManager)getSystemService(WINDOW_SERVICE);
         refreshDisplayGeometry();
-        DeskTouchRuntime.accessibilityPermissionChanged();
+        DeskTouchRuntime.accessibilityPermissionChanged(this);
     }
     private void refreshDisplayGeometry(){
         PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(this);
@@ -208,10 +285,24 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         DeskTouchRuntime.publishPhoneGeometry();
     }
     @Override public void onAccessibilityEvent(AccessibilityEvent event){
+        if(event==null)return;
+        int type=event.getEventType();
+        if(type==AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED){
+            if(!unbinding && autoPausePaymentAppsEnabled(this)){
+                CharSequence pkg=event.getPackageName();
+                if(PaymentAppDetector.isPaymentOrBankingPackage(pkg)){
+                    String appName=PaymentAppDetector.friendlyAppName(this,pkg);
+                    String reason="Auto-turned off when opening "+appName;
+                    Log.i("DeskTouch","Auto-turning off Accessibility for "+appName);
+                    pauseForBanking(this,reason);
+                    AutoConnectService.notifyAutoPausedForPayment(this,appName);
+                }
+            }
+            return;
+        }
         // Touch from the phone user takes priority over remote input.
         // Events generated by our own approved gestures are ignored.
-        if(event!=null&&event.getEventType()==
-            AccessibilityEvent.TYPE_TOUCH_INTERACTION_START && !remoteGesture){
+        if(type==AccessibilityEvent.TYPE_TOUCH_INTERACTION_START && !remoteGesture){
             DeskTouchRuntime.remoteNativeTouch();
             hidePointer();
         }
@@ -221,6 +312,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         removePointer();
     }
     @Override public void onDestroy(){
+        unbinding=false;
         if(instance==this)instance=null;
         if(choreographer!=null){
             try{choreographer.removeFrameCallback(frameCallback);}

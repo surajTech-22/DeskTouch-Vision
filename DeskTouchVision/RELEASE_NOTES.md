@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.40 — Accessibility-Free Virtual Bridge & Payment-Safe Mode
+
+DeskTouch Vision now controls your Android phone's mouse cursor, clicks, scroll wheel, and keyboard without enabling Android Accessibility Settings whenever activated from your connected Windows PC, while keeping 1-tap and automatic Accessibility pause controls ready when Accessibility mode is used.
+
+- **Accessibility-free Virtual Mouse & Keyboard Bridge:** When an authorized phone is connected over its data cable, DeskTouch launches a local virtual pointer and keyboard daemon directly via Android's shell privilege (`app_process` `/dev/uhid`), receives a fresh loopback token over the mutual-TLS connection, and tears down virtual hardware cleanly between handoffs so on-screen typing stays unaffected.
+- **Payment-safe automatic Accessibility pause & Home widget:** When using Android Accessibility fallback, DeskTouch automatically turns Accessibility off upon opening common payment or banking apps and 15 seconds after disconnect, adds a 1-tap "Pause phone for payments" control on Windows plus a Home screen Pay Mode button on Android, and keeps remote control status visible in notifications and Quick Settings.
+
+---
+
 # DeskTouch Vision v0.3.39 — Responsive Pacing Caps, Automatic USB Data-Cable Routing & Low-Latency Tracking
 
 DeskTouch Vision cuts wireless frame-pacing caps in half on high-refresh phones, removes Android display-mode ceiling clamping above 144 Hz, doubles background probe responsiveness, and automatically upgrades plugged-in Android phones onto a direct USB data-cable tunnel with zero artificial pacing delay.

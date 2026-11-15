@@ -861,4 +861,36 @@ public final class ProtocolSourceTest {
         // -1229px from bottom-right corner: first -127 counts at 0.5 (-63.5px), remaining -1165.5px at 1.5 (-777 counts) = -904
         assertEquals("Middle-screen entry must not overshoot 3x using scale-only division", -904, entry.rawY);
     }
+
+    @Test
+    public void continuousStepsCapToHidLimitAndDaemonPacingAlignsWithMinFrame() {
+        long gap144 = ShellPointerMath.computeDaemonPacingIntervalNs(144);
+        assertTrue("144 Hz UHID pacing must exceed minFrameSec and stay under 1x frame",
+            gap144 >= 4_000_000L && gap144 <= 6_000_000L);
+
+        ShellPointerMath.VelocityParams parsed = ShellPointerMath.parseDumpsysVelocityParams(
+            "    PointerVelocityControlParameters: scale=0.500, lowThreshold=500.000, highThreshold=3000.000, acceleration=3.000");
+        ShellPointerMath.PointerCompensator comp = new ShellPointerMath.PointerCompensator();
+        comp.configure(1080, 2460, parsed, 144);
+        long t = 3_000_000_000L;
+        ShellPointerMath.MoveStep entry = comp.stepTo(540, 200, t);
+        assertTrue(entry.needsAnchorReset);
+
+        // Fast continuous swipe must stay within single 8-bit HID report [-127, 127] and settle cleanly.
+        t += gap144;
+        ShellPointerMath.MoveStep fast = comp.stepTo(540, 620, t);
+        assertFalse(fast.needsAnchorReset);
+        assertTrue("Continuous UHID step must never split into microsecond multi-report bursts",
+            Math.abs(fast.rawX) <= 127 && Math.abs(fast.rawY) <= 127);
+        assertTrue("Continuous swipe must advance positive Y", fast.rawY > 0);
+        int settleSteps = 0;
+        for (int i = 0; i < 8; i++) {
+            t += gap144;
+            ShellPointerMath.MoveStep next = comp.stepTo(540, 620, t);
+            assertTrue(Math.abs(next.rawX) <= 127 && Math.abs(next.rawY) <= 127);
+            if (!next.hasMotion()) break;
+            settleSteps++;
+        }
+        assertTrue("Continuous swipe excess must settle quickly across paced frames", settleSteps >= 1 && settleSteps <= 5);
+    }
 }

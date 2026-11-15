@@ -1,3 +1,7 @@
+# DeskTouch Vision v0.3.49 — Reliable Trust Persistence, Smooth 144Hz Cursor Motion & Low-Latency Cable Ping
+
+Fixes "Trusted computers saved: 0" persistence failures and UI refresh delays on Android, eliminates initial UHID buffer overruns and microsecond cursor burst stalls for smooth 144Hz tracking without frame skipping, and prioritizes ping/pong heartbeats over pointer traffic to keep wired ping well under 10ms.
+
 # DeskTouch Vision v0.3.48 — Native Screen Dimensions, Smooth Un-broken Movement & Reliable Trusted Device Linking
 
 Fixes the v0.3.47 cursor stalling/breaking regression, preserves the connected Android phone's real original screen dimensions without comparing or shrinking against Windows monitors, and ensures trusted device linking works reliably from either device without losing saved keys or creating duplicate records.

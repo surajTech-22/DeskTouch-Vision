@@ -1340,7 +1340,7 @@ internal sealed class FastMovePacer : IDisposable
             double elapsedMs = _lastMoveUdpTicks == 0
                 ? minInterval
                 : (Stopwatch.GetTimestamp() - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
-            dueMs = (int)Math.Ceiling(Math.Max(1.0, minInterval - elapsedMs));
+            dueMs = Math.Max(1, (int)Math.Round(minInterval - elapsedMs));
         }
         else
         {

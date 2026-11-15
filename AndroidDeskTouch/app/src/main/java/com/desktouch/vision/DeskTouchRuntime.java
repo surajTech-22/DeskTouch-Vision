@@ -51,16 +51,42 @@ final class DeskTouchRuntime {
     static synchronized DeskTouchSession session(Context context) {
         appContext=context.getApplicationContext();
         // A reconnect service can establish the hub before the UI opens.
-        if(selectedFingerprint==null ||
-           (!sessions.containsKey(selectedFingerprint) &&
-            !sessions.isEmpty())){
-            selectedFingerprint=null;
+        DeskTouchSession current=selectedFingerprint!=null
+            ? sessions.get(selectedFingerprint) : null;
+        boolean needSelect=selectedFingerprint==null
+            || "__unselected__".equals(selectedFingerprint)
+            || current==null
+            || (!current.isConnected() && !current.isConnecting());
+        if(needSelect && !sessions.isEmpty()){
+            String nextId=null;
             for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
-                if(entry.getValue().isConnected()){
-                    selectedFingerprint=entry.getKey();break;
+                if(!"__unselected__".equals(entry.getKey()) && entry.getValue().isConnected()){
+                    nextId=entry.getKey();break;
                 }
             }
-            if(selectedFingerprint==null)selectedFingerprint="__unselected__";
+            if(nextId==null){
+                for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
+                    if(!"__unselected__".equals(entry.getKey()) && entry.getValue().isConnecting()){
+                        nextId=entry.getKey();break;
+                    }
+                }
+            }
+            if(nextId==null && (current==null || "__unselected__".equals(selectedFingerprint))){
+                for(String key:sessions.keySet()){
+                    if(!"__unselected__".equals(key)){
+                        nextId=key;break;
+                    }
+                }
+            }
+            if(nextId!=null){
+                selectedFingerprint=nextId;
+                DeskTouchSession stale=sessions.remove("__unselected__");
+                if(stale!=null && !stale.isConnected()) stale.close();
+            } else if(selectedFingerprint==null){
+                selectedFingerprint="__unselected__";
+            }
+        } else if(selectedFingerprint==null){
+            selectedFingerprint="__unselected__";
         }
         return sessions.computeIfAbsent(selectedFingerprint,
             id->newSession(context,id));

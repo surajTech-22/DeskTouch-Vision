@@ -106,10 +106,10 @@ final class ShellPointerMath {
 
     static long computeDaemonPacingIntervalNs(int refreshHz) {
         int clampedHz = Math.max(60, Math.min(240, refreshHz > 0 ? refreshHz : 60));
-        // Space reports slightly denser than half-frame (and below PC cable pacer) so
-        // healthy paced input emits with 0ms wait while USB bulk clumps are separated evenly.
-        long ns = Math.round(425_000_000.0 / clampedHz);
-        return Math.max(2_300_000L, Math.min(5_000_000L, ns));
+        // Space reports slightly denser than 1x display refresh so every VSYNC receives
+        // a fresh position while USB/TCP clumps never outpace minFrameSec or evdev.
+        long ns = Math.round(780_000_000.0 / clampedHz);
+        return Math.max(4_000_000L, Math.min(12_000_000L, ns));
     }
 
     /**
@@ -230,12 +230,12 @@ final class ShellPointerMath {
             if (!anchored) {
                 double minScale = Math.max(0.25, params.scale);
                 double highGain = Math.max(minScale, minScale * Math.max(1.0, params.acceleration));
-                int pull = (int) Math.min(20000L,
-                    Math.round(Math.max(screenWidth, screenHeight) * 2.5 / minScale));
+                int pullXMag = (int) Math.min(12000L, Math.round(screenWidth * 1.15 / minScale));
+                int pullYMag = (int) Math.min(14000L, Math.round(screenHeight * 1.15 / minScale));
                 int cornerX = tx > (screenWidth - 1) * 0.5 ? (screenWidth - 1) : 0;
                 int cornerY = ty > (screenHeight - 1) * 0.5 ? (screenHeight - 1) : 0;
-                int pullX = cornerX == 0 ? -pull : pull;
-                int pullY = cornerY == 0 ? -pull : pull;
+                int pullX = cornerX == 0 ? -pullXMag : pullXMag;
+                int pullY = cornerY == 0 ? -pullYMag : pullYMag;
 
                 // Sign reversal from corner pull resets AOSP VelocityTracker on report 1
                 // (at minScale); additional burst reports saturate at scale * acceleration.
@@ -282,7 +282,7 @@ final class ShellPointerMath {
                 return new MoveStep(false, 0, 0, 0, 0, 0, 0);
             }
 
-            double minFrameSec = Math.max(0.0025, 0.7 / Math.max(60, refreshHz));
+            double minFrameSec = Math.max(0.0025, 0.45 / Math.max(60, refreshHz));
             double dtSec;
             if (lastReportNs <= 0L || nowNs <= lastReportNs) {
                 dtSec = minFrameSec;
@@ -307,28 +307,36 @@ final class ShellPointerMath {
             double modelGain = gainForOutputSpeed(smoothedOutSpeed, params);
             double gain = params.scale + (modelGain - params.scale) * 0.85;
 
-            int rawX = (int) Math.round(dx / gain);
-            int rawY = (int) Math.round(dy / gain);
+            int rawX = clampRelative8((int) Math.round(dx / gain));
+            int rawY = clampRelative8((int) Math.round(dy / gain));
             if (hitLeft || pushingLeft) {
-                if (hitLeft) rawX -= edgeSnapCounts();
-                if (pushingLeft) rawX += edgePushRaw(pushX, params.scale);
-                cursorX = 0.0;
+                int extraX = (hitLeft ? -edgeSnapCounts() : 0)
+                    + (pushingLeft ? edgePushRaw(pushX, params.scale) : 0);
+                rawX = clampRelative8(rawX + extraX);
+                double nextX = cursorX + rawX * gain;
+                cursorX = (nextX <= 0.0 || Math.abs(rawX) < 127) ? 0.0 : nextX;
             } else if (hitRight || pushingRight) {
-                if (hitRight) rawX += edgeSnapCounts();
-                if (pushingRight) rawX += edgePushRaw(pushX, params.scale);
-                cursorX = screenWidth - 1;
+                int extraX = (hitRight ? edgeSnapCounts() : 0)
+                    + (pushingRight ? edgePushRaw(pushX, params.scale) : 0);
+                rawX = clampRelative8(rawX + extraX);
+                double nextX = cursorX + rawX * gain;
+                cursorX = (nextX >= screenWidth - 1 || Math.abs(rawX) < 127) ? screenWidth - 1 : nextX;
             } else {
                 cursorX = Math.max(0.0, Math.min(screenWidth - 1, cursorX + rawX * gain));
             }
 
             if (hitTop || pushingTop) {
-                if (hitTop) rawY -= edgeSnapCounts();
-                if (pushingTop) rawY += edgePushRaw(pushY, params.scale);
-                cursorY = 0.0;
+                int extraY = (hitTop ? -edgeSnapCounts() : 0)
+                    + (pushingTop ? edgePushRaw(pushY, params.scale) : 0);
+                rawY = clampRelative8(rawY + extraY);
+                double nextY = cursorY + rawY * gain;
+                cursorY = (nextY <= 0.0 || Math.abs(rawY) < 127) ? 0.0 : nextY;
             } else if (hitBottom || pushingBottom) {
-                if (hitBottom) rawY += edgeSnapCounts();
-                if (pushingBottom) rawY += edgePushRaw(pushY, params.scale);
-                cursorY = screenHeight - 1;
+                int extraY = (hitBottom ? edgeSnapCounts() : 0)
+                    + (pushingBottom ? edgePushRaw(pushY, params.scale) : 0);
+                rawY = clampRelative8(rawY + extraY);
+                double nextY = cursorY + rawY * gain;
+                cursorY = (nextY >= screenHeight - 1 || Math.abs(rawY) < 127) ? screenHeight - 1 : nextY;
             } else {
                 cursorY = Math.max(0.0, Math.min(screenHeight - 1, cursorY + rawY * gain));
             }
@@ -350,6 +358,10 @@ final class ShellPointerMath {
             double remainingPx = jumpDelta - firstReportPx;
             int tailCounts = (int) Math.round(remainingPx / Math.max(0.25, highGain));
             return (int) Math.round(sign * 127.0) + tailCounts;
+        }
+
+        private static int clampRelative8(int value) {
+            return Math.max(-127, Math.min(127, value));
         }
 
         private static int edgePushRaw(int pushDelta, double scale) {

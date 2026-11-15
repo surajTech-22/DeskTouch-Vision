@@ -87,6 +87,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal long LastTcpPingMs;
         internal double TcpRttMs;
         internal int CableDetachedOrUnresponsive;
+        internal int UrgentControlWaiters;
+        internal int CablePingInFlight;
         internal AdaptiveLinkTracker CableTracker = new("cable");
         internal long LastPongTicks;
         internal string LinkBand = "wireless";
@@ -803,11 +805,44 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         finally { session.Write.Release(); }
     }
 
-    private static async Task SendCablePingAsync(Session session, CancellationToken token)
+    private static async Task SendMoveToAsync(Session session, Packet packet,
+        CancellationToken token)
     {
+        while (Volatile.Read(ref session.UrgentControlWaiters) > 0 && !token.IsCancellationRequested)
+            await Task.Yield();
+        await SendToAsync(session, packet, token);
+    }
+
+    private static async Task SendUrgentAsync(Session session, Packet packet,
+        CancellationToken token)
+    {
+        bool waiterCounted = true;
+        Interlocked.Increment(ref session.UrgentControlWaiters);
         try
         {
             await session.Write.WaitAsync(token);
+            Interlocked.Decrement(ref session.UrgentControlWaiters);
+            waiterCounted = false;
+            try { await Wire.WriteAsync(session.Stream, packet, token); }
+            finally { session.Write.Release(); }
+        }
+        finally
+        {
+            if (waiterCounted) Interlocked.Decrement(ref session.UrgentControlWaiters);
+        }
+    }
+
+    private static async Task SendCablePingAsync(Session session, CancellationToken token)
+    {
+        if (Interlocked.CompareExchange(ref session.CablePingInFlight, 1, 0) != 0)
+            return;
+        bool waiterCounted = true;
+        Interlocked.Increment(ref session.UrgentControlWaiters);
+        try
+        {
+            await session.Write.WaitAsync(token);
+            Interlocked.Decrement(ref session.UrgentControlWaiters);
+            waiterCounted = false;
             try
             {
                 int pingToken = session.CableTracker.NextPingToken(Environment.TickCount64);
@@ -816,6 +851,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             finally { session.Write.Release(); }
         }
         catch (Exception) { }
+        finally
+        {
+            if (waiterCounted) Interlocked.Decrement(ref session.UrgentControlWaiters);
+            Interlocked.Exchange(ref session.CablePingInFlight, 0);
+        }
     }
 
     private async Task RelayForwardLoopAsync(RelayLease relay,CancellationToken token)
@@ -1210,7 +1250,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
                     var move = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (move != null)
-                        await SendToAsync(session, ReverseInputProtocol.Encode(move), token);
+                        await SendMoveToAsync(session, ReverseInputProtocol.Encode(move), token);
                     continue;
                 }
                 if (p.Type is "release" or "reset")
@@ -1218,7 +1258,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     session.MovePacer?.ClearPending();
                     var staleMove = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (staleMove != null)
-                        await SendToAsync(session, ReverseInputProtocol.Encode(staleMove), token);
+                        await SendMoveToAsync(session, ReverseInputProtocol.Encode(staleMove), token);
                     await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
                     continue;
                 }
@@ -1229,8 +1269,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var prior = udpSync ?? (isImmediateControl && session.UdpPeer is { Confirmed: true }
                     ? null : tcpPrior);
                 if (prior != null)
-                    await SendToAsync(session, ReverseInputProtocol.Encode(prior), token);
-                await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
+                    await SendMoveToAsync(session, ReverseInputProtocol.Encode(prior), token);
+                await SendMoveToAsync(session, ReverseInputProtocol.Encode(p), token);
             }
         }
         catch (OperationCanceledException) { }
@@ -1805,7 +1845,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // Answer authenticated heartbeats so Windows Wi-Fi roaming
                     // does not leave the input lease in an ambiguous state.
                     session.LastPongTicks = Stopwatch.GetTimestamp();
-                    await SendToAsync(session,new Packet("pong",p.A,p.B),token);
+                    await SendUrgentAsync(session,new Packet("pong",p.A,p.B),token);
                     continue;
                 }
                 if(p.Type=="pong")
@@ -2200,11 +2240,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static double ComputeAdaptiveCableIntervalMs(int? liveRefreshHz, double tcpRttMs)
     {
         double baseMs = liveRefreshHz is >= 24
-            ? Math.Clamp(950.0 / Math.Min(240, liveRefreshHz.Value), 5.8, 12.0)
+            ? Math.Clamp(840.0 / Math.Min(240, liveRefreshHz.Value), 5.8, 12.0)
             : 8.5;
         if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
             return baseMs;
-        double rttPressure = Math.Max(0.0, tcpRttMs - 10.0) * 0.15;
+        double rttPressure = Math.Max(0.0, tcpRttMs - 15.0) * 0.15;
         double maxCap = Math.Max(baseMs, 12.0);
         return Math.Clamp(baseMs + rttPressure, baseMs, maxCap);
     }

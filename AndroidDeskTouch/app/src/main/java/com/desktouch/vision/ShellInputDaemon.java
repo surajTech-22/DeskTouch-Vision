@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Shell-privileged virtual kernel mouse & keyboard bridge launched by the
@@ -109,7 +110,6 @@ public final class ShellInputDaemon {
     private int configuredPointerSpeed;
     private volatile int configuredRefreshHz = 60;
     private boolean hasDumpsysVelocityParams;
-    private volatile boolean dumpsysProbeRunning;
     private boolean hasPendingMove;
     private int pendingMoveX;
     private int pendingMoveY;
@@ -122,6 +122,7 @@ public final class ShellInputDaemon {
     private volatile boolean daemonRunning = true;
     private Thread mousePacerThread;
     private int buttonMask;
+    private boolean mousePrimedForReader;
     private int vWheelCarry;
     private int hWheelCarry;
     private int keyModifierMask;
@@ -319,8 +320,7 @@ public final class ShellInputDaemon {
                         } catch (InterruptedException ignored) {}
                     }
                     if (!daemonRunning) break;
-                    long fullGapNs = ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz);
-                    long minGapNs = Math.max(2_000_000L, Math.min(8_000_000L, (fullGapNs * 2L) / 3L));
+                    long minGapNs = ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz);
                     long waitNs = lastMouseWriteNs == 0L
                         ? 0L
                         : (lastMouseWriteNs + minGapNs - System.nanoTime());
@@ -433,17 +433,26 @@ public final class ShellInputDaemon {
         }
         screenWidth = nextW;
         screenHeight = nextH;
+        ShellPointerMath.VelocityParams probed =
+            (speedChanged || !hasDumpsysVelocityParams) ? probeVelocityParamsBlocking(250) : null;
+        if (probed != null) {
+            hasDumpsysVelocityParams = true;
+        }
         ShellPointerMath.VelocityParams initParams =
-            (!hasDumpsysVelocityParams || speedChanged)
-                ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
-                : null;
+            probed != null
+                ? probed
+                : ((!hasDumpsysVelocityParams || speedChanged)
+                    ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
+                    : null);
         pointer.configure(nextW, nextH, initParams, configuredRefreshHz);
         try {
             boolean createdMouse = false;
+            boolean createdKeyboard = false;
             if (mouseFd == null) {
                 mouseFd = createUhidDevice("DeskTouch USB Mouse", 0x3741, MOUSE_DESC);
                 pointer.releaseAnchor();
                 buttonMask = 0;
+                mousePrimedForReader = false;
                 vWheelCarry = 0;
                 hWheelCarry = 0;
                 createdMouse = true;
@@ -452,9 +461,11 @@ public final class ShellInputDaemon {
                 keyboardFd = createUhidDevice("DeskTouch USB Keyboard", 0x3742, KEYBOARD_DESC);
                 keyModifierMask = 0;
                 for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
+                createdKeyboard = true;
             }
-            if (createdMouse || speedChanged || !hasDumpsysVelocityParams) {
-                probeVelocityParamsAsync();
+            if (createdMouse || createdKeyboard) {
+                // Let EventHub/InputReader and hard-keyboard configuration transitions settle before mouse bursts arrive.
+                LockSupport.parkNanos(180_000_000L);
             }
             return mouseFd != null && keyboardFd != null;
         } catch (Exception ex) {
@@ -463,13 +474,13 @@ public final class ShellInputDaemon {
         }
     }
 
-    private void probeVelocityParamsAsync() {
-        if (dumpsysProbeRunning) return;
-        dumpsysProbeRunning = true;
+    private ShellPointerMath.VelocityParams probeVelocityParamsBlocking(long timeoutMs) {
+        final ShellPointerMath.VelocityParams[] foundRef = new ShellPointerMath.VelocityParams[1];
+        final Process[] procRef = new Process[1];
         Thread t = new Thread(() -> {
-            Process proc = null;
             try {
-                proc = new ProcessBuilder("dumpsys", "input").redirectErrorStream(true).start();
+                Process proc = new ProcessBuilder("dumpsys", "input").redirectErrorStream(true).start();
+                procRef[0] = proc;
                 try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
                     ShellPointerMath.VelocityParams found = null;
@@ -481,23 +492,28 @@ public final class ShellInputDaemon {
                             if (parsed != null) found = parsed;
                         }
                     }
-                    if (found != null) {
-                        synchronized (ShellInputDaemon.this) {
-                            pointer.updateVelocityParams(found);
-                            hasDumpsysVelocityParams = true;
-                        }
-                    }
+                    foundRef[0] = found;
                 }
             } catch (Throwable ignored) {
             } finally {
-                if (proc != null) {
-                    try { proc.destroy(); } catch (Throwable ignored) {}
+                Process p = procRef[0];
+                if (p != null) {
+                    try { p.destroy(); } catch (Throwable ignored) {}
                 }
-                dumpsysProbeRunning = false;
             }
         }, "DeskTouch-VelProbe");
         t.setDaemon(true);
         t.start();
+        try {
+            t.join(Math.max(50L, timeoutMs));
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+        Process p = procRef[0];
+        if (t.isAlive() && p != null) {
+            try { p.destroyForcibly(); } catch (Throwable ignored) {}
+        }
+        return foundRef[0];
     }
 
     private static FileDescriptor createUhidDevice(String name, int productId, byte[] desc)
@@ -592,21 +608,38 @@ public final class ShellInputDaemon {
         ShellPointerMath.MoveStep step = pointer.stepTo(targetX, targetY, pushX, pushY, System.nanoTime());
         if (!step.hasMotion()) return false;
         if (step.needsAnchorReset) {
-            sendRelativeBurst(step.anchorPullX, step.anchorPullY);
+            if (!mousePrimedForReader) {
+                int primeX = Integer.compare(step.anchorPullX, 0);
+                int primeY = Integer.compare(step.anchorPullY, 0);
+                if (primeX != 0 || primeY != 0) {
+                    writeMouseReport(primeX, primeY, 0, 0);
+                    // Wait for system InputReader/PointerController to allocate the cursor surface on event 1.
+                    LockSupport.parkNanos(25_000_000L);
+                }
+                mousePrimedForReader = true;
+            }
+            sendRelativeBurst(step.anchorPullX, step.anchorPullY, true);
+            LockSupport.parkNanos(500_000L);
             if (step.resetSignX != 0 || step.resetSignY != 0) {
                 writeMouseReport(step.resetSignX, step.resetSignY, 0, 0);
             }
         }
         if (step.rawX != 0 || step.rawY != 0) {
-            sendRelativeBurst(step.rawX, step.rawY);
+            if (step.needsAnchorReset) {
+                sendRelativeBurst(step.rawX, step.rawY, true);
+            } else {
+                writeMouseReport(step.rawX, step.rawY, 0, 0);
+                mousePrimedForReader = true;
+            }
         }
         return true;
     }
 
-    private void sendRelativeBurst(int totalDx, int totalDy) {
+    private void sendRelativeBurst(int totalDx, int totalDy, boolean paceChunks) {
         int steps = Math.max(1, (Math.max(Math.abs(totalDx), Math.abs(totalDy)) + 126) / 127);
         int rx = totalDx;
         int ry = totalDy;
+        int sent = 0;
         for (int rem = steps; rem > 0; rem--) {
             int stepX = Math.max(-127, Math.min(127, rx / rem));
             int stepY = Math.max(-127, Math.min(127, ry / rem));
@@ -614,6 +647,10 @@ public final class ShellInputDaemon {
                 writeMouseReport(stepX, stepY, 0, 0);
                 rx -= stepX;
                 ry -= stepY;
+                sent++;
+                if (paceChunks && (rem > 1 || rx != 0 || ry != 0)) {
+                    LockSupport.parkNanos((sent % 8 == 0) ? 1_500_000L : 900_000L);
+                }
             }
         }
         while (rx != 0 || ry != 0) {
@@ -622,6 +659,10 @@ public final class ShellInputDaemon {
             writeMouseReport(stepX, stepY, 0, 0);
             rx -= stepX;
             ry -= stepY;
+            sent++;
+            if (paceChunks && (rx != 0 || ry != 0)) {
+                LockSupport.parkNanos((sent % 8 == 0) ? 1_500_000L : 900_000L);
+            }
         }
     }
 

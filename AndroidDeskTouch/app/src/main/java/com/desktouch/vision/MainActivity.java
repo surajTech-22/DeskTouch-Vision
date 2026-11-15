@@ -597,6 +597,7 @@ public final class MainActivity extends Activity {
                 +" • Mode: "+kb.activeModeLabel
                 +" • Ready bindings: "+readyCount+"/"+kb.bindings.size()+pcTag);
         }
+        refreshTrustSummary();
     }
     private static String formatBandPlain(String band, int speedMbps){
         String base;

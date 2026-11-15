@@ -134,12 +134,22 @@ final class DeskTouchSession implements AutoCloseable {
         t.setDaemon(true);
         return t;
     });
+    private final ExecutorService controlSender=Executors.newSingleThreadExecutor(r->{
+        Thread t=new Thread(()->{
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+            catch (Throwable ignored) {}
+            r.run();
+        },"DeskTouch CtrlWriter");
+        t.setDaemon(true);
+        return t;
+    });
     private final ScheduledExecutorService udpPacer=Executors.newSingleThreadScheduledExecutor(r->{
         Thread t=new Thread(r,"DeskTouch UdpSend");
         t.setDaemon(true);
         return t;
     });
     private final Object writeLock=new Object();
+    private final Object pingTrackLock=new Object();
     private final Object udpPacerLock=new Object();
     private final java.util.concurrent.atomic.AtomicReference<Packet> newestMove =
         new java.util.concurrent.atomic.AtomicReference<>();
@@ -570,7 +580,10 @@ final class DeskTouchSession implements AutoCloseable {
                 if("udp-channel".equals(p.type)){
                     if(!cableSession) setupUdpChannel(p);
                 } else if("ping".equals(p.type)){
-                    writeNow(new Packet("pong",p.a,p.b));
+                    if(!controlSender.isShutdown()){
+                        final Packet pongPacket=new Packet("pong",p.a,p.b);
+                        controlSender.execute(()->writeNow(pongPacket));
+                    }
                 } else if("environment-roster".equals(p.type)){
                     acceptEnvironmentRoster(p);
                 } else if("environment-unavailable".equals(p.type)){
@@ -662,11 +675,13 @@ final class DeskTouchSession implements AutoCloseable {
                     int token=p.a;
                     if(token>0){
                         int slot=token%tcpPingTokens.length;
-                        if(tcpPingTokens[slot]==token){
-                            tcpPingTokens[slot]=0;
-                            long elapsedNs=System.nanoTime()-tcpPingSentNanos[slot];
-                            if(elapsedNs>0L && elapsedNs<10_000_000_000L){
-                                rttMs=Math.max(0.2,elapsedNs/1_000_000.0);
+                        synchronized(pingTrackLock){
+                            if(tcpPingTokens[slot]==token){
+                                tcpPingTokens[slot]=0;
+                                long elapsedNs=System.nanoTime()-tcpPingSentNanos[slot];
+                                if(elapsedNs>0L && elapsedNs<10_000_000_000L){
+                                    rttMs=Math.max(0.2,elapsedNs/1_000_000.0);
+                                }
                             }
                         }
                     }
@@ -995,15 +1010,31 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     private synchronized void sendTrackedPing(long nowMs){
-        if(!running) return;
+        if(!running || controlSender.isShutdown()) return;
         int token=(++tcpPingSeq)&0x7FFF;
         if(token==0) token=(++tcpPingSeq)&0x7FFF;
-        int slot=token%tcpPingTokens.length;
-        tcpPingTokens[slot]=token;
-        tcpPingSentNanos[slot]=System.nanoTime();
+        final int pingToken=token;
+        final int slot=pingToken%tcpPingTokens.length;
         lastPingSentMs=nowMs;
         missedPings++;
-        send(new Packet("ping",token));
+        controlSender.execute(()->{
+            if(!running) return;
+            DataOutputStream out=output;
+            if(out==null) return;
+            try {
+                synchronized(writeLock){
+                    if(!running || output==null) return;
+                    synchronized(pingTrackLock){
+                        tcpPingTokens[slot]=pingToken;
+                        tcpPingSentNanos[slot]=System.nanoTime();
+                    }
+                    new Packet("ping",pingToken).write(output);
+                }
+            } catch(Exception e){
+                status("Connection lost: "+e.getMessage());
+                closeConnection();
+            }
+        });
     }
 
     private void syncAdaptiveMetrics(FastUdpChannel ch){
@@ -1507,6 +1538,7 @@ final class DeskTouchSession implements AutoCloseable {
     @Override public void close(){
         closeConnection();
         udpPacer.shutdownNow();
+        controlSender.shutdownNow();
         sender.shutdownNow();
     }
 }

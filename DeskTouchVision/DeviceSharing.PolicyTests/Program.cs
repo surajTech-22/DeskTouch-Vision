@@ -2061,10 +2061,11 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
 // and verify cable adaptive pacing + ADB APK version tracking.
 {
     double cable144 = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 2.0);
+    double cable144ModerateRtt = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 14.0);
     double cable60 = ReceiverServer.ComputeAdaptiveCableIntervalMs(60, 2.0);
     double cableBusy = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 28.0);
-    Check(cable144 >= 5.8 && cable144 <= 7.2 && cable60 <= 12.0 && cableBusy > cable144 && cableBusy <= 14.0,
-        "Cable pacing interval must target 1x display refresh to avoid ADB WRTE/OKAY stall jitter");
+    Check(cable144 >= 5.8 && cable144 <= 6.5 && cable144ModerateRtt == cable144 && cable60 <= 12.0 && cableBusy > cable144 && cableBusy <= 14.0,
+        "Cable pacing interval must target sub-frame 144Hz rate and tolerate brief minor RTT jitter");
 
     int packed = FastMovePacer.PackEdgePush(-24, 37);
     var (unpackedX, unpackedY) = FastMovePacer.UnpackEdgePush(packed);

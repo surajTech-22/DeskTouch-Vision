@@ -2132,7 +2132,82 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     {
         try { Directory.Delete(nbTrustRoot, recursive: true); } catch { }
     }
-    Console.WriteLine("PASS: Cable adaptive pacing, APK daemon version tracking, and non-blocking trust approval verified.");
+
+    // Verify loopback Android ("cable") session delivers the initial reverse-move
+    // packet without clearing LatestReverseMove before ReverseSendLoopAsync flushes it.
+    string cableTestRoot = Path.Combine(Path.GetTempPath(), "DeskTouch-cable-handoff-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(cableTestRoot);
+    try
+    {
+        var cableId = Path.Combine(cableTestRoot, "id.dpapi");
+        var cableIn = Path.Combine(cableTestRoot, "in.dpapi");
+        using var cableReceiver = new ReceiverServer(
+            _ => { },
+            new LocalInputPriority(),
+            (_, _) => Task.FromResult(true),
+            new TrustedDeviceStore(cableIn),
+            (_, _) => Task.FromResult(false),
+            cableId);
+        cableReceiver.Start();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var peerConnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gotReverseGranted = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gotReverseActive = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        cableReceiver.PeerConnected += _ => peerConnected.TrySetResult();
+        cableReceiver.ReverseControlMessage += msg =>
+        {
+            if (msg.Type == "reverse-granted") gotReverseGranted.TrySetResult(msg.A);
+            else if (msg.Type == "reverse-active") gotReverseActive.TrySetResult(msg.A);
+        };
+        using var cableClient = new System.Net.Sockets.TcpClient();
+        await cableClient.ConnectAsync("127.0.0.1", Wire.Port, deadline.Token);
+        using var cableSsl = new System.Net.Security.SslStream(
+            cableClient.GetStream(),
+            leaveInnerStreamOpen: false,
+            (_, cert, _, _) => cert != null);
+        await cableSsl.AuthenticateAsClientAsync("desktouch.local");
+        await Wire.WriteAsync(cableSsl, new Packet("auth", Text: cableReceiver.Secret), deadline.Token);
+        var readyPkt = await Wire.ReadAsync(cableSsl, deadline.Token);
+        Check(readyPkt.Type == "ready", "Loopback Android cable client must authenticate cleanly");
+        var layoutJson = System.Text.Json.JsonSerializer.Serialize(new[] {
+            new MonitorRect("Android screen", 0, 0, 1080, 2400, true, RefreshHz: 144)
+        });
+        await Wire.WriteAsync(cableSsl, new Packet("hello", Text: System.Text.Json.JsonSerializer.Serialize(
+            new PeerHello("Xiaomi-Cable-Test", layoutJson, true, null, "Android", false, "15", "0.3.46", 440, 144, 0))),
+            deadline.Token);
+        await peerConnected.Task.WaitAsync(TimeSpan.FromSeconds(3), deadline.Token);
+
+        Check(cableReceiver.TrySendReverse(new Packet("claim", 15)), "Cable receiver must send reverse claim");
+        Packet? sawReverseMove = null;
+        bool sentGrant = false;
+        while (sawReverseMove == null)
+        {
+            var pkt = await Wire.ReadAsync(cableSsl, deadline.Token);
+            if (pkt.Type == "reverse-claim")
+            {
+                await Wire.WriteAsync(cableSsl, new Packet("reverse-granted", pkt.A), deadline.Token);
+                sentGrant = true;
+                int grantedClaim = await gotReverseGranted.Task.WaitAsync(TimeSpan.FromSeconds(2), deadline.Token);
+                Check(grantedClaim == 15, "Hub must observe reverse-granted claim #15");
+                Check(cableReceiver.TrySendReverse(new Packet("move", 321, 654)),
+                    "Cable pacer must accept initial handoff move");
+            }
+            else if (pkt.Type == "reverse-move" && sentGrant)
+            {
+                sawReverseMove = pkt;
+            }
+        }
+        Check(sawReverseMove.A == 321 && sawReverseMove.B == 654,
+            "Cable FastMovePacer must flush the initial reverse-move coordinate to Android instead of clearing LatestReverseMove");
+        await Wire.WriteAsync(cableSsl, new Packet("reverse-active", 15), deadline.Token);
+        int activeClaim = await gotReverseActive.Task.WaitAsync(TimeSpan.FromSeconds(2), deadline.Token);
+        Check(activeClaim == 15, "Cable handoff must receive reverse-active acknowledgement after reverse-move delivery");
+    }
+    finally
+    {
+        try { Directory.Delete(cableTestRoot, recursive: true); } catch { }
+    }
+    Console.WriteLine("PASS: Cable adaptive pacing, end-to-end cable handoff move delivery, APK daemon tracking, and non-blocking trust verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

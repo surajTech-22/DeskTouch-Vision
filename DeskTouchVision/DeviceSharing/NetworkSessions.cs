@@ -819,7 +819,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             if(relay.Target.MovePacer?.TryHandleMove(packet) == true)
             {
-                Interlocked.Exchange(ref relay.LatestMove, null);
+                if (!relay.Target.IsCableSession)
+                    Interlocked.Exchange(ref relay.LatestMove, null);
                 return true;
             }
             return QueueTcpRelayMove(relay, packet, countAsFallback: !relay.Target.IsCableSession);
@@ -1093,7 +1094,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             if (selected.MovePacer?.TryHandleMove(packet) == true)
             {
-                Interlocked.Exchange(ref selected.LatestReverseMove, null);
+                if (!selected.IsCableSession)
+                    Interlocked.Exchange(ref selected.LatestReverseMove, null);
                 return true;
             }
             return QueueTcpReverseMove(selected, packet, countAsFallback: !selected.IsCableSession);

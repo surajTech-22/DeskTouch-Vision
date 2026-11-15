@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.46 — Instant Data-Cable Screen Crossing Fix
+
+Fixes the v0.3.45 regression where moving the cursor across the screen edge over a USB data cable stalled on "waiting for cursor/authority application acknowledgement" and timed out instead of handing control to Android.
+
+- **Preserve queued cable pointer frames in the pacer:** Fixes `FastMovePacer` cable dispatch immediately clearing `LatestReverseMove` / `LatestMove` after queueing the initial `reverse-move` frame, restoring immediate cursor handoff (`reverse-move` -> `reverse-active`) on both direct and relayed cable sessions.
+- **End-to-end cable handoff regression test:** Verifies a loopback Android cable session receives `reverse-claim`, replies `reverse-granted`, receives the initial `reverse-move` coordinate without stalling, and completes `reverse-active`.
+
+---
+
 # DeskTouch Vision v0.3.45 — Smooth Native Data-Cable Cursor, Persistent Native Pointer & Reliable Trusted-Device Save
 
 Eliminates USB data-cable pointer jitter and speed wobble, prevents the Android pointer from flipping into the fallback software dot after repeated screen crossings, and fixes trusted-device saves being rejected when approving from Windows.

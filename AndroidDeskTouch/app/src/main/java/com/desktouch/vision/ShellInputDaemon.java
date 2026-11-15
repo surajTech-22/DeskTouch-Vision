@@ -100,13 +100,25 @@ public final class ShellInputDaemon {
     };
 
     private final byte[] expectedTokenBytes;
+    private final ShellPointerMath.PointerCompensator pointer = new ShellPointerMath.PointerCompensator();
+    private final Object mouseQueueLock = new Object();
     private FileDescriptor mouseFd;
     private FileDescriptor keyboardFd;
     private int screenWidth = 1080;
     private int screenHeight = 2400;
-    private boolean anchoredCursor;
-    private int cursorX;
-    private int cursorY;
+    private int configuredPointerSpeed;
+    private volatile int configuredRefreshHz = 60;
+    private boolean hasDumpsysVelocityParams;
+    private volatile boolean dumpsysProbeRunning;
+    private boolean hasPendingMove;
+    private int pendingMoveX;
+    private int pendingMoveY;
+    private long nextMoveSeq;
+    private long pendingMoveSeq;
+    private long appliedMoveSeq;
+    private long lastMouseWriteNs;
+    private volatile boolean daemonRunning = true;
+    private Thread mousePacerThread;
     private int buttonMask;
     private int vWheelCarry;
     private int hWheelCarry;
@@ -158,14 +170,21 @@ public final class ShellInputDaemon {
             }
             System.out.println("DESKTOUCH_SHELL_PORT=" + port);
             System.out.flush();
+            startMousePacer();
 
-            while (true) {
-                Socket client = server.accept();
-                if (!handleClient(client)) {
-                    destroyDevices();
-                    break;
+            try {
+                while (true) {
+                    Socket client = server.accept();
+                    if (!handleClient(client)) {
+                        destroyDevices();
+                        break;
+                    }
+                    // Keep kernel /dev/uhid devices registered across brief reconnects
+                    // so Android does not churn input device IDs or fall back to software pointer.
+                    releaseInputs();
                 }
-                destroyDevices();
+            } finally {
+                stopMousePacer();
             }
         }
     }
@@ -194,9 +213,9 @@ public final class ShellInputDaemon {
             writer.write("OK\n");
             writer.flush();
 
+            String[] pendingSlot = new String[1];
             String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.isEmpty()) continue;
+            while ((line = ShellPointerMath.readNextCommand(reader, pendingSlot)) != null) {
                 if ("PING".equals(line)) {
                     writer.write("PONG\n");
                     writer.flush();
@@ -223,39 +242,23 @@ public final class ShellInputDaemon {
                     String[] parts = line.split(" ");
                     int w = parts.length >= 3 ? parseBoundedInt(parts[1], 200, 16384, 1080) : 1080;
                     int h = parts.length >= 3 ? parseBoundedInt(parts[2], 200, 16384, 2400) : 2400;
-                    boolean started = ensureDevices(w, h);
+                    int speed = parts.length >= 4 ? parseBoundedInt(parts[3], -7, 7, configuredPointerSpeed) : configuredPointerSpeed;
+                    int hz = parts.length >= 5 ? parseBoundedInt(parts[4], 24, 360, configuredRefreshHz) : configuredRefreshHz;
+                    boolean started = ensureDevices(w, h, speed, hz);
                     writer.write(started ? "OK\n" : "ERR\n");
                     writer.flush();
                     continue;
                 }
                 if (line.startsWith("MOVETO ")) {
-                    // Coalesce any already-buffered MOVETO frames so bursty
-                    // cable/Wi-Fi input jumps straight to the newest coordinate.
-                    String latestMove = line;
-                    while (reader.ready()) {
-                        String nextLine = reader.readLine();
-                        if (nextLine == null) break;
-                        if (nextLine.startsWith("MOVETO ")) {
-                            latestMove = nextLine;
-                        } else {
-                            // Process the newest buffered MOVETO first, then break
-                            // cleanly after handling this non-move command below.
-                            applyMoveLine(latestMove);
-                            latestMove = null;
-                            line = nextLine;
-                            break;
-                        }
-                    }
-                    if (latestMove != null) {
-                        applyMoveLine(latestMove);
-                        continue;
-                    }
+                    applyMoveLine(line);
+                    continue;
                 }
                 if (line.startsWith("BTN ")) {
                     String[] parts = line.split(" ");
                     if (parts.length >= 3) {
                         int btn = parseBoundedInt(parts[1], 1, 5, 1);
                         boolean down = "1".equals(parts[2]);
+                        flushPendingMouseNow();
                         setMouseButton(btn, down);
                     }
                     continue;
@@ -265,6 +268,7 @@ public final class ShellInputDaemon {
                     if (parts.length >= 3) {
                         int amount = parseBoundedInt(parts[1], -12000, 12000, 0);
                         boolean horizontal = "1".equals(parts[2]);
+                        flushPendingMouseNow();
                         scrollWheel(amount, horizontal);
                     }
                     continue;
@@ -291,42 +295,175 @@ public final class ShellInputDaemon {
         }
     }
 
+    private void startMousePacer() {
+        daemonRunning = true;
+        Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+            } catch (Throwable ignored) {}
+            while (daemonRunning) {
+                int tx;
+                int ty;
+                long seq;
+                synchronized (mouseQueueLock) {
+                    while (daemonRunning && !hasPendingMove) {
+                        try {
+                            mouseQueueLock.wait();
+                        } catch (InterruptedException ignored) {}
+                    }
+                    if (!daemonRunning) break;
+                    long minGapNs = ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz);
+                    long waitNs = lastMouseWriteNs == 0L
+                        ? 0L
+                        : (lastMouseWriteNs + minGapNs - System.nanoTime());
+                    if (waitNs > 150_000L) {
+                        long waitMs = waitNs / 1_000_000L;
+                        int nanos = (int) (waitNs % 1_000_000L);
+                        try {
+                            mouseQueueLock.wait(waitMs, nanos);
+                        } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    tx = pendingMoveX;
+                    ty = pendingMoveY;
+                    seq = pendingMoveSeq;
+                    hasPendingMove = false;
+                }
+                moveTo(tx, ty, seq);
+                synchronized (mouseQueueLock) {
+                    lastMouseWriteNs = System.nanoTime();
+                }
+            }
+        }, "DeskTouch-UhidPacer");
+        t.setDaemon(true);
+        mousePacerThread = t;
+        t.start();
+    }
+
+    private void stopMousePacer() {
+        daemonRunning = false;
+        synchronized (mouseQueueLock) {
+            hasPendingMove = false;
+            mouseQueueLock.notifyAll();
+        }
+    }
+
     private void applyMoveLine(String line) {
         String[] parts = line.split(" ");
         if (parts.length >= 3) {
             int x = parseBoundedInt(parts[1], 0, screenWidth - 1, 0);
             int y = parseBoundedInt(parts[2], 0, screenHeight - 1, 0);
-            moveTo(x, y);
+            synchronized (mouseQueueLock) {
+                pendingMoveX = x;
+                pendingMoveY = y;
+                pendingMoveSeq = ++nextMoveSeq;
+                hasPendingMove = true;
+                mouseQueueLock.notifyAll();
+            }
+        }
+    }
+
+    private void flushPendingMouseNow() {
+        boolean have = false;
+        int tx = 0;
+        int ty = 0;
+        long seq = 0L;
+        synchronized (mouseQueueLock) {
+            if (hasPendingMove) {
+                tx = pendingMoveX;
+                ty = pendingMoveY;
+                seq = pendingMoveSeq;
+                hasPendingMove = false;
+                have = true;
+            }
+        }
+        if (have) {
+            moveTo(tx, ty, seq);
+            synchronized (mouseQueueLock) {
+                lastMouseWriteNs = System.nanoTime();
+            }
         }
     }
 
     private synchronized boolean ensureDevices(int width, int height) {
+        return ensureDevices(width, height, configuredPointerSpeed, configuredRefreshHz);
+    }
+
+    private synchronized boolean ensureDevices(int width, int height, int pointerSpeed, int refreshHz) {
         int nextW = Math.max(100, width);
         int nextH = Math.max(100, height);
-        boolean resized = nextW != screenWidth || nextH != screenHeight;
+        boolean speedChanged = pointerSpeed != configuredPointerSpeed;
+        configuredPointerSpeed = pointerSpeed;
+        if (refreshHz >= 24 && refreshHz <= 360) {
+            configuredRefreshHz = refreshHz;
+        }
         screenWidth = nextW;
         screenHeight = nextH;
-        if (resized) anchoredCursor = false;
+        ShellPointerMath.VelocityParams initParams =
+            (!hasDumpsysVelocityParams || speedChanged)
+                ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
+                : null;
+        pointer.configure(nextW, nextH, initParams, configuredRefreshHz);
         try {
+            boolean createdMouse = false;
             if (mouseFd == null) {
                 mouseFd = createUhidDevice("DeskTouch USB Mouse", 0x3741, MOUSE_DESC);
-                anchoredCursor = false;
-                cursorX = 0;
-                cursorY = 0;
+                pointer.releaseAnchor();
                 buttonMask = 0;
                 vWheelCarry = 0;
                 hWheelCarry = 0;
+                createdMouse = true;
             }
             if (keyboardFd == null) {
                 keyboardFd = createUhidDevice("DeskTouch USB Keyboard", 0x3742, KEYBOARD_DESC);
                 keyModifierMask = 0;
                 for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
             }
+            if (createdMouse || speedChanged || !hasDumpsysVelocityParams) {
+                probeVelocityParamsAsync();
+            }
             return mouseFd != null && keyboardFd != null;
         } catch (Exception ex) {
             destroyDevices();
             return false;
         }
+    }
+
+    private void probeVelocityParamsAsync() {
+        if (dumpsysProbeRunning) return;
+        dumpsysProbeRunning = true;
+        Thread t = new Thread(() -> {
+            Process proc = null;
+            try {
+                proc = new ProcessBuilder("dumpsys", "input").redirectErrorStream(true).start();
+                try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+                    ShellPointerMath.VelocityParams found = null;
+                    String row;
+                    while ((row = br.readLine()) != null) {
+                        if (row.contains("PointerVelocityControlParameters:")) {
+                            ShellPointerMath.VelocityParams parsed =
+                                ShellPointerMath.parseDumpsysVelocityParams(row);
+                            if (parsed != null) found = parsed;
+                        }
+                    }
+                    if (found != null) {
+                        synchronized (ShellInputDaemon.this) {
+                            pointer.updateVelocityParams(found);
+                            hasDumpsysVelocityParams = true;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (proc != null) {
+                    try { proc.destroy(); } catch (Throwable ignored) {}
+                }
+                dumpsysProbeRunning = false;
+            }
+        }, "DeskTouch-VelProbe");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static FileDescriptor createUhidDevice(String name, int productId, byte[] desc)
@@ -377,6 +514,9 @@ public final class ShellInputDaemon {
     }
 
     private synchronized void releaseInputs() {
+        synchronized (mouseQueueLock) {
+            hasPendingMove = false;
+        }
         if (buttonMask != 0 && mouseFd != null) {
             buttonMask = 0;
             writeMouseReport(0, 0, 0, 0);
@@ -388,7 +528,7 @@ public final class ShellInputDaemon {
         }
         vWheelCarry = 0;
         hWheelCarry = 0;
-        anchoredCursor = false;
+        pointer.releaseAnchor();
     }
 
     private synchronized void destroyDevices() {
@@ -409,33 +549,36 @@ public final class ShellInputDaemon {
         try { Os.close(fd); } catch (ErrnoException ignored) {}
     }
 
-    private synchronized void moveTo(int targetX, int targetY) {
-        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight)) return;
-        if (!anchoredCursor) {
-            // Pull Android's hardware pointer deterministically to top-left (0, 0)
-            // before applying the entry coordinate.
-            sendRelativeBurst(-Math.max(screenWidth, 2400), -Math.max(screenHeight, 2400));
-            anchoredCursor = true;
-            cursorX = 0;
-            cursorY = 0;
+    private synchronized void moveTo(int targetX, int targetY, long seq) {
+        if (seq <= appliedMoveSeq) return;
+        appliedMoveSeq = seq;
+        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight, configuredPointerSpeed, configuredRefreshHz)) return;
+        ShellPointerMath.MoveStep step = pointer.stepTo(targetX, targetY, System.nanoTime());
+        if (!step.hasMotion()) return;
+        if (step.needsAnchorReset) {
+            sendRelativeBurst(step.anchorPullX, step.anchorPullY);
+            if (step.resetSignX != 0 || step.resetSignY != 0) {
+                writeMouseReport(step.resetSignX, step.resetSignY, 0, 0);
+            }
         }
-        int dx = targetX - cursorX;
-        int dy = targetY - cursorY;
-        if (dx == 0 && targetX == 0) dx = -16;
-        else if (dx == 0 && targetX >= screenWidth - 1) dx = 16;
-        if (dy == 0 && targetY == 0) dy = -16;
-        else if (dy == 0 && targetY >= screenHeight - 1) dy = 16;
-
-        cursorX = targetX;
-        cursorY = targetY;
-        if (dx != 0 || dy != 0) {
-            sendRelativeBurst(dx, dy);
+        if (step.rawX != 0 || step.rawY != 0) {
+            sendRelativeBurst(step.rawX, step.rawY);
         }
     }
 
     private void sendRelativeBurst(int totalDx, int totalDy) {
+        int steps = Math.max(1, (Math.max(Math.abs(totalDx), Math.abs(totalDy)) + 126) / 127);
         int rx = totalDx;
         int ry = totalDy;
+        for (int rem = steps; rem > 0; rem--) {
+            int stepX = Math.max(-127, Math.min(127, rx / rem));
+            int stepY = Math.max(-127, Math.min(127, ry / rem));
+            if (stepX != 0 || stepY != 0) {
+                writeMouseReport(stepX, stepY, 0, 0);
+                rx -= stepX;
+                ry -= stepY;
+            }
+        }
         while (rx != 0 || ry != 0) {
             int stepX = Math.max(-127, Math.min(127, rx));
             int stepY = Math.max(-127, Math.min(127, ry));

@@ -16,6 +16,7 @@ internal sealed class AdbCableBridge : IDisposable
     private const string ShellPortFile = "/data/local/tmp/dt_s.port";
     private const string ShellPidFile = "/data/local/tmp/dt_s.pid";
     private const string ShellTokenFile = "/data/local/tmp/dt_s.tok";
+    private const string ShellApkFile = "/data/local/tmp/dt_s.apk";
     private const long BridgeRecheckIntervalMs = 12000;
     private const long HealthyShellVerifyIntervalMs = 45000;
 
@@ -180,15 +181,17 @@ internal sealed class AdbCableBridge : IDisposable
         "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
         $"PID=$(cat {ShellPidFile} 2>/dev/null | tr -d '\\r\\n '); " +
         $"PORT=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); " +
-        $"if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null && [ \"$PORT\" = \"{expectedPort}\" ]; then echo \"PORT=$PORT\"; else echo NEEDED; fi";
+        $"APK_RUN=$(cat {ShellApkFile} 2>/dev/null | tr -d '\\r\\n '); " +
+        $"if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null && [ \"$PORT\" = \"{expectedPort}\" ] && [ \"$APK_RUN\" = \"$APK\" ]; then echo \"PORT=$PORT\"; else echo NEEDED; fi";
 
     internal static string BuildShellDaemonScript() =>
         $"umask 077; if [ -s {ShellPidFile} ]; then OP=$(cat {ShellPidFile} 2>/dev/null | tr -d '\\r\\n '); [ -n \"$OP\" ] && [ \"$OP\" != \"$$\" ] && kill \"$OP\" 2>/dev/null || true; fi; " +
-        $"rm -f {ShellPortFile} {ShellPidFile} {ShellTokenFile}; " +
+        $"rm -f {ShellPortFile} {ShellPidFile} {ShellTokenFile} {ShellApkFile}; " +
         $"APK=$(pm path {AndroidAppPackage} 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\\r'); " +
         "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
         "IFS= read -r TK || exit 2; " +
         $"printf '%s\\n' \"$TK\" > {ShellTokenFile}; unset TK; " +
+        $"printf '%s\\n' \"$APK\" > {ShellApkFile}; " +
         $"{{ exec < {ShellTokenFile}; rm -f {ShellTokenFile}; CLASSPATH=\"$APK\" exec setsid /system/bin/app_process /system/bin com.desktouch.vision.ShellInputDaemon --pid-file {ShellPidFile} --port-file {ShellPortFile} >/dev/null 2>&1; }} </dev/null >/dev/null 2>&1 & " +
         "i=0; while [ \"$i\" -lt 40 ]; do " +
         $"[ -s {ShellPortFile} ] && {{ P=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); [ -n \"$P\" ] && {{ echo \"PORT=$P\"; exit 0; }}; }}; " +

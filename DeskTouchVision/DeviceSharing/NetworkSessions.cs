@@ -109,6 +109,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal long LastAndroidWarmEchoTicks;
         internal int LiveRefreshHz;
         internal int LiveFrameTenthsMs;
+        internal int PendingTrustRequest;
 
         internal int NextReverseActionSeq()
         {
@@ -528,6 +529,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (pacer == null) return;
         int liveHz = Volatile.Read(ref session.LiveRefreshHz);
         int? effectiveHz = liveHz >= 24 ? liveHz : session.Peer.RefreshHz;
+        if (session.IsCableSession)
+        {
+            pacer.SetMinIntervalMs(
+                ComputeAdaptiveCableIntervalMs(effectiveHz, Volatile.Read(ref session.TcpRttMs)));
+            return;
+        }
         var peer = session.UdpPeer;
         double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
         double minRtt = peer?.LinkTracker.MinRttMs ?? 0;
@@ -539,6 +546,44 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         pacer.SetMinIntervalMs(paceMs);
         int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
         pacer.SetWarmIntervalMs(warmMs);
+    }
+
+    private async Task HandleTrustRequestAsync(
+        Session session, int requestId, string? proposalText, CancellationToken token)
+    {
+        bool allowed = false;
+        if (_trusted != null && _requestTrustApproval != null &&
+            proposalText is { Length: 64 } proposal && proposal.All(Uri.IsHexDigit))
+        {
+            if (Interlocked.CompareExchange(ref session.PendingTrustRequest, 1, 0) != 0)
+            {
+                return;
+            }
+            using var trustLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
+            trustLimit.CancelAfter(TimeSpan.FromSeconds(50));
+            try
+            {
+                allowed = await _requestTrustApproval(session.Peer.Name, trustLimit.Token);
+                if (allowed) _trusted.AllowIncoming(session.Peer.Name, proposal);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _status("Cannot save device trust: " + ex.Message);
+            }
+            catch (OperationCanceledException) { allowed = false; }
+            finally
+            {
+                Volatile.Write(ref session.PendingTrustRequest, 0);
+            }
+        }
+        if (token.IsCancellationRequested) return;
+        try
+        {
+            await SendToAsync(session,
+                new Packet(allowed ? "trust-granted" : "trust-denied", requestId),
+                token);
+        }
+        catch (Exception) { }
     }
 
     private void ScheduleReverseClaimUdpRetry(Session session, int claimLease, int dispatchSeq)
@@ -1220,35 +1265,48 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             LastPongTicks=Stopwatch.GetTimestamp()
         };
         session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
-        session.MovePacer = isCable ? null : new FastMovePacer(
-            canSendUdp: () => _udpHub != null && session.UdpPeer is { Confirmed: true } &&
-                Volatile.Read(ref session.ActiveReverseLease) > 0,
-            sendUdp: move =>
-            {
-                var peerUdp = session.UdpPeer;
-                int lease = Volatile.Read(ref session.ActiveReverseLease);
-                return _udpHub != null && peerUdp != null && peerUdp.Confirmed && lease > 0 &&
-                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
-                        move.C > 0 ? move.C : null);
-            },
-            queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
-            sendWarm: () =>
-            {
-                var peerUdp = session.UdpPeer;
-                if (_udpHub != null && peerUdp is { Confirmed: true } && _sessions.ContainsKey(id))
-                    _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
-            },
-            queueTrailingSync: move =>
-            {
-                var peerUdp = session.UdpPeer;
-                int lease = Volatile.Read(ref session.ActiveReverseLease);
-                bool udpDelivered = _udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
-                    _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
-                        move.C > 0 ? move.C : null);
-                if (!udpDelivered || Volatile.Read(ref session.PendingFirstCursorAck) != 0)
+        session.MovePacer = isCable
+            ? new FastMovePacer(
+                canSendUdp: () => Volatile.Read(ref session.ActiveReverseLease) > 0,
+                sendUdp: move =>
+                {
                     QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
-            },
-            nextSeq: session.NextReverseMoveSeq);
+                    return true;
+                },
+                queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: false),
+                sendWarm: null,
+                queueTrailingSync: _ => { },
+                nextSeq: session.NextReverseMoveSeq)
+            : new FastMovePacer(
+                canSendUdp: () => _udpHub != null && session.UdpPeer is { Confirmed: true } &&
+                    Volatile.Read(ref session.ActiveReverseLease) > 0,
+                sendUdp: move =>
+                {
+                    var peerUdp = session.UdpPeer;
+                    int lease = Volatile.Read(ref session.ActiveReverseLease);
+                    return _udpHub != null && peerUdp != null && peerUdp.Confirmed && lease > 0 &&
+                        _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
+                            move.C > 0 ? move.C : null);
+                },
+                queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
+                sendWarm: () =>
+                {
+                    var peerUdp = session.UdpPeer;
+                    if (_udpHub != null && peerUdp is { Confirmed: true } && _sessions.ContainsKey(id))
+                        _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
+                },
+                queueTrailingSync: move =>
+                {
+                    var peerUdp = session.UdpPeer;
+                    int lease = Volatile.Read(ref session.ActiveReverseLease);
+                    bool udpDelivered = _udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
+                        _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
+                            move.C > 0 ? move.C : null);
+                    if (!udpDelivered || Volatile.Read(ref session.PendingFirstCursorAck) != 0)
+                        QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
+                },
+                nextSeq: session.NextReverseMoveSeq);
+        UpdateSessionAdaptivePacing(session);
         if(!_sessions.TryAdd(id,session))
         {
             session.MovePacer?.Dispose();
@@ -1346,24 +1404,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="trust-request")
                 {
-                    bool allowed=false;
-                    if(_trusted!=null && _requestTrustApproval!=null &&
-                       p.Text is {Length:64} proposal && proposal.All(Uri.IsHexDigit))
-                    {
-                        using var trustLimit=CancellationTokenSource.CreateLinkedTokenSource(token);
-                        trustLimit.CancelAfter(TimeSpan.FromSeconds(50));
-                        try
-                        {
-                            allowed=await _requestTrustApproval(peer.Name,trustLimit.Token);
-                            if(allowed)_trusted.AllowIncoming(peer.Name,proposal);
-                        }
-                        catch(Exception ex) when (ex is not OperationCanceledException)
-                        {
-                            _status("Cannot save device trust: "+ex.Message);
-                        }
-                        catch(OperationCanceledException){allowed=false;}
-                    }
-                    await SendToAsync(session,new Packet(allowed?"trust-granted":"trust-denied"),token);
+                    // Run approval dialog off the read loop so pings continue answering.
+                    _ = HandleTrustRequestAsync(session, p.A, p.Text, token);
                     continue;
                 }
                 if(p.Type=="topology")
@@ -1687,6 +1729,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         if (session.CableTracker.OnFeedbackReceived(p.A, -1, -1, Environment.TickCount64))
                         {
                             Volatile.Write(ref session.TcpRttMs, session.CableTracker.SmoothedRttMs);
+                            UpdateSessionAdaptivePacing(session);
                         }
                         if (wasDetached && !ReferenceEquals(Volatile.Read(ref _selected), session))
                             Select(session);
@@ -2064,6 +2107,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     : 20.0));
         maxCap = Math.Max(baseMs, maxCap);
         return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, maxCap);
+    }
+
+    internal static double ComputeAdaptiveCableIntervalMs(int? liveRefreshHz, double tcpRttMs)
+    {
+        double baseMs = liveRefreshHz is >= 24
+            ? Math.Clamp(500.0 / Math.Min(240, liveRefreshHz.Value), 2.8, 6.0)
+            : 4.2;
+        if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
+            return baseMs;
+        double rttPressure = Math.Max(0.0, tcpRttMs - 12.0) * 0.08;
+        return Math.Clamp(baseMs + rttPressure, baseMs, 8.0);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>

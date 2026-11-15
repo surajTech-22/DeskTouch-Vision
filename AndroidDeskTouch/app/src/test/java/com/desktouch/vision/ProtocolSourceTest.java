@@ -767,4 +767,63 @@ public final class ProtocolSourceTest {
         assertFalse(DeskTouchSession.shouldFastFailDeadSession(5000L, 1000L, 500L, 3, false));
         assertTrue(DeskTouchSession.shouldFastFailDeadSession(7000L, 1000L, 500L, 3, false));
     }
+
+    @Test
+    public void shellPointerMathCompensatesVelocityAndNeverDropsBufferedCommands() throws Exception {
+        ShellPointerMath.VelocityParams parsed = ShellPointerMath.parseDumpsysVelocityParams(
+            "  Configuration:\n" +
+            "    PointerVelocityControlParameters: scale=0.500, lowThreshold=500.000, highThreshold=3000.000, acceleration=3.000\n");
+        assertNotNull(parsed);
+        assertEquals(0.500, parsed.scale, 0.001);
+        assertEquals(500.0, parsed.lowThreshold, 0.1);
+        assertEquals(3000.0, parsed.highThreshold, 0.1);
+        assertEquals(3.0, parsed.acceleration, 0.01);
+
+        ShellPointerMath.VelocityParams fallback = ShellPointerMath.defaultVelocityParams(-4);
+        assertEquals(0.500, fallback.scale, 0.001);
+
+        for (double targetSpeed : new double[] { 120.0, 250.0, 750.0, 1500.0, 2800.0, 5200.0 }) {
+            double raw = ShellPointerMath.solveRawSpeedForOutputSpeed(targetSpeed, parsed);
+            double reconstructed = raw * ShellPointerMath.gainAtRawSpeed(raw, parsed);
+            assertEquals("VelocityControl inverse should reconstruct speed " + targetSpeed,
+                targetSpeed, reconstructed, 0.05);
+        }
+
+        // Verify MOVETO coalescing preserves buffered END/BEGIN/PING commands instead of swallowing them.
+        String wireStream =
+            "MOVETO 10 20\n" +
+            "MOVETO 30 40\n" +
+            "END\n" +
+            "BEGIN 1080 2460 -4 144\n" +
+            "MOVETO 55 65\n" +
+            "PING\n";
+        java.io.BufferedReader br = new java.io.BufferedReader(new java.io.StringReader(wireStream));
+        String[] pendingSlot = new String[1];
+        assertEquals("MOVETO 30 40", ShellPointerMath.readNextCommand(br, pendingSlot));
+        assertEquals("END", ShellPointerMath.readNextCommand(br, pendingSlot));
+        assertEquals("BEGIN 1080 2460 -4 144", ShellPointerMath.readNextCommand(br, pendingSlot));
+        assertEquals("MOVETO 55 65", ShellPointerMath.readNextCommand(br, pendingSlot));
+        assertEquals("PING", ShellPointerMath.readNextCommand(br, pendingSlot));
+        assertNull(ShellPointerMath.readNextCommand(br, pendingSlot));
+
+        // Verify PointerCompensator only nudges edge once on boundary arrival, never continuously.
+        ShellPointerMath.PointerCompensator comp = new ShellPointerMath.PointerCompensator();
+        comp.configure(1080, 2460, parsed, 144);
+        long t = 1_000_000_000L;
+        ShellPointerMath.MoveStep entry = comp.stepTo(20, 100, t);
+        assertTrue(entry.needsAnchorReset);
+        ShellPointerMath.MoveStep hitEdge = comp.stepTo(0, 100, t + 4_000_000L);
+        assertTrue("Arrival at x=0 must push negative edge align delta", hitEdge.rawX < 0);
+        ShellPointerMath.MoveStep slideAlongEdge = comp.stepTo(0, 110, t + 8_000_000L);
+        assertEquals("Sliding along left edge must not repeatedly inject -X edge bumps", 0, slideAlongEdge.rawX);
+        assertTrue("Sliding along left edge must continue tracking Y movement", slideAlongEdge.rawY > 0);
+    }
+
+    @Test
+    public void trustResponseCorrelationMatchesIdOrLegacyZero() {
+        assertTrue(DeskTouchSession.acceptPendingTrustResponse(7, 7));
+        assertTrue(DeskTouchSession.acceptPendingTrustResponse(7, 0));
+        assertFalse(DeskTouchSession.acceptPendingTrustResponse(7, 6));
+        assertFalse(DeskTouchSession.buildPendingTrustNotice().isEmpty());
+    }
 }

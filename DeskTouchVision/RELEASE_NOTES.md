@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.45 — Smooth Native Data-Cable Cursor, Persistent Native Pointer & Reliable Trusted-Device Save
+
+Eliminates USB data-cable pointer jitter and speed wobble, prevents the Android pointer from flipping into the fallback software dot after repeated screen crossings, and fixes trusted-device saves being rejected when approving from Windows.
+
+- **Smooth frame-aligned cable cursor & speed-curve compensation:** Paces Windows-to-phone cable pointer frames cleanly at half-frame intervals (~3.5 ms at 144 Hz) and adds a dedicated nanosecond-paced Android virtual mouse emitter that matches Android's system pointer velocity and acceleration curve with sub-pixel carryover while removing repeated edge-kick velocity spikes.
+- **Persistent native cursor across repeated screen crossings:** Fixes buffered `MOVETO` command coalescing swallowing trailing `BEGIN`/`END`/`PING` acknowledgments, preserves virtual mouse/keyboard registration across brief loopback reconnects, and self-heals the loopback bridge automatically on screen-entry claims instead of falling back to the Accessibility dot.
+- **Non-blocking trusted-device approval (`trust-request`):** Runs the Windows trust confirmation prompt asynchronously off the TLS read loop so heartbeats continue uninterrupted while deciding, correlates Android trust proposals by request ID, and prevents duplicate button taps from invalidating the pending key.
+- **Automatic virtual-bridge daemon refresh on app upgrade:** Tracks the installed APK path alongside the daemon PID so upgrading the Android app immediately reloads the updated daemon over cable without requiring a manual restart.
+
+---
+
 # DeskTouch Vision v0.3.44 — Bulletproof Windows Reopen & Recovery While Background Process Is Running
 
 Fixes the issue where launching DeskTouch Vision while `DeskTouch.DeviceShare` was already running in Task Manager (tray, minimized, background/other desktop, or mid-shutdown) could exit without opening a visible window on screen.

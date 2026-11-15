@@ -12,8 +12,10 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -34,8 +36,11 @@ final class ShellInputClient {
 
     private static volatile Context appContext;
     private static volatile boolean connectedReady;
+    private static volatile boolean remoteSessionActive;
     private static volatile int configuredPort;
     private static volatile String configuredSecret;
+    private static volatile int lastPointerSpeed;
+    private static volatile int lastRefreshHz = 60;
     private static volatile Socket socket;
     private static volatile BufferedWriter writer;
     private static volatile BufferedReader reader;
@@ -69,68 +74,180 @@ final class ShellInputClient {
         return s != null && !s.isClosed();
     }
 
+    static boolean hasBridgeConfig(Context context) {
+        return allowed(context) && configuredPort > 0 && configuredSecret != null;
+    }
+
     static void configure(Context context, int port, String secret) {
         if (context == null || port <= 0 || port > 65535 || secret == null || secret.length() < 32) {
             return;
         }
         final Context app = context.getApplicationContext();
         appContext = app;
+        boolean sameEndpoint = port == configuredPort && secret.equals(configuredSecret);
         configuredPort = port;
         configuredSecret = secret;
-        WORKER.execute(() -> connectAndAuth(app, port, secret));
+        if (sameEndpoint && ready(app)) {
+            return;
+        }
+        WORKER.execute(() -> {
+            synchronized (CLIENT_LOCK) {
+                connectAndAuthLocked(app, port, secret);
+                if (connectedReady && remoteSessionActive) {
+                    ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
+                }
+            }
+            DeskTouchRuntime.accessibilityPermissionChanged(app);
+        });
     }
 
-    private static void connectAndAuth(Context app, int port, String secret) {
-        synchronized (CLIENT_LOCK) {
-            closeSocketLocked();
-            try {
-                Socket s = new Socket();
-                s.connect(new InetSocketAddress("127.0.0.1", port), 1500);
-                s.setTcpNoDelay(true);
-                s.setSoTimeout(1500);
-                BufferedWriter w = new BufferedWriter(
-                    new OutputStreamWriter(s.getOutputStream(), StandardCharsets.US_ASCII));
-                BufferedReader r = new BufferedReader(
-                    new InputStreamReader(s.getInputStream(), StandardCharsets.US_ASCII));
-                w.write("AUTH " + secret + "\n");
-                w.flush();
-                String ack = r.readLine();
-                if (!"OK".equals(ack)) {
-                    try { s.close(); } catch (IOException ignored) {}
-                    connectedReady = false;
-                    DeskTouchRuntime.accessibilityPermissionChanged(app);
-                    return;
-                }
-                s.setSoTimeout(3000);
-                socket = s;
-                writer = w;
-                reader = r;
-                connectedReady = true;
-                Log.i("DeskTouch", "Accessibility-free Shell Bridge virtual input ready on loopback:" + port);
-            } catch (IOException ex) {
+    private static boolean connectAndAuthLocked(Context app, int port, String secret) {
+        closeSocketLocked();
+        if (port <= 0 || secret == null || secret.length() < 32) {
+            connectedReady = false;
+            return false;
+        }
+        try {
+            Socket s = new Socket();
+            s.connect(new InetSocketAddress("127.0.0.1", port), 1200);
+            s.setTcpNoDelay(true);
+            s.setSoTimeout(1200);
+            BufferedWriter w = new BufferedWriter(
+                new OutputStreamWriter(s.getOutputStream(), StandardCharsets.US_ASCII));
+            BufferedReader r = new BufferedReader(
+                new InputStreamReader(s.getInputStream(), StandardCharsets.US_ASCII));
+            w.write("AUTH " + secret + "\n");
+            w.flush();
+            String ack = r.readLine();
+            if (!"OK".equals(ack)) {
+                try { s.close(); } catch (IOException ignored) {}
                 connectedReady = false;
-                Log.w("DeskTouch", "Shell Bridge loopback connect deferred: " + ex.getMessage());
+                return false;
+            }
+            s.setSoTimeout(800);
+            socket = s;
+            writer = w;
+            reader = r;
+            connectedReady = true;
+            Log.i("DeskTouch", "Accessibility-free Shell Bridge virtual input ready on loopback:" + port);
+            return true;
+        } catch (IOException ex) {
+            connectedReady = false;
+            Log.w("DeskTouch", "Shell Bridge loopback connect deferred: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean pingLocked() {
+        BufferedWriter w = writer;
+        BufferedReader r = reader;
+        if (w == null || r == null) return false;
+        try {
+            w.write("PING\n");
+            w.flush();
+            return "PONG".equals(r.readLine());
+        } catch (IOException ex) {
+            closeSocketLocked();
+            connectedReady = false;
+            return false;
+        }
+    }
+
+    private static boolean ensureBeginLocked(Context app, int pointerSpeed, int refreshHz) {
+        if (app == null) app = appContext;
+        if (app == null) return false;
+        Point size = PhoneScreenGeometry.read(app);
+        int w = Math.max(200, size.x);
+        int h = Math.max(200, size.y);
+        int hz = refreshHz >= 24 && refreshHz <= 360 ? refreshHz : 60;
+        String cmd = "BEGIN " + w + " " + h + " " + pointerSpeed + " " + hz;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (writer == null || reader == null || !connectedReady) {
+                if (!connectAndAuthLocked(app, configuredPort, configuredSecret)) {
+                    return false;
+                }
+            }
+            try {
+                writer.write(cmd);
+                writer.write('\n');
+                writer.flush();
+                String resp = reader.readLine();
+                if ("OK".equals(resp)) {
+                    connectedReady = true;
+                    return true;
+                }
+                closeSocketLocked();
+                connectedReady = false;
+            } catch (IOException ex) {
+                closeSocketLocked();
+                connectedReady = false;
             }
         }
-        DeskTouchRuntime.accessibilityPermissionChanged(app);
+        return false;
+    }
+
+    /**
+     * Synchronously verifies (and self-heals on loopback if needed) both the
+     * Shell Bridge socket and kernel virtual HID devices before granting control,
+     * preventing transient loopback timeouts from falling back to Accessibility.
+     */
+    static boolean prepareReverseClaim(Context context, int pointerSpeed, int refreshHz) {
+        lastPointerSpeed = pointerSpeed;
+        if (refreshHz >= 24 && refreshHz <= 360) lastRefreshHz = refreshHz;
+        if (context == null || !allowed(context)) return false;
+        final Context app = context.getApplicationContext();
+        appContext = app;
+        if (configuredPort <= 0 || configuredSecret == null) return false;
+
+        final CompletableFuture<Boolean> done = new CompletableFuture<>();
+        WORKER.execute(() -> {
+            boolean ok;
+            synchronized (CLIENT_LOCK) {
+                boolean wasReady = connectedReady;
+                if (!ready(app) || !pingLocked()) {
+                    connectAndAuthLocked(app, configuredPort, configuredSecret);
+                }
+                ok = connectedReady && ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
+                remoteSessionActive = ok;
+                if (wasReady != connectedReady) {
+                    DeskTouchRuntime.accessibilityPermissionChanged(app);
+                }
+            }
+            done.complete(ok);
+        });
+        try {
+            return done.get(550, TimeUnit.MILLISECONDS);
+        } catch (Exception ex) {
+            return ready(app);
+        }
     }
 
     static void beginRemote(Context context) {
-        if (context == null || !ready(context)) return;
-        Point size = PhoneScreenGeometry.read(context);
-        final int w = Math.max(200, size.x);
-        final int h = Math.max(200, size.y);
+        beginRemote(context, lastPointerSpeed, lastRefreshHz);
+    }
+
+    static void beginRemote(Context context, int pointerSpeed, int refreshHz) {
+        if (context == null) return;
+        lastPointerSpeed = pointerSpeed;
+        if (refreshHz >= 24 && refreshHz <= 360) lastRefreshHz = refreshHz;
         final Context app = context.getApplicationContext();
+        appContext = app;
+        if (!hasBridgeConfig(app) && !ready(app)) return;
+        remoteSessionActive = true;
         WORKER.execute(() -> {
-            String resp = sendAndReadLine("BEGIN " + w + " " + h);
-            if (!"OK".equals(resp)) {
-                markDisconnected(app);
+            boolean wasReady = connectedReady;
+            boolean ok;
+            synchronized (CLIENT_LOCK) {
+                ok = ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
+            }
+            if (!ok || wasReady != connectedReady) {
+                DeskTouchRuntime.accessibilityPermissionChanged(app);
             }
         });
     }
 
     static boolean movePointer(int x, int y, Runnable ack) {
-        if (!connectedReady) return false;
+        if (!connectedReady && !hasBridgeConfig(appContext)) return false;
         synchronized (MOVE_LOCK) {
             pendingMoveX = x;
             pendingMoveY = y;
@@ -167,17 +284,17 @@ final class ShellInputClient {
     }
 
     static void mouseButton(int button, boolean pressed) {
-        if (!connectedReady || button < 1 || button > 5) return;
+        if ((!connectedReady && !hasBridgeConfig(appContext)) || button < 1 || button > 5) return;
         WORKER.execute(() -> sendLine("BTN " + button + " " + (pressed ? "1" : "0")));
     }
 
     static void wheel(int amount, boolean horizontal) {
-        if (!connectedReady || amount == 0) return;
+        if ((!connectedReady && !hasBridgeConfig(appContext)) || amount == 0) return;
         WORKER.execute(() -> sendLine("WHEEL " + amount + " " + (horizontal ? "1" : "0")));
     }
 
     static void key(int vk, boolean pressed, Runnable accepted, Runnable rejected) {
-        if (!connectedReady) {
+        if (!connectedReady && !hasBridgeConfig(appContext)) {
             if (rejected != null) rejected.run();
             return;
         }
@@ -197,7 +314,7 @@ final class ShellInputClient {
     }
 
     static void text(String value, Runnable accepted, Runnable rejected) {
-        if (!connectedReady || value == null || value.isEmpty()) {
+        if ((!connectedReady && !hasBridgeConfig(appContext)) || value == null || value.isEmpty()) {
             if (rejected != null) rejected.run();
             return;
         }
@@ -224,15 +341,27 @@ final class ShellInputClient {
     }
 
     static void endRemote() {
+        remoteSessionActive = false;
         synchronized (MOVE_LOCK) {
             hasPendingMove = false;
             pendingMoveAck = null;
         }
         if (!connectedReady) return;
-        WORKER.execute(() -> sendAndReadLine("END"));
+        WORKER.execute(() -> {
+            String resp = sendAndReadLine("END");
+            if (!"OK".equals(resp) && hasBridgeConfig(appContext)) {
+                // Heal dropped loopback socket right away so next screen entry stays native.
+                synchronized (CLIENT_LOCK) {
+                    if (connectAndAuthLocked(appContext, configuredPort, configuredSecret)) {
+                        DeskTouchRuntime.accessibilityPermissionChanged(appContext);
+                    }
+                }
+            }
+        });
     }
 
     static void disconnect() {
+        remoteSessionActive = false;
         synchronized (MOVE_LOCK) {
             hasPendingMove = false;
             pendingMoveAck = null;
@@ -247,21 +376,52 @@ final class ShellInputClient {
         });
     }
 
+    private static boolean reconnectLocked() {
+        Context app = appContext;
+        if (!allowed(app) || configuredPort <= 0 || configuredSecret == null) {
+            return false;
+        }
+        if (!connectAndAuthLocked(app, configuredPort, configuredSecret)) {
+            return false;
+        }
+        if (remoteSessionActive) {
+            return ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
+        }
+        return true;
+    }
+
     private static boolean sendLine(String line) {
         synchronized (CLIENT_LOCK) {
-            BufferedWriter w = writer;
-            if (w == null) return false;
-            try {
-                w.write(line);
-                w.write('\n');
-                w.flush();
-                return true;
-            } catch (IOException ex) {
-                closeSocketLocked();
-                connectedReady = false;
-                DeskTouchRuntime.accessibilityPermissionChanged(appContext);
-                return false;
+            boolean wasReady = connectedReady;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                BufferedWriter w = writer;
+                if (w == null) {
+                    if (attempt == 0 && reconnectLocked()) {
+                        continue;
+                    }
+                    break;
+                }
+                try {
+                    w.write(line);
+                    w.write('\n');
+                    w.flush();
+                    connectedReady = true;
+                    if (!wasReady) {
+                        DeskTouchRuntime.accessibilityPermissionChanged(appContext);
+                    }
+                    return true;
+                } catch (IOException ex) {
+                    closeSocketLocked();
+                    connectedReady = false;
+                    if (attempt == 0 && reconnectLocked()) {
+                        continue;
+                    }
+                }
             }
+            if (wasReady != connectedReady) {
+                DeskTouchRuntime.accessibilityPermissionChanged(appContext);
+            }
+            return false;
         }
     }
 

@@ -185,7 +185,11 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile int claim;
     private volatile String fingerprint;
     private volatile String requestedToken;
+    private final Object trustLock=new Object();
     private volatile String pendingTrust;
+    private int pendingTrustId;
+    private long pendingTrustAtMs;
+    private int nextTrustId=1;
     private final List<int[]> monitors=new ArrayList<>();
     private int cursorX,cursorY;
     private int screenX,screenY,screenWidth,screenHeight;
@@ -570,16 +574,41 @@ final class DeskTouchSession implements AutoCloseable {
                 } else if("local-active".equals(p.type)){
                     active=false;claim=0;status("Windows physical keyboard/mouse reclaimed control");
                 } else if("trust-granted".equals(p.type)){
-                    String token=pendingTrust;pendingTrust=null;
+                    String token;
+                    synchronized(trustLock){
+                        if(pendingTrust==null || !acceptPendingTrustResponse(pendingTrustId,p.a)){
+                            token=null;
+                        }else{
+                            token=pendingTrust;
+                            pendingTrust=null;
+                            pendingTrustId=0;
+                            pendingTrustAtMs=0L;
+                        }
+                    }
                     if(token!=null){
-                        trust.save(fingerprint,token);
-                        AutoConnectService.resumePeer(application,fingerprint);
-                        AutoConnectService.setEnabled(application,true);
-                        AutoConnectService.setReconnect(application,true);
-                        status("Trusted Windows PC saved securely, without storing its IP address");
+                        try{
+                            trust.save(fingerprint,token);
+                            AutoConnectService.resumePeer(application,fingerprint);
+                            AutoConnectService.setEnabled(application,true);
+                            AutoConnectService.setReconnect(application,true);
+                            status("Trusted Windows PC saved securely, without storing its IP address");
+                        }catch(Exception ex){
+                            String msg=ex.getMessage();
+                            status("Could not save trusted PC key on Android"
+                                +(msg!=null && !msg.isEmpty() ? ": "+msg : ""));
+                        }
                     }
                 } else if("trust-denied".equals(p.type)){
-                    pendingTrust=null;status("Windows declined trusted-device permission");
+                    boolean matched;
+                    synchronized(trustLock){
+                        matched=pendingTrust!=null && acceptPendingTrustResponse(pendingTrustId,p.a);
+                        if(matched){
+                            pendingTrust=null;
+                            pendingTrustId=0;
+                            pendingTrustAtMs=0L;
+                        }
+                    }
+                    if(matched)status("Windows declined trusted-device permission");
                 } else if("pong".equals(p.type)){
                     long nowMs=SystemClock.uptimeMillis();
                     double rttMs=-1.0;
@@ -636,7 +665,14 @@ final class DeskTouchSession implements AutoCloseable {
                     handlePauseAccessibilityFromWindows();
                 } else if("goodbye".equals(p.type)) break;
             }
-        } catch(Exception e){if(running)status("Windows disconnected: "+e.getMessage());}
+        } catch(Exception e){
+            if(running){
+                String msg=e.getMessage();
+                status(msg!=null && !msg.isEmpty()
+                    ? "Windows disconnected: "+msg
+                    : "Windows connection closed");
+            }
+        }
         finally{closeConnection();}
     }
     // Windows forwards approved local or environment-relayed input through
@@ -705,16 +741,39 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
 
+    private int readAndroidPointerSpeed(){
+        try{
+            return android.provider.Settings.System.getInt(
+                application.getContentResolver(),"pointer_speed",0);
+        }catch(Exception ignored){
+            return 0;
+        }
+    }
+
+    private int currentRefreshHz(){
+        int hz=livePhoneRefreshHz;
+        if(hz<24){
+            hz=PhoneScreenGeometry.readInfo(application).refreshHz;
+        }
+        return hz>=24 && hz<=360 ? hz : 60;
+    }
+
     private void handleReverseClaim(int claim, int dispatchSeq, boolean fromUdp){
         if(claim<=0){
             send(new Packet("reverse-busy",claim));
             return;
         }
+        int ptrSpeed=readAndroidPointerSpeed();
+        int hz=currentRefreshHz();
+        boolean preparedShell=false;
+        if(reverseLease!=claim && ShellInputClient.hasBridgeConfig(application)){
+            preparedShell=ShellInputClient.prepareReverseClaim(application,ptrSpeed,hz);
+        }
         boolean granted;
         boolean chosenShell=false;
         synchronized(reverseDedup){
             if(!reverseDedup.tryAcceptClaimDispatch(claim,dispatchSeq,reverseLease)) return;
-            boolean shellReady=ShellInputClient.ready(application);
+            boolean shellReady=preparedShell || ShellInputClient.ready(application);
             boolean accReady=DeskTouchAccessibilityService.ready(application);
             chosenShell=shouldUseShellBridge(shellReady,accReady);
             if(hasClaim() ||
@@ -746,7 +805,7 @@ final class DeskTouchSession implements AutoCloseable {
             send(new Packet("reverse-busy",claim));
             return;
         }
-        if(chosenShell) ShellInputClient.beginRemote(application);
+        if(chosenShell && !preparedShell) ShellInputClient.beginRemote(application,ptrSpeed,hz);
         send(new Packet("reverse-granted",claim));
         if(!fromUdp) warmOrProbeUdp();
         RemoteInputPower.begin(application);
@@ -801,7 +860,7 @@ final class DeskTouchSession implements AutoCloseable {
     }
     private boolean isActiveBackendReady(){
         return reverseUsingShell
-            ? ShellInputClient.ready(application)
+            ? (ShellInputClient.ready(application) || ShellInputClient.hasBridgeConfig(application))
             : DeskTouchAccessibilityService.ready(application);
     }
     private void dispatchReverseButton(int button,boolean down,int actionSeq,boolean fromUdp){
@@ -967,6 +1026,9 @@ final class DeskTouchSession implements AutoCloseable {
         livePhoneRefreshHz=refreshHz;
         livePhoneFrameTenthsMs=tenths;
         DeskTouchAccessibilityService.setDisplayRefreshHz(refreshHz);
+        if(changed && reverseLease>0 && reverseUsingShell){
+            ShellInputClient.beginRemote(application,readAndroidPointerSpeed(),refreshHz);
+        }
 
         long now=SystemClock.uptimeMillis();
         FastUdpChannel ch=udpChannel;
@@ -1002,7 +1064,7 @@ final class DeskTouchSession implements AutoCloseable {
             // Publish rotations on the existing authenticated TLS link.
             send(new Packet("topology",0,0,0,0,layout.toString()));
             if(reverseLease>0 && reverseUsingShell)
-                ShellInputClient.beginRemote(application);
+                ShellInputClient.beginRemote(application,readAndroidPointerSpeed(),currentRefreshHz());
         }catch(org.json.JSONException ignored){}
     }
     void publishAccessibilityCapability(){
@@ -1028,13 +1090,35 @@ final class DeskTouchSession implements AutoCloseable {
         clearReverseControl(true);
         status("Input control released; connections remain available.");
     }
+    static boolean acceptPendingTrustResponse(int expectedId, int responseId){
+        return responseId==0 || responseId==expectedId;
+    }
+
+    static String buildPendingTrustNotice(){
+        return "Trust approval is already waiting on Windows — click Yes on the PC dialog";
+    }
+
     void requestTrust(){
         if(!running){status("Pair with Windows first");return;}
-        byte[] secret=new byte[32];RANDOM.nextBytes(secret);
-        StringBuilder s=new StringBuilder();
-        for(byte b:secret)s.append(String.format(Locale.ROOT,"%02X",b&255));
-        pendingTrust=s.toString();
-        send(new Packet("trust-request",0,0,0,0,pendingTrust));
+        int reqId;
+        String proposal;
+        synchronized(trustLock){
+            long now=SystemClock.uptimeMillis();
+            if(pendingTrust!=null && now-pendingTrustAtMs<55_000L){
+                status(buildPendingTrustNotice());
+                return;
+            }
+            byte[] secret=new byte[32];RANDOM.nextBytes(secret);
+            StringBuilder s=new StringBuilder();
+            for(byte b:secret)s.append(String.format(Locale.ROOT,"%02X",b&255));
+            proposal=s.toString();
+            pendingTrust=proposal;
+            reqId=nextTrustId++;
+            if(nextTrustId<=0)nextTrustId=1;
+            pendingTrustId=reqId;
+            pendingTrustAtMs=now;
+        }
+        send(new Packet("trust-request",reqId,0,0,0,proposal));
         status("Approve 'Trust this device' on Windows");
     }
     private void clampToMonitor(){
@@ -1353,7 +1437,10 @@ final class DeskTouchSession implements AutoCloseable {
         clearReverseControl(false);
         reverseDedup.reset();
         RemoteInputPower.end();
-        running=false;active=false;claim=0;pendingTrust=null;peerInetAddress=null;cableSession=false;
+        synchronized(trustLock){
+            pendingTrust=null;pendingTrustId=0;pendingTrustAtMs=0L;
+        }
+        running=false;active=false;claim=0;peerInetAddress=null;cableSession=false;
         peerName=null;peerHostAddress=null;liveRttMs=0.0;liveLinkSpeedMbps=0;missedPings=0;
         lastPongReceivedMs=0L;connectedAtMs=0L;
         environmentTargets=java.util.Collections.emptyList();

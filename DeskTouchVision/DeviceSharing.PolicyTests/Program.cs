@@ -2057,6 +2057,84 @@ Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
     "Same-desktop tray window gets wake window to surface and recovers if stuck invisible");
 Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/other-desktop recovery logic verified.");
 
+// Verify non-blocking trust-request approval keeps heartbeats responsive while dialog is open,
+// and verify cable adaptive pacing + ADB APK version tracking.
+{
+    double cable144 = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 2.0);
+    double cable60 = ReceiverServer.ComputeAdaptiveCableIntervalMs(60, 2.0);
+    double cableBusy = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 28.0);
+    Check(cable144 >= 2.8 && cable144 <= 3.8 && cable60 <= 6.0 && cableBusy > cable144 && cableBusy <= 8.0,
+        "Cable pacing interval must target smooth half-frame cadence without choking high RTT links");
+
+    int cableDispatched = 0;
+    int cableTrailing = 0;
+    bool cableLease = true;
+    using var cablePacer = new FastMovePacer(
+        canSendUdp: () => cableLease,
+        sendUdp: _ => { Interlocked.Increment(ref cableDispatched); return true; },
+        queueReliableTcp: _ => Interlocked.Increment(ref cableDispatched),
+        sendWarm: null,
+        queueTrailingSync: _ => Interlocked.Increment(ref cableTrailing));
+    cablePacer.SetMinIntervalMs(cable144);
+    for (int i = 0; i < 8; i++)
+        Check(cablePacer.TryHandleMove(new Packet("move", 100 + i * 3, 200, i + 1, 1)),
+            "Cable pacer must accept high-rate moves");
+    Thread.Sleep(25);
+    Check(Volatile.Read(ref cableDispatched) >= 2 && Volatile.Read(ref cableDispatched) <= 4 &&
+        Volatile.Read(ref cableTrailing) == 0 &&
+        cablePacer.TakePendingReliableSync(skipIfUdpDelivered: true) == null,
+        "Cable pacer must coalesce bursts smoothly without duplicate trailing TCP writes");
+
+    string checkScriptV45 = AdbCableBridge.BuildShellCheckScript(41234);
+    string daemonScriptV45 = AdbCableBridge.BuildShellDaemonScript();
+    Check(checkScriptV45.Contains("APK_RUN", StringComparison.Ordinal) &&
+        daemonScriptV45.Contains("/data/local/tmp/dt_s.apk", StringComparison.Ordinal),
+        "Shell daemon launcher and health check must track installed APK path across app updates");
+
+    string nbTrustRoot = Path.Combine(Path.GetTempPath(), "DeskTouch-nb-trust-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(nbTrustRoot);
+    try
+    {
+        var nbId = Path.Combine(nbTrustRoot, "id.dpapi");
+        var nbIn = Path.Combine(nbTrustRoot, "in.dpapi");
+        var nbGrants = new TrustedDeviceStore(nbIn);
+        var dialogEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dialogDecision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var nbReceiver = new ReceiverServer(
+            _ => { },
+            new LocalInputPriority(),
+            (_, _) => Task.FromResult(true),
+            nbGrants,
+            (_, _) =>
+            {
+                dialogEntered.TrySetResult();
+                return dialogDecision.Task;
+            },
+            nbId);
+        nbReceiver.Start();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        using var host = await HostSession.ConnectWithApprovalAsync(
+            "127.0.0.1", nbReceiver.Fingerprint, _ => { }, deadline.Token);
+        var pongedDuringModal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.HeartbeatAcknowledged += () => pongedDuringModal.TrySetResult();
+
+        Task<string?> trustTask = host.RequestTrustAsync(deadline.Token);
+        await dialogEntered.Task.WaitAsync(TimeSpan.FromSeconds(3), deadline.Token);
+        Check(host.TrySend(new Packet("ping")), "Must be able to send heartbeat ping during open trust modal");
+        await pongedDuringModal.Task.WaitAsync(TimeSpan.FromSeconds(1), deadline.Token);
+
+        dialogDecision.TrySetResult(true);
+        string? grantedToken = await trustTask.WaitAsync(TimeSpan.FromSeconds(3), deadline.Token);
+        Check(!string.IsNullOrWhiteSpace(grantedToken) && nbGrants.Incoming.Count == 1,
+            "Trust approval completing after heartbeat exchanges must save incoming trusted token");
+    }
+    finally
+    {
+        try { Directory.Delete(nbTrustRoot, recursive: true); } catch { }
+    }
+    Console.WriteLine("PASS: Cable adaptive pacing, APK daemon version tracking, and non-blocking trust approval verified.");
+}
+
 internal sealed class RecordingInputSession : IInputSession
 {
     internal List<Packet> Packets { get; } = new();

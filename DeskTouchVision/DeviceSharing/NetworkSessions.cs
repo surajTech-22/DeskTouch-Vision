@@ -613,7 +613,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int tick = 0;
             while (!token.IsCancellationRequested)
             {
-                await Task.Delay(100, token);
+                await Task.Delay(40, token);
                 long nowMs = Environment.TickCount64;
                 foreach (var session in _sessions.Values)
                 {
@@ -632,12 +632,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         if (nowMs - session.LastTcpPingMs >= cableGapMs)
                         {
                             session.LastTcpPingMs = nowMs;
-                            int pingToken = session.CableTracker.NextPingToken(nowMs);
-                            _ = Task.Run(async () =>
-                            {
-                                try { await SendToAsync(session, new Packet("ping", pingToken), token); }
-                                catch (Exception) { }
-                            });
+                            _ = SendCablePingAsync(session, token);
                         }
                     }
                     else if (peer is { Confirmed: true } && _udpHub != null)
@@ -653,7 +648,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         }
                     }
 
-                    if ((tick % 30) != 29) continue;
+                    if ((tick % 75) != 74) continue;
                     int liveHz = Volatile.Read(ref session.LiveRefreshHz);
                     int effectiveHz = liveHz >= 24 ? liveHz : (session.Peer.RefreshHz ?? 0);
                     if (session.IsCableSession)
@@ -739,6 +734,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         await session.Write.WaitAsync(token);
         try { await Wire.WriteAsync(session.Stream, packet, token); }
         finally { session.Write.Release(); }
+    }
+
+    private static async Task SendCablePingAsync(Session session, CancellationToken token)
+    {
+        try
+        {
+            await session.Write.WaitAsync(token);
+            try
+            {
+                int pingToken = session.CableTracker.NextPingToken(Environment.TickCount64);
+                await Wire.WriteAsync(session.Stream, new Packet("ping", pingToken), token);
+            }
+            finally { session.Write.Release(); }
+        }
+        catch (Exception) { }
     }
 
     private async Task RelayForwardLoopAsync(RelayLease relay,CancellationToken token)
@@ -2114,12 +2124,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static double ComputeAdaptiveCableIntervalMs(int? liveRefreshHz, double tcpRttMs)
     {
         double baseMs = liveRefreshHz is >= 24
-            ? Math.Clamp(500.0 / Math.Min(240, liveRefreshHz.Value), 2.8, 6.0)
-            : 4.2;
+            ? Math.Clamp(950.0 / Math.Min(240, liveRefreshHz.Value), 5.8, 12.0)
+            : 8.5;
         if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
             return baseMs;
-        double rttPressure = Math.Max(0.0, tcpRttMs - 12.0) * 0.08;
-        return Math.Clamp(baseMs + rttPressure, baseMs, 8.0);
+        double rttPressure = Math.Max(0.0, tcpRttMs - 8.0) * 0.20;
+        return Math.Clamp(baseMs + rttPressure, baseMs, 14.0);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>

@@ -125,7 +125,15 @@ final class DeskTouchSession implements AutoCloseable {
     private final Context application;
     private volatile int reverseLease,reverseApplied,reportedMissingKeyboard;
     private volatile boolean reverseUsingShell;
-    private final ExecutorService sender=Executors.newSingleThreadExecutor();
+    private final ExecutorService sender=Executors.newSingleThreadExecutor(r->{
+        Thread t=new Thread(()->{
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+            catch (Throwable ignored) {}
+            r.run();
+        },"DeskTouch Sender");
+        t.setDaemon(true);
+        return t;
+    });
     private final ScheduledExecutorService udpPacer=Executors.newSingleThreadScheduledExecutor(r->{
         Thread t=new Thread(r,"DeskTouch UdpSend");
         t.setDaemon(true);
@@ -410,7 +418,7 @@ final class DeskTouchSession implements AutoCloseable {
                     ssl.setSoTimeout(50000);
                     ssl.startHandshake();
                     in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
-                    out=new DataOutputStream(new BufferedOutputStream(ssl.getOutputStream()));
+                    out=new DataOutputStream(ssl.getOutputStream());
                     new Packet(tryTrusted?"auth-trusted":"auth-request",0,0,0,0,
                         tryTrusted?saved:PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL)).write(out);
                     ready=Packet.read(in);
@@ -554,7 +562,7 @@ final class DeskTouchSession implements AutoCloseable {
                 if("udp-channel".equals(p.type)){
                     if(!cableSession) setupUdpChannel(p);
                 } else if("ping".equals(p.type)){
-                    send(new Packet("pong",p.a,p.b));
+                    writeNow(new Packet("pong",p.a,p.b));
                 } else if("environment-roster".equals(p.type)){
                     acceptEnvironmentRoster(p);
                 } else if("environment-unavailable".equals(p.type)){
@@ -832,7 +840,7 @@ final class DeskTouchSession implements AutoCloseable {
                 SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<40){
                 return;
             }
-            applyReversePointerMove(p.a,p.b,reverseLease,p.c,false);
+            applyReversePointerMove(p.a,p.b,(short)(p.d>>>16),(short)(p.d&0xFFFF),reverseLease,p.c,false);
         }else if("reverse-button".equals(p.type)){
             dispatchReverseButton(p.a,p.b!=0,p.c,false);
         }else if("reverse-wheel".equals(p.type)){
@@ -889,6 +897,9 @@ final class DeskTouchSession implements AutoCloseable {
         };
     }
     private void applyReversePointerMove(int x,int y,int lease,int moveSeq,boolean fromUdp){
+        applyReversePointerMove(x,y,0,0,lease,moveSeq,fromUdp);
+    }
+    private void applyReversePointerMove(int x,int y,int pushX,int pushY,int lease,int moveSeq,boolean fromUdp){
         final boolean posted;
         synchronized(reverseDedup){
             if(!running || lease<=0 || lease!=reverseLease
@@ -897,7 +908,7 @@ final class DeskTouchSession implements AutoCloseable {
             if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
             Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
             posted=reverseUsingShell
-                ? ShellInputClient.movePointer(x,y,ack)
+                ? ShellInputClient.movePointer(x,y,pushX,pushY,ack)
                 : DeskTouchAccessibilityService.pointer(x,y,ack);
         }
         if(!posted)revokeRemoteFromNative();

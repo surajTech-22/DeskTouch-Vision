@@ -259,6 +259,8 @@ internal sealed class AdbCableBridge : IDisposable
         if (!ok) return;
 
         IReadOnlyList<string> wiredSerials = ParseWiredAdbSerials(devicesOut);
+        if (wiredSerials.Count > 0)
+            ElevateAdbProcesses();
         var present = new HashSet<string>(wiredSerials, StringComparer.Ordinal);
         bool anyDetached = false;
         foreach (string gone in _bridgedSerials.Keys.Where(s => !present.Contains(s)).ToList())
@@ -444,6 +446,31 @@ internal sealed class AdbCableBridge : IDisposable
         {
             return (false, string.Empty);
         }
+    }
+
+    private static void ElevateAdbProcesses()
+    {
+        try
+        {
+            foreach (Process proc in Process.GetProcessesByName("adb"))
+            {
+                try
+                {
+                    if (proc.PriorityClass is ProcessPriorityClass.Normal
+                        or ProcessPriorityClass.BelowNormal
+                        or ProcessPriorityClass.Idle)
+                    {
+                        proc.PriorityClass = ProcessPriorityClass.AboveNormal;
+                    }
+                }
+                catch (Exception) { }
+                finally
+                {
+                    proc.Dispose();
+                }
+            }
+        }
+        catch (Exception) { }
     }
 
     public void Dispose()

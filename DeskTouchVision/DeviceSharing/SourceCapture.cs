@@ -1070,7 +1070,10 @@ internal sealed class SourceCapture : IDisposable
             new System.Drawing.Point(nextX, nextY));
         _remoteX = mapped.X;
         _remoteY = mapped.Y;
-        _session.TrySend(new Packet("move", _remoteX, _remoteY));
+        int pushX = Math.Clamp(nextX - mapped.X, -120, 120);
+        int pushY = Math.Clamp(nextY - mapped.Y, -120, 120);
+        int packedPush = FastMovePacer.PackEdgePush(pushX, pushY);
+        _session.TrySend(new Packet("move", _remoteX, _remoteY, 0, packedPush));
     }
 
     public void Dispose()

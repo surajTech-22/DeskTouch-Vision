@@ -27,7 +27,12 @@ final class ShellInputClient {
     private static final String PREFS = "desktouch_android_control";
     private static final String ALLOW_SHELL_BRIDGE = "user_allowed_shell_bridge";
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "DeskTouch shell-bridge");
+        Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+            } catch (Throwable ignored) {}
+            r.run();
+        }, "DeskTouch shell-bridge");
         t.setDaemon(true);
         return t;
     });
@@ -48,6 +53,8 @@ final class ShellInputClient {
     private static boolean hasPendingMove;
     private static int pendingMoveX;
     private static int pendingMoveY;
+    private static int pendingPushX;
+    private static int pendingPushY;
     private static Runnable pendingMoveAck;
 
     private ShellInputClient() {}
@@ -247,10 +254,28 @@ final class ShellInputClient {
     }
 
     static boolean movePointer(int x, int y, Runnable ack) {
+        return movePointer(x, y, 0, 0, ack);
+    }
+
+    static boolean movePointer(int x, int y, int pushX, int pushY, Runnable ack) {
         if (!connectedReady && !hasBridgeConfig(appContext)) return false;
         synchronized (MOVE_LOCK) {
+            if (!hasPendingMove) {
+                pendingPushX = 0;
+                pendingPushY = 0;
+            }
             pendingMoveX = x;
             pendingMoveY = y;
+            if (pushX != 0) {
+                pendingPushX = Math.max(-240, Math.min(240, pendingPushX + pushX));
+            } else {
+                pendingPushX = 0;
+            }
+            if (pushY != 0) {
+                pendingPushY = Math.max(-240, Math.min(240, pendingPushY + pushY));
+            } else {
+                pendingPushY = 0;
+            }
             if (ack != null) pendingMoveAck = ack;
             hasPendingMove = true;
         }
@@ -262,7 +287,7 @@ final class ShellInputClient {
 
     private static void drainPendingMove() {
         while (true) {
-            int x, y;
+            int x, y, pushX, pushY;
             Runnable ack;
             synchronized (MOVE_LOCK) {
                 if (!hasPendingMove) {
@@ -274,11 +299,19 @@ final class ShellInputClient {
                 }
                 x = pendingMoveX;
                 y = pendingMoveY;
+                pushX = pendingPushX;
+                pushY = pendingPushY;
                 ack = pendingMoveAck;
                 hasPendingMove = false;
+                pendingPushX = 0;
+                pendingPushY = 0;
                 pendingMoveAck = null;
             }
-            sendLine("MOVETO " + x + " " + y);
+            if (pushX != 0 || pushY != 0) {
+                sendLine("MOVETO " + x + " " + y + " " + pushX + " " + pushY);
+            } else {
+                sendLine("MOVETO " + x + " " + y);
+            }
             if (ack != null) ack.run();
         }
     }
@@ -344,6 +377,8 @@ final class ShellInputClient {
         remoteSessionActive = false;
         synchronized (MOVE_LOCK) {
             hasPendingMove = false;
+            pendingPushX = 0;
+            pendingPushY = 0;
             pendingMoveAck = null;
         }
         if (!connectedReady) return;
@@ -364,6 +399,8 @@ final class ShellInputClient {
         remoteSessionActive = false;
         synchronized (MOVE_LOCK) {
             hasPendingMove = false;
+            pendingPushX = 0;
+            pendingPushY = 0;
             pendingMoveAck = null;
         }
         connectedReady = false;

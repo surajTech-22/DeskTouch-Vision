@@ -301,7 +301,7 @@ internal sealed class AdaptiveLinkTracker
         string band = Band;
         return band switch
         {
-            "cable" => controlActive ? 150 : 600,
+            "cable" => controlActive ? 38 : 120,
             "5GHz" or "6GHz" => controlActive ? 120 : 500,
             "2.4GHz" => controlActive ? 350 : 900,
             _ => controlActive ? 220 : 750
@@ -999,6 +999,16 @@ internal sealed class FastUdpClient : IDisposable
 /// </summary>
 internal sealed class FastMovePacer : IDisposable
 {
+    internal static int PackEdgePush(int pushX, int pushY)
+    {
+        int cx = Math.Clamp(pushX, -240, 240);
+        int cy = Math.Clamp(pushY, -240, 240);
+        return ((cx & 0xFFFF) << 16) | (cy & 0xFFFF);
+    }
+
+    internal static (int PushX, int PushY) UnpackEdgePush(int packed) =>
+        ((short)(packed >> 16), (short)(packed & 0xFFFF));
+
     private const double MinUdpIntervalMs = 1.5;
     private const int TrailingTcpSyncDelayMs = 130;
     private const int WarmKeepaliveIntervalMs = 22;

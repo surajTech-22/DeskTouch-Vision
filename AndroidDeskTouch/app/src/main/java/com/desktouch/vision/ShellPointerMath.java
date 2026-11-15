@@ -220,6 +220,10 @@ final class ShellPointerMath {
         }
 
         MoveStep stepTo(int targetX, int targetY, long nowNs) {
+            return stepTo(targetX, targetY, 0, 0, nowNs);
+        }
+
+        MoveStep stepTo(int targetX, int targetY, int pushX, int pushY, long nowNs) {
             int tx = Math.max(0, Math.min(screenWidth - 1, targetX));
             int ty = Math.max(0, Math.min(screenHeight - 1, targetY));
 
@@ -227,24 +231,17 @@ final class ShellPointerMath {
                 double minScale = Math.max(0.25, params.scale);
                 int pull = (int) Math.min(20000L,
                     Math.round(Math.max(screenWidth, screenHeight) * 2.5 / minScale));
-                int edgePad = edgeSnapCounts();
+                int cornerX = tx > (screenWidth - 1) * 0.5 ? (screenWidth - 1) : 0;
+                int cornerY = ty > (screenHeight - 1) * 0.5 ? (screenHeight - 1) : 0;
+                int pullX = cornerX == 0 ? -pull : pull;
+                int pullY = cornerY == 0 ? -pull : pull;
 
-                int resetX = tx > 0 ? 1 : 0;
-                int resetY = ty > 0 ? 1 : 0;
-                double startX = resetX > 0 ? params.scale : 0.0;
-                double startY = resetY > 0 ? params.scale : 0.0;
-
-                double jumpDx = Math.max(0.0, tx - startX);
-                double jumpDy = Math.max(0.0, ty - startY);
-                double dist = Math.hypot(jumpDx, jumpDy);
-                double entryGain = dist > 160.0 * params.scale
-                    ? params.scale * params.acceleration
-                    : params.scale;
-
-                int rawX = tx == 0 ? -edgePad : (int) Math.round(jumpDx / entryGain);
-                int rawY = ty == 0 ? -edgePad : (int) Math.round(jumpDy / entryGain);
-                if (tx >= screenWidth - 1) rawX += edgePad;
-                if (ty >= screenHeight - 1) rawY += edgePad;
+                // Sign reversal from corner pull resets AOSP VelocityTracker so the jump
+                // burst executes at params.scale regardless of pointer_speed.
+                double jumpDx = tx - cornerX;
+                double jumpDy = ty - cornerY;
+                int rawX = (int) Math.round(jumpDx / minScale);
+                int rawY = (int) Math.round(jumpDy / minScale);
 
                 cursorX = tx;
                 cursorY = ty;
@@ -255,61 +252,81 @@ final class ShellPointerMath {
                 prevDx = 0.0;
                 prevDy = 0.0;
                 lastReportNs = nowNs;
-                return new MoveStep(true, -pull, -pull, resetX, resetY, rawX, rawY);
+                return new MoveStep(true, pullX, pullY, 0, 0, rawX, rawY);
             }
 
             double dx = tx - cursorX;
             double dy = ty - cursorY;
-            boolean hitLeft = tx == 0 && lastTargetX != 0 && dx <= 0.0;
-            boolean hitRight = tx >= screenWidth - 1 && lastTargetX < screenWidth - 1 && dx >= 0.0;
-            boolean hitTop = ty == 0 && lastTargetY != 0 && dy <= 0.0;
-            boolean hitBottom = ty >= screenHeight - 1 && lastTargetY < screenHeight - 1 && dy >= 0.0;
+            boolean atLeft = tx == 0;
+            boolean atRight = tx >= screenWidth - 1;
+            boolean atTop = ty == 0;
+            boolean atBottom = ty >= screenHeight - 1;
+
+            boolean hitLeft = atLeft && lastTargetX != 0 && dx <= 0.0;
+            boolean hitRight = atRight && lastTargetX < screenWidth - 1 && dx >= 0.0;
+            boolean hitTop = atTop && lastTargetY != 0 && dy <= 0.0;
+            boolean hitBottom = atBottom && lastTargetY < screenHeight - 1 && dy >= 0.0;
+
+            boolean pushingLeft = atLeft && pushX < 0;
+            boolean pushingRight = atRight && pushX > 0;
+            boolean pushingTop = atTop && pushY < 0;
+            boolean pushingBottom = atBottom && pushY > 0;
+
             lastTargetX = tx;
             lastTargetY = ty;
 
-            double dist = Math.hypot(dx, dy);
-            if (dist < 0.35 && !hitLeft && !hitRight && !hitTop && !hitBottom) {
+            boolean hasEdgeAction = hitLeft || hitRight || hitTop || hitBottom
+                || pushingLeft || pushingRight || pushingTop || pushingBottom;
+            if (Math.abs(dx) < 0.25 && Math.abs(dy) < 0.25 && !hasEdgeAction) {
                 return new MoveStep(false, 0, 0, 0, 0, 0, 0);
             }
 
+            double minFrameSec = Math.max(0.0055, 0.9 / Math.max(60, refreshHz));
             double dtSec;
             if (lastReportNs <= 0L || nowNs <= lastReportNs) {
-                dtSec = Math.max(0.0025, 1.0 / Math.max(60, refreshHz * 2.0));
+                dtSec = minFrameSec;
                 smoothedOutSpeed = 0.0;
             } else {
                 dtSec = (nowNs - lastReportNs) / 1_000_000_000.0;
-                if (dtSec > 0.120) {
+                if (dtSec > 0.090) {
                     smoothedOutSpeed = 0.0;
-                    dtSec = 0.012;
+                    dtSec = 0.014;
                 }
             }
-            double effectiveDt = Math.max(0.0023, Math.min(0.045, dtSec));
-            if (dx * prevDx + dy * prevDy < 0.0) {
-                smoothedOutSpeed *= 0.25;
+            double effectiveDt = Math.max(minFrameSec, Math.min(0.045, dtSec));
+            // AOSP VelocityControl clears velocity tracking when either axis flips sign.
+            if (dx * prevDx < 0.0 || dy * prevDy < 0.0) {
+                smoothedOutSpeed = 0.0;
             }
 
+            double dist = Math.hypot(dx, dy);
             double instSpeed = dist / effectiveDt;
-            double alpha = effectiveDt / (effectiveDt + 0.024);
+            double alpha = effectiveDt / (effectiveDt + 0.075);
             smoothedOutSpeed += alpha * (instSpeed - smoothedOutSpeed);
-            double gain = gainForOutputSpeed(smoothedOutSpeed, params);
+            double modelGain = gainForOutputSpeed(smoothedOutSpeed, params);
+            double gain = params.scale + (modelGain - params.scale) * 0.70;
 
             int rawX = (int) Math.round(dx / gain);
             int rawY = (int) Math.round(dy / gain);
-            if (hitLeft) {
-                rawX -= edgeSnapCounts();
+            if (hitLeft || pushingLeft) {
+                if (hitLeft) rawX -= edgeSnapCounts();
+                if (pushingLeft) rawX += edgePushRaw(pushX, params.scale);
                 cursorX = 0.0;
-            } else if (hitRight) {
-                rawX += edgeSnapCounts();
+            } else if (hitRight || pushingRight) {
+                if (hitRight) rawX += edgeSnapCounts();
+                if (pushingRight) rawX += edgePushRaw(pushX, params.scale);
                 cursorX = screenWidth - 1;
             } else {
                 cursorX = Math.max(0.0, Math.min(screenWidth - 1, cursorX + rawX * gain));
             }
 
-            if (hitTop) {
-                rawY -= edgeSnapCounts();
+            if (hitTop || pushingTop) {
+                if (hitTop) rawY -= edgeSnapCounts();
+                if (pushingTop) rawY += edgePushRaw(pushY, params.scale);
                 cursorY = 0.0;
-            } else if (hitBottom) {
-                rawY += edgeSnapCounts();
+            } else if (hitBottom || pushingBottom) {
+                if (hitBottom) rawY += edgeSnapCounts();
+                if (pushingBottom) rawY += edgePushRaw(pushY, params.scale);
                 cursorY = screenHeight - 1;
             } else {
                 cursorY = Math.max(0.0, Math.min(screenHeight - 1, cursorY + rawY * gain));
@@ -321,6 +338,12 @@ final class ShellPointerMath {
                 lastReportNs = nowNs;
             }
             return new MoveStep(false, 0, 0, 0, 0, rawX, rawY);
+        }
+
+        private static int edgePushRaw(int pushDelta, double scale) {
+            if (pushDelta == 0) return 0;
+            int scaled = (int) Math.round(pushDelta / Math.max(0.25, scale));
+            return scaled != 0 ? scaled : (pushDelta > 0 ? 1 : -1);
         }
 
         private int edgeSnapCounts() {

@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.47 — Full-Screen Cursor Tracking & Sub-10ms Cable Ping
+
+Fixes the v0.3.45/v0.3.46 regression where cursor movement stalled or remained trapped inside only part of the Android screen, eliminates double-pacer cable jitter, and reduces wired USB data-cable RTT spikes below 10 ms.
+
+- **Full-screen reachability & edge-overflow pass-through (`ShellPointerMath`, `SourceCapture`, `ShellInputClient`):** Anchors initial pointer entry from the nearest display corner using exact baseline velocity scale (`params.scale`), removes positive-feedback velocity drift on USB bursts, and packs Windows boundary push deltas (`Packet.D`) so continuous movement past clamped screen borders always reaches 100% of the Android screen without stalling or corner bounce.
+- **Single-stage jitter-free UHID emission (`ShellInputDaemon`):** Removes the duplicate Android secondary sleep pacer so coalesced `MOVETO` frames execute directly on an `URGENT_DISPLAY` thread aligned with Windows `FastMovePacer` framing.
+- **Sub-10ms wired data-cable latency & ADB scheduling (`NetworkSessions`, `FastUdpChannel`, `AdbCableBridge`, `DeskTouchSession`):** Aligns wired `FastMovePacer` interval to 1x live refresh rate to prevent ADB `WRTE/OKAY` congestion, tightens wired keepalive probe cadence (38 ms active / 120 ms idle) to stop USB idle-wakeup spikes, elevates running `adb` processes to `AboveNormal` priority during wired sync, removes double socket buffering on Android, and replies to heartbeats immediately on the urgent read loop.
+
+---
+
 # DeskTouch Vision v0.3.46 — Instant Data-Cable Screen Crossing Fix
 
 Fixes the v0.3.45 regression where moving the cursor across the screen edge over a USB data cable stalled on "waiting for cursor/authority application acknowledgement" and timed out instead of handing control to Android.

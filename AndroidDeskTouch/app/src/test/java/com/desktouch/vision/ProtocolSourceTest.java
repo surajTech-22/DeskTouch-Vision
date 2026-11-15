@@ -817,6 +817,28 @@ public final class ProtocolSourceTest {
         ShellPointerMath.MoveStep slideAlongEdge = comp.stepTo(0, 110, t + 8_000_000L);
         assertEquals("Sliding along left edge must not repeatedly inject -X edge bumps", 0, slideAlongEdge.rawX);
         assertTrue("Sliding along left edge must continue tracking Y movement", slideAlongEdge.rawY > 0);
+
+        // Verify explicit edge push recovers even when target X is clamped at screen border.
+        ShellPointerMath.MoveStep pushLeft = comp.stepTo(0, 110, -18, 0, t + 16_000_000L);
+        assertTrue("Pushing past left boundary must emit negative recovery counts", pushLeft.rawX < 0);
+        ShellPointerMath.MoveStep pushRightAtLeftZero = comp.stepTo(0, 110, 18, 0, t + 24_000_000L);
+        assertEquals("Inward push at left edge must not emit edge push", 0, pushRightAtLeftZero.rawX);
+
+        // Verify nearest-corner entry avoids cross-screen error spikes.
+        ShellPointerMath.PointerCompensator farEntryComp = new ShellPointerMath.PointerCompensator();
+        farEntryComp.configure(1080, 2460, parsed, 144);
+        ShellPointerMath.MoveStep farEntry = farEntryComp.stepTo(1060, 2400, t);
+        assertTrue(farEntry.needsAnchorReset);
+        assertTrue("Far-side entry should anchor to bottom-right corner", farEntry.anchorPullX > 0 && farEntry.anchorPullY > 0);
+        assertEquals("Nearest-corner jump should use exact minScale counts", -38, farEntry.rawX);
+        assertEquals("Nearest-corner jump should use exact minScale counts on Y", -118, farEntry.rawY);
+
+        // Verify full-screen sweep reaches right-bottom corner and pushes through if clamped.
+        ShellPointerMath.MoveStep toRight = farEntryComp.stepTo(1079, 2459, 24, 20, t + 8_000_000L);
+        assertTrue("Sweep to right-bottom corner must push both axes positive", toRight.rawX > 0 && toRight.rawY > 0);
+        ShellPointerMath.MoveStep clampedPush = farEntryComp.stepTo(1079, 2459, 25, 0, t + 16_000_000L);
+        assertTrue("Continuous right push at clamped edge must keep moving pointer right", clampedPush.rawX > 0);
+        assertEquals("No Y push should emit zero Y counts at bottom edge", 0, clampedPush.rawY);
     }
 
     @Test

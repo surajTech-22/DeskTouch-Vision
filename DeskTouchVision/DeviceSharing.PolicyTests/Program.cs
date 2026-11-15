@@ -2063,8 +2063,21 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     double cable144 = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 2.0);
     double cable60 = ReceiverServer.ComputeAdaptiveCableIntervalMs(60, 2.0);
     double cableBusy = ReceiverServer.ComputeAdaptiveCableIntervalMs(144, 28.0);
-    Check(cable144 >= 2.8 && cable144 <= 3.8 && cable60 <= 6.0 && cableBusy > cable144 && cableBusy <= 8.0,
-        "Cable pacing interval must target smooth half-frame cadence without choking high RTT links");
+    Check(cable144 >= 5.8 && cable144 <= 7.2 && cable60 <= 12.0 && cableBusy > cable144 && cableBusy <= 14.0,
+        "Cable pacing interval must target 1x display refresh to avoid ADB WRTE/OKAY stall jitter");
+
+    int packed = FastMovePacer.PackEdgePush(-24, 37);
+    var (unpackedX, unpackedY) = FastMovePacer.UnpackEdgePush(packed);
+    Check(unpackedX == -24 && unpackedY == 37 && FastMovePacer.PackEdgePush(0, 0) == 0,
+        "Edge overflow push must pack and unpack signed deltas losslessly");
+    Packet encodedMove = ReverseInputProtocol.Encode(new Packet("move", 1079, 2459, 0, packed));
+    Check(ReverseInputProtocol.TryDecode(encodedMove, out var decodedMove) && decodedMove.D == packed,
+        "ReverseInputProtocol must preserve packed edge-overflow delta D");
+
+    var cableTracker = new AdaptiveLinkTracker();
+    cableTracker.OnLinkProfileChanged("cable", 480, 0);
+    Check(cableTracker.ComputeProbeIntervalMs(true) <= 45 && cableTracker.ComputeProbeIntervalMs(false) <= 140,
+        "Cable ping probe cadence must stay tight enough to prevent USB idle wakeup latency spikes");
 
     int cableDispatched = 0;
     int cableTrailing = 0;
@@ -2079,8 +2092,8 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     for (int i = 0; i < 8; i++)
         Check(cablePacer.TryHandleMove(new Packet("move", 100 + i * 3, 200, i + 1, 1)),
             "Cable pacer must accept high-rate moves");
-    Thread.Sleep(25);
-    Check(Volatile.Read(ref cableDispatched) >= 2 && Volatile.Read(ref cableDispatched) <= 4 &&
+    Thread.Sleep(30);
+    Check(Volatile.Read(ref cableDispatched) >= 2 && Volatile.Read(ref cableDispatched) <= 5 &&
         Volatile.Read(ref cableTrailing) == 0 &&
         cablePacer.TakePendingReliableSync(skipIfUdpDelivered: true) == null,
         "Cable pacer must coalesce bursts smoothly without duplicate trailing TCP writes");

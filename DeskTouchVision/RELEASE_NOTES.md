@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.41 — Reliable Virtual Bridge Startup & Non-Locking Folder Updates
+
+Fixes a shell self-termination race when launching the Accessibility-free Virtual Bridge daemon on Android and ensures background cable monitoring no longer locks the Windows installation folder during updates.
+
+- **PID-file Virtual Bridge lifecycle (`--pid-file` + `kill -0`):** Tracks the running virtual mouse and keyboard daemon by exact PID file instead of process-name pattern matching so the launch shell never terminates itself mid-startup.
+- **Update-safe Windows bridge process launch:** Starts background cable tooling from its own SDK working directory so in-place Windows updates swap folders cleanly without directory handle locks.
+
+---
+
 # DeskTouch Vision v0.3.40 — Accessibility-Free Virtual Bridge & Payment-Safe Mode
 
 DeskTouch Vision now controls your Android phone's mouse cursor, clicks, scroll wheel, and keyboard without enabling Android Accessibility Settings whenever activated from your connected Windows PC, while keeping 1-tap and automatic Accessibility pause controls ready when Accessibility mode is used.

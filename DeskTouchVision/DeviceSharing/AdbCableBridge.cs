@@ -14,6 +14,7 @@ internal sealed class AdbCableBridge : IDisposable
 {
     private const string AndroidAppPackage = "com.desktouch.vision";
     private const string ShellPortFile = "/data/local/tmp/dt_s.port";
+    private const string ShellPidFile = "/data/local/tmp/dt_s.pid";
     private const string ShellTokenFile = "/data/local/tmp/dt_s.tok";
     private const long BridgeRecheckIntervalMs = 15000;
 
@@ -168,18 +169,18 @@ internal sealed class AdbCableBridge : IDisposable
     internal static string BuildShellCheckScript(int expectedPort) =>
         $"APK=$(pm path {AndroidAppPackage} 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\\r'); " +
         "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
-        "PID=$(pgrep -f 'com\\.desktouch\\.vision\\.[S]hellInputDaemon' | head -n 1 | tr -d '\\r'); " +
+        $"PID=$(cat {ShellPidFile} 2>/dev/null | tr -d '\\r\\n '); " +
         $"PORT=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); " +
-        $"if [ -n \"$PID\" ] && [ \"$PORT\" = \"{expectedPort}\" ]; then echo \"PORT=$PORT\"; else echo NEEDED; fi";
+        $"if [ -n \"$PID\" ] && kill -0 \"$PID\" 2>/dev/null && [ \"$PORT\" = \"{expectedPort}\" ]; then echo \"PORT=$PORT\"; else echo NEEDED; fi";
 
     internal static string BuildShellDaemonScript() =>
-        $"umask 077; rm -f {ShellPortFile} {ShellTokenFile}; " +
+        $"umask 077; if [ -s {ShellPidFile} ]; then OP=$(cat {ShellPidFile} 2>/dev/null | tr -d '\\r\\n '); [ -n \"$OP\" ] && [ \"$OP\" != \"$$\" ] && kill \"$OP\" 2>/dev/null || true; fi; " +
+        $"rm -f {ShellPortFile} {ShellPidFile} {ShellTokenFile}; " +
         $"APK=$(pm path {AndroidAppPackage} 2>/dev/null | head -n 1 | cut -d: -f2 | tr -d '\\r'); " +
         "[ -n \"$APK\" ] || { echo NO_APP; exit 0; }; " +
         "IFS= read -r TK || exit 2; " +
         $"printf '%s\\n' \"$TK\" > {ShellTokenFile}; unset TK; " +
-        "pkill -f 'com\\.desktouch\\.vision\\.[S]hellInputDaemon' >/dev/null 2>&1 || true; " +
-        $"{{ exec < {ShellTokenFile}; rm -f {ShellTokenFile}; CLASSPATH=\"$APK\" exec setsid /system/bin/app_process /system/bin com.desktouch.vision.ShellInputDaemon --port-file {ShellPortFile} >/dev/null 2>&1; }} </dev/null >/dev/null 2>&1 & " +
+        $"{{ exec < {ShellTokenFile}; rm -f {ShellTokenFile}; CLASSPATH=\"$APK\" exec setsid /system/bin/app_process /system/bin com.desktouch.vision.ShellInputDaemon --pid-file {ShellPidFile} --port-file {ShellPortFile} >/dev/null 2>&1; }} </dev/null >/dev/null 2>&1 & " +
         "i=0; while [ \"$i\" -lt 40 ]; do " +
         $"[ -s {ShellPortFile} ] && {{ P=$(cat {ShellPortFile} 2>/dev/null | tr -d '\\r\\n '); [ -n \"$P\" ] && {{ echo \"PORT=$P\"; exit 0; }}; }}; " +
         "sleep 0.05 2>/dev/null || sleep 1; i=$((i+1)); done; echo NO_PORT";
@@ -355,6 +356,9 @@ internal sealed class AdbCableBridge : IDisposable
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = adbPath,
+                    // Start adb from its own SDK folder so a cold-started adb server never
+                    // holds a directory lock on DeskTouchVision during in-place updates.
+                    WorkingDirectory = Path.GetDirectoryName(adbPath) ?? Environment.SystemDirectory,
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardInput = stdInText != null,

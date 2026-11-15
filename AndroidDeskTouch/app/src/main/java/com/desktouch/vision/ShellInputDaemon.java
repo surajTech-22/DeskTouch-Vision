@@ -119,9 +119,12 @@ public final class ShellInputDaemon {
 
     public static void main(String[] args) throws Exception {
         String portFile = null;
+        String pidFile = null;
         for (int i = 0; i + 1 < args.length; i++) {
             if ("--port-file".equals(args[i])) {
                 portFile = args[i + 1];
+            } else if ("--pid-file".equals(args[i])) {
+                pidFile = args[i + 1];
             }
         }
         BufferedReader stdin = new BufferedReader(
@@ -134,10 +137,16 @@ public final class ShellInputDaemon {
             .getBytes(StandardCharsets.US_ASCII);
 
         ShellInputDaemon daemon = new ShellInputDaemon(expectedBytes);
-        daemon.runServer(portFile);
+        daemon.runServer(portFile, pidFile);
     }
 
-    private void runServer(String portFile) throws Exception {
+    private void runServer(String portFile, String pidFile) throws Exception {
+        if (pidFile != null && !pidFile.isEmpty()) {
+            try (FileOutputStream out = new FileOutputStream(pidFile)) {
+                out.write((Os.getpid() + "\n").getBytes(StandardCharsets.US_ASCII));
+                out.getFD().sync();
+            }
+        }
         InetAddress loopback = InetAddress.getByName("127.0.0.1");
         try (ServerSocket server = new ServerSocket(0, 4, loopback)) {
             int port = server.getLocalPort();

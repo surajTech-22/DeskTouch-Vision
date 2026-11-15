@@ -680,10 +680,13 @@ string checkScript = AdbCableBridge.BuildShellCheckScript(41234);
 Check(daemonScript.Contains("umask 077", StringComparison.Ordinal) &&
     daemonScript.Contains("IFS= read -r TK", StringComparison.Ordinal) &&
     daemonScript.Contains("com.desktouch.vision.ShellInputDaemon", StringComparison.Ordinal) &&
+    daemonScript.Contains("--pid-file /data/local/tmp/dt_s.pid", StringComparison.Ordinal) &&
     daemonScript.Contains("rm -f /data/local/tmp/dt_s.tok", StringComparison.Ordinal) &&
+    !daemonScript.Contains("pkill -f", StringComparison.Ordinal) &&
+    checkScript.Contains("kill -0", StringComparison.Ordinal) &&
     !checkScript.Contains("NO_PORT", StringComparison.Ordinal) &&
     checkScript.Contains("41234", StringComparison.Ordinal),
-    "Shell Bridge launcher script must pass token only via stdin 077 file unlinked before exec");
+    "Shell Bridge launcher script must pass token only via stdin 077 file unlinked before exec without pkill self-match");
 Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch scripts enforce safety invariants.");
 
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.

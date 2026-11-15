@@ -260,20 +260,20 @@ final class ShellInputClient {
     static boolean movePointer(int x, int y, int pushX, int pushY, Runnable ack) {
         if (!connectedReady && !hasBridgeConfig(appContext)) return false;
         synchronized (MOVE_LOCK) {
-            if (!hasPendingMove) {
-                pendingPushX = 0;
-                pendingPushY = 0;
-            }
+            boolean sameX = hasPendingMove && pendingMoveX == x;
+            boolean sameY = hasPendingMove && pendingMoveY == y;
             pendingMoveX = x;
             pendingMoveY = y;
             if (pushX != 0) {
-                pendingPushX = Math.max(-240, Math.min(240, pendingPushX + pushX));
-            } else {
+                int base = sameX ? pendingPushX : 0;
+                pendingPushX = Math.max(-240, Math.min(240, base + pushX));
+            } else if (!sameX) {
                 pendingPushX = 0;
             }
             if (pushY != 0) {
-                pendingPushY = Math.max(-240, Math.min(240, pendingPushY + pushY));
-            } else {
+                int base = sameY ? pendingPushY : 0;
+                pendingPushY = Math.max(-240, Math.min(240, base + pushY));
+            } else if (!sameY) {
                 pendingPushY = 0;
             }
             if (ack != null) pendingMoveAck = ack;

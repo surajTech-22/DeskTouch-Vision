@@ -637,12 +637,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void UpdateButtons()
     {
         if (IsDisposed) return;
-        _trustDevice.Enabled = _trusted != null && _host != null &&
+        bool canTrustOutbound = _trusted != null && _host != null &&
             !string.IsNullOrEmpty(_currentFingerprint) &&
             !_trusted.IsTrustedReceiver(_currentFingerprint);
-        _trustDevice.Visible = _trusted != null && _host != null &&
-            !string.IsNullOrEmpty(_currentFingerprint) &&
-            !_trusted.IsTrustedReceiver(_currentFingerprint);
+        bool canTrustInbound = _trusted != null && _host == null && _receiver != null &&
+            !string.IsNullOrEmpty(_receiver.ConnectedPeerName) &&
+            !_trusted.IsTrustedIncoming(_receiver.ConnectedPeerName, _receiver.ConnectedPeerFingerprint);
+        bool canTrust = canTrustOutbound || canTrustInbound;
+        _trustDevice.Enabled = canTrust;
+        _trustDevice.Visible = canTrust;
         _manageTrusted.Enabled = _trusted != null;
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
         _copyCode.Enabled = _receiver?.CanAcceptNewPeer == true &&
@@ -1402,6 +1405,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question,
                     MessageBoxDefaultButton.Button2);
                 completion.TrySetResult(result == DialogResult.Yes);
+                if (result == DialogResult.Yes)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(120);
+                        try { if (!IsDisposed && IsHandleCreated) BeginInvoke(UpdateButtons); }
+                        catch (Exception) { }
+                    });
+                }
             });
         }
         catch (InvalidOperationException) { completion.TrySetResult(false); }
@@ -1578,6 +1590,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question,
                     MessageBoxDefaultButton.Button2);
                 completion.TrySetResult(result == DialogResult.Yes);
+                if (result == DialogResult.Yes)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(120);
+                        try { if (!IsDisposed && IsHandleCreated) BeginInvoke(UpdateButtons); }
+                        catch (Exception) { }
+                    });
+                }
             });
         }
         catch (InvalidOperationException) { completion.TrySetResult(false); }
@@ -1586,8 +1607,33 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private async Task TrustConnectedDeviceAsync()
     {
-        if (_host == null || _trusted == null ||
-            string.IsNullOrEmpty(_currentFingerprint)) return;
+        if (_trusted == null) return;
+        if (_host == null)
+        {
+            if (_receiver == null) return;
+            var peerName = _receiver.ConnectedPeerName;
+            if (string.IsNullOrWhiteSpace(peerName)) return;
+            if (MessageBox.Show(this,
+                $"Trust {peerName}?\n\nOnce confirmed, {peerName} can reconnect automatically whenever it is reachable over data cable or wireless.",
+                "DeskTouch — Trust connected device?", MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question, MessageBoxDefaultButton.Button1) != DialogResult.Yes)
+                return;
+            _trustDevice.Enabled = false;
+            try
+            {
+                bool saved = await _receiver.OfferTrustToConnectedAsync(_trusted, _closing.Token);
+                if (!saved)
+                {
+                    Status("Trusted device offer was declined or timed out.");
+                    return;
+                }
+                Status($"{peerName} trusted and saved for automatic reconnection.");
+            }
+            catch (Exception ex) { Status("Could not save trusted device: " + ex.Message); }
+            finally { UpdateButtons(); }
+            return;
+        }
+        if (string.IsNullOrEmpty(_currentFingerprint)) return;
         var name = _remoteAddress;
         var fingerprint = _currentFingerprint;
         if (MessageBox.Show(this,

@@ -10,7 +10,7 @@ namespace DeskTouch.DeviceShare;
 // fingerprint + a per-peer 256-bit secret authenticate reconnection.
 internal sealed record TrustedOutgoing(string Name, string Fingerprint,
     string Token, bool AutoConnect = true);
-internal sealed record TrustedIncoming(string Name, string TokenSha256);
+internal sealed record TrustedIncoming(string Name, string TokenSha256, string? Fingerprint = null);
 
 internal sealed class TrustedDeviceStore
 {
@@ -134,14 +134,30 @@ internal sealed class TrustedDeviceStore
         finally { CryptographicOperations.ZeroMemory(receivedHash); }
     }
 
-    internal void AllowIncoming(string name, string token)
+    internal bool IsTrustedIncoming(string? name, string? fingerprint = null)
+    {
+        lock (_lock)
+        {
+            if (!string.IsNullOrWhiteSpace(fingerprint) &&
+                _data.Incoming.Any(x => string.Equals(x.Fingerprint, fingerprint, StringComparison.OrdinalIgnoreCase)))
+                return true;
+            return !string.IsNullOrWhiteSpace(name) &&
+                _data.Incoming.Any(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    internal void AllowIncoming(string name, string token, string? fingerprint = null)
     {
         string hash = HashToken(token);
+        string? cleanFp = string.IsNullOrWhiteSpace(fingerprint) ? null : fingerprint.Trim();
         lock (_lock)
         {
             _data.Incoming.RemoveAll(x =>
-                x.TokenSha256.Equals(hash, StringComparison.OrdinalIgnoreCase));
-            _data.Incoming.Add(new TrustedIncoming(name, hash));
+                x.TokenSha256.Equals(hash, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(cleanFp) &&
+                    string.Equals(x.Fingerprint, cleanFp, StringComparison.OrdinalIgnoreCase)) ||
+                (string.IsNullOrWhiteSpace(cleanFp) && x.Name.Equals(name, StringComparison.OrdinalIgnoreCase)));
+            _data.Incoming.Add(new TrustedIncoming(name, hash, cleanFp));
             Save();
         }
     }

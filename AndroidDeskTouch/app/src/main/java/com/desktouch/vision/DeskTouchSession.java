@@ -422,14 +422,22 @@ final class DeskTouchSession implements AutoCloseable {
                     new Packet(tryTrusted?"auth-trusted":"auth-request",0,0,0,0,
                         tryTrusted?saved:PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL)).write(out);
                     ready=Packet.read(in);
-                    if("ready".equals(ready.type)) break;
+                    if(ready!=null && "ready".equals(ready.type)) break;
                     try { ssl.close(); } catch (Exception ignored) {}
                     ssl=null;
+                    boolean explicitlyRejected = ready!=null && (
+                        "denied".equals(ready.type) ||
+                        "trust-denied".equals(ready.type) ||
+                        "untrusted".equals(ready.type));
                     if(tryTrusted){
-                        trust.forget(pinned);
-                        if(interactiveUser){
-                            status("Saved Windows trust expired; requesting fresh Windows approval...");
-                            continue;
+                        if(explicitlyRejected){
+                            trust.forget(pinned);
+                            if(interactiveUser){
+                                status("Saved Windows trust revoked or not matched; requesting fresh approval...");
+                                continue;
+                            }
+                        }else if(ready==null){
+                            throw new IOException("Windows connection closed before confirming trust");
                         }
                     }
                     throw new SecurityException("Windows did not approve pairing");
@@ -600,11 +608,39 @@ final class DeskTouchSession implements AutoCloseable {
                             AutoConnectService.setEnabled(application,true);
                             AutoConnectService.setReconnect(application,true);
                             status("Trusted Windows PC saved securely, without storing its IP address");
+                            DeskTouchRuntime.notifyLiveStatusChanged();
                         }catch(Exception ex){
                             String msg=ex.getMessage();
                             status("Could not save trusted PC key on Android"
                                 +(msg!=null && !msg.isEmpty() ? ": "+msg : ""));
                         }
+                    }
+                } else if("trust-offer".equals(p.type)){
+                    boolean savedOffer=false;
+                    String offerErr=null;
+                    String raw=p.text;
+                    if(raw!=null && fingerprint!=null && !fingerprint.isEmpty()){
+                        int nl=raw.indexOf('\n');
+                        String offeredFp=nl>0 ? raw.substring(0,nl).trim() : fingerprint;
+                        String offeredToken=nl>0 ? raw.substring(nl+1).trim() : raw.trim();
+                        if(offeredFp.equalsIgnoreCase(fingerprint) &&
+                            offeredToken.matches("[A-Fa-f0-9]{64}")){
+                            try{
+                                trust.save(fingerprint,offeredToken);
+                                AutoConnectService.resumePeer(application,fingerprint);
+                                AutoConnectService.setEnabled(application,true);
+                                AutoConnectService.setReconnect(application,true);
+                                savedOffer=true;
+                                status("Trusted Windows PC saved securely, without storing its IP address");
+                                DeskTouchRuntime.notifyLiveStatusChanged();
+                            }catch(Exception ex){
+                                offerErr=ex.getMessage();
+                            }
+                        }
+                    }
+                    send(new Packet(savedOffer?"trust-accepted":"trust-denied",p.a));
+                    if(!savedOffer && offerErr!=null && !offerErr.isEmpty()){
+                        status("Could not save trusted PC key on Android: "+offerErr);
                     }
                 } else if("trust-denied".equals(p.type)){
                     boolean matched;
@@ -616,7 +652,10 @@ final class DeskTouchSession implements AutoCloseable {
                             pendingTrustAtMs=0L;
                         }
                     }
-                    if(matched)status("Windows declined trusted-device permission");
+                    if(matched){
+                        status("Windows declined trusted-device permission");
+                        DeskTouchRuntime.notifyLiveStatusChanged();
+                    }
                 } else if("pong".equals(p.type)){
                     long nowMs=SystemClock.uptimeMillis();
                     double rttMs=-1.0;

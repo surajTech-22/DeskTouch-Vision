@@ -848,4 +848,17 @@ public final class ProtocolSourceTest {
         assertFalse(DeskTouchSession.acceptPendingTrustResponse(7, 6));
         assertFalse(DeskTouchSession.buildPendingTrustNotice().isEmpty());
     }
+
+    @Test
+    public void middleScreenEntryAccountsForVelocitySaturation() {
+        ShellPointerMath.VelocityParams parsed = ShellPointerMath.parseDumpsysVelocityParams(
+            "    PointerVelocityControlParameters: scale=0.500, lowThreshold=500.000, highThreshold=3000.000, acceleration=3.000");
+        ShellPointerMath.PointerCompensator midComp = new ShellPointerMath.PointerCompensator();
+        midComp.configure(1080, 2460, parsed, 144);
+        long t = 2_000_000_000L;
+        ShellPointerMath.MoveStep entry = midComp.stepTo(1079, 1230, t);
+        assertTrue(entry.needsAnchorReset);
+        // -1229px from bottom-right corner: first -127 counts at 0.5 (-63.5px), remaining -1165.5px at 1.5 (-777 counts) = -904
+        assertEquals("Middle-screen entry must not overshoot 3x using scale-only division", -904, entry.rawY);
+    }
 }

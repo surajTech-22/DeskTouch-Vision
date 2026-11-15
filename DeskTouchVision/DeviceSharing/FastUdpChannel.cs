@@ -1020,6 +1020,7 @@ internal sealed class FastMovePacer : IDisposable
     private readonly Func<Packet, bool> _sendUdp;
     private readonly Action<Packet> _queueReliableTcp;
     private readonly Action<Packet> _queueTrailingSync;
+    private readonly bool _enableTrailingSync;
     private readonly Action? _sendWarm;
     private readonly Func<int>? _nextSeq;
     private readonly System.Threading.Timer _timer;
@@ -1041,12 +1042,14 @@ internal sealed class FastMovePacer : IDisposable
         Action<Packet> queueReliableTcp,
         Action? sendWarm = null,
         Action<Packet>? queueTrailingSync = null,
-        Func<int>? nextSeq = null)
+        Func<int>? nextSeq = null,
+        bool enableTrailingSync = true)
     {
         _canSendUdp = canSendUdp;
         _sendUdp = sendUdp;
         _queueReliableTcp = queueReliableTcp;
         _queueTrailingSync = queueTrailingSync ?? queueReliableTcp;
+        _enableTrailingSync = enableTrailingSync;
         _sendWarm = sendWarm;
         _nextSeq = nextSeq;
         _timer = new System.Threading.Timer(OnTimer, null, Timeout.Infinite, Timeout.Infinite);
@@ -1066,11 +1069,25 @@ internal sealed class FastMovePacer : IDisposable
         }
     }
 
+    internal static Packet MergeCoalescedMove(Packet previous, Packet incoming)
+    {
+        if (previous.A != incoming.A || previous.B != incoming.B)
+            return incoming;
+        var (oldPx, oldPy) = UnpackEdgePush(previous.D);
+        var (newPx, newPy) = UnpackEdgePush(incoming.D);
+        if (oldPx == 0 && oldPy == 0)
+            return incoming;
+        int mergedX = newPx == 0 ? 0 : Math.Clamp(oldPx + newPx, -240, 240);
+        int mergedY = newPy == 0 ? 0 : Math.Clamp(oldPy + newPy, -240, 240);
+        return incoming with { D = PackEdgePush(mergedX, mergedY) };
+    }
+
     internal bool TryHandleMove(Packet move)
     {
         if (!_canSendUdp()) return false;
         bool sendNow = false;
         long order;
+        Packet dispatchPacket = move;
         lock (_gate)
         {
             if (_disposed) return false;
@@ -1083,21 +1100,25 @@ internal sealed class FastMovePacer : IDisposable
                 : (now - _lastMoveUdpTicks) * 1000.0 / Stopwatch.Frequency;
             if (elapsedMs >= minInterval)
             {
+                if (_throttledUdp != null)
+                    dispatchPacket = MergeCoalescedMove(_throttledUdp, move);
                 _throttledUdp = null;
                 _throttledOrder = 0;
-                _pendingTcpSync = move;
+                _pendingTcpSync = _enableTrailingSync ? dispatchPacket : null;
                 _lastMoveUdpTicks = now;
                 sendNow = true;
             }
             else
             {
-                _throttledUdp = move;
+                _throttledUdp = _throttledUdp != null
+                    ? MergeCoalescedMove(_throttledUdp, move)
+                    : move;
                 _throttledOrder = order;
-                _pendingTcpSync = move;
+                _pendingTcpSync = _enableTrailingSync ? _throttledUdp : null;
             }
             UpdateTimerLocked();
         }
-        if (sendNow && DispatchUdpMove(move, order))
+        if (sendNow && DispatchUdpMove(dispatchPacket, order))
             Interlocked.Increment(ref _udpDirectCount);
         return true;
     }

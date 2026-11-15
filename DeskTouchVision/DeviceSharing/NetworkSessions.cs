@@ -110,6 +110,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int LiveRefreshHz;
         internal int LiveFrameTenthsMs;
         internal int PendingTrustRequest;
+        internal int PendingOfferedTrustId;
+        internal string? PendingOfferedTrustToken;
+        internal TaskCompletionSource<bool>? PendingTrustOffer;
 
         internal int NextReverseActionSeq()
         {
@@ -138,8 +141,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             lock (ReverseMoveOrderLock)
             {
                 Packet stamped = move.C > 0 ? move : move with { C = NextReverseMoveSeq() };
-                if (slot == null || stamped.C >= slot.C)
+                if (slot == null)
                     slot = stamped;
+                else if (stamped.C >= slot.C)
+                    slot = FastMovePacer.MergeCoalescedMove(slot, stamped);
             }
         }
 
@@ -548,6 +553,59 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         pacer.SetWarmIntervalMs(warmMs);
     }
 
+    internal string? ConnectedPeerName =>
+        (Volatile.Read(ref _selected) ?? _sessions.Values.FirstOrDefault())?.Peer.Name;
+
+    internal string? ConnectedPeerFingerprint =>
+        (Volatile.Read(ref _selected) ?? _sessions.Values.FirstOrDefault())?.Peer.DeviceFingerprint;
+
+    internal async Task<bool> OfferTrustToConnectedAsync(
+        TrustedDeviceStore trusted, CancellationToken cancellation)
+    {
+        Session? target = Volatile.Read(ref _selected) ?? _sessions.Values.FirstOrDefault();
+        if (target == null) return false;
+        string token = TrustedDeviceStore.NewSecret();
+        int offerId = Interlocked.Increment(ref target.PendingOfferedTrustId);
+        if (offerId <= 0)
+        {
+            Interlocked.Exchange(ref target.PendingOfferedTrustId, 1);
+            offerId = 1;
+        }
+        var offerTcs = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_authorityGate)
+        {
+            target.PendingTrustOffer?.TrySetResult(false);
+            target.PendingOfferedTrustToken = token;
+            target.PendingTrustOffer = offerTcs;
+        }
+        try
+        {
+            string payload = $"{Fingerprint}\n{token}";
+            await SendToAsync(target, new Packet("trust-offer", offerId, 0, 0, 0, payload), cancellation);
+            using var cancelReg = cancellation.Register(() => offerTcs.TrySetCanceled(cancellation));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            timeout.CancelAfter(TimeSpan.FromSeconds(45));
+            using var timeoutReg = timeout.Token.Register(() => offerTcs.TrySetResult(false));
+            bool accepted = await offerTcs.Task;
+            if (!accepted) return false;
+            trusted.AllowIncoming(target.Peer.Name, token, target.Peer.DeviceFingerprint);
+            _status($"Trusted incoming device saved: {target.Peer.Name}");
+            return true;
+        }
+        finally
+        {
+            lock (_authorityGate)
+            {
+                if (ReferenceEquals(target.PendingTrustOffer, offerTcs))
+                {
+                    target.PendingTrustOffer = null;
+                    target.PendingOfferedTrustToken = null;
+                }
+            }
+        }
+    }
+
     private async Task HandleTrustRequestAsync(
         Session session, int requestId, string? proposalText, CancellationToken token)
     {
@@ -557,6 +615,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             if (Interlocked.CompareExchange(ref session.PendingTrustRequest, 1, 0) != 0)
             {
+                try
+                {
+                    await SendToAsync(session, new Packet("trust-denied", requestId), token);
+                }
+                catch (Exception) { }
                 return;
             }
             using var trustLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -564,7 +627,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             try
             {
                 allowed = await _requestTrustApproval(session.Peer.Name, trustLimit.Token);
-                if (allowed) _trusted.AllowIncoming(session.Peer.Name, proposal);
+                if (allowed)
+                {
+                    _trusted.AllowIncoming(session.Peer.Name, proposal, session.Peer.DeviceFingerprint);
+                    _status($"Trusted incoming device saved: {session.Peer.Name}");
+                }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -1288,7 +1355,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: false),
                 sendWarm: null,
                 queueTrailingSync: _ => { },
-                nextSeq: session.NextReverseMoveSeq)
+                nextSeq: session.NextReverseMoveSeq,
+                enableTrailingSync: false)
             : new FastMovePacer(
                 canSendUdp: () => _udpHub != null && session.UdpPeer is { Confirmed: true } &&
                     Volatile.Read(ref session.ActiveReverseLease) > 0,
@@ -1418,6 +1486,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     // Run approval dialog off the read loop so pings continue answering.
                     _ = HandleTrustRequestAsync(session, p.A, p.Text, token);
+                    continue;
+                }
+                if(p.Type is "trust-accepted" or "trust-denied")
+                {
+                    TaskCompletionSource<bool>? pendingOffer;
+                    lock (_authorityGate)
+                        pendingOffer = session.PendingTrustOffer;
+                    pendingOffer?.TrySetResult(p.Type == "trust-accepted");
                     continue;
                 }
                 if(p.Type=="topology")
@@ -2128,8 +2204,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             : 8.5;
         if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
             return baseMs;
-        double rttPressure = Math.Max(0.0, tcpRttMs - 8.0) * 0.20;
-        return Math.Clamp(baseMs + rttPressure, baseMs, 14.0);
+        double rttPressure = Math.Max(0.0, tcpRttMs - 10.0) * 0.15;
+        return Math.Clamp(baseMs + rttPressure, baseMs, 11.0);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>

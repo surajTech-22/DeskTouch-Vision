@@ -221,6 +221,8 @@ internal sealed class DisplayArrangementControl : Control
             float originTo = horizontal ? edgeRect.Bottom : edgeRect.Right;
             int? best = null;
             double nearest = double.PositiveInfinity;
+            int? fallbackBest = null;
+            double fallbackNearest = double.PositiveInfinity;
             foreach (var candidate in devices)
             {
                 if (candidate.Id == currentId) continue;
@@ -243,22 +245,27 @@ internal sealed class DisplayArrangementControl : Control
                     float to = horizontal ? target.Bottom : target.Right;
                     const float tolerance = 8f;
                     bool aligned = cross >= from - tolerance && cross <= to + tolerance;
-                    // When a tall portrait phone is centered beside a shorter screen
-                    // that spans most of that side, don't strand its upper/lower corners.
-                    if (!aligned)
-                    {
-                        float originSpan = originTo - originFrom;
-                        float targetSpan = to - from;
-                        bool centeredTargetInsideOrigin = from >= originFrom - tolerance &&
-                            to <= originTo + tolerance &&
-                            originSpan > 1f && targetSpan >= originSpan * 0.65f;
-                        if (!centeredTargetInsideOrigin) continue;
-                    }
                     double distance = Math.Max(0, gap);
-                    if (distance < nearest) { nearest = distance; best = candidate.Id; }
+                    if (aligned)
+                    {
+                        if (distance < nearest) { nearest = distance; best = candidate.Id; }
+                        continue;
+                    }
+                    // When a tall portrait phone keeps its native dimensions beside a shorter
+                    // display docked along that edge, don't strand its upper/lower corners.
+                    float originSpan = originTo - originFrom;
+                    float targetSpan = to - from;
+                    bool centeredTargetInsideOrigin = from >= originFrom - tolerance &&
+                        to <= originTo + tolerance &&
+                        originSpan > 1f && targetSpan >= Math.Min(originSpan * 0.25f, 300f);
+                    if (centeredTargetInsideOrigin && distance < fallbackNearest)
+                    {
+                        fallbackNearest = distance;
+                        fallbackBest = candidate.Id;
+                    }
                 }
             }
-            return best;
+            return best ?? fallbackBest;
         }
 
         return FindBest(originEdge) ??
@@ -496,21 +503,17 @@ internal sealed class DisplayArrangementControl : Control
     private static Size ScaledTopologySize(int referenceHeight, MonitorTopology? topo,
         bool isAndroid, int screenCount)
     {
-        int height = Math.Max(380,
-            (int)(referenceHeight * (isAndroid ? 0.90 : 0.79)));
-        int width;
         if (topo != null)
         {
-            double ratio = (double)topo.Bounds.Width / Math.Max(1, topo.Bounds.Height);
-            ratio = isAndroid ? Math.Clamp(ratio, 0.35, 2.5) : Math.Clamp(ratio, 0.5, 4.5);
-            width = Math.Max(isAndroid ? 160 : 360, (int)Math.Round(height * ratio));
+            return new Size(
+                Math.Max(1, topo.Bounds.Width),
+                Math.Max(1, topo.Bounds.Height));
         }
-        else
-        {
-            width = isAndroid
-                ? Math.Max(300, (int)(height * .64))
-                : Math.Max(420, (int)(height * .95 * screenCount));
-        }
+        int height = Math.Max(380,
+            (int)(referenceHeight * (isAndroid ? 0.90 : 0.79)));
+        int width = isAndroid
+            ? Math.Max(300, (int)(height * .64))
+            : Math.Max(420, (int)(height * .95 * screenCount));
         return new Size(width, height);
     }
 
@@ -615,9 +618,7 @@ internal sealed class DisplayArrangementControl : Control
         var r = _remote?.Bounds;
         var remoteBox = r is null
             ? new Rectangle(0, 0, Math.Max(900, l.Width * 2 / 3), Math.Max(540, l.Height * 2 / 3))
-            : _remotePlatform == "Android"
-                ? new Rectangle(Point.Empty, ScaledTopologySize(l.Height, _remote, true, 1))
-                : r.Value;
+            : r.Value;
         var remotePos = Placement(l, remoteBox, _remoteEdge);
 
         // All authenticated screens belong in the SAME display arrangement.

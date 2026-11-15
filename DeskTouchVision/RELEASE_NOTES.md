@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.48 — Native Screen Dimensions, Smooth Un-broken Movement & Reliable Trusted Device Linking
+
+Fixes the v0.3.47 cursor stalling/breaking regression, preserves the connected Android phone's real original screen dimensions without comparing or shrinking against Windows monitors, and ensures trusted device linking works reliably from either device without losing saved keys or creating duplicate records.
+
+- **Native Android screen dimensions & unrestricted movement (`DisplayArrangementControl`, `SourceCapture`, `FastMovePacer`):** Displays and maps Android devices at their actual reported resolution (such as 1080×2460) instead of scaling/clamping them relative to the Windows screen height, ensures edge-adjacent docked tall screens can always cross smoothly back across all corners, removes the restrictive 450-count Android mouse delta cap, raises Android return-edge hysteresis cleanly, and merges coalesced boundary push deltas without dropping motion.
+- **Smooth jitter-free UHID pointer tracking (`ShellInputDaemon`, `ShellPointerMath`, `ShellInputClient`):** Restores the non-blocking `DeskTouch-UhidPacer` emission loop with boundary-push accumulation and anti-clump framing so TCP/USB packet bursts never stall `/dev/uhid` or spike velocity calculations, fixes 3× initial entry overshoot on saturated burst reports, and eliminates trailing 130 ms sync wakes on cable sessions.
+- **Reliable mutual trusted-device saving & persistence (`TrustedDevices`, `DisplaySettingsForm`, `NetworkSessions`, `DeskTouchSession`):** Enables trusting an already-connected inbound device directly from Windows (`trust-offer` / `trust-accepted`), deduplicates incoming trust records by device identity, replies cleanly on busy trust requests instead of leaving Android waiting, updates trust status immediately across UI screens, and preserves Android's saved key across transient disconnects instead of erasing it on interrupted handshakes.
+
+---
+
 # DeskTouch Vision v0.3.47 — Full-Screen Cursor Tracking & Sub-10ms Cable Ping
 
 Fixes the v0.3.45/v0.3.46 regression where cursor movement stalled or remained trapped inside only part of the Android screen, eliminates double-pacer cable jitter, and reduces wired USB data-cable RTT spikes below 10 ms.

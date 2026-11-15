@@ -101,6 +101,7 @@ public final class ShellInputDaemon {
 
     private final byte[] expectedTokenBytes;
     private final ShellPointerMath.PointerCompensator pointer = new ShellPointerMath.PointerCompensator();
+    private final Object mouseQueueLock = new Object();
     private FileDescriptor mouseFd;
     private FileDescriptor keyboardFd;
     private int screenWidth = 1080;
@@ -109,6 +110,17 @@ public final class ShellInputDaemon {
     private volatile int configuredRefreshHz = 60;
     private boolean hasDumpsysVelocityParams;
     private volatile boolean dumpsysProbeRunning;
+    private boolean hasPendingMove;
+    private int pendingMoveX;
+    private int pendingMoveY;
+    private int pendingPushX;
+    private int pendingPushY;
+    private long nextMoveSeq;
+    private long pendingMoveSeq;
+    private long appliedMoveSeq;
+    private long lastMouseWriteNs;
+    private volatile boolean daemonRunning = true;
+    private Thread mousePacerThread;
     private int buttonMask;
     private int vWheelCarry;
     private int hWheelCarry;
@@ -163,16 +175,21 @@ public final class ShellInputDaemon {
             }
             System.out.println("DESKTOUCH_SHELL_PORT=" + port);
             System.out.flush();
+            startMousePacer();
 
-            while (true) {
-                Socket client = server.accept();
-                if (!handleClient(client)) {
-                    destroyDevices();
-                    break;
+            try {
+                while (true) {
+                    Socket client = server.accept();
+                    if (!handleClient(client)) {
+                        destroyDevices();
+                        break;
+                    }
+                    // Keep kernel /dev/uhid devices registered across brief reconnects
+                    // so Android does not churn input device IDs or fall back to software pointer.
+                    releaseInputs();
                 }
-                // Keep kernel /dev/uhid devices registered across brief reconnects
-                // so Android does not churn input device IDs or fall back to software pointer.
-                releaseInputs();
+            } finally {
+                stopMousePacer();
             }
         }
     }
@@ -246,6 +263,7 @@ public final class ShellInputDaemon {
                     if (parts.length >= 3) {
                         int btn = parseBoundedInt(parts[1], 1, 5, 1);
                         boolean down = "1".equals(parts[2]);
+                        flushPendingMouseNow();
                         setMouseButton(btn, down);
                     }
                     continue;
@@ -255,6 +273,7 @@ public final class ShellInputDaemon {
                     if (parts.length >= 3) {
                         int amount = parseBoundedInt(parts[1], -12000, 12000, 0);
                         boolean horizontal = "1".equals(parts[2]);
+                        flushPendingMouseNow();
                         scrollWheel(amount, horizontal);
                     }
                     continue;
@@ -281,6 +300,69 @@ public final class ShellInputDaemon {
         }
     }
 
+    private void startMousePacer() {
+        daemonRunning = true;
+        Thread t = new Thread(() -> {
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY);
+            } catch (Throwable ignored) {}
+            while (daemonRunning) {
+                int tx;
+                int ty;
+                int px;
+                int py;
+                long seq;
+                synchronized (mouseQueueLock) {
+                    while (daemonRunning && !hasPendingMove) {
+                        try {
+                            mouseQueueLock.wait();
+                        } catch (InterruptedException ignored) {}
+                    }
+                    if (!daemonRunning) break;
+                    long fullGapNs = ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz);
+                    long minGapNs = Math.max(2_000_000L, Math.min(8_000_000L, (fullGapNs * 2L) / 3L));
+                    long waitNs = lastMouseWriteNs == 0L
+                        ? 0L
+                        : (lastMouseWriteNs + minGapNs - System.nanoTime());
+                    if (waitNs > 150_000L) {
+                        long waitMs = waitNs / 1_000_000L;
+                        int nanos = (int) (waitNs % 1_000_000L);
+                        try {
+                            mouseQueueLock.wait(waitMs, nanos);
+                        } catch (InterruptedException ignored) {}
+                        continue;
+                    }
+                    tx = pendingMoveX;
+                    ty = pendingMoveY;
+                    px = pendingPushX;
+                    py = pendingPushY;
+                    seq = pendingMoveSeq;
+                    hasPendingMove = false;
+                    pendingPushX = 0;
+                    pendingPushY = 0;
+                }
+                if (moveTo(tx, ty, px, py, seq)) {
+                    synchronized (mouseQueueLock) {
+                        lastMouseWriteNs = System.nanoTime();
+                    }
+                }
+            }
+        }, "DeskTouch-UhidPacer");
+        t.setDaemon(true);
+        mousePacerThread = t;
+        t.start();
+    }
+
+    private void stopMousePacer() {
+        daemonRunning = false;
+        synchronized (mouseQueueLock) {
+            hasPendingMove = false;
+            pendingPushX = 0;
+            pendingPushY = 0;
+            mouseQueueLock.notifyAll();
+        }
+    }
+
     private void applyMoveLine(String line) {
         String[] parts = line.split(" ");
         if (parts.length >= 3) {
@@ -288,7 +370,52 @@ public final class ShellInputDaemon {
             int y = parseBoundedInt(parts[2], 0, screenHeight - 1, 0);
             int pushX = parts.length >= 4 ? parseBoundedInt(parts[3], -240, 240, 0) : 0;
             int pushY = parts.length >= 5 ? parseBoundedInt(parts[4], -240, 240, 0) : 0;
-            moveTo(x, y, pushX, pushY);
+            synchronized (mouseQueueLock) {
+                boolean sameX = hasPendingMove && pendingMoveX == x;
+                boolean sameY = hasPendingMove && pendingMoveY == y;
+                pendingMoveX = x;
+                pendingMoveY = y;
+                if (pushX != 0) {
+                    pendingPushX = Math.max(-240, Math.min(240, (sameX ? pendingPushX : 0) + pushX));
+                } else if (!sameX) {
+                    pendingPushX = 0;
+                }
+                if (pushY != 0) {
+                    pendingPushY = Math.max(-240, Math.min(240, (sameY ? pendingPushY : 0) + pushY));
+                } else if (!sameY) {
+                    pendingPushY = 0;
+                }
+                pendingMoveSeq = ++nextMoveSeq;
+                hasPendingMove = true;
+                mouseQueueLock.notifyAll();
+            }
+        }
+    }
+
+    private void flushPendingMouseNow() {
+        boolean have = false;
+        int tx = 0;
+        int ty = 0;
+        int px = 0;
+        int py = 0;
+        long seq = 0L;
+        synchronized (mouseQueueLock) {
+            if (hasPendingMove) {
+                tx = pendingMoveX;
+                ty = pendingMoveY;
+                px = pendingPushX;
+                py = pendingPushY;
+                seq = pendingMoveSeq;
+                hasPendingMove = false;
+                pendingPushX = 0;
+                pendingPushY = 0;
+                have = true;
+            }
+        }
+        if (have && moveTo(tx, ty, px, py, seq)) {
+            synchronized (mouseQueueLock) {
+                lastMouseWriteNs = System.nanoTime();
+            }
         }
     }
 
@@ -421,6 +548,11 @@ public final class ShellInputDaemon {
     }
 
     private synchronized void releaseInputs() {
+        synchronized (mouseQueueLock) {
+            hasPendingMove = false;
+            pendingPushX = 0;
+            pendingPushY = 0;
+        }
         if (buttonMask != 0 && mouseFd != null) {
             buttonMask = 0;
             writeMouseReport(0, 0, 0, 0);
@@ -453,10 +585,12 @@ public final class ShellInputDaemon {
         try { Os.close(fd); } catch (ErrnoException ignored) {}
     }
 
-    private synchronized void moveTo(int targetX, int targetY, int pushX, int pushY) {
-        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight, configuredPointerSpeed, configuredRefreshHz)) return;
+    private synchronized boolean moveTo(int targetX, int targetY, int pushX, int pushY, long seq) {
+        if (seq <= appliedMoveSeq) return false;
+        appliedMoveSeq = seq;
+        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight, configuredPointerSpeed, configuredRefreshHz)) return false;
         ShellPointerMath.MoveStep step = pointer.stepTo(targetX, targetY, pushX, pushY, System.nanoTime());
-        if (!step.hasMotion()) return;
+        if (!step.hasMotion()) return false;
         if (step.needsAnchorReset) {
             sendRelativeBurst(step.anchorPullX, step.anchorPullY);
             if (step.resetSignX != 0 || step.resetSignY != 0) {
@@ -466,6 +600,7 @@ public final class ShellInputDaemon {
         if (step.rawX != 0 || step.rawY != 0) {
             sendRelativeBurst(step.rawX, step.rawY);
         }
+        return true;
     }
 
     private void sendRelativeBurst(int totalDx, int totalDy) {

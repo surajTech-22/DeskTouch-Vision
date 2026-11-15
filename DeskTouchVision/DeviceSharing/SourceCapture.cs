@@ -926,15 +926,15 @@ internal sealed class SourceCapture : IDisposable
         double sensitivity = 1.0)
     {
         if (raw == 0) return 0;
-        int bounded = Math.Clamp(raw, isAndroid ? -450 : -800, isAndroid ? 450 : 800);
+        int bounded = Math.Clamp(raw, -2400, 2400);
         double speedFactor = Math.Clamp(systemMouseSpeed, 1, 20) / 10.0;
         double sensFactor = Math.Clamp(sensitivity, 0.25, 2.50);
         if (!isAndroid)
             return bounded * speedFactor * 1.45 * sensFactor;
         double dpiFactor = remoteDensityDpi is > 0
-            ? Math.Clamp(remoteDensityDpi.Value / 440.0, 0.70, 1.35)
+            ? Math.Clamp(remoteDensityDpi.Value / 440.0, 0.70, 2.0)
             : 1.0;
-        return bounded * speedFactor * 0.95 * dpiFactor * sensFactor;
+        return bounded * speedFactor * 1.00 * dpiFactor * sensFactor;
     }
 
     private static int EdgeOvershoot(MonitorRect monitor, int nextX, int nextY, MonitorEdge edge) =>
@@ -952,7 +952,12 @@ internal sealed class SourceCapture : IDisposable
     {
         if (!isAndroidTarget || !isReturnEdge) return true;
         int overshoot = EdgeOvershoot(monitor, nextX, nextY, edge);
-        return (_androidReturnPushPx += Math.Max(1, overshoot)) >= 12;
+        if (overshoot <= 0)
+        {
+            _androidReturnPushPx = 0;
+            return false;
+        }
+        return (_androidReturnPushPx += overshoot) >= 36;
     }
 
     private void MoveRemote(int dx, int dy)

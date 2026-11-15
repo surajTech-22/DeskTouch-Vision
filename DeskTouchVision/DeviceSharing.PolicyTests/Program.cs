@@ -2215,12 +2215,57 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         await Wire.WriteAsync(cableSsl, new Packet("reverse-active", 15), deadline.Token);
         int activeClaim = await gotReverseActive.Task.WaitAsync(TimeSpan.FromSeconds(2), deadline.Token);
         Check(activeClaim == 15, "Cable handoff must receive reverse-active acknowledgement after reverse-move delivery");
+
+        // Verify Windows-initiated inbound trust offer saves deduplicated trust on both ends.
+        var trustStore = new TrustedDeviceStore(cableIn);
+        var offerTask = cableReceiver.OfferTrustToConnectedAsync(trustStore, deadline.Token);
+        Packet offerPkt = await Wire.ReadAsync(cableSsl, deadline.Token);
+        Check(offerPkt.Type == "trust-offer" && !string.IsNullOrEmpty(offerPkt.Text) && offerPkt.Text.Contains('\n'),
+            "Inbound trust offer must carry receiver fingerprint and 256-bit secret");
+        await Wire.WriteAsync(cableSsl, new Packet("trust-accepted", offerPkt.A), deadline.Token);
+        bool offerSaved = await offerTask.WaitAsync(TimeSpan.FromSeconds(2), deadline.Token);
+        Check(offerSaved && trustStore.IsTrustedIncoming("Xiaomi-Cable-Test") && trustStore.Incoming.Count == 1,
+            "Accepted inbound trust offer must deduplicate and save incoming trust cleanly");
+        trustStore.AllowIncoming("Xiaomi-Cable-Test", TrustedDeviceStore.NewSecret());
+        Check(trustStore.Incoming.Count == 1,
+            "Repeated incoming trust grants for the same device must deduplicate instead of stacking duplicates");
     }
     finally
     {
         try { Directory.Delete(cableTestRoot, recursive: true); } catch { }
     }
-    Console.WriteLine("PASS: Cable adaptive pacing, end-to-end cable handoff move delivery, APK daemon tracking, and non-blocking trust verified.");
+
+    // Verify native Android dimensions are preserved without scaling down to Windows monitor height,
+    // unrestricted delta scaling, and edge-push coalescing across FastMovePacer.
+    var winPrimary = new MonitorTopology(new[] {
+        new MonitorRect(@"\\.\DISPLAY1", 0, 0, 1920, 1080, true)
+    });
+    var nativePhone = new MonitorTopology(new[] {
+        new MonitorRect("Android screen", 0, 0, 1080, 2460, true, RefreshHz: 144)
+    });
+    var nativeInline = DisplayArrangementControl.ComposeInlineDevices(
+        new System.Drawing.Rectangle(0, 0, 1920, 1080),
+        new[] { new EnvironmentDisplayTile(1, "Xiaomi", "Android", 1, true, "FP_NATIVE", nativePhone) });
+    Check(nativeInline[0].World.Width == 1080 && nativeInline[0].World.Height == 2460,
+        "Android arrangement must keep original phone screen dimensions (1080x2460) instead of shrinking to Windows screen height");
+    Check(SourceCapture.ScaleRawDeltaPrecise(900, 10, true, 440) >
+          SourceCapture.ScaleRawDeltaPrecise(450, 10, true, 440),
+        "Android pointer raw deltas must not be capped at 450 counts during full-screen swipes");
+    using (var coalescePacer = new FastMovePacer(
+        canSendUdp: () => false,
+        sendUdp: _ => false,
+        queueReliableTcp: _ => { },
+        enableTrailingSync: false))
+    {
+        // Just ensure Push coalescing merges cleanly without dropping prior push delta.
+        var merged = FastMovePacer.MergeCoalescedMove(
+            new Packet("move", 1079, 2459, 1, FastMovePacer.PackEdgePush(20, 30)),
+            new Packet("move", 1079, 2459, 2, FastMovePacer.PackEdgePush(15, 25)));
+        var (mpx, mpy) = FastMovePacer.UnpackEdgePush(merged.D);
+        Check(mpx == 35 && mpy == 55 && coalescePacer.TakePendingReliableSync() == null,
+            "Coalesced moves at boundary must accumulate edge push without trailing sync when disabled");
+    }
+    Console.WriteLine("PASS: Cable adaptive pacing, inbound trust offer/dedup, native Android dimensions, and smooth UHID tracking verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

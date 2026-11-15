@@ -229,6 +229,7 @@ final class ShellPointerMath {
 
             if (!anchored) {
                 double minScale = Math.max(0.25, params.scale);
+                double highGain = Math.max(minScale, minScale * Math.max(1.0, params.acceleration));
                 int pull = (int) Math.min(20000L,
                     Math.round(Math.max(screenWidth, screenHeight) * 2.5 / minScale));
                 int cornerX = tx > (screenWidth - 1) * 0.5 ? (screenWidth - 1) : 0;
@@ -236,12 +237,12 @@ final class ShellPointerMath {
                 int pullX = cornerX == 0 ? -pull : pull;
                 int pullY = cornerY == 0 ? -pull : pull;
 
-                // Sign reversal from corner pull resets AOSP VelocityTracker so the jump
-                // burst executes at params.scale regardless of pointer_speed.
+                // Sign reversal from corner pull resets AOSP VelocityTracker on report 1
+                // (at minScale); additional burst reports saturate at scale * acceleration.
                 double jumpDx = tx - cornerX;
                 double jumpDy = ty - cornerY;
-                int rawX = (int) Math.round(jumpDx / minScale);
-                int rawY = (int) Math.round(jumpDy / minScale);
+                int rawX = computeEntryCounts(jumpDx, minScale, highGain);
+                int rawY = computeEntryCounts(jumpDy, minScale, highGain);
 
                 cursorX = tx;
                 cursorY = ty;
@@ -281,7 +282,7 @@ final class ShellPointerMath {
                 return new MoveStep(false, 0, 0, 0, 0, 0, 0);
             }
 
-            double minFrameSec = Math.max(0.0055, 0.9 / Math.max(60, refreshHz));
+            double minFrameSec = Math.max(0.0025, 0.7 / Math.max(60, refreshHz));
             double dtSec;
             if (lastReportNs <= 0L || nowNs <= lastReportNs) {
                 dtSec = minFrameSec;
@@ -301,10 +302,10 @@ final class ShellPointerMath {
 
             double dist = Math.hypot(dx, dy);
             double instSpeed = dist / effectiveDt;
-            double alpha = effectiveDt / (effectiveDt + 0.075);
+            double alpha = effectiveDt / (effectiveDt + 0.025);
             smoothedOutSpeed += alpha * (instSpeed - smoothedOutSpeed);
             double modelGain = gainForOutputSpeed(smoothedOutSpeed, params);
-            double gain = params.scale + (modelGain - params.scale) * 0.70;
+            double gain = params.scale + (modelGain - params.scale) * 0.85;
 
             int rawX = (int) Math.round(dx / gain);
             int rawY = (int) Math.round(dy / gain);
@@ -338,6 +339,17 @@ final class ShellPointerMath {
                 lastReportNs = nowNs;
             }
             return new MoveStep(false, 0, 0, 0, 0, rawX, rawY);
+        }
+
+        private static int computeEntryCounts(double jumpDelta, double minScale, double highGain) {
+            if (Math.abs(jumpDelta) <= 127.0 * minScale) {
+                return (int) Math.round(jumpDelta / minScale);
+            }
+            double sign = jumpDelta >= 0.0 ? 1.0 : -1.0;
+            double firstReportPx = sign * 127.0 * minScale;
+            double remainingPx = jumpDelta - firstReportPx;
+            int tailCounts = (int) Math.round(remainingPx / Math.max(0.25, highGain));
+            return (int) Math.round(sign * 127.0) + tailCounts;
         }
 
         private static int edgePushRaw(int pushDelta, double scale) {

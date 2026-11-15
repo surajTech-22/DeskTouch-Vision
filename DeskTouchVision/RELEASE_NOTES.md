@@ -1,3 +1,7 @@
+# DeskTouch Vision v0.3.50 — Full-Screen Cursor Completion, Clean Data Cable UI & Accurate Low-Loss Wireless Link
+
+Fixes incomplete full-screen traversal and mid-screen stalls during fast swipes by completing remaining multi-frame UHID steps cleanly and forwarding boundary edge-push deltas over wireless; removes misleading data-cable ping polling and displays clean Data cable status with ping, jitter, and percentage loss shown strictly on wireless connections; eliminates false wireless packet-loss inflation from reordered frames, prevents same-AP epoch resets, prioritizes wireless QoS (`0xB8`), and backs off redundant 2.4 GHz keepalive traffic.
+
 # DeskTouch Vision v0.3.49 — Reliable Trust Persistence, Smooth 144Hz Cursor Motion & Low-Latency Cable Ping
 
 Fixes "Trusted computers saved: 0" persistence failures and UI refresh delays on Android, eliminates initial UHID buffer overruns and microsecond cursor burst stalls for smooth 144Hz tracking without frame skipping, and prioritizes ping/pong heartbeats over pointer traffic to keep wired ping well under 10ms.

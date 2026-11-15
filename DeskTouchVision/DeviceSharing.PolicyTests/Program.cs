@@ -2267,6 +2267,65 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
             "Coalesced moves at boundary must accumulate edge push without trailing sync when disabled");
     }
     Console.WriteLine("PASS: Cable adaptive pacing, inbound trust offer/dedup, native Android dimensions, and smooth UHID tracking verified.");
+
+    // Verify v0.3.50 fixes: cable UI hides ping/jitter, UDP edge-push packs/unpacks,
+    // reordered coordinates don't inflate loss, and 2.4 GHz Warm pacing backs off cleanly.
+    var (cableClr, cableText) = DisplaySettingsForm.FormatLiveLinkDisplay(
+        new ReceiverServer.ActiveLinkSnapshot(true, "Xiaomi", "cable", 0, 0, 0, 0, null), "English (US)");
+    Check(cableText.Contains("Data cable", StringComparison.Ordinal) &&
+          !cableText.Contains("ping", StringComparison.OrdinalIgnoreCase) &&
+          !cableText.Contains("jitter", StringComparison.OrdinalIgnoreCase) &&
+          cableClr.G > cableClr.B,
+        "Data cable status display must hide ping and jitter completely");
+    var (_, wifiText) = DisplaySettingsForm.FormatLiveLinkDisplay(
+        new ReceiverServer.ActiveLinkSnapshot(true, "Xiaomi", "5GHz", 433, 11.4, 2.3, 30.0, null), "English (US)");
+    Check(wifiText.Contains("11.4 ms ping", StringComparison.Ordinal) &&
+          wifiText.Contains("jitter 2.3 ms", StringComparison.Ordinal) &&
+          wifiText.Contains("loss 3.0%", StringComparison.Ordinal),
+        "Wireless status display must report ping, jitter, and percent loss accurately");
+
+    Check(ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 0, 0) >= 55 &&
+          ReceiverServer.ComputeWarmIntervalMs("5GHz", 0, 0) == 24 &&
+          ReceiverServer.SupportsUdpEdgePush("0.3.50") &&
+          !ReceiverServer.SupportsUdpEdgePush("0.3.49"),
+        "2.4 GHz keepalive interval and v0.3.50 edge-push version gate must behave safely");
+
+    var cableProbeTracker = new AdaptiveLinkTracker("cable");
+    Check(cableProbeTracker.ComputeProbeIntervalMs(true) >= 750,
+        "Data cable keepalive must never flood every 38ms during active cursor movement");
+
+    byte[] reorderKey = Enumerable.Range(10, FastUdpCodec.KeySize).Select(x => (byte)x).ToArray();
+    using var sCodec = new FastUdpCodec(reorderKey, peerId: 21, isServer: true);
+    using var cCodec = new FastUdpCodec(reorderKey, peerId: 21, isServer: false);
+    var udpReorderTracker = new AdaptiveLinkTracker("5GHz");
+    byte[] u1 = new byte[FastUdpCodec.FrameSize];
+    byte[] u2 = new byte[FastUdpCodec.FrameSize];
+    sCodec.Seal(FastUdpOp.ReverseMove, 400, 900, 12, 1, u1);
+    int packA = ((22 & 0xFFFF) << 16) | (1079 & 0xFFFF);
+    int packB = ((-19 & 0xFFFF) << 16) | (2459 & 0xFFFF);
+    sCodec.Seal(FastUdpOp.ReverseEdgePush, packA, packB, 12, 2, u2);
+    Check(cCodec.TryOpen(u2, out var pushMsg, udpReorderTracker) &&
+          pushMsg.Op == FastUdpOp.ReverseEdgePush &&
+          unchecked((short)(pushMsg.A & 0xFFFF)) == 1079 &&
+          unchecked((short)(pushMsg.A >> 16)) == 22 &&
+          unchecked((short)(pushMsg.B & 0xFFFF)) == 2459 &&
+          unchecked((short)(pushMsg.B >> 16)) == -19,
+        "ReverseEdgePush UDP frame must preserve both screen coordinates and signed edge push");
+    udpReorderTracker.RecordInboundPacket(pushMsg.Seq, false, 0, 2000);
+    Check(!cCodec.TryOpen(u1, out _, udpReorderTracker),
+        "Out-of-order coordinate packet must not move pointer backward");
+    Check(!cCodec.TryOpen(u1, out _, udpReorderTracker),
+        "Replay of already-seen reordered packet must still be blocked");
+    for (ulong s = 3; s <= 15; s++)
+    {
+        byte[] nxt = new byte[FastUdpCodec.FrameSize];
+        sCodec.Seal(FastUdpOp.ReverseMove, 500, 1000, 12, (int)s, nxt);
+        Check(cCodec.TryOpen(nxt, out var nm, udpReorderTracker), "Subsequent ordered frames must open");
+        udpReorderTracker.RecordInboundPacket(nm.Seq, false, 0, 2000 + (long)(s * 6));
+    }
+    Check(udpReorderTracker.LostPackets == 0 && udpReorderTracker.ReorderedPackets == 1,
+        "Out-of-order wireless coordinate packet must count as reordered rather than packet loss");
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, and 2.4 GHz backoff verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

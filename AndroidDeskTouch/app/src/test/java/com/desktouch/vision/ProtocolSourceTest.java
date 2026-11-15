@@ -893,4 +893,85 @@ public final class ProtocolSourceTest {
         }
         assertTrue("Continuous swipe excess must settle quickly across paced frames", settleSteps >= 1 && settleSteps <= 5);
     }
+
+    @Test
+    public void cableLiveLinkHidesPingAndWirelessUsesPercentLoss() {
+        DeskTouchSession.LiveStatusSnapshot cableSnap = new DeskTouchSession.LiveStatusSnapshot(
+            true, "DESKTOP-IQ1KSJ9", "FP1", true, WifiLinkMonitor.BAND_CABLE, 0,
+            4.5, 1.2, 5.0, "", null);
+        String cableText = MainActivity.formatLiveLinkText(cableSnap, "Wi-Fi");
+        assertTrue(cableText.contains("via Data cable"));
+        assertFalse("Data cable status must never show ping", cableText.contains("ping"));
+        assertFalse("Data cable status must never show jitter", cableText.contains("jitter"));
+
+        DeskTouchSession.LiveStatusSnapshot wifiSnap = new DeskTouchSession.LiveStatusSnapshot(
+            true, "DESKTOP-IQ1KSJ9", "FP1", false, WifiLinkMonitor.BAND_5_GHZ, 433,
+            12.4, 2.1, 30.0, "", null);
+        String wifiText = MainActivity.formatLiveLinkText(wifiSnap, "Wi-Fi");
+        assertTrue(wifiText.contains("ping 12.4 ms"));
+        assertTrue(wifiText.contains("loss 3.0%"));
+        assertFalse("Wireless UI must show percentage rather than per-mille", wifiText.contains("‰"));
+    }
+
+    @Test
+    public void reorderedUdpCoordinatesTrackLossZeroAndEdgePushUnpacksCleanly() throws Exception {
+        byte[] key = new byte[FastUdpChannel.KEY_SIZE];
+        for (int i = 0; i < key.length; i++) key[i] = (byte) (i + 3);
+        FastUdpChannel.Codec srv = new FastUdpChannel.Codec(key, 12, true);
+        FastUdpChannel.Codec cli = new FastUdpChannel.Codec(key, 12, false);
+        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker("5GHz");
+
+        byte[] seq1Move = new byte[FastUdpChannel.FRAME_SIZE];
+        byte[] seq2Push = new byte[FastUdpChannel.FRAME_SIZE];
+        srv.seal(FastUdpChannel.OP_REVERSE_MOVE, 900, 1800, 44, 1, seq1Move);
+        int packedA = ((24 & 0xFFFF) << 16) | (1079 & 0xFFFF);
+        int packedB = ((18 & 0xFFFF) << 16) | (2459 & 0xFFFF);
+        srv.seal(FastUdpChannel.OP_REVERSE_EDGE_PUSH, packedA, packedB, 44, 2, seq2Push);
+
+        FastUdpChannel.Message opened2 = cli.tryOpen(seq2Push, seq2Push.length, tracker);
+        assertNotNull(opened2);
+        assertEquals(FastUdpChannel.OP_REVERSE_EDGE_PUSH, opened2.op);
+        assertEquals(1079, (short) (opened2.a & 0xFFFF));
+        assertEquals(24, (short) (opened2.a >> 16));
+        assertEquals(2459, (short) (opened2.b & 0xFFFF));
+        assertEquals(18, (short) (opened2.b >> 16));
+        tracker.recordInboundPacket(opened2.seq, false, 0, 1000L);
+
+        // Stale coordinate still rejected for pointer motion, yet credited to prevent false loss.
+        assertNull(cli.tryOpen(seq1Move, seq1Move.length, tracker));
+        for (long s = 3; s <= 15; s++) {
+            byte[] next = new byte[FastUdpChannel.FRAME_SIZE];
+            srv.seal(FastUdpChannel.OP_REVERSE_MOVE, 1000, 2000, 44, (int) s, next);
+            FastUdpChannel.Message m = cli.tryOpen(next, next.length, tracker);
+            assertNotNull(m);
+            tracker.recordInboundPacket(m.seq, false, 0, 1000L + s * 6L);
+        }
+        assertEquals("Reordered frame must not count as lost", 0L, tracker.getLostPackets());
+        assertEquals("Reordered frame must be tracked as reordered", 1L, tracker.getReorderedPackets());
+    }
+
+    @Test
+    public void pointerCompensatorFullScreenCoastReachesAllCorners() {
+        ShellPointerMath.VelocityParams parsed = ShellPointerMath.parseDumpsysVelocityParams(
+            "    PointerVelocityControlParameters: scale=0.500, lowThreshold=500.000, highThreshold=3000.000, acceleration=3.000");
+        ShellPointerMath.PointerCompensator comp = new ShellPointerMath.PointerCompensator();
+        comp.configure(1080, 2460, parsed, 144);
+        long t = 5_000_000_000L;
+        long gap = ShellPointerMath.computeDaemonPacingIntervalNs(144);
+
+        comp.stepTo(100, 100, t);
+        int[][] corners = { {1079, 2459}, {0, 2459}, {0, 0}, {1079, 0} };
+        for (int[] corner : corners) {
+            int steps = 0;
+            while (steps < 40) {
+                t += gap;
+                ShellPointerMath.MoveStep s = comp.stepTo(corner[0], corner[1], t);
+                assertTrue(Math.abs(s.rawX) <= 127 && Math.abs(s.rawY) <= 127);
+                steps++;
+                if (!comp.hasRemainingMotion(corner[0], corner[1])) break;
+            }
+            assertFalse("Pointer must converge cleanly to corner " + corner[0] + "," + corner[1],
+                comp.hasRemainingMotion(corner[0], corner[1]));
+        }
+    }
 }

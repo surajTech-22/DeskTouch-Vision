@@ -267,10 +267,8 @@ final class DeskTouchSession implements AutoCloseable {
         String band = cableSession ? WifiLinkMonitor.BAND_CABLE : liveLinkBand;
         double jitter = 0.0;
         double loss = 0.0;
-        double rtt = liveRttMs;
-        if (cableSession) {
-            if (cableTracker.getSmoothedRttMs() > 0) rtt = cableTracker.getSmoothedRttMs();
-        } else if (ch != null) {
+        double rtt = cableSession ? 0.0 : liveRttMs;
+        if (!cableSession && ch != null) {
             if (ch.linkTracker.getSmoothedRttMs() > 0) rtt = ch.linkTracker.getSmoothedRttMs();
             jitter = ch.linkTracker.getEffectiveJitterMs();
             loss = ch.linkTracker.getInboundLossPermille();
@@ -692,8 +690,7 @@ final class DeskTouchSession implements AutoCloseable {
                     if(rttMs>0.0 && rttMs<=5000.0){
                         if(cableSession){
                             cableTracker.recordRttSample(rttMs,nowMs);
-                            double smoothed=cableTracker.getSmoothedRttMs();
-                            liveRttMs=smoothed>0.0 ? smoothed : rttMs;
+                            liveRttMs=0.0;
                         } else {
                             FastUdpChannel ch=udpChannel;
                             if(ch!=null){
@@ -1301,6 +1298,9 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 @Override public void onReverseMove(int x,int y,int lease,int moveSeq){
                     applyReversePointerMove(x,y,lease,moveSeq,true);
+                }
+                @Override public void onReverseMove(int x,int y,int pushX,int pushY,int lease,int moveSeq){
+                    applyReversePointerMove(x,y,pushX,pushY,lease,moveSeq,true);
                 }
                 @Override public void onReverseClaim(int claim,int dispatchSeq){
                     if(!running) return;

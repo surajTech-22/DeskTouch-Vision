@@ -321,15 +321,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return new ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
         if (session.IsCableSession)
         {
-            double cableRtt = session.CableTracker.SmoothedRttMs;
-            if (cableRtt <= 0) cableRtt = Volatile.Read(ref session.TcpRttMs);
             return new ActiveLinkSnapshot(
                 true,
                 session.Peer.Name,
                 "cable",
                 Volatile.Read(ref session.LinkSpeedMbps),
-                cableRtt,
-                session.CableTracker.EffectiveJitterMs,
+                0,
+                0,
                 0,
                 Volatile.Read(ref session.KeyboardInfoJson));
         }
@@ -551,8 +549,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double paceMs = ComputeAdaptiveUdpIntervalMs(
             session.Peer.Platform, effectiveHz, rtt, minRtt, jitter, loss, session.LinkBand);
         pacer.SetMinIntervalMs(paceMs);
-        int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
-        pacer.SetWarmIntervalMs(warmMs);
+        pacer.SetWarmIntervalMs(ComputeWarmIntervalMs(session.LinkBand, queueDelay, loss));
     }
 
     internal string? ConnectedPeerName =>
@@ -725,9 +722,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         long cableMoves = Interlocked.Exchange(ref session.CableMoves, 0);
                         long cableFallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
                         if (cableMoves == 0 && cableFallback == 0) continue;
-                        double cableRtt = Volatile.Read(ref session.TcpRttMs);
                         DiagnosticLog?.Invoke(
-                            $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} transport=cable live_hz={effectiveHz} rtt_ms={cableRtt:F1} cable_moves={cableMoves} tcp_fallback={cableFallback}");
+                            $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} transport=cable live_hz={effectiveHz} cable_moves={cableMoves} tcp_fallback={cableFallback}");
                         continue;
                     }
                     var pacer = session.MovePacer;
@@ -764,7 +760,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var id = Interlocked.Increment(ref _nextClientId);
                 _clients[id] = client;
                 client.NoDelay = true;
-                try { client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10); }
+                try { client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8); }
                 catch (Exception) { }
                 client.Client.SetSocketOption(SocketOptionLevel.Socket,
                     SocketOptionName.KeepAlive,true);
@@ -836,13 +832,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     {
         if (Interlocked.CompareExchange(ref session.CablePingInFlight, 1, 0) != 0)
             return;
-        bool waiterCounted = true;
-        Interlocked.Increment(ref session.UrgentControlWaiters);
         try
         {
             await session.Write.WaitAsync(token);
-            Interlocked.Decrement(ref session.UrgentControlWaiters);
-            waiterCounted = false;
             try
             {
                 int pingToken = session.CableTracker.NextPingToken(Environment.TickCount64);
@@ -853,7 +845,6 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         catch (Exception) { }
         finally
         {
-            if (waiterCounted) Interlocked.Decrement(ref session.UrgentControlWaiters);
             Interlocked.Exchange(ref session.CablePingInFlight, 0);
         }
     }
@@ -1404,9 +1395,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     var peerUdp = session.UdpPeer;
                     int lease = Volatile.Read(ref session.ActiveReverseLease);
-                    return _udpHub != null && peerUdp != null && peerUdp.Confirmed && lease > 0 &&
-                        _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
-                            move.C > 0 ? move.C : null);
+                    return SendReverseMoveUdp(session, peerUdp, lease, move);
                 },
                 queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
                 sendWarm: () =>
@@ -1419,9 +1408,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     var peerUdp = session.UdpPeer;
                     int lease = Volatile.Read(ref session.ActiveReverseLease);
-                    bool udpDelivered = _udpHub != null && peerUdp is { Confirmed: true } && lease > 0 &&
-                        _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease,
-                            move.C > 0 ? move.C : null);
+                    bool udpDelivered = SendReverseMoveUdp(session, peerUdp, lease, move);
                     if (!udpDelivered || Volatile.Read(ref session.PendingFirstCursorAck) != 0)
                         QueueReliableReverseMoveForSession(session, move, countAsFallback: false);
                 },
@@ -1653,7 +1640,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         if (changed)
                         {
                             string desc = speedMbps > 0 ? $"{band} ({speedMbps} Mbps)" : band;
-                            DiagnosticLog?.Invoke($"Peer link profile changed [{session.Peer.Name}]: {desc} freq={p.B}MHz epoch={epoch}");
+                            DiagnosticLog?.Invoke($"Peer link profile changed [{session.Peer.Name}]: {desc} rssi={p.B}dBm freq={p.D}MHz epoch={epoch}");
                         }
                     }
                     else if (p.A > 0)
@@ -2249,6 +2236,39 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return Math.Clamp(baseMs + rttPressure, baseMs, maxCap);
     }
 
+    internal static int ComputeWarmIntervalMs(string? linkBand, double queueDelayMs, double lossPermille)
+    {
+        bool isSlow24 = string.Equals(AdaptiveLinkTracker.NormalizeBand(linkBand), "2.4GHz", StringComparison.Ordinal);
+        int minMs = isSlow24 ? 55 : 24;
+        int maxMs = isSlow24 ? 95 : 52;
+        double baseMs = isSlow24 ? 55.0 : 24.0;
+        return Math.Clamp((int)Math.Round(baseMs + queueDelayMs * 0.65 + lossPermille * 0.25), minMs, maxMs);
+    }
+
+    internal static bool SupportsUdpEdgePush(string? appVersion) =>
+        Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 50);
+
+    private bool SendReverseMoveUdp(Session session, FastUdpHub.Peer? peerUdp, int lease, Packet move)
+    {
+        if (_udpHub == null || peerUdp is not { Confirmed: true } || lease <= 0)
+            return false;
+        int? tag = move.C > 0 ? move.C : null;
+        if (move.D != 0 &&
+            move.A is >= short.MinValue and <= short.MaxValue &&
+            move.B is >= short.MinValue and <= short.MaxValue &&
+            SupportsUdpEdgePush(session.Peer.AppVersion))
+        {
+            var (pushX, pushY) = FastMovePacer.UnpackEdgePush(move.D);
+            if (pushX != 0 || pushY != 0)
+            {
+                int packedA = ((pushX & 0xFFFF) << 16) | (move.A & 0xFFFF);
+                int packedB = ((pushY & 0xFFFF) << 16) | (move.B & 0xFFFF);
+                return _udpHub.Send(peerUdp, FastUdpOp.ReverseEdgePush, packedA, packedB, lease, tag);
+            }
+        }
+        return _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease, tag);
+    }
+
     internal static bool ShouldEchoAndroidWarm(string? platform) =>
         string.Equals(platform, "Android", StringComparison.Ordinal);
 
@@ -2405,8 +2425,8 @@ internal sealed class HostSession : IInputSession, IDisposable
         pacer.SetMinIntervalMs(
             ReceiverServer.ComputeAdaptiveUdpIntervalMs(
                 platform, effectiveHz, rtt, minRtt, jitter, loss, client?.LinkTracker.Band));
-        int warmMs = (int)Math.Clamp(Math.Round(22.0 + queueDelay * 0.6 + loss * 0.25), 22, 50);
-        pacer.SetWarmIntervalMs(warmMs);
+        pacer.SetWarmIntervalMs(
+            ReceiverServer.ComputeWarmIntervalMs(client?.LinkTracker.Band, queueDelay, loss));
     }
 
     internal void AttachReverseInput(LocalInputPriority priority, Func<bool> allowClaim)

@@ -108,7 +108,7 @@ final class ShellPointerMath {
         int clampedHz = Math.max(60, Math.min(240, refreshHz > 0 ? refreshHz : 60));
         // Space reports slightly denser than 1x display refresh so every VSYNC receives
         // a fresh position while USB/TCP clumps never outpace minFrameSec or evdev.
-        long ns = Math.round(780_000_000.0 / clampedHz);
+        long ns = Math.round(600_000_000.0 / clampedHz);
         return Math.max(4_000_000L, Math.min(12_000_000L, ns));
     }
 
@@ -230,8 +230,9 @@ final class ShellPointerMath {
             if (!anchored) {
                 double minScale = Math.max(0.25, params.scale);
                 double highGain = Math.max(minScale, minScale * Math.max(1.0, params.acceleration));
-                int pullXMag = (int) Math.min(12000L, Math.round(screenWidth * 1.15 / minScale));
-                int pullYMag = (int) Math.min(14000L, Math.round(screenHeight * 1.15 / minScale));
+                double accelSpanGain = Math.min(highGain, minScale + (highGain - minScale) * 0.65);
+                int pullXMag = (int) Math.min(12000L, Math.round(screenWidth * 1.15 / accelSpanGain));
+                int pullYMag = (int) Math.min(14000L, Math.round(screenHeight * 1.15 / accelSpanGain));
                 int cornerX = tx > (screenWidth - 1) * 0.5 ? (screenWidth - 1) : 0;
                 int cornerY = ty > (screenHeight - 1) * 0.5 ? (screenHeight - 1) : 0;
                 int pullX = cornerX == 0 ? -pullXMag : pullXMag;
@@ -302,10 +303,10 @@ final class ShellPointerMath {
 
             double dist = Math.hypot(dx, dy);
             double instSpeed = dist / effectiveDt;
-            double alpha = effectiveDt / (effectiveDt + 0.025);
+            double alpha = effectiveDt / (effectiveDt + 0.045);
             smoothedOutSpeed += alpha * (instSpeed - smoothedOutSpeed);
             double modelGain = gainForOutputSpeed(smoothedOutSpeed, params);
-            double gain = params.scale + (modelGain - params.scale) * 0.85;
+            double gain = params.scale + (modelGain - params.scale) * 0.70;
 
             int rawX = clampRelative8((int) Math.round(dx / gain));
             int rawY = clampRelative8((int) Math.round(dy / gain));
@@ -370,8 +371,15 @@ final class ShellPointerMath {
             return scaled != 0 ? scaled : (pushDelta > 0 ? 1 : -1);
         }
 
+        boolean hasRemainingMotion(int targetX, int targetY) {
+            if (!anchored) return true;
+            int tx = Math.max(0, Math.min(screenWidth - 1, targetX));
+            int ty = Math.max(0, Math.min(screenHeight - 1, targetY));
+            return Math.abs(tx - cursorX) >= 1.5 || Math.abs(ty - cursorY) >= 1.5;
+        }
+
         private int edgeSnapCounts() {
-            return (int) Math.max(4L, Math.round(6.0 / Math.max(0.25, params.scale)));
+            return (int) Math.max(10L, Math.round(16.0 / Math.max(0.25, params.scale)));
         }
     }
 }

@@ -690,17 +690,35 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void UpdateLiveLinkDisplay()
     {
         if (IsDisposed) return;
-        var snap = _receiver?.GetActiveLinkSummary();
+        var (color, text) = FormatLiveLinkDisplay(
+            _receiver?.GetActiveLinkSummary(),
+            KeyboardLayoutHelper.DescribeCurrentWindowsLayout());
+        _liveLinkLabel.ForeColor = color;
+        _liveLinkLabel.Text = text;
+    }
+
+    internal static (Color Color, string Text) FormatLiveLinkDisplay(
+        ReceiverServer.ActiveLinkSnapshot? snap,
+        string currentWindowsLayout)
+    {
         if (snap is not { Connected: true })
         {
-            _liveLinkLabel.ForeColor = Color.FromArgb(172, 184, 198);
-            _liveLinkLabel.Text = "Live link: Waiting for connection  •  Keyboard: " +
-                KeyboardLayoutHelper.DescribeCurrentWindowsLayout();
-            return;
+            return (
+                Color.FromArgb(172, 184, 198),
+                "Live link: Waiting for connection  •  Keyboard: " + currentWindowsLayout
+            );
+        }
+        var kb = KeyboardLayoutHelper.TryParseWireSummary(snap.KeyboardInfoJson);
+        string kbText = kb != null ? $"  •  Keyboard: {kb.Keyboard}" : "";
+        if (snap.TransportBand == "cable")
+        {
+            return (
+                Color.FromArgb(136, 224, 168),
+                $"Live link [{snap.PeerName}]: Data cable{kbText}"
+            );
         }
         string bandText = snap.TransportBand switch
         {
-            "cable" => "Data cable",
             "5GHz" => "5 GHz wireless",
             "6GHz" => "6 GHz wireless",
             "2.4GHz" => "2.4 GHz wireless",
@@ -708,12 +726,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         string speedText = snap.LinkSpeedMbps > 0 ? $" ({snap.LinkSpeedMbps} Mbps)" : "";
         string pingText = snap.RttMs > 0 ? $"{snap.RttMs:F1} ms ping" : "measuring ping...";
-        var kb = KeyboardLayoutHelper.TryParseWireSummary(snap.KeyboardInfoJson);
-        string kbText = kb != null ? $"  •  Keyboard: {kb.Keyboard}" : "";
-        _liveLinkLabel.ForeColor = snap.RttMs is > 0 and <= 20
+        string lossText = snap.LossPermille >= 1.0 ? $"  •  loss {snap.LossPermille / 10.0:F1}%" : "";
+        Color color = snap.RttMs is > 0 and <= 20
             ? Color.FromArgb(136, 224, 168)
             : (snap.RttMs > 60 ? Color.FromArgb(245, 200, 120) : Color.FromArgb(170, 212, 245));
-        _liveLinkLabel.Text = $"Live link [{snap.PeerName}]: {bandText}{speedText}  •  {pingText}  •  jitter {snap.JitterMs:F1} ms{kbText}";
+        return (
+            color,
+            $"Live link [{snap.PeerName}]: {bandText}{speedText}  •  {pingText}  •  jitter {snap.JitterMs:F1} ms{lossText}{kbText}"
+        );
     }
 
     private void ShowConnectedShortcuts()

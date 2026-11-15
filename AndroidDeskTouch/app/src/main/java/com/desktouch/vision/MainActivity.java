@@ -569,23 +569,9 @@ public final class MainActivity extends Activity {
             connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
         }
         if(liveLinkView!=null){
-            if(snap==null){
-                liveLinkView.setText("Live link: waiting for connection");
-            }else if(!snap.connected){
-                WifiLinkMonitor.LinkSnapshot local=WifiLinkMonitor.inspect(this,false,0);
-                liveLinkView.setText("Live link: Disconnected • Phone network: "+local.describePlainLabel());
-            }else{
-                String path=snap.cable ? "Data cable" : formatBandPlain(snap.band,snap.speedMbps);
-                String ping=snap.rttMs>0.0
-                    ? String.format(java.util.Locale.US,"ping %.1f ms",snap.rttMs)
-                    : "measuring ping...";
-                String extra="";
-                if(!snap.cable && (snap.jitterMs>=0.2 || snap.lossPermille>=0.5)){
-                    extra=String.format(java.util.Locale.US," • jitter %.1f ms • loss %.1f‰",
-                        snap.jitterMs,snap.lossPermille);
-                }
-                liveLinkView.setText("Live link: "+snap.peerName+" via "+path+" • "+ping+extra);
-            }
+            WifiLinkMonitor.LinkSnapshot local=(snap==null || !snap.connected)
+                ? WifiLinkMonitor.inspect(this,false,0) : null;
+            liveLinkView.setText(formatLiveLinkText(snap, local!=null ? local.describePlainLabel() : ""));
         }
         if(keyboardBindingsView!=null && snap!=null && snap.keyboardReport!=null){
             KeyboardBindingInspector.KeyboardReport kb=snap.keyboardReport;
@@ -598,6 +584,29 @@ public final class MainActivity extends Activity {
                 +" • Ready bindings: "+readyCount+"/"+kb.bindings.size()+pcTag);
         }
         refreshTrustSummary();
+    }
+    static String formatLiveLinkText(DeskTouchSession.LiveStatusSnapshot snap, String offlineNetworkLabel){
+        if(snap==null){
+            return "Live link: waiting for connection";
+        }
+        if(!snap.connected){
+            return "Live link: Disconnected • Phone network: "+offlineNetworkLabel;
+        }
+        if(snap.cable){
+            return "Live link: "+snap.peerName+" via Data cable";
+        }
+        String path=formatBandPlain(snap.band,snap.speedMbps);
+        String ping=snap.rttMs>0.0
+            ? String.format(java.util.Locale.US,"ping %.1f ms",snap.rttMs)
+            : "measuring ping...";
+        String extra="";
+        if(snap.jitterMs>=0.2){
+            extra+=String.format(java.util.Locale.US," • jitter %.1f ms",snap.jitterMs);
+        }
+        if(snap.lossPermille>=1.0){
+            extra+=String.format(java.util.Locale.US," • loss %.1f%%",snap.lossPermille/10.0);
+        }
+        return "Live link: "+snap.peerName+" via "+path+" • "+ping+extra;
     }
     private static String formatBandPlain(String band, int speedMbps){
         String base;

@@ -36,6 +36,7 @@ final class FastUdpChannel implements Closeable {
     static final byte OP_REVERSE_WHEEL = 10;
     static final byte OP_LINK_PING = 11;
     static final byte OP_LINK_FEEDBACK = 12;
+    static final byte OP_REVERSE_EDGE_PUSH = 13;
 
     static final class Message {
         final byte op;
@@ -125,6 +126,10 @@ final class FastUdpChannel implements Closeable {
         }
 
         Message tryOpen(byte[] frame, int length) {
+            return tryOpen(frame, length, null);
+        }
+
+        Message tryOpen(byte[] frame, int length, AdaptiveLinkTracker tracker) {
             if (closed || frame == null || length != FRAME_SIZE) return null;
             if (frame[0] != MAGIC[0] || frame[1] != MAGIC[1]
                     || frame[2] != MAGIC[2] || frame[3] != MAGIC[3]) {
@@ -134,18 +139,17 @@ final class FastUdpChannel implements Closeable {
             int id = ((frame[6] & 0xFF) << 8) | (frame[7] & 0xFF);
             if (id != peerId) return null;
             byte op = frame[5];
-            if (op < OP_REVERSE_MOVE || op > OP_LINK_FEEDBACK) return null;
+            if (op < OP_REVERSE_MOVE || op > OP_REVERSE_EDGE_PUSH) return null;
             long seq = readLongBE(frame, 8);
             if (seq == 0) return null;
 
             synchronized (recvLock) {
                 if (closed) return null;
-                boolean isCoordinateOp = op == OP_MOVE || op == OP_REVERSE_MOVE;
+                boolean isCoordinateOp = op == OP_MOVE || op == OP_REVERSE_MOVE || op == OP_REVERSE_EDGE_PUSH;
                 boolean isNewMax = lastRecvSeq == 0L || Long.compareUnsigned(seq, lastRecvSeq) > 0;
                 long back = 0L;
                 long backBit = 0L;
                 if (!isNewMax) {
-                    if (isCoordinateOp) return null;
                     back = lastRecvSeq - seq;
                     if (Long.compareUnsigned(back, 64L) >= 0) return null;
                     backBit = 1L << (int) back;
@@ -170,6 +174,10 @@ final class FastUdpChannel implements Closeable {
                     lastRecvSeq = seq;
                 } else {
                     recvWindowMask |= backBit;
+                    if (isCoordinateOp) {
+                        if (tracker != null) tracker.recordAuthenticatedSeqOnly(seq);
+                        return null;
+                    }
                 }
                 return new Message(
                     op,
@@ -193,6 +201,9 @@ final class FastUdpChannel implements Closeable {
     interface Listener {
         void onProbeConfirmed();
         void onReverseMove(int x, int y, int lease, int moveSeq);
+        default void onReverseMove(int x, int y, int pushX, int pushY, int lease, int moveSeq) {
+            onReverseMove(x, y, lease, moveSeq);
+        }
         default void onReverseClaim(int claim, int dispatchSeq) {}
         default void onReverseButton(int button, int down, int lease, int actionSeq) {}
         default void onReverseWheel(int amount, int horizontal, int lease, int actionSeq) {}
@@ -221,7 +232,7 @@ final class FastUdpChannel implements Closeable {
         this.codec = new Codec(key, peerId, false);
         this.socket = new DatagramSocket(0);
         try {
-            this.socket.setTrafficClass(0x10);
+            this.socket.setTrafficClass(0xB8);
         } catch (Exception ignored) {
         }
         try {
@@ -297,7 +308,7 @@ final class FastUdpChannel implements Closeable {
                 packet.setLength(recvBuf.length);
                 socket.receive(packet);
                 if (packet.getLength() != FRAME_SIZE) continue;
-                Message msg = codec.tryOpen(recvBuf, packet.getLength());
+                Message msg = codec.tryOpen(recvBuf, packet.getLength(), linkTracker);
                 if (msg == null) continue;
                 InetAddress srcAddr = packet.getAddress();
                 int srcPort = packet.getPort();
@@ -328,11 +339,19 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                     linkTracker.onFeedbackReceived(msg.a, msg.b, msg.timestampMs, nowMs);
                     listener.onLinkFeedback(msg.a, msg.b, msg.timestampMs, msg.lease);
-                } else if (msg.op == OP_REVERSE_MOVE) {
+                } else if (msg.op == OP_REVERSE_MOVE || msg.op == OP_REVERSE_EDGE_PUSH) {
                     markConfirmed();
                     if (highestReverseMoveSeq == 0L || Long.compareUnsigned(msg.seq, highestReverseMoveSeq) > 0) {
                         highestReverseMoveSeq = msg.seq;
-                        listener.onReverseMove(msg.a, msg.b, msg.lease, msg.timestampMs);
+                        if (msg.op == OP_REVERSE_EDGE_PUSH) {
+                            int x = (short) (msg.a & 0xFFFF);
+                            int pushX = (short) (msg.a >> 16);
+                            int y = (short) (msg.b & 0xFFFF);
+                            int pushY = (short) (msg.b >> 16);
+                            listener.onReverseMove(x, y, pushX, pushY, msg.lease, msg.timestampMs);
+                        } else {
+                            listener.onReverseMove(msg.a, msg.b, msg.lease, msg.timestampMs);
+                        }
                     }
                 } else if (msg.op == OP_REVERSE_CLAIM) {
                     markConfirmed();

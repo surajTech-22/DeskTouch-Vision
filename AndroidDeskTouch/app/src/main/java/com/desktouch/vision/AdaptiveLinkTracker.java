@@ -183,13 +183,20 @@ public final class AdaptiveLinkTracker {
             smoothedRttMs = sampleRtt;
             rttJitterMs = 0.0;
         } else {
-            double dev = Math.abs(sampleRtt - smoothedRttMs);
-            rttJitterMs += 0.25 * (dev - rttJitterMs);
+            double rawDev = Math.abs(sampleRtt - smoothedRttMs);
+            double clampedDev = Math.min(rawDev, Math.max(25.0, smoothedRttMs * 1.8));
+            rttJitterMs += (clampedDev > rttJitterMs ? 0.14 : 0.25) * (clampedDev - rttJitterMs);
             // Adapt down fast when a better band/link arrives; damp isolated upward spikes.
             double alpha = sampleRtt < smoothedRttMs
                 ? (sampleRtt < smoothedRttMs * 0.65 ? 0.55 : 0.42)
-                : 0.20;
+                : 0.15;
             smoothedRttMs += alpha * (sampleRtt - smoothedRttMs);
+        }
+    }
+
+    public void recordAuthenticatedSeqOnly(long seq) {
+        synchronized (recvGate) {
+            recordSeqLocked(seq);
         }
     }
 
@@ -208,8 +215,8 @@ public final class AdaptiveLinkTracker {
                     long recvDelta = nowMs - lastTransitRecvMs;
                     long sendDelta = senderTimestampMs - lastTransitSenderMs;
                     if (recvDelta >= 0L && recvDelta <= 400L && sendDelta >= 0L && sendDelta <= 400L) {
-                        double transitDiff = Math.min(250.0, Math.abs((double) recvDelta - (double) sendDelta));
-                        inboundJitterMs += (transitDiff > inboundJitterMs ? 0.28 : 0.22) * (transitDiff - inboundJitterMs);
+                        double transitDiff = Math.min(110.0, Math.abs((double) recvDelta - (double) sendDelta));
+                        inboundJitterMs += (transitDiff > inboundJitterMs ? 0.22 : 0.28) * (transitDiff - inboundJitterMs);
                     } else if (recvDelta > 400L) {
                         inboundJitterMs *= 0.80;
                     }

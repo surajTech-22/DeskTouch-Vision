@@ -110,7 +110,12 @@ public final class ShellInputDaemon {
     private int configuredPointerSpeed;
     private volatile int configuredRefreshHz = 60;
     private boolean hasDumpsysVelocityParams;
+    private static final int MOVE_DONE_IDLE = 0;
+    private static final int MOVE_SENT_SETTLED = 1;
+    private static final int MOVE_SENT_MORE = 2;
+
     private boolean hasPendingMove;
+    private boolean pendingMoveCoasting;
     private int pendingMoveX;
     private int pendingMoveY;
     private int pendingPushX;
@@ -313,6 +318,7 @@ public final class ShellInputDaemon {
                 int px;
                 int py;
                 long seq;
+                boolean coasting;
                 synchronized (mouseQueueLock) {
                     while (daemonRunning && !hasPendingMove) {
                         try {
@@ -337,13 +343,24 @@ public final class ShellInputDaemon {
                     px = pendingPushX;
                     py = pendingPushY;
                     seq = pendingMoveSeq;
+                    coasting = pendingMoveCoasting;
+                    pendingMoveCoasting = false;
                     hasPendingMove = false;
                     pendingPushX = 0;
                     pendingPushY = 0;
                 }
-                if (moveTo(tx, ty, px, py, seq)) {
+                int moveOutcome = moveTo(tx, ty, px, py, seq, coasting);
+                if (moveOutcome != MOVE_DONE_IDLE) {
                     synchronized (mouseQueueLock) {
                         lastMouseWriteNs = System.nanoTime();
+                        if (moveOutcome == MOVE_SENT_MORE && daemonRunning && !hasPendingMove && seq == pendingMoveSeq) {
+                            pendingMoveX = Math.max(0, Math.min(screenWidth - 1, tx));
+                            pendingMoveY = Math.max(0, Math.min(screenHeight - 1, ty));
+                            pendingPushX = 0;
+                            pendingPushY = 0;
+                            pendingMoveCoasting = true;
+                            hasPendingMove = true;
+                        }
                     }
                 }
             }
@@ -386,6 +403,7 @@ public final class ShellInputDaemon {
                     pendingPushY = 0;
                 }
                 pendingMoveSeq = ++nextMoveSeq;
+                pendingMoveCoasting = false;
                 hasPendingMove = true;
                 mouseQueueLock.notifyAll();
             }
@@ -399,6 +417,7 @@ public final class ShellInputDaemon {
         int px = 0;
         int py = 0;
         long seq = 0L;
+        boolean coasting = false;
         synchronized (mouseQueueLock) {
             if (hasPendingMove) {
                 tx = pendingMoveX;
@@ -406,15 +425,26 @@ public final class ShellInputDaemon {
                 px = pendingPushX;
                 py = pendingPushY;
                 seq = pendingMoveSeq;
+                coasting = pendingMoveCoasting;
+                pendingMoveCoasting = false;
                 hasPendingMove = false;
                 pendingPushX = 0;
                 pendingPushY = 0;
                 have = true;
             }
         }
-        if (have && moveTo(tx, ty, px, py, seq)) {
-            synchronized (mouseQueueLock) {
-                lastMouseWriteNs = System.nanoTime();
+        if (have) {
+            int outcome = moveTo(tx, ty, px, py, seq, coasting);
+            int extraSteps = 0;
+            while (outcome == MOVE_SENT_MORE && extraSteps < 8) {
+                LockSupport.parkNanos(ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz));
+                outcome = moveTo(tx, ty, 0, 0, seq, true);
+                extraSteps++;
+            }
+            if (outcome != MOVE_DONE_IDLE || extraSteps > 0) {
+                synchronized (mouseQueueLock) {
+                    lastMouseWriteNs = System.nanoTime();
+                }
             }
         }
     }
@@ -601,12 +631,14 @@ public final class ShellInputDaemon {
         try { Os.close(fd); } catch (ErrnoException ignored) {}
     }
 
-    private synchronized boolean moveTo(int targetX, int targetY, int pushX, int pushY, long seq) {
-        if (seq <= appliedMoveSeq) return false;
-        appliedMoveSeq = seq;
-        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight, configuredPointerSpeed, configuredRefreshHz)) return false;
+    private synchronized int moveTo(int targetX, int targetY, int pushX, int pushY, long seq, boolean coasting) {
+        if (!coasting && seq <= appliedMoveSeq) return MOVE_DONE_IDLE;
+        if (seq > appliedMoveSeq) appliedMoveSeq = seq;
+        if (mouseFd == null && !ensureDevices(screenWidth, screenHeight, configuredPointerSpeed, configuredRefreshHz)) {
+            return MOVE_DONE_IDLE;
+        }
         ShellPointerMath.MoveStep step = pointer.stepTo(targetX, targetY, pushX, pushY, System.nanoTime());
-        if (!step.hasMotion()) return false;
+        if (!step.hasMotion()) return MOVE_DONE_IDLE;
         if (step.needsAnchorReset) {
             if (!mousePrimedForReader) {
                 int primeX = Integer.compare(step.anchorPullX, 0);
@@ -614,12 +646,12 @@ public final class ShellInputDaemon {
                 if (primeX != 0 || primeY != 0) {
                     writeMouseReport(primeX, primeY, 0, 0);
                     // Wait for system InputReader/PointerController to allocate the cursor surface on event 1.
-                    LockSupport.parkNanos(25_000_000L);
+                    LockSupport.parkNanos(12_000_000L);
                 }
                 mousePrimedForReader = true;
             }
             sendRelativeBurst(step.anchorPullX, step.anchorPullY, true);
-            LockSupport.parkNanos(500_000L);
+            LockSupport.parkNanos(400_000L);
             if (step.resetSignX != 0 || step.resetSignY != 0) {
                 writeMouseReport(step.resetSignX, step.resetSignY, 0, 0);
             }
@@ -632,7 +664,8 @@ public final class ShellInputDaemon {
                 mousePrimedForReader = true;
             }
         }
-        return true;
+        boolean needMore = !step.needsAnchorReset && pointer.hasRemainingMotion(targetX, targetY);
+        return needMore ? MOVE_SENT_MORE : MOVE_SENT_SETTLED;
     }
 
     private void sendRelativeBurst(int totalDx, int totalDy, boolean paceChunks) {
@@ -649,7 +682,7 @@ public final class ShellInputDaemon {
                 ry -= stepY;
                 sent++;
                 if (paceChunks && (rem > 1 || rx != 0 || ry != 0)) {
-                    LockSupport.parkNanos((sent % 8 == 0) ? 1_500_000L : 900_000L);
+                    LockSupport.parkNanos((sent % 8 == 0) ? 700_000L : 350_000L);
                 }
             }
         }
@@ -661,7 +694,7 @@ public final class ShellInputDaemon {
             ry -= stepY;
             sent++;
             if (paceChunks && (rx != 0 || ry != 0)) {
-                LockSupport.parkNanos((sent % 8 == 0) ? 1_500_000L : 900_000L);
+                LockSupport.parkNanos((sent % 8 == 0) ? 700_000L : 350_000L);
             }
         }
     }

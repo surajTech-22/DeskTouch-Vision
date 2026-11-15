@@ -317,29 +317,33 @@ public final class AutoConnectService extends Service {
     }
 
     private void handleNetworkTransition(String reason) {
-        int nextEpoch=networkEpoch.incrementAndGet();
-        WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(
-            this,DeskTouchRuntime.anyCableConnected(),nextEpoch);
-        WifiLinkMonitor.LinkSnapshot prev=lastLinkSnapshot;
-        lastLinkSnapshot=snap;
-        if(prev==null || !snap.sameRadioPath(prev) || snap.significantlyDifferentForReporting(prev)) {
-            DeskTouchRuntime.notifyNetworkProfile(this,snap);
-        }
-        triggerFastReconnect();
+        applyObservedNetworkChange(false);
     }
 
     private void handleNetworkCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+        applyObservedNetworkChange(true);
+    }
+
+    private void applyObservedNetworkChange(boolean capabilitiesOnly) {
+        WifiLinkMonitor.LinkSnapshot prev=lastLinkSnapshot;
         WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(
             this,DeskTouchRuntime.anyCableConnected(),networkEpoch.get());
-        WifiLinkMonitor.LinkSnapshot prev=lastLinkSnapshot;
-        if(prev!=null && snap.sameRadioPath(prev) && !snap.significantlyDifferentForReporting(prev))
+        boolean radioPathChanged = prev==null || !snap.sameRadioPath(prev);
+        if(!radioPathChanged && !snap.significantlyDifferentForReporting(prev)) {
+            if(!capabilitiesOnly && DeskTouchRuntime.connectedCount()==0) {
+                triggerFastReconnect();
+            }
             return;
-        if(prev==null || !snap.band.equals(prev.band) || snap.networkHash!=prev.networkHash) {
-            snap=WifiLinkMonitor.inspect(this,DeskTouchRuntime.anyCableConnected(),
-                networkEpoch.incrementAndGet());
+        }
+        if(radioPathChanged) {
+            snap=WifiLinkMonitor.inspect(
+                this,DeskTouchRuntime.anyCableConnected(),networkEpoch.incrementAndGet());
         }
         lastLinkSnapshot=snap;
         DeskTouchRuntime.notifyNetworkProfile(this,snap);
+        if(!capabilitiesOnly && (radioPathChanged || DeskTouchRuntime.connectedCount()==0)) {
+            triggerFastReconnect();
+        }
     }
 
     private void handleNetworkLost() {

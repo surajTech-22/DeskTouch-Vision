@@ -20,7 +20,8 @@ internal enum FastUdpOp : byte
     ReverseButton = 9,
     ReverseWheel = 10,
     LinkPing = 11,
-    LinkFeedback = 12
+    LinkFeedback = 12,
+    ReverseEdgePush = 13
 }
 
 internal readonly record struct FastUdpMessage(
@@ -107,7 +108,7 @@ internal sealed class FastUdpCodec : IDisposable
         }
     }
 
-    internal bool TryOpen(ReadOnlySpan<byte> frame, out FastUdpMessage message)
+    internal bool TryOpen(ReadOnlySpan<byte> frame, out FastUdpMessage message, AdaptiveLinkTracker? tracker = null)
     {
         message = default;
         if (frame.Length != FrameSize) return false;
@@ -123,12 +124,13 @@ internal sealed class FastUdpCodec : IDisposable
         lock (_recvLock)
         {
             if (_disposed) return false;
-            bool isCoordinateOp = rawOp is (byte)FastUdpOp.Move or (byte)FastUdpOp.ReverseMove;
+            bool isCoordinateOp = rawOp is (byte)FastUdpOp.Move
+                or (byte)FastUdpOp.ReverseMove
+                or (byte)FastUdpOp.ReverseEdgePush;
             bool isNewMax = _lastRecvSeq == 0 || seq > _lastRecvSeq;
             ulong backBit = 0;
             if (!isNewMax)
             {
-                if (isCoordinateOp) return false;
                 ulong back = _lastRecvSeq - seq;
                 if (back >= 64) return false;
                 backBit = 1UL << (int)back;
@@ -162,6 +164,11 @@ internal sealed class FastUdpCodec : IDisposable
             else
             {
                 _recvWindowMask |= backBit;
+                if (isCoordinateOp)
+                {
+                    tracker?.RecordAuthenticatedSeqOnly(seq);
+                    return false;
+                }
             }
             message = new FastUdpMessage(
                 (FastUdpOp)rawOp,
@@ -301,7 +308,7 @@ internal sealed class AdaptiveLinkTracker
         string band = Band;
         return band switch
         {
-            "cable" => controlActive ? 38 : 120,
+            "cable" => controlActive ? 750 : 900,
             "5GHz" or "6GHz" => controlActive ? 120 : 500,
             "2.4GHz" => controlActive ? 350 : 900,
             _ => controlActive ? 220 : 750
@@ -406,15 +413,22 @@ internal sealed class AdaptiveLinkTracker
         }
         else
         {
-            double dev = Math.Abs(sampleRtt - _smoothedRttMs);
-            _rttJitterMs += (dev > _rttJitterMs ? 0.25 : 0.25) * (dev - _rttJitterMs);
+            double rawDev = Math.Abs(sampleRtt - _smoothedRttMs);
+            double clampedDev = Math.Min(rawDev, Math.Max(25.0, _smoothedRttMs * 1.8));
+            _rttJitterMs += (clampedDev > _rttJitterMs ? 0.14 : 0.25) * (clampedDev - _rttJitterMs);
             // Adapt down rapidly when a faster link/band becomes available,
             // while damping isolated upward Wi-Fi retry spikes.
             double alpha = sampleRtt < _smoothedRttMs
                 ? (sampleRtt < _smoothedRttMs * 0.65 ? 0.55 : 0.42)
-                : 0.20;
+                : 0.15;
             _smoothedRttMs += alpha * (sampleRtt - _smoothedRttMs);
         }
+    }
+
+    internal void RecordAuthenticatedSeqOnly(ulong seq)
+    {
+        lock (_recvGate)
+            RecordSeqLocked(seq);
     }
 
     internal void RecordInboundPacket(ulong seq, bool streamTimingOp, long nowMs) =>
@@ -434,8 +448,8 @@ internal sealed class AdaptiveLinkTracker
                     long sendDelta = unchecked(senderTimestampMs - _lastTransitSenderMs);
                     if (recvDelta is >= 0 and <= 400 && sendDelta is >= 0 and <= 400)
                     {
-                        double transitDiff = Math.Min(250.0, Math.Abs((double)recvDelta - (double)sendDelta));
-                        _inboundJitterMs += (transitDiff > _inboundJitterMs ? 0.28 : 0.22) * (transitDiff - _inboundJitterMs);
+                        double transitDiff = Math.Min(110.0, Math.Abs((double)recvDelta - (double)sendDelta));
+                        _inboundJitterMs += (transitDiff > _inboundJitterMs ? 0.22 : 0.28) * (transitDiff - _inboundJitterMs);
                     }
                     else if (recvDelta > 400)
                     {
@@ -629,7 +643,7 @@ internal static class FastUdpSocketOptions
         catch (Exception) { }
         try { socket.SendBufferSize = 262144; } catch (Exception) { }
         try { socket.ReceiveBufferSize = 262144; } catch (Exception) { }
-        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10); }
+        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8); }
         catch (Exception) { }
     }
 
@@ -788,7 +802,7 @@ internal sealed class FastUdpHub : IDisposable
                 ushort wireId = (ushort)((buffer[6] << 8) | buffer[7]);
                 if (!_peers.TryGetValue(wireId, out var peer)) continue;
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
-                if (!peer.Codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
+                if (!peer.Codec.TryOpen(buffer.AsSpan(0, received), out var msg, peer.LinkTracker)) continue;
 
                 peer.UpdateEndpointOnAuthenticatedPacket(normalized, srcIp.Port);
 
@@ -1140,7 +1154,7 @@ internal sealed class FastMovePacer : IDisposable
 
     internal void SetWarmIntervalMs(int ms)
     {
-        int clamped = Math.Clamp(ms, 18, 60);
+        int clamped = Math.Clamp(ms, 18, 120);
         lock (_gate)
         {
             if (_effectiveWarmIntervalMs == clamped) return;

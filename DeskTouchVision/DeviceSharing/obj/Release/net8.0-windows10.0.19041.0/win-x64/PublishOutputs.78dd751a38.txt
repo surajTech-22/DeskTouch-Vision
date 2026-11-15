@@ -1,0 +1,9 @@
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\DeskTouch.DeviceShare.exe
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\ALLOW_PRIVATE_LAN.ps1
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\DeskTouch.DeviceShare.dll
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\DeskTouch.DeviceShare.deps.json
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\DeskTouch.DeviceShare.runtimeconfig.json
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\DeskTouch.DeviceShare.pdb
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\Microsoft.Windows.SDK.NET.dll
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\WinRT.Runtime.dll
+C:\Users\welcome\.gemini\antigravity\brain\2334767f-1546-4939-a27e-1ca8ed3c70b2\scratch\stage-v0344\DeviceSharing\QRCoder.dll

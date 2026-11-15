@@ -2016,6 +2016,47 @@ await uiCheck2.Task.WaitAsync(TimeSpan.FromSeconds(15));
 uiThread2.Join();
 Console.WriteLine("PASS: Keyboard binding metadata helper and Windows UI shortcuts/live-link controls verified.");
 
+Check(DeskTouchVision.SingleInstanceActivation.IsDeskTouchMainWindowTitle("DeskTouch Vision — Displays") &&
+    DeskTouchVision.SingleInstanceActivation.IsDeskTouchMainWindowTitle("DeskTouch Vision — checking updates") &&
+    !DeskTouchVision.SingleInstanceActivation.IsDeskTouchMainWindowTitle("DeskTouch.DeviceShare") &&
+    !DeskTouchVision.SingleInstanceActivation.IsDeskTouchMainWindowTitle(""),
+    "Window matcher must identify only DeskTouch Vision Displays windows");
+
+var surfacedMatch = new[] {
+    new DeskTouchVision.SingleInstanceActivation.WindowMatch((IntPtr)1234, 42, Visible: true, Minimized: false, Responsive: true)
+};
+Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        surfacedMatch, true, TimeSpan.FromMilliseconds(40), TimeSpan.FromSeconds(10)) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.SurfacedOnCurrentDesktop,
+    "Visible responsive window on current desktop must complete wakeup cleanly");
+
+Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        Array.Empty<DeskTouchVision.SingleInstanceActivation.WindowMatch>(), false, TimeSpan.FromMilliseconds(40), null) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.NoExistingInstance,
+    "Missing peer process must allow fresh startup without recovery delay");
+
+Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        Array.Empty<DeskTouchVision.SingleInstanceActivation.WindowMatch>(), true, TimeSpan.FromMilliseconds(400), TimeSpan.FromSeconds(12)) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.NeedsRecovery,
+    "Established background/other-desktop process with zero windows on caller desktop must trigger fast recovery");
+
+Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        Array.Empty<DeskTouchVision.SingleInstanceActivation.WindowMatch>(), true, TimeSpan.FromMilliseconds(400), TimeSpan.FromSeconds(1)) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.Waiting,
+    "Brand-new process creating its initial HWND must be given startup grace before recovery");
+
+var hiddenTrayMatch = new[] {
+    new DeskTouchVision.SingleInstanceActivation.WindowMatch((IntPtr)1234, 42, Visible: false, Minimized: false, Responsive: true)
+};
+Check(DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        hiddenTrayMatch, true, TimeSpan.FromMilliseconds(400), TimeSpan.FromMinutes(5)) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.Waiting &&
+    DeskTouchVision.SingleInstanceActivation.EvaluateCurrentDesktopMatches(
+        hiddenTrayMatch, true, TimeSpan.FromMilliseconds(1900), TimeSpan.FromMinutes(5)) ==
+    DeskTouchVision.SingleInstanceActivation.WakeStepResult.NeedsRecovery,
+    "Same-desktop tray window gets wake window to surface and recovers if stuck invisible");
+Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/other-desktop recovery logic verified.");
+
 internal sealed class RecordingInputSession : IInputSession
 {
     internal List<Packet> Packets { get; } = new();

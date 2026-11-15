@@ -1,0 +1,15 @@
+R_DEF: Internal format may change without notice
+local
+drawable ic_desktouch
+drawable payment_widget_bg_active
+drawable payment_widget_bg_safe
+id payment_widget_root
+id payment_widget_status
+id payment_widget_title
+layout payment_pause_widget
+string accessibility_description
+string payment_widget_name
+xml desktouch_accessibility
+xml desktouch_ime
+xml desktouch_update_paths
+xml payment_pause_widget

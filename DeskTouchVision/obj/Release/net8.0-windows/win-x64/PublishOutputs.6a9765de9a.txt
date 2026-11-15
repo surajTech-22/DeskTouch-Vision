@@ -1,0 +1,8 @@
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\DeskTouchVision.pdb
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\Install-DeskTouch.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\Update-DeskTouch.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\CHECK_DESKTOUCH.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\RECOVER_DESKTOUCH.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\VERIFY_DESKTOUCH_PAYLOAD.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\CHECK_SECURITY_STATUS.ps1
+C:\Users\welcome\.gemini\antigravity\scratch\DeskTouch-Vision\DeskTouchVision\dist\app\DeskTouchVision.exe

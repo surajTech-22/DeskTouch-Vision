@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.44 — Bulletproof Windows Reopen & Recovery While Background Process Is Running
+
+Fixes the issue where launching DeskTouch Vision while `DeskTouch.DeviceShare` was already running in Task Manager (tray, minimized, background/other desktop, or mid-shutdown) could exit without opening a visible window on screen.
+
+- **Verified desktop window wakeup & automatic recovery (`SingleInstanceActivation`):** Launching DeskTouch Vision (`DeskTouchVision.exe` or `DeskTouch.DeviceShare.exe` directly) serializes rapid double-clicks, checks the caller's active desktop to confirm the Displays window actually becomes visible, un-minimized, and responsive, and automatically shuts down and replaces orphaned, stuck, or non-visible background instances so the Windows app always opens cleanly.
+- **Reliable WinForms tray/minimized restoration (`DisplaySettingsForm`):** Closes the startup `--tray` vs wakeup signal race, restores minimized windows cleanly before clamping off-screen coordinates, and brings the existing window to the foreground cleanly without breaking input hooks.
+
+---
+
 # DeskTouch Vision v0.3.43 — Zero-Delay Cable, Band-Adaptive Wireless Ping, Dynamic Cable↔Wireless Shifting & Keyboard Binding Live Inspector
 
 Delivers instant USB data-cable input and seamless switching between wireless bands (5 GHz ↔ 2.4 GHz ↔ 6 GHz) and the USB data cable, instant keyboard handoff across edges without waiting for Windows key recovery, real Android shortcut transparency backed by the connected keyboard layout, and live ping metrics across both Windows and Android.

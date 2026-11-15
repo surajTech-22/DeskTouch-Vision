@@ -44,6 +44,7 @@ public final class AutoConnectService extends Service {
     private volatile boolean pendingWake;
     private volatile boolean retryScheduled;
     private volatile boolean hadConnectedWithAccessibility;
+    private volatile String lastAutoConnectSkipReason="";
     private volatile WifiLinkMonitor.LinkSnapshot lastLinkSnapshot;
     private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
         new java.util.concurrent.atomic.AtomicInteger();
@@ -477,8 +478,16 @@ public final class AutoConnectService extends Service {
         },900,TimeUnit.MILLISECONDS);
     }
 
+    private void logSkipReasonOnce(String reason) {
+        if(reason==null || reason.equals(lastAutoConnectSkipReason)) return;
+        lastAutoConnectSkipReason=reason;
+        Log.i("DeskTouch","Auto-connect idle: "+reason);
+    }
+
     private void autoConnect() {
-        if(scanning || !reconnectEnabled(this) || !enabled(this)) return;
+        if(scanning) return;
+        if(!enabled(this)) { logSkipReasonOnce("service-disabled"); return; }
+        if(!reconnectEnabled(this)) { logSkipReasonOnce("reconnect-disabled"); return; }
         scanning=true;
         boolean connectedNow=false;
         try {
@@ -487,7 +496,11 @@ public final class AutoConnectService extends Service {
                 .getStringSet("pausedPeers",java.util.Collections.emptySet());
             Set<String> eligible=new HashSet<>(verified);
             eligible.removeAll(paused);
-            if(eligible.isEmpty()) return; // no silent first-time pairing
+            if(eligible.isEmpty()) {
+                logSkipReasonOnce("no-eligible-peers verified="+verified.size()+" paused="+paused.size());
+                return; // no silent first-time pairing
+            }
+            lastAutoConnectSkipReason="";
             android.graphics.Point display=PhoneScreenGeometry.read(this);
             // One logical environment => ONE TLS gateway session from this
             // Android device. Other Windows/phone members are authenticated

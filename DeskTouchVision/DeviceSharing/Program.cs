@@ -1,65 +1,65 @@
 using System;
-using System.Runtime.InteropServices;
+using System.Linq;
 using System.Threading;
 using System.Windows.Forms;
+using DeskTouchVision;
 
 namespace DeskTouch.DeviceShare;
 
 internal static class Program
 {
-    internal const string SingleInstanceMutexName = @"Local\DeskTouchVision.WindowsDisplays";
-    internal const string ShowEventName = @"Local\DeskTouchVision.WindowsDisplays.ShowEvent.2026";
-    internal const string ExitEventName = @"Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026";
+    internal const string SingleInstanceMutexName = SingleInstanceActivation.SingleInstanceMutexName;
+    internal const string ShowEventName = SingleInstanceActivation.ShowEventName;
+    internal const string ExitEventName = SingleInstanceActivation.ExitEventName;
 
     // A second desktop-shortcut launch must reopen the already-running tray
     // instance. FindWindow(window title) is unreliable because auto-updating
     // temporarily changes the title; registered Windows messages plus a per-user
     // kernel event reliably reach hidden top-level form windows without creating
     // a second input hook.
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern uint RegisterWindowMessage(string messageName);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool PostMessage(IntPtr hwnd, uint message,
-        IntPtr wParam, IntPtr lParam);
-
-    internal static readonly int ShowDisplaysMessage = (int)RegisterWindowMessage(
-        "DeskTouchVision.WindowsDisplays.ShowFromTray.2026");
+    internal static readonly int ShowDisplaysMessage = SingleInstanceActivation.ShowDisplaysMessage;
 
     internal static bool ShouldShowExistingInstance(string[] args) =>
         !args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
 
-    internal static void SignalExistingInstanceToShow()
-    {
-        try { _ = Win.AllowSetForegroundWindow(Win.ASFW_ANY); } catch { }
-        try
-        {
-            if (EventWaitHandle.TryOpenExisting(ShowEventName, out var showEvent))
-            {
-                using (showEvent) showEvent.Set();
-            }
-        }
-        catch { }
-        const int HwndBroadcast = 0xFFFF;
-        if (ShowDisplaysMessage != 0)
-            PostMessage((IntPtr)HwndBroadcast, (uint)ShowDisplaysMessage,
-                IntPtr.Zero, IntPtr.Zero);
-    }
+    internal static void SignalExistingInstanceToShow() =>
+        SingleInstanceActivation.SignalExistingHandlesBestEffort();
 
     [STAThread]
     private static void Main(string[] args)
     {
         bool startInTray = args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
-        using var singleInstance = new Mutex(true,
-            SingleInstanceMutexName, out bool firstInstance);
+        var singleInstance = new Mutex(true, SingleInstanceMutexName, out bool firstInstance);
         if (!firstInstance)
         {
-            if (ShouldShowExistingInstance(args))
-                SignalExistingInstanceToShow();
-            return;
+            singleInstance.Dispose();
+            singleInstance = null;
+            if (!ShouldShowExistingInstance(args))
+                return;
+
+            Mutex? gate = SingleInstanceActivation.AcquireActivationGate(TimeSpan.FromSeconds(5));
+            bool acquired = false;
+            try
+            {
+                if (SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(Environment.ProcessId))
+                    return;
+
+                singleInstance = new Mutex(false, SingleInstanceMutexName);
+                try { acquired = singleInstance.WaitOne(2000); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (!acquired)
+                {
+                    singleInstance.Dispose();
+                    return;
+                }
+            }
+            finally
+            {
+                SingleInstanceActivation.ReleaseActivationGate(gate);
+            }
         }
 
+        using var ownedInstanceLock = singleInstance;
         ApplicationConfiguration.Initialize();
         var form = new DisplaySettingsForm(startInTray);
         form.EnableLifecycleSignals();

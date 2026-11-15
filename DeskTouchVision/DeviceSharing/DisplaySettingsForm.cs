@@ -305,8 +305,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _liveLinkTimer.Start();
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
-            if (_startInTray && !_showRequestedBeforeShown) HideToTray(showBalloon: false);
-            else BringWindowToForegroundSafely();
+            if (_startInTray && !_showRequestedBeforeShown)
+            {
+                HideToTray(showBalloon: false);
+                if (_showRequestedBeforeShown)
+                    ShowFromTray();
+            }
+            else
+            {
+                BringWindowToForegroundSafely();
+            }
         };
         InitializeTray();
         FormClosing += OnDeskTouchFormClosing;
@@ -416,22 +424,19 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         catch { /* HWND_BROADCAST and CloseMainWindow remain active as fallback. */ }
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (_exitRequested && !IsDisposed) PostToUi(ExitDeskTouch);
+    }
+
     private void BringWindowToForegroundSafely()
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
-        var screens = Screen.AllScreens;
-        if (screens.Length > 0)
-        {
-            var clamped = EnsureVisibleBounds(
-                Bounds,
-                screens.Select(s => s.WorkingArea).ToArray(),
-                Screen.FromControl(this).WorkingArea);
-            if (clamped != Bounds)
-                Bounds = clamped;
-        }
         // Do not toggle ShowInTaskbar: WinForms may recreate the HWND, which
         // would invalidate Raw Input registrations and break mouse handoff.
         if (!Visible) Show();
+        Opacity = 1.0;
         if (WindowState == FormWindowState.Minimized || (IsHandleCreated && Win.IsIconic(Handle)))
         {
             WindowState = FormWindowState.Normal;
@@ -442,29 +447,49 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Win.ShowWindow(Handle, Win.SW_SHOW);
         }
 
-        // Briefly pulse TopMost so Windows 11 Foreground Lock lets a reopened
-        // or installer-started window rise cleanly above the active app.
-        bool prevTopMost = TopMost;
-        try
+        // Clamp bounds only after restoring from Minimized so Windows' (-32000, -32000)
+        // iconic coordinates cannot corrupt restored screen placement.
+        var screens = Screen.AllScreens;
+        if (screens.Length > 0)
         {
-            TopMost = true;
-            if (IsHandleCreated)
+            var clamped = EnsureVisibleBounds(
+                Bounds,
+                screens.Select(s => s.WorkingArea).ToArray(),
+                Screen.FromControl(this).WorkingArea);
+            if (clamped != Bounds)
+                Bounds = clamped;
+        }
+
+        if (IsHandleCreated)
+        {
+            Win.BringWindowToTop(Handle);
+            Win.SetForegroundWindow(Handle);
+        }
+        Activate();
+        BringToFront();
+
+        // If Windows 11 Foreground Lock kept another window on top, briefly pulse TopMost.
+        if (IsHandleCreated && Win.GetForegroundWindow() != Handle)
+        {
+            bool prevTopMost = TopMost;
+            try
             {
+                TopMost = true;
                 Win.BringWindowToTop(Handle);
                 Win.SetForegroundWindow(Handle);
+                Activate();
             }
-            Activate();
-            BringToFront();
-        }
-        finally
-        {
-            TopMost = prevTopMost;
+            finally
+            {
+                TopMost = prevTopMost;
+            }
         }
     }
 
     internal void ShowFromTray()
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
+        _showRequestedBeforeShown = true;
         _isHiddenInTray = false;
         BringWindowToForegroundSafely();
         BroadcastOnlinePresence();

@@ -2,45 +2,14 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
 namespace DeskTouchVision;
 internal static class Program
 {
-    private const uint ASFW_ANY = 0xFFFFFFFF;
-    private const string ShowEventName = @"Local\DeskTouchVision.WindowsDisplays.ShowEvent.2026";
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool AllowSetForegroundWindow(uint processId);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern uint RegisterWindowMessage(string messageName);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool PostMessage(IntPtr hwnd, uint message,
-        IntPtr wParam, IntPtr lParam);
-
-    private static bool TryWakeRunningDisplays()
-    {
-        try { _ = AllowSetForegroundWindow(ASFW_ANY); } catch { }
-        try
-        {
-            if (EventWaitHandle.TryOpenExisting(ShowEventName, out var showEvent))
-            {
-                using (showEvent) showEvent.Set();
-                uint msg = RegisterWindowMessage("DeskTouchVision.WindowsDisplays.ShowFromTray.2026");
-                if (msg != 0)
-                    PostMessage((IntPtr)0xFFFF, msg, IntPtr.Zero, IntPtr.Zero);
-                return true;
-            }
-        }
-        catch { }
-        return false;
-    }
+    private static bool TryWakeRunningDisplays() =>
+        SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(Environment.ProcessId);
 
     [STAThread]
     private static void Main(string[] args)
@@ -79,32 +48,40 @@ internal static class Program
             return;
         }
         bool startInTray = args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase));
-        if (!startInTray && TryWakeRunningDisplays())
-            return;
+        Mutex? gate = SingleInstanceActivation.AcquireActivationGate(TimeSpan.FromSeconds(5));
         try
         {
-            if (!startInTray)
-                try { _ = AllowSetForegroundWindow(ASFW_ANY); } catch { }
-            var launch = new ProcessStartInfo(share)
+            if (!startInTray && TryWakeRunningDisplays())
+                return;
+            try
             {
-                UseShellExecute = true,
-                WorkingDirectory = Path.GetDirectoryName(share)!
-            };
-            if (args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase)))
-                launch.ArgumentList.Add("--tray");
-            using var started = Process.Start(launch);
-            // Keep the foreground launcher alive briefly while Windows creates
-            // the target UI message loop so focus is transferred cleanly.
-            if (!startInTray && started != null)
+                if (!startInTray)
+                    SingleInstanceActivation.AllowSetForegroundWindowAny();
+                var launch = new ProcessStartInfo(share)
+                {
+                    UseShellExecute = true,
+                    WorkingDirectory = Path.GetDirectoryName(share)!
+                };
+                if (startInTray)
+                    launch.ArgumentList.Add("--tray");
+                using var started = Process.Start(launch);
+                // Keep the foreground launcher alive briefly while Windows creates
+                // the target UI message loop so focus is transferred cleanly.
+                if (!startInTray && started != null)
+                {
+                    try { if (!started.HasExited) started.WaitForInputIdle(2500); }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
             {
-                try { if (!started.HasExited) started.WaitForInputIdle(2500); }
-                catch { }
+                MessageBox.Show("Unable to start Windows display sharing: " + ex.Message,
+                    "DeskTouch Vision", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
-        catch (Exception ex)
+        finally
         {
-            MessageBox.Show("Unable to start Windows display sharing: " + ex.Message,
-                "DeskTouch Vision", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            SingleInstanceActivation.ReleaseActivationGate(gate);
         }
     }
 }

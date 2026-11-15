@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.desktouch.vision.ProtocolSourceTest" tests="32" skipped="0" failures="0" errors="0" timestamp="2026-11-15T06:02:50.600Z" hostname="DESKTOP-IQ1KSJ9" time="0.065">
+  <properties/>
+  <testcase name="keyboardBindingsAndExtendedKeysMatchSupportedModes" classname="com.desktouch.vision.ProtocolSourceTest" time="0.013"/>
+  <testcase name="paymentAppDetectorMatchesPaymentAndBankingPackagesSafely" classname="com.desktouch.vision.ProtocolSourceTest" time="0.002"/>
+  <testcase name="adaptiveLinkTrackerMeasuresLossRttBloatAndReordering" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="interactiveKeepaliveIntervalStaysWithinWirelessWakeThreshold" classname="com.desktouch.vision.ProtocolSourceTest" time="0.003"/>
+  <testcase name="packetConstructorsPreserveAuthorityFields" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="moveSequenceDedupAndPackedCoordsPreventStaleTcpAndTearing" classname="com.desktouch.vision.ProtocolSourceTest" time="0.004"/>
+  <testcase name="heartbeatFastFailAndIntervalScaleByTransport" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="multipleDevicesAndBusyPeersAreRecognized" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="phoneGeometryAndOnlineBeaconHelpersWork" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="wifiBandClassificationMatchesRealFrequencies" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="windowsKeyboardTypesIntoAndroidTextFields" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="gesturesAndShortcutsScaleSafely" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="linkedPcsUseOneCardWithDistinctApprovedSessions" classname="com.desktouch.vision.ProtocolSourceTest" time="0.002"/>
+  <testcase name="fastUdpCodecAuthenticatesAndRejectsReplay" classname="com.desktouch.vision.ProtocolSourceTest" time="0.017"/>
+  <testcase name="shellBridgeInputAndHidKeyTableWorkWithoutAccessibility" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="windowsToAndroidAuthorityIsExplicitlyWhitelisted" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="packetRejectsUnknownTypesOnClientSide" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="remoteAndroidTextNeverTargetsPasswordEditors" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="pointerSmootherTracksLiveRefreshRateAndAdaptsZeroDelayCleanVsJittery" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="environmentDiscoveryPrefersActualHubNotJoinedMember" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="ownAndroidBeaconIsNotAnotherDevice" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="fastUdpExtendedControlOpsAndDedupPreventStaleAndDuplicateActions" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="scrollWheelDirectionStaysInsideSafeScreenMargins" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="releaseUpdaterComparesSemanticVersions" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="liveRefreshRateResolutionAndUdpSlidingReplayWindow" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="unavailableGatewayDoesNotBecomeTrusted" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="loopbackCableDiscoveryParsesReadyHubOverSocket" classname="com.desktouch.vision.ProtocolSourceTest" time="0.008"/>
+  <testcase name="environmentMemberHasRoutedDisplayWithoutNewConnection" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="adaptiveLinkTrackerCapsPacingAndRecoversLossQuickly" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="appApprovalSurvivesUpdateWithoutGrantingOsAccessibility" classname="com.desktouch.vision.ProtocolSourceTest" time="0.001"/>
+  <testcase name="connectedWindowsPcGroupRetainsSeparateFingerprints" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <testcase name="bandShiftAdaptiveTrackerClearsStaleBaselineAndScalesProbes" classname="com.desktouch.vision.ProtocolSourceTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

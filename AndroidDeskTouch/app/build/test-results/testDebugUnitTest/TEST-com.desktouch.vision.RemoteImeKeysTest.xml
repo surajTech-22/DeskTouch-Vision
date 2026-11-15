@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.desktouch.vision.RemoteImeKeysTest" tests="2" skipped="0" failures="0" errors="0" timestamp="2026-11-15T06:02:50.667Z" hostname="DESKTOP-IQ1KSJ9" time="0.0">
-  <properties/>
-  <testcase name="functionAndUnsupportedKeys" classname="com.desktouch.vision.RemoteImeKeysTest" time="0.0"/>
-  <testcase name="editingAndNavigation" classname="com.desktouch.vision.RemoteImeKeysTest" time="0.0"/>
-  <system-out><![CDATA[]]></system-out>
-  <system-err><![CDATA[]]></system-err>
-</testsuite>

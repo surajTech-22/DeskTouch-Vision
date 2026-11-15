@@ -1,8 +1,0 @@
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\DeskTouchVision.pdb
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\Install-DeskTouch.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\Update-DeskTouch.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\CHECK_DESKTOUCH.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\RECOVER_DESKTOUCH.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\VERIFY_DESKTOUCH_PAYLOAD.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\CHECK_SECURITY_STATUS.ps1
-C:\Users\welcome\AppData\Local\Temp\dt_check_app\DeskTouchVision.exe

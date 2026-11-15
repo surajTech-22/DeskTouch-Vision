@@ -1,0 +1,13 @@
+# .NET / Visual Studio build outputs
+**/bin/
+**/obj/
+*.user
+*.suo
+DeskTouchVision/dist/
+DeskTouchVision/published/
+
+# Android / Gradle build outputs
+.gradle/
+**/.gradle/
+**/build/
+local.properties

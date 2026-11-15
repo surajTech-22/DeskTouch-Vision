@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="com.desktouch.vision.PacketFramingTest" tests="3" skipped="0" failures="0" errors="0" timestamp="2026-11-15T06:02:50.577Z" hostname="DESKTOP-IQ1KSJ9" time="0.013">
-  <properties/>
-  <testcase name="rejectsOversizedWireFrame" classname="com.desktouch.vision.PacketFramingTest" time="0.001"/>
-  <testcase name="rejectsTruncatedWireFrame" classname="com.desktouch.vision.PacketFramingTest" time="0.0"/>
-  <testcase name="preservesWindowsWireFields" classname="com.desktouch.vision.PacketFramingTest" time="0.006"/>
-  <system-out><![CDATA[]]></system-out>
-  <system-err><![CDATA[]]></system-err>
-</testsuite>

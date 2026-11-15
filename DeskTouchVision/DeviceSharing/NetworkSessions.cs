@@ -2205,7 +2205,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (tcpRttMs <= 0 || double.IsNaN(tcpRttMs) || double.IsInfinity(tcpRttMs))
             return baseMs;
         double rttPressure = Math.Max(0.0, tcpRttMs - 10.0) * 0.15;
-        return Math.Clamp(baseMs + rttPressure, baseMs, 11.0);
+        double maxCap = Math.Max(baseMs, 12.0);
+        return Math.Clamp(baseMs + rttPressure, baseMs, maxCap);
     }
 
     internal static bool ShouldEchoAndroidWarm(string? platform) =>

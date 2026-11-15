@@ -59,6 +59,12 @@ function Stop-InstalledApplications([string]$installDir) {
       $p = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
       if (-not $p) { continue }
       Log "Requesting graceful close: $exeName PID=$($p.Id)"
+      if ($exeName -eq 'DeskTouch.DeviceShare.exe') {
+        $exitHandle = $null
+        if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
+          try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
+        }
+      }
       [void]$p.CloseMainWindow()
       if (-not $p.WaitForExit(12000)) {
         throw "Active $exeName did not close safely; update deferred to avoid leaving input hooks/held keys behind."

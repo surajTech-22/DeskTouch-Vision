@@ -5,10 +5,10 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$release = 'v0.3.41'
+$release = 'v0.3.42'
 $baseUrl = "https://github.com/surajTech-22/DeskTouch-Vision/releases/download/$release"
 $archiveName = 'DeskTouchVision-win-x64.zip'
-$expectedAppVersion = '0.3.41.0'
+$expectedAppVersion = '0.3.42.0'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -114,6 +114,12 @@ try {
       $process = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
       if ($process) {
         Write-Record "Closing installed $name (PID $($process.Id)) gracefully."
+        if ($name -eq 'DeskTouch.DeviceShare.exe') {
+          $exitHandle = $null
+          if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
+            try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
+          }
+        }
         [void]$process.CloseMainWindow()
         if (-not $process.WaitForExit(15000)) {
           throw "DeskTouch input-sharing process $($process.Id) did not close safely."

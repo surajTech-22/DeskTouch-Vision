@@ -25,6 +25,12 @@ function Stop-DeskTouchGracefully([string]$root) {
       $process = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
       if (!$process) { continue }
       Log "Closing installed $exeName PID=$($process.Id) gracefully"
+      if ($exeName -eq 'DeskTouch.DeviceShare.exe') {
+        $exitHandle = $null
+        if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
+          try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
+        }
+      }
       [void]$process.CloseMainWindow()
       if (-not $process.WaitForExit(15000)) {
         throw "$exeName did not stop normally. Installation was cancelled without terminating native input hooks."
@@ -62,12 +68,22 @@ try {
   & (Join-Path $target 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $target
 
   $exe = Join-Path $target 'DeskTouchVision.exe'
-  $shortcutPath = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'DeskTouch Vision.lnk'
   $wsh = New-Object -ComObject WScript.Shell
-  $shortcut = $wsh.CreateShortcut($shortcutPath)
-  $shortcut.TargetPath = $exe
-  $shortcut.WorkingDirectory = $target
-  $shortcut.Save()
+  $shortcutPaths = @(
+    (Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'DeskTouch Vision.lnk'),
+    (Join-Path ([Environment]::GetFolderPath('Programs')) 'DeskTouch Vision.lnk')
+  )
+  foreach ($shortcutPath in $shortcutPaths) {
+    $shortcutDir = Split-Path -Path $shortcutPath -Parent
+    if ($shortcutDir -and -not (Test-Path -LiteralPath $shortcutDir)) {
+      New-Item -ItemType Directory -Path $shortcutDir -Force | Out-Null
+    }
+    $shortcut = $wsh.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $exe
+    $shortcut.WorkingDirectory = $target
+    $shortcut.Description = 'DeskTouch Vision - Displays & Device Sharing'
+    $shortcut.Save()
+  }
   Start-Process -FilePath $exe -ErrorAction Stop
   $activated = $true
   Log "Verified and installed Windows Displays application from package under $target"

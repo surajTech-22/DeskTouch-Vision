@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.42 — Reliable Window Activation, Foreground Reopen & Tray Upgrades
+
+Fixes cases where launching DeskTouch Vision again while running in the system tray failed to pop the Displays window into view, adds a Start Menu app shortcut alongside Desktop launch, and ensures installer upgrades stop tray instances gracefully.
+
+- **Foreground single-instance wakeup:** Passes Windows foreground permission from the launcher (`DeskTouchVision.exe`) to the active Displays window, adds a per-user wakeup signal alongside window broadcast messaging, restores minimized or off-screen bounds safely inside the active display, and brings the window cleanly to the front.
+- **Start Menu launch & reliable tray shutdown for installers:** Installs a normal Start Menu shortcut (`DeskTouch Vision`) so searching Windows Start launches the visible app rather than only the background sign-in entry, and adds a graceful shutdown signal so installer and updater scripts close tray instances cleanly while preserving input-hook safety.
+
+---
+
 # DeskTouch Vision v0.3.41 — Reliable Virtual Bridge Startup & Non-Locking Folder Updates
 
 Fixes a shell self-termination race when launching the Accessibility-free Virtual Bridge daemon on Android and ensures background cable monitoring no longer locks the Windows installation folder during updates.

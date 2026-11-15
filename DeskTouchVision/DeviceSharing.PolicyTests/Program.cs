@@ -639,6 +639,26 @@ Check(!DisplaySettingsForm.ShouldStayInTray(
     "Verified update or application exit must release sharing input hooks");
 Console.WriteLine("PASS: user Close hides to tray; intentional Exit/update shuts down.");
 
+Check(DeskTouch.DeviceShare.Program.ShouldShowExistingInstance(Array.Empty<string>()) &&
+    !DeskTouch.DeviceShare.Program.ShouldShowExistingInstance(new[] { "--tray" }) &&
+    !DeskTouch.DeviceShare.Program.ShouldShowExistingInstance(new[] { "--TRAY" }),
+    "Normal relaunch wakes an existing DeskTouch instance while --tray does not force popup");
+
+var primaryWa = new System.Drawing.Rectangle(0, 0, 1920, 1032);
+var visibleWindow = new System.Drawing.Rectangle(400, 180, 1000, 690);
+Check(DisplaySettingsForm.EnsureVisibleBounds(visibleWindow, new[] { primaryWa }, primaryWa) == visibleWindow,
+    "Window already visible inside a display keeps its saved position");
+var offscreenWindow = new System.Drawing.Rectangle(-32000, -32000, 1000, 690);
+var restoredOffscreen = DisplaySettingsForm.EnsureVisibleBounds(offscreenWindow, new[] { primaryWa }, primaryWa);
+Check(restoredOffscreen.Location == new System.Drawing.Point(460, 171) &&
+    restoredOffscreen.Size == new System.Drawing.Size(1000, 690),
+    "Off-screen or minimized coordinates restore centered inside the visible working area");
+var topHiddenWindow = new System.Drawing.Rectangle(300, -120, 1000, 690);
+var restoredTop = DisplaySettingsForm.EnsureVisibleBounds(topHiddenWindow, new[] { primaryWa }, primaryWa);
+Check(restoredTop.Top >= primaryWa.Top,
+    "Window whose title bar drifted above the monitor top edge resets inside working area");
+Console.WriteLine("PASS: Single-instance wakeup policy and visible window bounds clamping verified.");
+
 var monitorTile = new System.Drawing.RectangleF(640, 130, 130, 85);
 var rightClamped = DisplayArrangementControl.ConstrainDrag(
     monitorTile, new System.Drawing.Size(800, 350), new System.Drawing.Point(300, 0));

@@ -74,10 +74,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private ContextMenuStrip? _trayMenu;
     private bool _formDisposed;
     private ToolStripMenuItem? _startupMenu;
-    private bool _exitRequested;
+    private volatile bool _exitRequested;
     private bool _trayTipShown;
     private readonly bool _startInTray;
     private volatile bool _isHiddenInTray;
+    private EventWaitHandle? _showSignal;
+    private EventWaitHandle? _exitSignal;
+    private RegisteredWaitHandle? _showWait;
+    private RegisteredWaitHandle? _exitWait;
+    private volatile bool _showRequestedBeforeShown;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
     private AdbCableBridge? _adbBridge;
@@ -262,6 +267,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _display.RemoteEdge = _preferredEdge;
         Shown += (_, _) =>
         {
+            if (_exitRequested)
+            {
+                BeginInvoke(ExitDeskTouch);
+                return;
+            }
             RefreshDisplays();
             StartListening();
             try
@@ -278,7 +288,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trustedScanTimer.Start();
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
-            if (_startInTray) HideToTray(showBalloon: false);
+            if (_startInTray && !_showRequestedBeforeShown) HideToTray(showBalloon: false);
+            else BringWindowToForegroundSafely();
         };
         InitializeTray();
         FormClosing += OnDeskTouchFormClosing;
@@ -343,16 +354,102 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trayIcon.DoubleClick += (_, _) => ShowFromTray();
     }
 
+    internal static Rectangle EnsureVisibleBounds(
+        Rectangle bounds,
+        IReadOnlyList<Rectangle> workingAreas,
+        Rectangle fallbackWorkingArea)
+    {
+        foreach (var area in workingAreas)
+        {
+            var visible = Rectangle.Intersect(bounds, area);
+            if (visible.Width >= 160 && visible.Height >= 90 &&
+                bounds.Top >= area.Top - 8)
+                return bounds;
+        }
+        if (fallbackWorkingArea.Width <= 0 || fallbackWorkingArea.Height <= 0)
+            return bounds;
+        int w = Math.Min(Math.Max(1, bounds.Width), fallbackWorkingArea.Width);
+        int h = Math.Min(Math.Max(1, bounds.Height), fallbackWorkingArea.Height);
+        int x = fallbackWorkingArea.Left + Math.Max(0, (fallbackWorkingArea.Width - w) / 2);
+        int y = fallbackWorkingArea.Top + Math.Max(0, (fallbackWorkingArea.Height - h) / 2);
+        return new Rectangle(x, y, w, h);
+    }
+
+    internal void EnableLifecycleSignals()
+    {
+        if (_showSignal != null) return;
+        try
+        {
+            _showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ShowEventName);
+            _showWait = ThreadPool.RegisterWaitForSingleObject(_showSignal, (_, timedOut) =>
+            {
+                if (timedOut || _closing.IsCancellationRequested) return;
+                _showRequestedBeforeShown = true;
+                if (!IsDisposed && IsHandleCreated) PostToUi(ShowFromTray);
+            }, null, Timeout.Infinite, executeOnlyOnce: false);
+
+            _exitSignal = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ExitEventName);
+            _exitWait = ThreadPool.RegisterWaitForSingleObject(_exitSignal, (_, timedOut) =>
+            {
+                if (timedOut || _closing.IsCancellationRequested) return;
+                _exitRequested = true;
+                if (!IsDisposed && IsHandleCreated) PostToUi(ExitDeskTouch);
+            }, null, Timeout.Infinite, executeOnlyOnce: false);
+        }
+        catch { /* HWND_BROADCAST and CloseMainWindow remain active as fallback. */ }
+    }
+
+    private void BringWindowToForegroundSafely()
+    {
+        if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
+        var screens = Screen.AllScreens;
+        if (screens.Length > 0)
+        {
+            var clamped = EnsureVisibleBounds(
+                Bounds,
+                screens.Select(s => s.WorkingArea).ToArray(),
+                Screen.FromControl(this).WorkingArea);
+            if (clamped != Bounds)
+                Bounds = clamped;
+        }
+        // Do not toggle ShowInTaskbar: WinForms may recreate the HWND, which
+        // would invalidate Raw Input registrations and break mouse handoff.
+        if (!Visible) Show();
+        if (WindowState == FormWindowState.Minimized || (IsHandleCreated && Win.IsIconic(Handle)))
+        {
+            WindowState = FormWindowState.Normal;
+            if (IsHandleCreated) Win.ShowWindow(Handle, Win.SW_RESTORE);
+        }
+        else if (IsHandleCreated)
+        {
+            Win.ShowWindow(Handle, Win.SW_SHOW);
+        }
+
+        // Briefly pulse TopMost so Windows 11 Foreground Lock lets a reopened
+        // or installer-started window rise cleanly above the active app.
+        bool prevTopMost = TopMost;
+        try
+        {
+            TopMost = true;
+            if (IsHandleCreated)
+            {
+                Win.BringWindowToTop(Handle);
+                Win.SetForegroundWindow(Handle);
+            }
+            Activate();
+            BringToFront();
+        }
+        finally
+        {
+            TopMost = prevTopMost;
+        }
+    }
+
     internal void ShowFromTray()
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
         _isHiddenInTray = false;
-        // Do not toggle ShowInTaskbar: WinForms may recreate the HWND, which
-        // would invalidate Raw Input registrations and break mouse handoff.
-        if (!Visible) Show();
-        WindowState = FormWindowState.Normal;
-        Activate();
-        BringToFront();
+        BringWindowToForegroundSafely();
         BroadcastOnlinePresence();
     }
 
@@ -1201,9 +1298,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 // A receiving computer should visibly request local approval
                 // even if its Displays window was minimized in the background.
                 if (!Visible) ShowFromTray();
-                else if (WindowState == FormWindowState.Minimized)
-                    WindowState = FormWindowState.Normal;
-                Activate();
+                else BringWindowToForegroundSafely();
                 var result = MessageBox.Show(this,
                     $"Allow {safePeer} to share its keyboard and mouse with this computer?\n\n" +
                     "Your own keyboard, mouse and touchpad always have priority. " +
@@ -1376,11 +1471,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     return;
                 }
                 if (!Visible) ShowFromTray();
-                bool prevTopMost = TopMost;
-                TopMost = true;
-                Activate();
-                BringToFront();
-                TopMost = prevTopMost;
+                else BringWindowToForegroundSafely();
                 string safeName = name.Replace("\r", " ").Replace("\n", " ");
                 var result = MessageBox.Show(this,
                     $"Trust {safeName} for automatic reconnection?\n\n" +
@@ -1867,6 +1958,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _logChannel.Writer.TryComplete();
             _trustedScanTimer?.Dispose();
             _trustedScanTimer = null;
+            _showWait?.Unregister(null);
+            _showWait = null;
+            _exitWait?.Unregister(null);
+            _exitWait = null;
+            _showSignal?.Dispose();
+            _showSignal = null;
+            _exitSignal?.Dispose();
+            _exitSignal = null;
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;

@@ -26,6 +26,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class ShellInputClient {
     private static final String PREFS = "desktouch_android_control";
     private static final String ALLOW_SHELL_BRIDGE = "user_allowed_shell_bridge";
+    private static final String PREF_BRIDGE_PORT = "shell_bridge_port";
+    private static final String PREF_BRIDGE_SECRET = "shell_bridge_secret";
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
             try {
@@ -81,8 +83,64 @@ final class ShellInputClient {
         return s != null && !s.isClosed();
     }
 
+    private static void ensurePersistedConfigLoaded(Context context) {
+        if ((configuredPort > 0 && configuredSecret != null) || context == null) return;
+        Context app = context.getApplicationContext();
+        appContext = app;
+        try {
+            android.content.SharedPreferences sp = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            int p = sp.getInt(PREF_BRIDGE_PORT, 0);
+            String sec = sp.getString(PREF_BRIDGE_SECRET, null);
+            if (p > 0 && p <= 65535 && sec != null && sec.length() >= 32) {
+                if (configuredPort <= 0) configuredPort = p;
+                if (configuredSecret == null) configuredSecret = sec;
+            }
+        } catch (RuntimeException ignored) {}
+    }
+
+    private static void persistBridgeConfig(Context app, int port, String secret) {
+        if (app == null || port <= 0 || port > 65535 || secret == null || secret.length() < 32) return;
+        try {
+            app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putInt(PREF_BRIDGE_PORT, port)
+                .putString(PREF_BRIDGE_SECRET, secret)
+                .apply();
+        } catch (RuntimeException ignored) {}
+    }
+
+    private static void clearDeadBridgeConfigLocked(Context app) {
+        configuredPort = 0;
+        configuredSecret = null;
+        if (app == null) return;
+        try {
+            app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove(PREF_BRIDGE_PORT)
+                .remove(PREF_BRIDGE_SECRET)
+                .apply();
+        } catch (RuntimeException ignored) {}
+    }
+
     static boolean hasBridgeConfig(Context context) {
+        ensurePersistedConfigLoaded(context);
         return allowed(context) && configuredPort > 0 && configuredSecret != null;
+    }
+
+    static void warmConnectIfConfigured(Context context) {
+        if (context == null || !hasBridgeConfig(context) || ready(context)) return;
+        final Context app = context.getApplicationContext();
+        final int port = configuredPort;
+        final String secret = configuredSecret;
+        if (port <= 0 || secret == null) return;
+        WORKER.execute(() -> {
+            synchronized (CLIENT_LOCK) {
+                if (!ready(app)) {
+                    connectAndAuthLocked(app, port, secret);
+                }
+            }
+            if (connectedReady) {
+                DeskTouchRuntime.accessibilityPermissionChanged(app);
+            }
+        });
     }
 
     static void configure(Context context, int port, String secret) {
@@ -94,6 +152,7 @@ final class ShellInputClient {
         boolean sameEndpoint = port == configuredPort && secret.equals(configuredSecret);
         configuredPort = port;
         configuredSecret = secret;
+        persistBridgeConfig(app, port, secret);
         if (sameEndpoint && ready(app)) {
             return;
         }
@@ -116,7 +175,7 @@ final class ShellInputClient {
         }
         try {
             Socket s = new Socket();
-            s.connect(new InetSocketAddress("127.0.0.1", port), 1200);
+            s.connect(new InetSocketAddress("127.0.0.1", port), 650);
             s.setTcpNoDelay(true);
             s.setSoTimeout(1200);
             BufferedWriter w = new BufferedWriter(
@@ -129,6 +188,7 @@ final class ShellInputClient {
             if (!"OK".equals(ack)) {
                 try { s.close(); } catch (IOException ignored) {}
                 connectedReady = false;
+                clearDeadBridgeConfigLocked(app);
                 return false;
             }
             s.setSoTimeout(1100);
@@ -140,6 +200,7 @@ final class ShellInputClient {
             return true;
         } catch (IOException ex) {
             connectedReady = false;
+            clearDeadBridgeConfigLocked(app);
             Log.w("DeskTouch", "Shell Bridge loopback connect deferred: " + ex.getMessage());
             return false;
         }
@@ -204,6 +265,7 @@ final class ShellInputClient {
         if (context == null || !allowed(context)) return false;
         final Context app = context.getApplicationContext();
         appContext = app;
+        ensurePersistedConfigLoaded(app);
         if (configuredPort <= 0 || configuredSecret == null) return false;
 
         final CompletableFuture<Boolean> done = new CompletableFuture<>();
@@ -439,8 +501,7 @@ final class ShellInputClient {
                     break;
                 }
                 try {
-                    w.write(line);
-                    w.write('\n');
+                    w.write(line + "\n");
                     w.flush();
                     connectedReady = true;
                     if (!wasReady) {

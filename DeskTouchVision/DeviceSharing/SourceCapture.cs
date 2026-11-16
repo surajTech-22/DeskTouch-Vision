@@ -682,7 +682,7 @@ internal sealed class SourceCapture : IDisposable
                 {
                     int missingRaw = ++_hookMovesWithoutRaw;
                     long now = Environment.TickCount64;
-                    if (now - _lastRawMs > 14 && missingRaw >= 1)
+                    if (ShouldTriggerMouseHookFallback(_lastRawMs, now, missingRaw))
                     {
                         _lastFallbackMs = now;
                         double sens = Volatile.Read(ref _pointerSensitivity);
@@ -905,6 +905,9 @@ internal sealed class SourceCapture : IDisposable
             }
         }
     }
+
+    internal static bool ShouldTriggerMouseHookFallback(long lastRawMs, long now, int missingRaw) =>
+        now - lastRawMs > 30 && missingRaw >= 2;
 
     internal static bool ShouldDropDuplicateRaw(long lastHookFallback,long now) =>
         lastHookFallback>0 && now>=lastHookFallback &&

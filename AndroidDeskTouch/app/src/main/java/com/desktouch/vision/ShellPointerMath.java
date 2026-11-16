@@ -94,32 +94,33 @@ final class ShellPointerMath {
     }
 
     static double gainAtRawSpeed(double rawSpeedCountsPerSec, VelocityParams p) {
-        if (rawSpeedCountsPerSec <= p.lowThreshold || p.highThreshold <= p.lowThreshold || p.acceleration <= 1.0) {
+        double scaledSpeed = rawSpeedCountsPerSec * p.scale;
+        if (scaledSpeed <= p.lowThreshold || p.highThreshold <= p.lowThreshold || p.acceleration <= 1.0) {
             return p.scale;
         }
-        if (rawSpeedCountsPerSec >= p.highThreshold) {
+        if (scaledSpeed >= p.highThreshold) {
             return p.scale * p.acceleration;
         }
-        double frac = (rawSpeedCountsPerSec - p.lowThreshold) / (p.highThreshold - p.lowThreshold);
+        double frac = (scaledSpeed - p.lowThreshold) / (p.highThreshold - p.lowThreshold);
         return p.scale * (1.0 + (p.acceleration - 1.0) * frac);
     }
 
     static double solveRawSpeedForOutputSpeed(double outSpeedPxPerSec, VelocityParams p) {
         if (outSpeedPxPerSec <= 0.0) return 0.0;
-        double outLow = p.lowThreshold * p.scale;
-        if (outSpeedPxPerSec <= outLow || p.highThreshold <= p.lowThreshold || p.acceleration <= 1.0) {
-            return outSpeedPxPerSec / Math.max(0.05, p.scale);
+        double safeScale = Math.max(0.05, p.scale);
+        if (outSpeedPxPerSec <= p.lowThreshold || p.highThreshold <= p.lowThreshold || p.acceleration <= 1.0) {
+            return outSpeedPxPerSec / safeScale;
         }
-        double highGain = p.scale * p.acceleration;
-        double outHigh = p.highThreshold * highGain;
+        double outHigh = p.highThreshold * p.acceleration;
         if (outSpeedPxPerSec >= outHigh) {
-            return outSpeedPxPerSec / Math.max(0.05, highGain);
+            return outSpeedPxPerSec / Math.max(0.05, p.scale * p.acceleration);
         }
         double slope = (p.acceleration - 1.0) / (p.highThreshold - p.lowThreshold);
-        double a = p.scale * slope;
-        double b = p.scale * (1.0 - slope * p.lowThreshold);
+        double a = slope;
+        double b = 1.0 - slope * p.lowThreshold;
         double disc = b * b + 4.0 * a * outSpeedPxPerSec;
-        return (-b + Math.sqrt(Math.max(0.0, disc))) / (2.0 * a);
+        double scaledSpeed = (-b + Math.sqrt(Math.max(0.0, disc))) / (2.0 * a);
+        return scaledSpeed / safeScale;
     }
 
     static double gainForOutputSpeed(double outSpeedPxPerSec, VelocityParams p) {
@@ -134,6 +135,15 @@ final class ShellPointerMath {
         // a fresh position while USB/TCP clumps never outpace minFrameSec or evdev.
         long ns = Math.round(600_000_000.0 / clampedHz);
         return Math.max(4_000_000L, Math.min(12_000_000L, ns));
+    }
+
+    static long computeSubFrameIntervalNs(int refreshHz) {
+        int clampedHz = Math.max(60, Math.min(240, refreshHz > 0 ? refreshHz : 60));
+        // Double the display refresh rate (capped at 288 Hz) so 125 Hz mice, 60 Hz touchpads,
+        // and jittery transports place fresh cursor updates inside every VSYNC frame.
+        long targetTickHz = Math.min(288L, clampedHz * 2L);
+        long ns = Math.round(1_000_000_000.0 / targetTickHz);
+        return Math.max(3_200_000L, Math.min(8_500_000L, ns));
     }
 
     /**
@@ -194,6 +204,249 @@ final class ShellPointerMath {
     }
 
     /**
+     * Zero-allocation per-axis mirror of AOSP's 100 ms Least-Squares VelocityTracker,
+     * matching Android 14 / HyperOS CursorInputMapper without wiping cross-axis speed on curve bends.
+     */
+    static final class AospAxisTracker {
+        private static final int CAP = 20;
+        private static final long HORIZON_NS = 100_000_000L;
+        private static final long IDLE_RESET_NS = 200_000_000L;
+        private final long[] tNs = new long[CAP];
+        private final double[] pos = new double[CAP];
+        private final double[] fitX = new double[CAP + 1];
+        private final double[] fitY = new double[CAP + 1];
+        private double cum;
+        private int head;
+        private int count;
+
+        void reset() {
+            head = 0;
+            count = 0;
+            cum = 0.0;
+        }
+
+        void add(long nowNs, double delta) {
+            if (count > 0) {
+                long lastT = tNs[(head + count - 1) % CAP];
+                if (nowNs - lastT > IDLE_RESET_NS) {
+                    reset();
+                } else if (nowNs < lastT) {
+                    nowNs = lastT;
+                }
+            }
+            cum += delta;
+            int slot = (head + count) % CAP;
+            if (count == CAP) {
+                head = (head + 1) % CAP;
+                count--;
+                slot = (head + count) % CAP;
+            }
+            tNs[slot] = nowNs;
+            pos[slot] = cum;
+            count++;
+        }
+
+        double velocity() {
+            return computeVelocity(false, 0L, 0.0);
+        }
+
+        double previewVelocityWith(long nowNs, double candDelta) {
+            if (count > 0 && nowNs - tNs[(head + count - 1) % CAP] > IDLE_RESET_NS) {
+                return 0.0;
+            }
+            return computeVelocity(true, nowNs, candDelta);
+        }
+
+        private double computeVelocity(boolean includeCandidate, long candNs, double candDelta) {
+            int total = count + (includeCandidate ? 1 : 0);
+            if (total < 2) return 0.0;
+
+            long newestT = includeCandidate
+                ? Math.max(candNs, count > 0 ? tNs[(head + count - 1) % CAP] : candNs)
+                : tNs[(head + count - 1) % CAP];
+            int m = 0;
+            long oldestT = newestT;
+            if (includeCandidate) {
+                fitX[0] = 0.0;
+                fitY[0] = cum + candDelta;
+                m = 1;
+            }
+            for (int i = count - 1; i >= 0; i--) {
+                int s = (head + i) % CAP;
+                long age = newestT - tNs[s];
+                if (age > HORIZON_NS) break;
+                fitX[m] = -age / 1_000_000_000.0;
+                fitY[m] = pos[s];
+                oldestT = tNs[s];
+                m++;
+            }
+            if (m < 2) return 0.0;
+            if (m == 2 || newestT - oldestT < 12_000_000L) {
+                double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+                for (int i = 0; i < m; i++) {
+                    double xi = fitX[i], yi = fitY[i];
+                    sx += xi;
+                    sy += yi;
+                    sxx += xi * xi;
+                    sxy += xi * yi;
+                }
+                double denom = m * sxx - sx * sx;
+                return Math.abs(denom) > 1e-12 ? (m * sxy - sx * sy) / denom : 0.0;
+            }
+            double s0 = m, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+            double sy0 = 0.0, sy1 = 0.0, sy2 = 0.0;
+            for (int i = 0; i < m; i++) {
+                double xi = fitX[i], x2 = xi * xi, yi = fitY[i];
+                s1 += xi;
+                s2 += x2;
+                s3 += x2 * xi;
+                s4 += x2 * x2;
+                sy0 += yi;
+                sy1 += xi * yi;
+                sy2 += x2 * yi;
+            }
+            double[][] a = {
+                { s0, s1, s2, sy0 },
+                { s1, s2, s3, sy1 },
+                { s2, s3, s4, sy2 }
+            };
+            for (int col = 0; col < 3; col++) {
+                int piv = col;
+                for (int r = col + 1; r < 3; r++) {
+                    if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
+                }
+                double[] tmp = a[col];
+                a[col] = a[piv];
+                a[piv] = tmp;
+                if (Math.abs(a[col][col]) < 1e-18) return 0.0;
+                for (int r = col + 1; r < 3; r++) {
+                    double f = a[r][col] / a[col][col];
+                    for (int c = col; c < 4; c++) a[r][c] -= f * a[col][c];
+                }
+            }
+            double c2 = a[2][3] / a[2][2];
+            return (a[1][3] - a[1][2] * c2) / a[1][1];
+        }
+    }
+
+    /**
+     * Sub-frame cadence smoother that splits slower or jittery mouse/touchpad updates
+     * (such as 125 Hz USB mice, 60 Hz touchpads, or wireless bursts) smoothly across
+     * 2x-refresh sub-VSYNC ticks while letting fast >=180 Hz mice and clicks pass immediately.
+     */
+    static final class SubFrameGlide {
+        private volatile long subFrameNs = 3_472_222L;
+        private boolean hasTarget;
+        private boolean active;
+        private boolean urgentSnap;
+        private double curX;
+        private double curY;
+        private int targetX;
+        private int targetY;
+        private int pushX;
+        private int pushY;
+        private long lastPacketNs;
+        private long emaInputGapNs;
+        private long glideDeadlineNs;
+
+        void configure(int refreshHz) {
+            this.subFrameNs = computeSubFrameIntervalNs(refreshHz);
+        }
+
+        long subFrameIntervalNs() {
+            return subFrameNs;
+        }
+
+        void reset() {
+            hasTarget = false;
+            active = false;
+            urgentSnap = false;
+            pushX = 0;
+            pushY = 0;
+            lastPacketNs = 0L;
+            emaInputGapNs = 0L;
+            glideDeadlineNs = 0L;
+        }
+
+        void onTarget(int tx, int ty, int px, int py, long nowNs) {
+            if (lastPacketNs > 0L && nowNs > lastPacketNs) {
+                long gap = nowNs - lastPacketNs;
+                if (gap <= 35_000_000L) {
+                    long clamped = Math.max(2_000_000L, Math.min(28_000_000L, gap));
+                    emaInputGapNs = emaInputGapNs == 0L ? clamped : (emaInputGapNs * 3L + clamped) / 4L;
+                } else {
+                    emaInputGapNs = 0L;
+                }
+            }
+            lastPacketNs = nowNs;
+
+            if (!hasTarget) {
+                curX = tx;
+                curY = ty;
+                hasTarget = true;
+                glideDeadlineNs = nowNs;
+            } else {
+                double dist = Math.hypot(tx - curX, ty - curY);
+                if (px != 0 || py != 0 || dist <= 2.2 || emaInputGapNs == 0L ||
+                        emaInputGapNs <= (long) (subFrameNs * 1.65)) {
+                    glideDeadlineNs = nowNs;
+                } else {
+                    long horizonNs = Math.min(16_000_000L,
+                        Math.max(subFrameNs, Math.round(emaInputGapNs * 0.90)));
+                    glideDeadlineNs = nowNs + horizonNs;
+                }
+            }
+            targetX = tx;
+            targetY = ty;
+            pushX = px;
+            pushY = py;
+            urgentSnap = false;
+            active = true;
+        }
+
+        void snapToTarget() {
+            urgentSnap = true;
+            glideDeadlineNs = 0L;
+        }
+
+        boolean isActive() {
+            return active && hasTarget;
+        }
+
+        int currentPushX() {
+            return pushX;
+        }
+
+        int currentPushY() {
+            return pushY;
+        }
+
+        boolean sampleNext(long nowNs, int[] outCoords) {
+            if (!active || !hasTarget) return false;
+            if (urgentSnap || nowNs >= glideDeadlineNs || (glideDeadlineNs - nowNs) <= (subFrameNs / 2L)) {
+                curX = targetX;
+                curY = targetY;
+                active = false;
+                urgentSnap = false;
+                pushX = 0;
+                pushY = 0;
+            } else {
+                int ticksLeft = Math.max(1, (int) Math.round((glideDeadlineNs - nowNs) / (double) subFrameNs) + 1);
+                curX += (targetX - curX) / ticksLeft;
+                curY += (targetY - curY) / ticksLeft;
+                if (Math.abs(targetX - curX) < 0.5 && Math.abs(targetY - curY) < 0.5) {
+                    curX = targetX;
+                    curY = targetY;
+                    active = false;
+                }
+            }
+            outCoords[0] = (int) Math.round(curX);
+            outCoords[1] = (int) Math.round(curY);
+            return true;
+        }
+    }
+
+    /**
      * Stateful inverse-VelocityControl mapper with sub-pixel error feedback and
      * single-shot boundary snaps (preventing continuous edge-bump velocity spikes).
      */
@@ -208,10 +461,8 @@ final class ShellPointerMath {
         private double cursorY;
         private int lastTargetX = -1;
         private int lastTargetY = -1;
-        private double smoothedOutSpeed;
-        private double prevDx;
-        private double prevDy;
-        private long lastReportNs;
+        private final AospAxisTracker vxTracker = new AospAxisTracker();
+        private final AospAxisTracker vyTracker = new AospAxisTracker();
 
         void configure(int width, int height, VelocityParams params, int refreshHz) {
             int nextW = Math.max(100, width);
@@ -233,10 +484,8 @@ final class ShellPointerMath {
             anchored = false;
             lastTargetX = -1;
             lastTargetY = -1;
-            smoothedOutSpeed = 0.0;
-            prevDx = 0.0;
-            prevDy = 0.0;
-            lastReportNs = 0L;
+            vxTracker.reset();
+            vyTracker.reset();
         }
 
         long minPacingIntervalNs() {
@@ -276,10 +525,8 @@ final class ShellPointerMath {
                 lastTargetX = tx;
                 lastTargetY = ty;
                 anchored = true;
-                smoothedOutSpeed = 0.0;
-                prevDx = 0.0;
-                prevDy = 0.0;
-                lastReportNs = nowNs;
+                vxTracker.reset();
+                vyTracker.reset();
                 return new MoveStep(true, pullX, pullY, resetSignX, resetSignY, rawX, rawY);
             }
 
@@ -309,32 +556,23 @@ final class ShellPointerMath {
                 return new MoveStep(false, 0, 0, 0, 0, 0, 0);
             }
 
-            double minFrameSec = Math.max(0.0025, 0.45 / Math.max(60, refreshHz));
-            double dtSec;
-            if (lastReportNs <= 0L || nowNs <= lastReportNs) {
-                dtSec = minFrameSec;
-                smoothedOutSpeed = 0.0;
-            } else {
-                dtSec = (nowNs - lastReportNs) / 1_000_000_000.0;
-                if (dtSec > 0.080) {
-                    smoothedOutSpeed = 0.0;
-                    dtSec = 0.014;
-                }
+            double gain = gainAtRawSpeed(Math.hypot(vxTracker.velocity(), vyTracker.velocity()), params);
+            for (int it = 0; it < 3; it++) {
+                double candRawX = clampRelative8Continuous(dx / gain);
+                double candRawY = clampRelative8Continuous(dy / gain);
+                double vx = vxTracker.previewVelocityWith(nowNs, candRawX);
+                double vy = vyTracker.previewVelocityWith(nowNs, candRawY);
+                gain = gainAtRawSpeed(Math.hypot(vx, vy), params);
             }
-            double effectiveDt = Math.max(minFrameSec, Math.min(0.045, dtSec));
-            // AOSP VelocityControl clears velocity tracking when either axis flips sign.
-            if (dx * prevDx < 0.0 || dy * prevDy < 0.0) {
-                smoothedOutSpeed = 0.0;
-            }
-
-            double dist = Math.hypot(dx, dy);
-            double instSpeed = dist / effectiveDt;
-            double alpha = effectiveDt / (effectiveDt + 0.032);
-            smoothedOutSpeed += alpha * (instSpeed - smoothedOutSpeed);
-            double gain = gainForOutputSpeed(smoothedOutSpeed, params);
 
             int rawX = clampRelative8((int) Math.round(dx / gain));
             int rawY = clampRelative8((int) Math.round(dy / gain));
+            if (rawX != 0 || rawY != 0) {
+                vxTracker.add(nowNs, rawX);
+                vyTracker.add(nowNs, rawY);
+                gain = gainAtRawSpeed(Math.hypot(vxTracker.velocity(), vyTracker.velocity()), params);
+            }
+
             if (hitLeft || pushingLeft) {
                 int extraX = (hitLeft ? -edgeSnapCounts() : 0)
                     + (pushingLeft ? edgePushRaw(pushX, params.scale) : 0);
@@ -367,12 +605,11 @@ final class ShellPointerMath {
                 cursorY = Math.max(0.0, Math.min(screenHeight - 1, cursorY + rawY * gain));
             }
 
-            prevDx = dx;
-            prevDy = dy;
-            if (rawX != 0 || rawY != 0) {
-                lastReportNs = nowNs;
-            }
             return new MoveStep(false, 0, 0, 0, 0, rawX, rawY);
+        }
+
+        private static double clampRelative8Continuous(double value) {
+            return Math.max(-127.0, Math.min(127.0, value));
         }
 
         private static int computeEntryCounts(double jumpDelta, double minScale, double highGain) {

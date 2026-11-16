@@ -1,3 +1,15 @@
+# DeskTouch Vision v0.3.52 — Smooth Zero-Skip 144Hz Cursor Motion & Wireless Stability
+
+Eliminates cursor frame-skipping, beat-frequency judder, velocity drift, high-refresh throttling, and wireless metric/cursor fallbacks:
+
+- **Exact Android 14 / HyperOS VelocityControl inverse tracking (`ShellPointerMath`, `ShellInputDaemon`):** Fixes pointer speed scaling (`scaledSpeed = rawSpeed * scale` threshold domain matching verified hardware measurements), replaces exponential single-axis speed guesswork with a zero-allocation per-axis 100 ms least-squares trajectory predictor (`AospAxisTracker`), and removes premature X/Y speed wipeouts on diagonal curve bends (`Err < 1 px` across slow, fast, and curved sweeps instead of up to 33% shortfalls).
+- **Sub-frame 2× VSYNC micro-glide & jitter-free deadline pacing (`ShellPointerMath`, `ShellInputDaemon`):** Splits slower or jittery mouse/touchpad streams (such as 125 Hz optical mice, 60 Hz touchpads, or wireless bursts) evenly across lock-free sub-frame ticks (3.47 ms / 288 Hz on 144 Hz panels) while passing >=180 Hz mice and pre-click snaps immediately with zero added lag, and replaces regex move parsing and sloppy `Object.wait` sleeps with alloc-free ASCII parsing and sub-millisecond `LockSupport` deadline pacing.
+- **High-refresh display lock during kernel UHID control (`DeskTouchAccessibilityService`, `PhoneScreenGeometry`, `DeskTouchSession`):** Retains an active peak display refresh-rate/mode vote while Windows controls the phone via kernel UHID so the panel does not drop to 50/60 Hz idle modes during cursor movement.
+- **Kernel cursor persistence & wireless mode improvements (`ShellInputClient`, `AdbCableBridge`, `DeskTouchSession`, `AdaptiveLinkTracker`, `FastUdpChannel`):** Persists active virtual cursor bridge credentials safely across app restarts and USB cable unplugs so wireless sessions reuse the running kernel cursor instead of falling back to the Accessibility blue-dot overlay; stops slow TCP heartbeat jitter from polluting fast UDP wireless ping/jitter metrics; removes redundant upstream keepalive collisions on 2.4 GHz Wi-Fi; and prevents stale burst-loss values from sticking on quiet wireless links.
+- **Windows RawInput blackout guard (`SourceCapture`):** Requires sustained (>30 ms, multiple missed hooks) RawInput absence before triggering touchpad hook fallback so brief optical-mouse pauses never black out 24 ms of native raw packets.
+
+---
+
 # DeskTouch Vision v0.3.51 — Elimination of Cursor Sticking, Edge Trapping & 144Hz Frame Skipping
 
 Solves cursor stalls/sticking and frame skipping end-to-end across Windows capture, data-cable/wireless pacing, and Android kernel `/dev/uhid` mouse injection:

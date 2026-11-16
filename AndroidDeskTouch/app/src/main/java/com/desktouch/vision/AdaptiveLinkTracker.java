@@ -206,6 +206,12 @@ public final class AdaptiveLinkTracker {
 
     public void recordInboundPacket(long seq, boolean hasSenderTimestamp, int senderTimestampMs, long nowMs) {
         synchronized (recvGate) {
+            if (nowMs > 0L && lastArriveMs > 0L && nowMs > lastArriveMs) {
+                long gapMs = nowMs - lastArriveMs;
+                if (gapMs > 800L) {
+                    ewmaLossRatio *= Math.pow(0.75, Math.min(8.0, gapMs / 1000.0));
+                }
+            }
             recordSeqLocked(seq);
             if (nowMs <= 0L) {
                 return;
@@ -253,7 +259,7 @@ public final class AdaptiveLinkTracker {
                 seenMask = 1L;
                 long skipped = Long.compareUnsigned(diff, 65L) >= 0 ? 64L : (diff - 1L);
                 lostPackets += skipped;
-                long ewmaSteps = Math.min(16L, skipped);
+                long ewmaSteps = Math.min(8L, skipped);
                 for (long i = 0; i < ewmaSteps; i++) {
                     ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
                 }

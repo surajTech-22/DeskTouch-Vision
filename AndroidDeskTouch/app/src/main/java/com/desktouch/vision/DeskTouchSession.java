@@ -144,7 +144,11 @@ final class DeskTouchSession implements AutoCloseable {
         return t;
     });
     private final ScheduledExecutorService udpPacer=Executors.newSingleThreadScheduledExecutor(r->{
-        Thread t=new Thread(r,"DeskTouch UdpSend");
+        Thread t=new Thread(()->{
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY); }
+            catch (Throwable ignored) {}
+            r.run();
+        },"DeskTouch UdpSend");
         t.setDaemon(true);
         return t;
     });
@@ -531,6 +535,7 @@ final class DeskTouchSession implements AutoCloseable {
                     WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(application,false,0);
                     publishLinkProfile(snap);
                 }
+                ShellInputClient.warmConnectIfConfigured(application);
                 publishKeyboardBindings();
                 if(onConnected!=null) onConnected.run();
                 DeskTouchRuntime.notifyLiveStatusChanged();
@@ -693,7 +698,10 @@ final class DeskTouchSession implements AutoCloseable {
                             liveRttMs=0.0;
                         } else {
                             FastUdpChannel ch=udpChannel;
-                            if(ch!=null){
+                            if(ch!=null && ch.confirmed){
+                                // Do not pollute fast UDP RTT & jitter metrics with slow TCP TLS heartbeat spikes.
+                                liveRttMs=0.0;
+                            } else if(ch!=null){
                                 ch.linkTracker.recordRttSample(rttMs,nowMs);
                                 syncAdaptiveMetrics(ch);
                             } else {
@@ -814,6 +822,10 @@ final class DeskTouchSession implements AutoCloseable {
         if(hz<24){
             hz=PhoneScreenGeometry.readInfo(application).refreshHz;
         }
+        int peak=PhoneScreenGeometry.readPeakRefreshHz(application);
+        if(peak>hz && peak<=360){
+            hz=peak;
+        }
         return hz>=24 && hz<=360 ? hz : 60;
     }
 
@@ -864,7 +876,10 @@ final class DeskTouchSession implements AutoCloseable {
             send(new Packet("reverse-busy",claim));
             return;
         }
-        if(chosenShell && !preparedShell) ShellInputClient.beginRemote(application,ptrSpeed,hz);
+        if(chosenShell){
+            if(!preparedShell) ShellInputClient.beginRemote(application,ptrSpeed,hz);
+            DeskTouchAccessibilityService.setNativeCursorRefreshVote(true);
+        }
         send(new Packet("reverse-granted",claim));
         if(!fromUdp) warmOrProbeUdp();
         RemoteInputPower.begin(application);
@@ -972,6 +987,7 @@ final class DeskTouchSession implements AutoCloseable {
         DeskTouchRuntime.releaseAndroidControl(this);
         if(!running && lease>0)RemoteInputPower.end();
         ShellInputClient.endRemote();
+        DeskTouchAccessibilityService.setNativeCursorRefreshVote(false);
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
@@ -999,10 +1015,14 @@ final class DeskTouchSession implements AutoCloseable {
 
     private int packCurrentDisplayRate(){
         int accHz=DeskTouchAccessibilityService.liveEffectiveRefreshHz();
-        int hz=resolveLiveRefreshHz(accHz, livePhoneRefreshHz>0 ? livePhoneRefreshHz : announcedPhoneRefreshHz);
-        int tenths=accHz>=24
-            ? DeskTouchAccessibilityService.liveEffectiveFrameTenthsMs()
-            : (livePhoneFrameTenthsMs>0 ? livePhoneFrameTenthsMs : (int)Math.round(10000.0/hz));
+        int hz=reverseUsingShell && reverseLease>0
+            ? currentRefreshHz()
+            : resolveLiveRefreshHz(accHz, livePhoneRefreshHz>0 ? livePhoneRefreshHz : announcedPhoneRefreshHz);
+        int tenths=(reverseUsingShell && reverseLease>0)
+            ? (int)Math.round(10000.0/hz)
+            : (accHz>=24
+                ? DeskTouchAccessibilityService.liveEffectiveFrameTenthsMs()
+                : (livePhoneFrameTenthsMs>0 ? livePhoneFrameTenthsMs : (int)Math.round(10000.0/hz)));
         return AdaptiveLinkTracker.packDisplayRate(hz,tenths);
     }
 
@@ -1105,7 +1125,7 @@ final class DeskTouchSession implements AutoCloseable {
         livePhoneFrameTenthsMs=tenths;
         DeskTouchAccessibilityService.setDisplayRefreshHz(refreshHz);
         if(changed && reverseLease>0 && reverseUsingShell){
-            ShellInputClient.beginRemote(application,readAndroidPointerSpeed(),refreshHz);
+            ShellInputClient.beginRemote(application,readAndroidPointerSpeed(),currentRefreshHz());
         }
 
         long now=SystemClock.uptimeMillis();
@@ -1362,9 +1382,11 @@ final class DeskTouchSession implements AutoCloseable {
                         running,true,true,serviceReady,screenInteractive,true)){
                         boolean slow24=WifiLinkMonitor.BAND_24_GHZ.equals(ch.linkTracker.getBand())
                             || WifiLinkMonitor.BAND_24_GHZ.equals(liveLinkBand);
-                        long baseWarm=slow24 ? 60L : INTERACTIVE_KEEPALIVE_MS;
-                        int warmGapMs=(int)Math.min(slow24 ? 95L : 44L,Math.max(baseWarm,
-                            Math.round((slow24 ? 50.0 : 20.0)+ch.linkTracker.getQueueDelayMs()*0.6)));
+                        long baseWarm=hasClaim()
+                            ? (slow24 ? 60L : INTERACTIVE_KEEPALIVE_MS)
+                            : (slow24 ? 180L : 95L);
+                        int warmGapMs=(int)Math.min(hasClaim() ? (slow24 ? 95L : 44L) : 220L,
+                            Math.max(baseWarm, Math.round((slow24 ? 50.0 : 20.0)+ch.linkTracker.getQueueDelayMs()*0.6)));
                         if(now-lastWarmSentMs>=warmGapMs){
                             lastWarmSentMs=now;
                             ch.sendWarm();

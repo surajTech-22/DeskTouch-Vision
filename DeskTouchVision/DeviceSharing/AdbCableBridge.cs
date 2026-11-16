@@ -271,7 +271,6 @@ internal sealed class AdbCableBridge : IDisposable
         }
         if (anyDetached)
         {
-            lock (_shellGate) _currentShellBridge = null;
             _onBridgeDetached?.Invoke();
         }
 
@@ -325,6 +324,10 @@ internal sealed class AdbCableBridge : IDisposable
         {
             _shellBridges.Remove(gone);
             _loggedMissingAppSerials.Remove(gone);
+        }
+        if (_shellBridges.Count == 0)
+        {
+            lock (_shellGate) _currentShellBridge = null;
         }
 
         foreach (string serial in connectedSerials)

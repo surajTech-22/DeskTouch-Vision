@@ -55,6 +55,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private WindowManager windows;
     private FrameLayout cursorRoot;
     private PointerDotView pointerDot;
+    private View refreshVoteView;
     private int pointerDotSize;
     private float pointerDotHalf;
     private WindowManager.LayoutParams pointerParams;
@@ -93,6 +94,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private int lastFedTargetX=Integer.MIN_VALUE,lastFedTargetY=Integer.MIN_VALUE;
     private int lastReportedEffectiveHz;
     private volatile float cachedPreferredRefreshHz;
+    private volatile int cachedPreferredModeId;
     private Choreographer choreographer;
     private final Choreographer.FrameCallback frameCallback=this::flushPointerVsync;
     private final ArrayDeque<TouchAction> pendingActions=new ArrayDeque<>();
@@ -272,7 +274,9 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private void refreshDisplayGeometry(){
         PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(this);
         displayWidth=Math.max(1,info.width);displayHeight=Math.max(1,info.height);
-        cachedPreferredRefreshHz=PhoneScreenGeometry.readPreferredActiveRefreshRate(this);
+        android.view.Display.Mode preferred=PhoneScreenGeometry.readPreferredDisplayMode(this);
+        cachedPreferredRefreshHz=preferred!=null ? preferred.getRefreshRate() : 0f;
+        cachedPreferredModeId=preferred!=null ? preferred.getModeId() : 0;
         if(info.refreshHz>0){
             smoother.setDisplayRefreshHz(info.refreshHz);
         }
@@ -329,9 +333,57 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private float preferredActiveRefreshRate(){
         float cached=cachedPreferredRefreshHz;
         if(cached>0f)return cached;
-        cached=PhoneScreenGeometry.readPreferredActiveRefreshRate(this);
-        cachedPreferredRefreshHz=cached;
-        return cached;
+        refreshDisplayGeometry();
+        return cachedPreferredRefreshHz;
+    }
+    private int preferredDisplayModeId(){
+        int cached=cachedPreferredModeId;
+        if(cached>0)return cached;
+        refreshDisplayGeometry();
+        return cachedPreferredModeId;
+    }
+    static void setNativeCursorRefreshVote(boolean active){
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null)service.ui.post(()->service.applyNativeRefreshVote(active));
+    }
+    private void applyNativeRefreshVote(boolean active){
+        if(!active || windows==null || unbinding || !ready(this)){
+            removeRefreshVoteOverlay();
+            return;
+        }
+        float rate=preferredActiveRefreshRate();
+        if(rate<=60.5f){
+            removeRefreshVoteOverlay();
+            return;
+        }
+        if(refreshVoteView!=null) return;
+        View voteView=new View(this);
+        voteView.setAlpha(0f);
+        WindowManager.LayoutParams lp=new WindowManager.LayoutParams(
+            1,1,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+            PixelFormat.TRANSPARENT);
+        lp.gravity=Gravity.TOP|Gravity.LEFT;
+        lp.x=0;lp.y=0;
+        if(Build.VERSION.SDK_INT>=23){
+            lp.preferredRefreshRate=rate;
+            int modeId=preferredDisplayModeId();
+            if(modeId>0) lp.preferredDisplayModeId=modeId;
+        }
+        try{
+            windows.addView(voteView,lp);
+            refreshVoteView=voteView;
+        }catch(RuntimeException ignored){}
+    }
+    private void removeRefreshVoteOverlay(){
+        View v=refreshVoteView;
+        refreshVoteView=null;
+        if(v!=null && windows!=null){
+            try{windows.removeView(v);}catch(RuntimeException ignored){}
+        }
     }
     private boolean tryAttachOverlay(FrameLayout root,WindowManager.LayoutParams params){
         try{
@@ -354,7 +406,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             PixelFormat.TRANSLUCENT);
         params.gravity=Gravity.TOP|Gravity.LEFT;
         if(Build.VERSION.SDK_INT>=23){
-            params.preferredRefreshRate=preferredActiveRefreshRate();
+            float rate=preferredActiveRefreshRate();
+            if(rate>0f) params.preferredRefreshRate=rate;
+            int modeId=preferredDisplayModeId();
+            if(modeId>0) params.preferredDisplayModeId=modeId;
         }
         if(Build.VERSION.SDK_INT>=28)
             params.layoutInDisplayCutoutMode=
@@ -520,6 +575,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     private void removePointer(){
         resetGestureState();
+        removeRefreshVoteOverlay();
         lastOverlayX=lastOverlayY=Integer.MIN_VALUE;
         if(cursorRoot!=null&&windows!=null){
             try{windows.removeView(cursorRoot);}catch(RuntimeException ignored){}
@@ -654,7 +710,10 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
     static void endRemote(){
         DeskTouchAccessibilityService service=instance;
-        if(service!=null)service.ui.post(service::hidePointer);
+        if(service!=null)service.ui.post(()->{
+            service.hidePointer();
+            service.removeRefreshVoteOverlay();
+        });
     }
     static long gestureDurationMs(int dx,int dy){
         long distance=Math.round(Math.hypot(dx,dy));

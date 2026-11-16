@@ -438,6 +438,12 @@ internal sealed class AdaptiveLinkTracker
     {
         lock (_recvGate)
         {
+            if (nowMs > 0 && _lastArriveMs > 0 && nowMs > _lastArriveMs)
+            {
+                long gapMs = nowMs - _lastArriveMs;
+                if (gapMs > 800)
+                    _ewmaLossRatio *= Math.Pow(0.75, Math.Min(8.0, gapMs / 1000.0));
+            }
             RecordSeqLocked(seq);
             if (nowMs <= 0) return;
             if (hasSenderTimestamp)
@@ -490,7 +496,7 @@ internal sealed class AdaptiveLinkTracker
                 _seenMask = 1UL;
                 ulong skipped = diff >= 65 ? 64UL : diff - 1;
                 _lostPackets += (long)skipped;
-                ulong ewmaSteps = Math.Min(16UL, skipped);
+                ulong ewmaSteps = Math.Min(8UL, skipped);
                 for (ulong i = 0; i < ewmaSteps; i++)
                 {
                     _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
@@ -1026,7 +1032,7 @@ internal sealed class FastMovePacer : IDisposable
     private const double MinUdpIntervalMs = 1.5;
     private const int TrailingTcpSyncDelayMs = 130;
     private const int WarmKeepaliveIntervalMs = 22;
-    private const int WarmCooldownSeconds = 4;
+    private const int WarmCooldownSeconds = 2;
 
     private readonly object _gate = new();
     private readonly object _udpSendGate = new();

@@ -104,16 +104,17 @@ final class PhoneScreenGeometry {
         return readDisplayRefreshHz(getDefaultDisplay(context));
     }
 
-    static float readPreferredActiveRefreshRate(Context context) {
+    static Display.Mode readPreferredDisplayMode(Context context) {
         Display display=getDefaultDisplay(context);
-        if(display==null || Build.VERSION.SDK_INT<Build.VERSION_CODES.M) return 0f;
+        if(display==null || Build.VERSION.SDK_INT<Build.VERSION_CODES.M) return null;
         try {
             Display.Mode active=display.getMode();
             Display.Mode[] modes=display.getSupportedModes();
-            if(active==null || modes==null) return 0f;
+            if(active==null || modes==null) return null;
             int physW=active.getPhysicalWidth();
             int physH=active.getPhysicalHeight();
-            float best=0f;
+            Display.Mode best=null;
+            float bestRate=0f;
             for(Display.Mode mode : modes) {
                 if(mode==null) continue;
                 if(physW>0 && physH>0 &&
@@ -121,14 +122,33 @@ final class PhoneScreenGeometry {
                     continue;
                 }
                 float rate=mode.getRefreshRate();
-                if(rate>60.5f && rate<=240.5f && rate>best) {
-                    best=rate;
+                if(rate>60.5f && rate<=240.5f && rate>bestRate) {
+                    bestRate=rate;
+                    best=mode;
                 }
             }
             return best;
         } catch(RuntimeException ignored) {
-            return 0f;
+            return null;
         }
+    }
+
+    static float readPreferredActiveRefreshRate(Context context) {
+        Display.Mode best=readPreferredDisplayMode(context);
+        return best!=null ? best.getRefreshRate() : 0f;
+    }
+
+    static int readPreferredDisplayModeId(Context context) {
+        Display.Mode best=readPreferredDisplayMode(context);
+        return best!=null ? best.getModeId() : 0;
+    }
+
+    static int readPeakRefreshHz(Context context) {
+        Display.Mode best=readPreferredDisplayMode(context);
+        if(best!=null) {
+            return PointerSmoother.snapNearestStandardHz(Math.round(best.getRefreshRate()));
+        }
+        return readLiveRefreshHz(context);
     }
 
     static Info readInfo(Context context) {

@@ -2348,7 +2348,22 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         Check(cable144Fast <= 3.0,
             "Data cable interval at 144Hz must be <=3.0ms so every 6.94ms display VSYNC receives fresh pointer updates");
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, and v0.3.51 zero-skip UHID fixes verified.");
+    // Verify v0.3.52: brief optical-mouse pauses must never falsely trigger touchpad hook fallback & black out RawInput,
+    // and wireless AdaptiveLinkTracker recovers cleanly after quiet radio gaps without pinning high loss.
+    Check(!SourceCapture.ShouldTriggerMouseHookFallback(1000, 1020, 1) &&
+          !SourceCapture.ShouldTriggerMouseHookFallback(1000, 1035, 1) &&
+          !SourceCapture.ShouldTriggerMouseHookFallback(1000, 1020, 4) &&
+          SourceCapture.ShouldTriggerMouseHookFallback(1000, 1035, 2),
+        "MouseHook fallback must require sustained >30ms RawInput absence across multiple hook moves");
+    var wifiLossGap = new AdaptiveLinkTracker("2.4GHz");
+    wifiLossGap.RecordInboundPacket(1, true, 1000, 1000);
+    wifiLossGap.RecordInboundPacket(10, true, 1070, 1070);
+    wifiLossGap.RecordInboundPacket(19, true, 1140, 1140);
+    double preGapLoss = wifiLossGap.InboundLossPermille;
+    wifiLossGap.RecordInboundPacket(20, true, 4140, 4140);
+    Check(preGapLoss > 50.0 && wifiLossGap.InboundLossPermille < preGapLoss * 0.6,
+        "Wireless loss tracker must decay stale outage spikes after quiet recovery gaps");
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, and v0.3.52 zero-skip UHID & wireless fixes verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

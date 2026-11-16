@@ -102,6 +102,8 @@ public final class ShellInputDaemon {
 
     private final byte[] expectedTokenBytes;
     private final ShellPointerMath.PointerCompensator pointer = new ShellPointerMath.PointerCompensator();
+    private final ShellPointerMath.SubFrameGlide subFrameGlide = new ShellPointerMath.SubFrameGlide();
+    private final int[] glideOutXY = new int[2];
     private final Object mouseQueueLock = new Object();
     private FileDescriptor mouseFd;
     private FileDescriptor keyboardFd;
@@ -124,6 +126,7 @@ public final class ShellInputDaemon {
     private long pendingMoveSeq;
     private long appliedMoveSeq;
     private long lastMouseWriteNs;
+    private long nextSubFrameTickNs;
     private volatile boolean daemonRunning = true;
     private Thread mousePacerThread;
     private int buttonMask;
@@ -318,44 +321,78 @@ public final class ShellInputDaemon {
                 int px;
                 int py;
                 long seq;
-                boolean coasting;
+                boolean allowSameSeq;
+                long subFrameNs;
                 synchronized (mouseQueueLock) {
-                    while (daemonRunning && !hasPendingMove) {
+                    while (daemonRunning && !hasPendingMove && !subFrameGlide.isActive()) {
+                        nextSubFrameTickNs = 0L;
                         try {
                             mouseQueueLock.wait();
                         } catch (InterruptedException ignored) {}
                     }
                     if (!daemonRunning) break;
+                    subFrameNs = subFrameGlide.subFrameIntervalNs();
+                    long nowNs = System.nanoTime();
+                    if (nextSubFrameTickNs == 0L) {
+                        nextSubFrameTickNs = nowNs;
+                    }
                     long minGapNs = pendingMoveCoasting
-                        ? ShellPointerMath.computeDaemonPacingIntervalNs(configuredRefreshHz)
-                        : 900_000L;
-                    long waitNs = lastMouseWriteNs == 0L
-                        ? 0L
-                        : (lastMouseWriteNs + minGapNs - System.nanoTime());
-                    if (waitNs > 150_000L) {
-                        long waitMs = waitNs / 1_000_000L;
-                        int nanos = (int) (waitNs % 1_000_000L);
+                        ? subFrameNs
+                        : (subFrameGlide.isActive() ? subFrameNs : Math.min(900_000L, subFrameNs / 3L));
+                    long targetTickNs = Math.max(
+                        nextSubFrameTickNs,
+                        lastMouseWriteNs == 0L ? 0L : (lastMouseWriteNs + minGapNs));
+                    long waitNs = targetTickNs - nowNs;
+                    if (waitNs > 1_200_000L) {
+                        long sleepNs = waitNs - 350_000L;
+                        long waitMs = sleepNs / 1_000_000L;
+                        int nanos = (int) (sleepNs % 1_000_000L);
                         try {
                             mouseQueueLock.wait(waitMs, nanos);
                         } catch (InterruptedException ignored) {}
                         continue;
                     }
-                    tx = pendingMoveX;
-                    ty = pendingMoveY;
-                    px = pendingPushX;
-                    py = pendingPushY;
+                    if (waitNs > 0L) {
+                        long parkNs = waitNs - 160_000L;
+                        if (parkNs > 80_000L) {
+                            LockSupport.parkNanos(parkNs);
+                        }
+                        while (System.nanoTime() < targetTickNs && daemonRunning) {
+                            Thread.yield();
+                        }
+                        if (!daemonRunning) break;
+                        nowNs = System.nanoTime();
+                    }
+
+                    if (hasPendingMove || subFrameGlide.isActive()) {
+                        px = subFrameGlide.currentPushX();
+                        py = subFrameGlide.currentPushY();
+                        if (subFrameGlide.sampleNext(nowNs, glideOutXY)) {
+                            tx = glideOutXY[0];
+                            ty = glideOutXY[1];
+                        } else {
+                            tx = pendingMoveX;
+                            ty = pendingMoveY;
+                            px = pendingPushX;
+                            py = pendingPushY;
+                        }
+                    } else {
+                        break;
+                    }
                     seq = pendingMoveSeq;
-                    coasting = pendingMoveCoasting;
+                    allowSameSeq = pendingMoveCoasting || subFrameGlide.isActive() || hasPendingMove;
                     pendingMoveCoasting = false;
                     hasPendingMove = false;
                     pendingPushX = 0;
                     pendingPushY = 0;
+                    nextSubFrameTickNs = targetTickNs + subFrameNs;
                 }
-                int moveOutcome = moveTo(tx, ty, px, py, seq, coasting);
-                if (moveOutcome != MOVE_DONE_IDLE) {
-                    synchronized (mouseQueueLock) {
+                int moveOutcome = moveTo(tx, ty, px, py, seq, allowSameSeq);
+                synchronized (mouseQueueLock) {
+                    if (moveOutcome != MOVE_DONE_IDLE) {
                         lastMouseWriteNs = System.nanoTime();
-                        if (moveOutcome == MOVE_SENT_MORE && daemonRunning && !hasPendingMove && seq == pendingMoveSeq) {
+                        if (moveOutcome == MOVE_SENT_MORE && daemonRunning &&
+                                !hasPendingMove && !subFrameGlide.isActive() && seq == pendingMoveSeq) {
                             pendingMoveX = Math.max(0, Math.min(screenWidth - 1, tx));
                             pendingMoveY = Math.max(0, Math.min(screenHeight - 1, ty));
                             pendingPushX = 0;
@@ -363,6 +400,8 @@ public final class ShellInputDaemon {
                             pendingMoveCoasting = true;
                             hasPendingMove = true;
                         }
+                    } else if (!hasPendingMove && !subFrameGlide.isActive()) {
+                        nextSubFrameTickNs = 0L;
                     }
                 }
             }
@@ -378,37 +417,56 @@ public final class ShellInputDaemon {
             hasPendingMove = false;
             pendingPushX = 0;
             pendingPushY = 0;
+            nextSubFrameTickNs = 0L;
+            subFrameGlide.reset();
             mouseQueueLock.notifyAll();
         }
     }
 
     private void applyMoveLine(String line) {
-        String[] parts = line.split(" ");
-        if (parts.length >= 3) {
-            int x = parseBoundedInt(parts[1], 0, screenWidth - 1, 0);
-            int y = parseBoundedInt(parts[2], 0, screenHeight - 1, 0);
-            int pushX = parts.length >= 4 ? parseBoundedInt(parts[3], -240, 240, 0) : 0;
-            int pushY = parts.length >= 5 ? parseBoundedInt(parts[4], -240, 240, 0) : 0;
-            synchronized (mouseQueueLock) {
-                boolean sameX = hasPendingMove && pendingMoveX == x;
-                boolean sameY = hasPendingMove && pendingMoveY == y;
-                pendingMoveX = x;
-                pendingMoveY = y;
-                if (pushX != 0) {
-                    pendingPushX = Math.max(-240, Math.min(240, (sameX ? pendingPushX : 0) + pushX));
-                } else if (!sameX) {
-                    pendingPushX = 0;
-                }
-                if (pushY != 0) {
-                    pendingPushY = Math.max(-240, Math.min(240, (sameY ? pendingPushY : 0) + pushY));
-                } else if (!sameY) {
-                    pendingPushY = 0;
-                }
-                pendingMoveSeq = ++nextMoveSeq;
-                pendingMoveCoasting = false;
-                hasPendingMove = true;
-                mouseQueueLock.notifyAll();
+        int len = line.length();
+        int idx = 7; // Skip "MOVETO "
+        if (idx >= len) return;
+        int xEnd = findSpaceOrEnd(line, idx, len);
+        int x = parseAsciiBoundedInt(line, idx, xEnd, 0, screenWidth - 1, -1);
+        if (x < 0 || xEnd >= len) return;
+        int yStart = xEnd + 1;
+        int yEnd = findSpaceOrEnd(line, yStart, len);
+        int y = parseAsciiBoundedInt(line, yStart, yEnd, 0, screenHeight - 1, -1);
+        if (y < 0) return;
+        int pushX = 0;
+        int pushY = 0;
+        if (yEnd + 1 < len) {
+            int pxStart = yEnd + 1;
+            int pxEnd = findSpaceOrEnd(line, pxStart, len);
+            pushX = parseAsciiBoundedInt(line, pxStart, pxEnd, -240, 240, 0);
+            if (pxEnd + 1 < len) {
+                int pyStart = pxEnd + 1;
+                int pyEnd = findSpaceOrEnd(line, pyStart, len);
+                pushY = parseAsciiBoundedInt(line, pyStart, pyEnd, -240, 240, 0);
             }
+        }
+        long nowNs = System.nanoTime();
+        synchronized (mouseQueueLock) {
+            boolean sameX = hasPendingMove && pendingMoveX == x;
+            boolean sameY = hasPendingMove && pendingMoveY == y;
+            pendingMoveX = x;
+            pendingMoveY = y;
+            if (pushX != 0) {
+                pendingPushX = Math.max(-240, Math.min(240, (sameX ? pendingPushX : 0) + pushX));
+            } else if (!sameX) {
+                pendingPushX = 0;
+            }
+            if (pushY != 0) {
+                pendingPushY = Math.max(-240, Math.min(240, (sameY ? pendingPushY : 0) + pushY));
+            } else if (!sameY) {
+                pendingPushY = 0;
+            }
+            subFrameGlide.onTarget(x, y, pendingPushX, pendingPushY, nowNs);
+            pendingMoveSeq = ++nextMoveSeq;
+            pendingMoveCoasting = false;
+            hasPendingMove = true;
+            mouseQueueLock.notifyAll();
         }
     }
 
@@ -419,28 +477,37 @@ public final class ShellInputDaemon {
         int px = 0;
         int py = 0;
         long seq = 0L;
-        boolean coasting = false;
         synchronized (mouseQueueLock) {
-            if (hasPendingMove) {
-                tx = pendingMoveX;
-                ty = pendingMoveY;
-                px = pendingPushX;
-                py = pendingPushY;
+            if (hasPendingMove || subFrameGlide.isActive()) {
+                px = Math.abs(pendingPushX) >= Math.abs(subFrameGlide.currentPushX())
+                    ? pendingPushX : subFrameGlide.currentPushX();
+                py = Math.abs(pendingPushY) >= Math.abs(subFrameGlide.currentPushY())
+                    ? pendingPushY : subFrameGlide.currentPushY();
+                subFrameGlide.snapToTarget();
+                if (subFrameGlide.sampleNext(System.nanoTime(), glideOutXY)) {
+                    tx = glideOutXY[0];
+                    ty = glideOutXY[1];
+                } else {
+                    tx = pendingMoveX;
+                    ty = pendingMoveY;
+                }
                 seq = pendingMoveSeq;
-                coasting = pendingMoveCoasting;
                 pendingMoveCoasting = false;
                 hasPendingMove = false;
                 pendingPushX = 0;
                 pendingPushY = 0;
+                nextSubFrameTickNs = 0L;
                 have = true;
             }
         }
         if (have) {
-            int outcome = moveTo(tx, ty, px, py, seq, coasting);
-            if (outcome != MOVE_DONE_IDLE) {
+            for (int step = 0; step < 12; step++) {
+                int outcome = moveTo(tx, ty, step == 0 ? px : 0, step == 0 ? py : 0, seq, true);
+                if (outcome == MOVE_DONE_IDLE) break;
                 synchronized (mouseQueueLock) {
                     lastMouseWriteNs = System.nanoTime();
                 }
+                if (outcome != MOVE_SENT_MORE) break;
             }
         }
     }
@@ -463,6 +530,7 @@ public final class ShellInputDaemon {
             ? ShellPointerMath.defaultVelocityParams(configuredPointerSpeed)
             : null;
         pointer.configure(nextW, nextH, initParams, configuredRefreshHz);
+        subFrameGlide.configure(configuredRefreshHz);
         try {
             boolean createdMouse = false;
             boolean createdKeyboard = false;
@@ -614,6 +682,8 @@ public final class ShellInputDaemon {
             hasPendingMove = false;
             pendingPushX = 0;
             pendingPushY = 0;
+            nextSubFrameTickNs = 0L;
+            subFrameGlide.reset();
         }
         if (buttonMask != 0 && mouseFd != null) {
             buttonMask = 0;
@@ -849,6 +919,37 @@ public final class ShellInputDaemon {
         try {
             Os.write(fd, pkt.array(), 0, pkt.capacity());
         } catch (ErrnoException | IOException ignored) {}
+    }
+
+    private static int findSpaceOrEnd(String s, int start, int len) {
+        int i = start;
+        while (i < len && s.charAt(i) != ' ') i++;
+        return i;
+    }
+
+    private static int parseAsciiBoundedInt(String s, int start, int end, int min, int max, int fallback) {
+        if (start >= end) return fallback;
+        int i = start;
+        boolean neg = false;
+        char first = s.charAt(i);
+        if (first == '-') {
+            neg = true;
+            i++;
+        } else if (first == '+') {
+            i++;
+        }
+        if (i >= end) return fallback;
+        long val = 0;
+        for (; i < end; i++) {
+            char ch = s.charAt(i);
+            if (ch < '0' || ch > '9') return fallback;
+            val = val * 10 + (ch - '0');
+            if (val > 1_000_000L) break;
+        }
+        long signed = neg ? -val : val;
+        if (signed < min) return min;
+        if (signed > max) return max;
+        return (int) signed;
     }
 
     private static int parseBoundedInt(String raw, int min, int max, int fallback) {

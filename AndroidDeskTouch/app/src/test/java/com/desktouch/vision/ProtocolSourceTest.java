@@ -1009,4 +1009,74 @@ public final class ProtocolSourceTest {
         assertTrue("Small 1px delta must remain pending whenever not within sub-count tolerance",
             borderComp.hasRemainingMotion(503, 1200));
     }
+
+    @Test
+    public void scaledVelocityDomainAospLsqTrackerAndSubFrameGlidePreventFrameSkips() {
+        ShellPointerMath.VelocityParams xiaomi = new ShellPointerMath.VelocityParams(0.500, 500.0, 3000.0, 3.0);
+        // Velocity thresholds apply to scaled speed (raw * scale): at scale=0.5, 864 raw/s -> 432 px/s <= 500.
+        assertEquals(0.500, ShellPointerMath.gainAtRawSpeed(864.0, xiaomi), 1e-6);
+        assertEquals(0.6456, ShellPointerMath.gainAtRawSpeed(1728.0, xiaomi), 1e-4);
+
+        // Curve test: sinusoidal Y reversal must NOT wipe independent X LSQ2 velocity.
+        ShellPointerMath.AospAxisTracker tx = new ShellPointerMath.AospAxisTracker();
+        ShellPointerMath.AospAxisTracker ty = new ShellPointerMath.AospAxisTracker();
+        long t = 1_000_000_000L;
+        long dt144 = 6_944_444L;
+        for (int i = 0; i < 16; i++) {
+            int rawY = i < 8 ? 10 : -10;
+            tx.add(t, 24);
+            ty.add(t, rawY);
+            t += dt144;
+        }
+        assertTrue("X velocity must stay fast when Y reverses along a curve", tx.velocity() > 2800.0);
+
+        // Sub-frame pacing: 144Hz -> ~3.47ms (288Hz), splitting 125Hz (8ms) updates across 2 ticks without tail lag.
+        long sub144 = ShellPointerMath.computeSubFrameIntervalNs(144);
+        assertTrue(sub144 >= 3_200_000L && sub144 <= 3_800_000L);
+        ShellPointerMath.SubFrameGlide glide = new ShellPointerMath.SubFrameGlide();
+        glide.configure(144);
+        int[] out = new int[2];
+        long clk = 10_000_000_000L;
+        glide.onTarget(100, 100, 0, 0, clk);
+        assertTrue(glide.sampleNext(clk, out));
+        assertEquals(100, out[0]);
+        for (int i = 1; i <= 4; i++) {
+            clk += 8_000_000L; // 125 Hz input mouse updates
+            glide.onTarget(100 + i * 20, 100, 0, 0, clk);
+            if (i < 4) {
+                assertTrue(glide.sampleNext(clk, out));
+                assertTrue(glide.sampleNext(clk + sub144, out));
+                assertTrue(glide.sampleNext(clk + sub144 * 2L, out));
+                assertEquals(100 + i * 20, out[0]);
+            }
+        }
+        assertTrue(glide.sampleNext(clk, out));
+        assertTrue("125Hz input on 144Hz display should glide smoothly rather than jumping full 20px on tick 1",
+            out[0] > 160 && out[0] < 180);
+        glide.snapToTarget();
+        assertTrue(glide.sampleNext(clk + sub144, out));
+        assertEquals("Click/flush snap must hit exact newest target", 180, out[0]);
+
+        // High-rate >=250Hz input passes immediately with zero artificial glide lag.
+        glide.reset();
+        glide.onTarget(200, 200, 0, 0, clk);
+        assertTrue(glide.sampleNext(clk, out));
+        for (int i = 1; i <= 4; i++) {
+            clk += 4_000_000L;
+            glide.onTarget(200 + i * 10, 200, 0, 0, clk);
+        }
+        assertTrue(glide.sampleNext(clk, out));
+        assertEquals(240, out[0]);
+
+        // Verify v0.3.52 wireless loss recovery after brief radio idle gap without masking streaming loss.
+        AdaptiveLinkTracker wifiRecovery = new AdaptiveLinkTracker("2.4GHz");
+        wifiRecovery.recordInboundPacket(1L, true, 1000, 1000L);
+        wifiRecovery.recordInboundPacket(10L, true, 1070, 1070L);
+        wifiRecovery.recordInboundPacket(19L, true, 1140, 1140L);
+        double burstLoss = wifiRecovery.getInboundLossPermille();
+        assertTrue("Burst skip should register non-zero loss", burstLoss > 50.0);
+        wifiRecovery.recordInboundPacket(20L, true, 4140, 4140L);
+        assertTrue("Quiet radio gap must decay stale loss rather than freezing UI above 30%",
+            wifiRecovery.getInboundLossPermille() < burstLoss * 0.6);
+    }
 }

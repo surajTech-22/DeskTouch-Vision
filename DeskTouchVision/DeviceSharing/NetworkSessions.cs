@@ -2225,7 +2225,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double maxCap = !isAndroid
             ? 12.0
             : (isSlow24Ghz
-                ? 24.0
+                ? 16.5
                 : (liveRefreshHz is >= 115 ? 14.0
                     : liveRefreshHz is >= 85 ? 16.0
                     : liveRefreshHz is >= 55 ? 18.5

@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.59 — Computer Peer Link Prioritization & Client-Side Wired Network Display
+
+Enhances multi-device status reporting and client-side link transparency across simultaneous connections:
+
+- **Computer peer link prioritization (`ReceiverServer`, `NetworkSessions`):** When both a computer and a mobile phone are connected simultaneously to the sharing hub, the live link status summary prioritizes the computer peer. This ensures high-speed wired network connections remain prominently displayed with real-time ping and throughput statistics rather than being superseded by auxiliary wireless devices.
+- **Client-side active link status display (`HostSession`, `DisplaySettingsForm`):** Enables client-side destination machines to inspect and display active outbound link telemetry (connection type, adapter speed, and round-trip ping) directly in the settings window rather than showing an idle waiting state while actively connected.
+
+---
+
 # DeskTouch Vision v0.3.58 — Wired Ethernet Media Classification & Instant-Glide Pointer Restoration
 
 Corrects physical network adapter classification for computer-to-computer connections and restores instant, responsive cursor glide:

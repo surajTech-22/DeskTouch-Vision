@@ -579,7 +579,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal ActiveLinkSnapshot GetActiveLinkSummary()
     {
-        var session = Volatile.Read(ref _selected) ?? _sessions.Values.OrderBy(s => s.Id).FirstOrDefault();
+        var session = Volatile.Read(ref _selected) ??
+            _sessions.Values.OrderByDescending(s => s.Peer.Platform == "Windows").ThenBy(s => s.Id).FirstOrDefault();
         if (session == null)
             return new ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
         if (session.IsCableSession)
@@ -3457,6 +3458,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     private LocalInputPriority? _reversePriority;
     private Func<bool>? _allowReverseClaim;
     private readonly object _reverseInputGate = new();
+    private readonly string _linkBand;
+    private readonly int _linkSpeedMbps;
     private InputInjector? _reverseInjector;
     private int _reverseLease;
     private int _reverseAppliedLease;
@@ -3679,7 +3682,8 @@ internal sealed class HostSession : IInputSession, IDisposable
 
     private HostSession(TcpClient client, SslStream ssl, IPAddress serverAddress,
         string pinnedFingerprint, bool trustedConnection,
-        MonitorTopology monitors, Action<string> onFailure)
+        MonitorTopology monitors, Action<string> onFailure,
+        string linkBand = "wireless", int linkSpeedMbps = 0)
     {
         _client = client; _ssl = ssl; _serverAddress = serverAddress;
         _pinnedFingerprint = pinnedFingerprint;
@@ -3687,6 +3691,8 @@ internal sealed class HostSession : IInputSession, IDisposable
         _remoteAppVersion = monitors.Monitors.FirstOrDefault()?.AppVersion;
         _remoteMonitors = monitors;
         _environmentHubMonitors = monitors; _onFailure = onFailure;
+        _linkBand = linkBand;
+        _linkSpeedMbps = linkSpeedMbps;
         _movePacer = new FastMovePacer(
             canSendUdp: () => Volatile.Read(ref _closed) == 0 &&
                 _udpClient is { Confirmed: true } && Volatile.Read(ref _forwardClaimLease) > 0,
@@ -3716,6 +3722,28 @@ internal sealed class HostSession : IInputSession, IDisposable
         _ = Task.Run(SendLoopAsync);
         _ = Task.Run(HeartbeatAsync);
         _ = Task.Run(ReceiveLoopAsync);
+    }
+
+    internal ReceiverServer.ActiveLinkSnapshot GetActiveLinkSummary()
+    {
+        if (Volatile.Read(ref _closed) != 0)
+            return new ReceiverServer.ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
+        string name = RemoteSystemName ?? _environmentHubName ?? _serverAddress.ToString();
+        var udp = Volatile.Read(ref _udpClient);
+        string band = udp?.LinkTracker.Band ?? _linkBand;
+        int speed = _linkSpeedMbps;
+        double rtt = udp?.LinkTracker.SmoothedRttMs ?? Volatile.Read(ref _lastRttMs);
+        double jitter = udp?.LinkTracker.EffectiveJitterMs ?? 0;
+        double loss = udp?.LinkTracker.CombinedLossPermille ?? 0;
+        return new ReceiverServer.ActiveLinkSnapshot(
+            true,
+            name,
+            band,
+            speed,
+            rtt,
+            jitter,
+            loss,
+            null);
     }
 
     internal static Task<HostSession> ConnectAsync(
@@ -3982,7 +4010,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             {
                 await Wire.WriteAsync(ssl, new Packet("link-info", Text: outBand, A: outSpeed), acceptedLimit.Token);
             }
-            return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure);
+            return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure, outBand, outSpeed);
         }
         catch (Exception ex)
         {

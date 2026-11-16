@@ -33,6 +33,7 @@ public final class AutoConnectService extends Service {
     private static final int NOTIFICATION_ID=37377;
     private static final int PAYMENT_NOTICE_ID=37378;
     private static final long DISCONNECT_AUTO_PAUSE_DELAY_MS=15_000L;
+    private static final long HUB_RECHECK_INTERVAL_MS=8_000L;
     private static volatile AutoConnectService activeInstance;
     private ScheduledExecutorService scheduler;
     private MobileDiscoveryResponder responder;
@@ -45,6 +46,7 @@ public final class AutoConnectService extends Service {
     private volatile boolean retryScheduled;
     private volatile boolean hadConnectedWithAccessibility;
     private volatile String lastAutoConnectSkipReason="";
+    private volatile long lastHubCheckAtMs;
     private volatile WifiLinkMonitor.LinkSnapshot lastLinkSnapshot;
     private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
         new java.util.concurrent.atomic.AtomicInteger();
@@ -488,6 +490,33 @@ public final class AutoConnectService extends Service {
         Log.i("DeskTouch","Auto-connect idle: "+reason);
     }
 
+    static boolean shouldAcceptCachedDirectPeer(DesktopDiscovery.Device direct, int eligibleCount) {
+        return direct != null && direct.ready && !direct.android && (direct.isHub || eligibleCount <= 1);
+    }
+
+    static boolean shouldSwitchWirelessPeerToHub(
+            boolean cableConnected, boolean leaseActive, int eligibleCount,
+            DesktopDiscovery.Device currentDirect, DesktopDiscovery.Device gateway) {
+        return !cableConnected && !leaseActive && eligibleCount > 1
+            && currentDirect != null && !currentDirect.isHub
+            && gateway != null && gateway.isHub && gateway.ready
+            && !gateway.fingerprint.equalsIgnoreCase(currentDirect.fingerprint);
+    }
+
+    private DesktopDiscovery.Device findCachedDirectHub(Set<String> eligible) {
+        java.util.LinkedHashSet<String> ordered = new java.util.LinkedHashSet<>();
+        String preferred = DeskTouchRuntime.selectedIdentity();
+        if (preferred != null && eligible.contains(preferred)) ordered.add(preferred);
+        ordered.addAll(eligible);
+        for (String fp : ordered) {
+            String cachedIp = DeskTouchRuntime.getLastKnownPeerHost(fp);
+            DesktopDiscovery.Device direct = DesktopDiscovery.probeDirectHost(cachedIp, eligible);
+            if (shouldAcceptCachedDirectPeer(direct, eligible.size()))
+                return direct;
+        }
+        return null;
+    }
+
     private void autoConnect() {
         if(scanning) return;
         if(!enabled(this)) { logSkipReasonOnce("service-disabled"); return; }
@@ -518,6 +547,32 @@ public final class AutoConnectService extends Service {
                                 if(reconnectEnabled(this) && enabled(this))
                                     scheduleInteractiveFollowUp();
                             });
+                    } else if(eligible.size()>1) {
+                        long nowUp=android.os.SystemClock.uptimeMillis();
+                        if(nowUp-lastHubCheckAtMs>=HUB_RECHECK_INTERVAL_MS) {
+                            lastHubCheckAtMs=nowUp;
+                            String currentFp=DeskTouchRuntime.connectedNonCableFingerprint();
+                            String currentIp=currentFp==null ? null : DeskTouchRuntime.getLastKnownPeerHost(currentFp);
+                            DesktopDiscovery.Device currentDirect=DesktopDiscovery.probeDirectHost(currentIp,eligible);
+                            if(currentDirect!=null && !currentDirect.isHub) {
+                                java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
+                                    DesktopDiscovery.windowsGroups(DesktopDiscovery.scanFast(eligible));
+                                for(java.util.List<DesktopDiscovery.Device> members:groups.values()) {
+                                    DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
+                                        members,java.util.Collections.emptySet(),eligible);
+                                    if(shouldSwitchWirelessPeerToHub(false,false,eligible.size(),currentDirect,gateway)
+                                        && eligible.contains(gateway.fingerprint)
+                                        && !DeskTouchRuntime.isConnecting(gateway.fingerprint)) {
+                                        DeskTouchRuntime.switchToHubMakeBeforeBreak(
+                                            this,gateway,display.x,display.y,()->{
+                                                if(reconnectEnabled(this) && enabled(this))
+                                                    scheduleInteractiveFollowUp();
+                                            });
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 connectedNow=true;
@@ -534,32 +589,15 @@ public final class AutoConnectService extends Service {
                 connectedNow=true;
                 return;
             }
-            String preferred=DeskTouchRuntime.selectedIdentity();
-            if(preferred!=null && eligible.contains(preferred)) {
-                String cachedIp=DeskTouchRuntime.getLastKnownPeerHost(preferred);
-                DesktopDiscovery.Device direct=DesktopDiscovery.probeDirectHost(cachedIp,eligible);
-                if(direct!=null && !DeskTouchRuntime.isConnecting(direct.fingerprint)) {
-                    DeskTouchSession selected=DeskTouchRuntime.select(this,direct.fingerprint);
-                    selected.connect(direct,display.x,display.y,false,()->{
-                        if(reconnectEnabled(this) && enabled(this))
-                            scheduleInteractiveFollowUp();
-                    });
-                    connectedNow=true;
-                    return;
-                }
-            }
-            for(String fp:eligible) {
-                String cachedIp=DeskTouchRuntime.getLastKnownPeerHost(fp);
-                DesktopDiscovery.Device direct=DesktopDiscovery.probeDirectHost(cachedIp,eligible);
-                if(direct!=null && !DeskTouchRuntime.isConnecting(direct.fingerprint)) {
-                    DeskTouchSession selected=DeskTouchRuntime.select(this,direct.fingerprint);
-                    selected.connect(direct,display.x,display.y,false,()->{
-                        if(reconnectEnabled(this) && enabled(this))
-                            scheduleInteractiveFollowUp();
-                    });
-                    connectedNow=true;
-                    return;
-                }
+            DesktopDiscovery.Device cachedHub=findCachedDirectHub(eligible);
+            if(cachedHub!=null && !DeskTouchRuntime.isConnecting(cachedHub.fingerprint)) {
+                DeskTouchSession selected=DeskTouchRuntime.select(this,cachedHub.fingerprint);
+                selected.connect(cachedHub,display.x,display.y,false,()->{
+                    if(reconnectEnabled(this) && enabled(this))
+                        scheduleInteractiveFollowUp();
+                });
+                connectedNow=true;
+                return;
             }
             java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
                 DesktopDiscovery.windowsGroups(DesktopDiscovery.scanFast(eligible));

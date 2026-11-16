@@ -659,12 +659,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         var localDesc = _display.Local?.DescribeSummary("Windows") ?? $"{localScreens} display(s)";
         if (_host != null)
         {
-            int members=_host.EnvironmentMembers.Count;
-            int android=_host.EnvironmentMembers.Count(m=>m.Platform=="Android");
+            var localExtra = GetDistinctLocalReceiverPeersWhenHosted();
+            int members = _host.EnvironmentMembers.Count + localExtra.Length;
             var phoneMember = _host.EnvironmentMembers.FirstOrDefault(m => m.Platform == "Android");
             string phoneInfo = phoneMember != null
                 ? $"  +  {phoneMember.Name} ({MonitorTopology.FromWire(phoneMember.Layout).DescribeSummary("Android")})"
                 : "";
+            if (string.IsNullOrEmpty(phoneInfo))
+            {
+                var localPhone = localExtra.Select(p => p.Peer).FirstOrDefault(p => p.Platform == "Android");
+                if (localPhone != null)
+                    phoneInfo = $"  +  {localPhone.Name} ({localPhone.FormatScreenInfo()})";
+            }
             _summary.Text = $"{Environment.MachineName} ({localDesc})  +  " +
                             $"{_remoteAddress} ({_host.RemoteMonitors.DescribeSummary("Windows")})" +
                             $"{phoneInfo}  ·  {members} device(s)";
@@ -748,6 +754,29 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         dialog.ShowDialog(this);
     }
 
+    private (int Id, ConnectedPeer Peer)[] GetDistinctLocalReceiverPeersWhenHosted()
+    {
+        if (_host == null || _receiver == null)
+            return Array.Empty<(int Id, ConnectedPeer Peer)>();
+        var hostedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(_currentFingerprint))
+            hostedIds.Add(_currentFingerprint);
+        foreach (var member in _host.EnvironmentMembers)
+        {
+            if (!string.IsNullOrWhiteSpace(member.StableIdentity))
+                hostedIds.Add(member.StableIdentity);
+        }
+        return _receiver.ConnectedPeers
+            .Where(item =>
+            {
+                string layoutId = ReceiverServer.LayoutIdentity(item.Peer);
+                if (hostedIds.Contains(layoutId)) return false;
+                return string.IsNullOrWhiteSpace(item.Peer.DeviceFingerprint) ||
+                       !hostedIds.Contains(item.Peer.DeviceFingerprint);
+            })
+            .ToArray();
+    }
+
     private void RefreshDisplays()
     {
         try
@@ -779,6 +808,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                         member.Platform,memberTopology.Monitors.Count,
                         member.SupportsReverseInput,member.StableIdentity,
                         memberTopology,memberTopology.DescribeSummary(member.Platform)));
+                }
+                foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
+                {
+                    tiles.Add(new EnvironmentDisplayTile(id, peer.Name,
+                        peer.Platform, peer.Monitors.Monitors.Count,
+                        peer.SupportsReverseInput, peer.DeviceFingerprint,
+                        peer.Monitors, peer.FormatScreenInfo()));
                 }
             }
             else
@@ -846,8 +882,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             if (_targetChoice.SelectedIndex == -1 && _targetChoice.Items.Count > 0)
                 _targetChoice.SelectedIndex = 0;
             _targetChoice.Visible = false;
-            int online=_host!=null ? Math.Max(1,_host.EnvironmentMembers.Count) :
-                1+(_receiver?.ConnectedPeerCount??0);
+            int online=_host!=null
+                ? Math.Max(1,_host.EnvironmentMembers.Count) + GetDistinctLocalReceiverPeersWhenHosted().Length
+                : 1+(_receiver?.ConnectedPeerCount??0);
             _environmentHeader.Text=$"One environment  •  {online} devices";
         }
         finally { _updatingTargetChoice = false; }
@@ -895,6 +932,35 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         capture.ToggleMobileRequested+=JumpToMobileOrReturn;
     }
 
+    private int? FindReadyAndroidTargetInReceiver(out bool pausedFound)
+    {
+        var peers = _receiver?.ConnectedPeers ?? Array.Empty<(int Id, ConnectedPeer Peer)>();
+        pausedFound = peers.Any(p => p.Peer.Platform == "Android");
+        int current = _receiver?.SelectedPeerId ?? 0;
+        var currentAndroid = peers.FirstOrDefault(
+            p => p.Id == current && p.Peer.Platform == "Android" && p.Peer.SupportsReverseInput);
+        if (currentAndroid.Peer != null) return currentAndroid.Id;
+        var firstReady = peers.FirstOrDefault(
+            p => p.Peer.Platform == "Android" && p.Peer.SupportsReverseInput);
+        return firstReady.Peer != null ? firstReady.Id : null;
+    }
+
+    private int? FindReadyAndroidTargetInHost(out bool pausedFound)
+    {
+        if (_host == null)
+        {
+            pausedFound = false;
+            return null;
+        }
+        pausedFound = _host.EnvironmentMembers.Any(m => m.Platform == "Android");
+        int current = _host.SelectedEnvironmentTargetId;
+        var readyMember = _host.EnvironmentMembers.FirstOrDefault(
+            m => m.Id == current && m.Platform == "Android" && m.SupportsReverseInput)
+            ?? _host.EnvironmentMembers.FirstOrDefault(
+                m => m.Platform == "Android" && m.SupportsReverseInput);
+        return readyMember != null ? -readyMember.Id : null;
+    }
+
     private void JumpToMobileOrReturn()
     {
         if(IsDisposed || _closing.IsCancellationRequested)return;
@@ -903,48 +969,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _capture.ReturnLocal();
             return;
         }
-        int? androidTargetId=null;
-        if(_captureUsesInbound || _host==null)
-        {
-            var peers=_receiver?.ConnectedPeers ??
-                Array.Empty<(int Id,ConnectedPeer Peer)>();
-            int current=_receiver?.SelectedPeerId ?? 0;
-            var currentAndroid=peers.FirstOrDefault(
-                p=>p.Id==current && p.Peer.Platform=="Android" && p.Peer.SupportsReverseInput);
-            if(currentAndroid.Peer!=null)
-                androidTargetId=currentAndroid.Id;
-            else
-            {
-                var firstReady=peers.FirstOrDefault(
-                    p=>p.Peer.Platform=="Android" && p.Peer.SupportsReverseInput);
-                if(firstReady.Peer!=null)
-                    androidTargetId=firstReady.Id;
-                else if(peers.Any(p=>p.Peer.Platform=="Android"))
-                {
-                    Status("Android control is paused or off on the phone. Tap Resume in the phone app.");
-                    return;
-                }
-            }
-        }
-        else
-        {
-            int current=_host.SelectedEnvironmentTargetId;
-            var readyMember=_host.EnvironmentMembers.FirstOrDefault(
-                m=>m.Id==current && m.Platform=="Android" && m.SupportsReverseInput);
-            if(readyMember==null)
-                readyMember=_host.EnvironmentMembers.FirstOrDefault(
-                    m=>m.Platform=="Android" && m.SupportsReverseInput);
-            if(readyMember!=null)
-                androidTargetId=-readyMember.Id;
-            else if(_host.EnvironmentMembers.Any(m=>m.Platform=="Android"))
-            {
-                Status("Android control is paused or off on the phone. Tap Resume in the phone app.");
-                return;
-            }
-        }
+        bool pausedInbound = false;
+        bool pausedHost = false;
+        int? androidTargetId = (_captureUsesInbound || _host == null)
+            ? FindReadyAndroidTargetInReceiver(out pausedInbound) ?? FindReadyAndroidTargetInHost(out pausedHost)
+            : FindReadyAndroidTargetInHost(out pausedHost) ?? FindReadyAndroidTargetInReceiver(out pausedInbound);
         if(androidTargetId==null)
         {
-            Status("No Android phone connected yet. Open DeskTouch on your phone to connect.");
+            if(pausedInbound || pausedHost)
+                Status("Android control is paused or off on the phone. Tap Resume in the phone app.");
+            else
+                Status("No Android phone connected yet. Open DeskTouch on your phone to connect.");
             return;
         }
         var actualEdge=_display.EdgeToward(EnvironmentRouteOrder.Local,androidTargetId.Value,
@@ -1307,6 +1342,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     "on the phone to share mouse and keyboard.");
             }
             RefreshDisplays();
+            ResolveDualComputerLoopIfNeeded();
         });
     }
 
@@ -1461,12 +1497,83 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         catch (Exception ex) { Status("Unable to copy pairing code: " + ex.Message); }
     }
 
+    internal static bool ShouldBlockAutoConnectBecauseReceiverActive(
+        IReadOnlyCollection<ConnectedPeer> receiverPeers,
+        string? candidateFingerprint)
+    {
+        if (receiverPeers == null || receiverPeers.Count == 0)
+            return false;
+        foreach (var peer in receiverPeers)
+        {
+            if (string.Equals(peer.Platform, "Windows", StringComparison.Ordinal))
+                return true;
+            if (!string.IsNullOrWhiteSpace(candidateFingerprint) &&
+                !string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
+                string.Equals(peer.DeviceFingerprint, candidateFingerprint,
+                    StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    internal static bool ShouldYieldOutboundToBecomeHub(
+        string? localFingerprint,
+        string? remoteFingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(localFingerprint) ||
+            string.IsNullOrWhiteSpace(remoteFingerprint) ||
+            localFingerprint.Length != 64 || remoteFingerprint.Length != 64)
+            return false;
+        return string.Compare(localFingerprint, remoteFingerprint,
+            StringComparison.OrdinalIgnoreCase) > 0;
+    }
+
+    internal static Dictionary<string, PointF> MergeRemoteEnvironmentOffsets(
+        IReadOnlyDictionary<string, PointF> remotePositions,
+        IReadOnlyDictionary<string, PointF> localStoredOffsets,
+        IReadOnlyCollection<ConnectedPeer> localReceiverPeers)
+    {
+        var merged = new Dictionary<string, PointF>(remotePositions, StringComparer.Ordinal);
+        if (localStoredOffsets == null || localReceiverPeers == null || localReceiverPeers.Count == 0)
+            return merged;
+        foreach (var (key, point) in localStoredOffsets)
+        {
+            if (merged.ContainsKey(key)) continue;
+            if (localReceiverPeers.Any(peer => ReceiverServer.OwnsPlacement(peer, key)))
+                merged[key] = point;
+        }
+        return merged;
+    }
+
+    private bool _resolvingDualLoop;
+
+    private void ResolveDualComputerLoopIfNeeded()
+    {
+        if (_resolvingDualLoop || _host == null || _receiver == null || _currentFingerprint.Length != 64)
+            return;
+        bool samePeerInbound = _receiver.ConnectedPeers.Any(p =>
+            string.Equals(p.Peer.Platform, "Windows", StringComparison.Ordinal) &&
+            string.Equals(p.Peer.DeviceFingerprint, _currentFingerprint, StringComparison.OrdinalIgnoreCase));
+        if (!samePeerInbound || !ShouldYieldOutboundToBecomeHub(_receiver.Fingerprint, _currentFingerprint))
+            return;
+        _resolvingDualLoop = true;
+        try
+        {
+            string peerLabel = _remoteAddress;
+            DisconnectHost();
+            Status($"Kept one shared DeskTouch environment hub with {peerLabel}.");
+        }
+        finally { _resolvingDualLoop = false; }
+    }
+
     private async Task AddComputerAsync()
     {
         if (_connecting || _closing.IsCancellationRequested) return;
         // The Windows client joins ONE environment. Adding another machine
-        // must never silently drop the existing hub or keyboard lease.
-        if(_host != null || (_receiver?.ConnectedPeerCount ?? 0)>0)
+        // must never silently drop an active Windows hub or keyboard lease.
+        bool hasWindowsReceiverPeer = _receiver?.ConnectedPeers.Any(
+            p => string.Equals(p.Peer.Platform, "Windows", StringComparison.Ordinal)) == true;
+        if (_host != null || hasWindowsReceiverPeer)
         {
             var members=_host!=null ? _host.EnvironmentMembers
                 .Select(x=>x.Platform+" • "+x.Name).Distinct().ToArray()
@@ -1492,12 +1599,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try { choice = dialog.ShowDialog(this); }
         finally { _manualPairDialogOpen = false; }
         if (choice != DialogResult.OK || _connecting || _closing.IsCancellationRequested) return;
+        if (_receiver != null && _receiver.ConnectedDeviceFingerprints.Any(
+            fp => string.Equals(fp, dialog.Fingerprint, StringComparison.OrdinalIgnoreCase)))
+        {
+            Status("That computer is already connected in this shared environment.");
+            return;
+        }
         _connecting = true;
         // Never tear down Windows's incoming TLS listener when this PC also
         // initiates an outgoing connection. Other mobiles and PCs may connect
         // concurrently. The same authenticated hub arbitrates input authority.
         UpdateButtons();
-        Status("Connecting securely. The other computer may ask its user to approve...");
+        Status("Connecting securely to the shared DeskTouch environment...");
         try
         {
             void OnFailure(string reason)
@@ -1506,11 +1619,41 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 try { if (IsHandleCreated && !IsDisposed) BeginInvoke(DisconnectHost); }
                 catch (InvalidOperationException) { }
             }
-            var candidate = dialog.UseRemoteApproval
-                ? await HostSession.ConnectWithApprovalAsync(dialog.Address,
-                    dialog.Fingerprint, OnFailure, _closing.Token)
-                : await HostSession.ConnectAsync(dialog.Address, dialog.Fingerprint,
-                    dialog.Secret, OnFailure, _closing.Token);
+            HostSession candidate;
+            var savedTrust = dialog.UseRemoteApproval
+                ? _trusted?.FindAnyOutgoing(dialog.Fingerprint)
+                : null;
+            if (savedTrust != null)
+            {
+                try
+                {
+                    candidate = await HostSession.ConnectTrustedAsync(dialog.Address,
+                        dialog.Fingerprint, savedTrust.Token, OnFailure, _closing.Token);
+                    if (_trusted != null)
+                    {
+                        _trusted.SetAutoConnect(dialog.Fingerprint, true);
+                        _trusted.AutoConnectEnabled = true;
+                    }
+                }
+                catch (Exception ex) when (!_closing.IsCancellationRequested &&
+                    (ex is System.Security.Authentication.AuthenticationException ||
+                     ex.InnerException is System.Security.Authentication.AuthenticationException))
+                {
+                    Status("Saved trust was not recognized on that computer; requesting fresh approval...");
+                    candidate = await HostSession.ConnectWithApprovalAsync(dialog.Address,
+                        dialog.Fingerprint, OnFailure, _closing.Token);
+                }
+            }
+            else if (dialog.UseRemoteApproval)
+            {
+                candidate = await HostSession.ConnectWithApprovalAsync(dialog.Address,
+                    dialog.Fingerprint, OnFailure, _closing.Token);
+            }
+            else
+            {
+                candidate = await HostSession.ConnectAsync(dialog.Address,
+                    dialog.Fingerprint, dialog.Secret, OnFailure, _closing.Token);
+            }
             if (IsDisposed || _closing.IsCancellationRequested)
             {
                 candidate.Dispose();
@@ -1570,7 +1713,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;
         session.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
         if(session.SharedLayout.Count>0)
-            _display.RestoreMemberOffsets(session.SharedLayout);
+        {
+            var localPeers = _receiver?.ConnectedPeers.Select(p => p.Peer).ToArray()
+                ?? Array.Empty<ConnectedPeer>();
+            _display.RestoreMemberOffsets(MergeRemoteEnvironmentOffsets(
+                session.SharedLayout, _display.StoredMemberOffsets, localPeers));
+        }
         if (session.RemoteSystemName is { Length: > 0 } actual)
             _remoteAddress = DisplayArrangementControl.CleanDeviceName(actual,
                 _remoteAddress);
@@ -1579,6 +1727,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture.Arm();
         session.PublishSourcePlacement(_preferredEdge);
         UpdateButtons();
+        ResolveDualComputerLoopIfNeeded();
     }
 
     private async Task<bool> ConfirmTrustAsync(string name, CancellationToken cancellation)
@@ -1709,6 +1858,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trusted?.AutoConnectEnabled != true || _trusted.Outgoing.Count == 0 ||
             DateTime.UtcNow < _retryTrustedAfter || _receiver == null)
             return;
+        var initialReceiverPeers = _receiver.ConnectedPeers.Select(p => p.Peer).ToArray();
+        if (initialReceiverPeers.Any(p => string.Equals(p.Platform, "Windows", StringComparison.Ordinal)))
+            return;
         _scanningTrusted = true;
         try
         {
@@ -1726,11 +1878,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // real hub is discoverable but has not yet been approved.
             bool hubAvailable = peers.Any(p => p.IsHub && p.CanReceive);
             var found = remembered.FirstOrDefault(x =>
-                x.Saved != null && x.Peer.IsHub);
-            if(found == null && !hubAvailable)
-                found = remembered.FirstOrDefault(x => x.Saved != null);
+                x.Saved != null && x.Peer.IsHub && x.Peer.CanReceive);
+            if (found == null && !hubAvailable)
+                found = remembered.FirstOrDefault(x => x.Saved != null && x.Peer.CanReceive);
+            var latestReceiverPeers = _receiver?.ConnectedPeers.Select(p => p.Peer).ToArray()
+                ?? Array.Empty<ConnectedPeer>();
             if (found == null || _host != null ||
-                _connecting || !_trusted.AutoConnectEnabled)
+                _connecting || !_trusted.AutoConnectEnabled ||
+                ShouldBlockAutoConnectBecauseReceiverActive(latestReceiverPeers, found.Saved!.Fingerprint))
                 return;
             _connecting = true;
             // Outbound auto-connect must not make Windows disappear or mark
@@ -1808,6 +1963,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         // never create an independent PC-to-PC layout or another pairing.
         if(_host!=null)
         {
+            bool localOnlyPeer = _receiver?.ConnectedPeers.Any(
+                p => ReceiverServer.OwnsPlacement(p.Peer, key)) == true &&
+                !_host.EnvironmentMembers.Any(m =>
+                    string.Equals(m.StableIdentity, key, StringComparison.Ordinal) ||
+                    string.Equals("hub@" + m.StableIdentity, key, StringComparison.Ordinal) ||
+                    string.Equals(m.Platform + "|" + m.Name, key, StringComparison.Ordinal) ||
+                    string.Equals("hub@" + m.Platform + "|" + m.Name, key, StringComparison.Ordinal));
+            if (localOnlyPeer) return;
             if(!_host.PublishEnvironmentPlacement(key,point))
                 Status("Could not synchronize this device position to the environment hub.");
         }
@@ -1819,7 +1982,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         IReadOnlyDictionary<string,PointF> canonicalPositions) => PostToUi(() =>
     {
         if(canonicalPositions.Count==0)return;
-        _display.RestoreMemberOffsets(canonicalPositions);
+        var localPeers = _receiver?.ConnectedPeers.Select(p => p.Peer).ToArray()
+            ?? Array.Empty<ConnectedPeer>();
+        _display.RestoreMemberOffsets(MergeRemoteEnvironmentOffsets(
+            canonicalPositions, _display.StoredMemberOffsets, localPeers));
         SavePreferredEdge();
         // Applying a hub snapshot MUST NOT re-send it as a local drag.
         RefreshDisplays();
@@ -1914,6 +2080,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _display.Remote = null;
         if (_incomingPeer != null && !_closing.IsCancellationRequested)
             OnIncomingPeerConnected(_incomingPeer);
+        else
+            RefreshDisplays();
         UpdateButtons();
     }
 

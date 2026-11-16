@@ -1079,4 +1079,33 @@ public final class ProtocolSourceTest {
         assertTrue("Quiet radio gap must decay stale loss rather than freezing UI above 30%",
             wifiRecovery.getInboundLossPermille() < burstLoss * 0.6);
     }
+
+    @Test
+    public void cachedLeafDoesNotBypassHubAndWirelessMigratesToRealHub() {
+        String hubFp = "B".repeat(64);
+        String leafFp = "A".repeat(64);
+        assertEquals(hubFp, DesktopDiscovery.parseHubHintFingerprint("DT1-HUB|" + hubFp.toLowerCase()));
+        assertNull(DesktopDiscovery.parseHubHintFingerprint("DT1-READY|PC|" + hubFp));
+
+        DesktopDiscovery.Device leaf = new DesktopDiscovery.Device("DESKTOP", "192.168.1.10", leafFp, true, false);
+        leaf.isHub = false;
+        DesktopDiscovery.Device hub = new DesktopDiscovery.Device("SURAJ", "192.168.1.11", hubFp, true, false);
+        hub.isHub = true;
+
+        assertFalse("Cached leaf PC must not bypass multi-PC LAN hub scan",
+            AutoConnectService.shouldAcceptCachedDirectPeer(leaf, 2));
+        assertTrue("Single trusted PC remains directly reachable",
+            AutoConnectService.shouldAcceptCachedDirectPeer(leaf, 1));
+        assertTrue("True hub bypasses LAN broadcast via cached probe",
+            AutoConnectService.shouldAcceptCachedDirectPeer(hub, 2));
+
+        assertTrue("Idle wireless peer on leaf PC must migrate to real trusted hub",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 2, leaf, hub));
+        assertFalse("Data cable session must never migrate off cable to LAN hub",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(true, false, 2, leaf, hub));
+        assertFalse("Active input lease must never be interrupted mid-control",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(false, true, 2, leaf, hub));
+        assertFalse("Already connected to the hub must not re-migrate",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 2, hub, leaf));
+    }
 }

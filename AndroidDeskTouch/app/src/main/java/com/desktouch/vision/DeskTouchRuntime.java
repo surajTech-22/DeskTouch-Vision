@@ -12,7 +12,7 @@ import java.util.function.Consumer;
  */
 final class DeskTouchRuntime {
     private static final Map<String,DeskTouchSession> sessions=new ConcurrentHashMap<>();
-    private static final Map<String,DeskTouchSession> pendingCableUpgrades=new ConcurrentHashMap<>();
+    private static final Map<String,DeskTouchSession> pendingMakeBeforeBreak=new ConcurrentHashMap<>();
     private static final Map<String,String> lastKnownPeerHosts=new ConcurrentHashMap<>();
     private static volatile Consumer<String> listener;
     private static volatile Runnable liveStatusListener;
@@ -147,46 +147,80 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isBusyInLease())return true;
         return false;
     }
+    static synchronized String connectedNonCableFingerprint(){
+        String sel=selectedFingerprint;
+        if(sel!=null){
+            DeskTouchSession s=sessions.get(sel);
+            if(s!=null && s.isConnected() && !s.isCableSession())return s.connectedFingerprint();
+        }
+        for(DeskTouchSession s:sessions.values()){
+            if(s.isConnected() && !s.isCableSession())return s.connectedFingerprint();
+        }
+        return null;
+    }
     static boolean upgradeToCableMakeBeforeBreak(
             Context context, DesktopDiscovery.Device cableDevice,
             int width, int height, Runnable onFailure){
-        if(context==null || cableDevice==null || cableDevice.fingerprint==null)return false;
-        String id=cableDevice.fingerprint.toUpperCase(Locale.ROOT);
+        return connectMakeBeforeBreak(context,cableDevice,width,height,false,onFailure);
+    }
+    static boolean switchToHubMakeBeforeBreak(
+            Context context, DesktopDiscovery.Device hubDevice,
+            int width, int height, Runnable onFailure){
+        return connectMakeBeforeBreak(context,hubDevice,width,height,true,onFailure);
+    }
+    private static boolean connectMakeBeforeBreak(
+            Context context, DesktopDiscovery.Device targetDevice,
+            int width, int height, boolean migrateToHub, Runnable onFailure){
+        if(context==null || targetDevice==null || targetDevice.fingerprint==null)return false;
+        String id=targetDevice.fingerprint.toUpperCase(Locale.ROOT);
         DeskTouchSession candidate;
         synchronized(DeskTouchRuntime.class){
             if(anyInputLeaseActive())return false;
             DeskTouchSession current=sessions.get(id);
-            if(current!=null && current.isConnected() && current.isCableSession())return false;
-            DeskTouchSession pending=pendingCableUpgrades.get(id);
+            if(migrateToHub){
+                if(anyCableConnected())return false;
+                if(current!=null && current.isConnected())return false;
+            }else if(current!=null && current.isConnected() && current.isCableSession()){
+                return false;
+            }
+            DeskTouchSession pending=pendingMakeBeforeBreak.get(id);
             if(pending!=null && pending.isConnecting())return false;
             candidate=newSession(context,id);
-            pendingCableUpgrades.put(id,candidate);
+            pendingMakeBeforeBreak.put(id,candidate);
         }
-        candidate.connect(cableDevice,width,height,false,()->{
+        candidate.connect(targetDevice,width,height,false,()->{
+            boolean keptCandidate=true;
             synchronized(DeskTouchRuntime.class){
-                pendingCableUpgrades.remove(id,candidate);
-                DeskTouchSession previous=sessions.get(id);
-                if(previous!=null && previous!=candidate){
-                    if(previous.isBusyInLease()){
-                        // Lease became active mid-handshake; defer drop so active input is not torn mid-stroke.
-                        sessions.put(id,candidate);
-                        selectedFingerprint=id;
-                        previous.releaseControl();
-                        previous.close();
-                    }else{
-                        sessions.put(id,candidate);
-                        selectedFingerprint=id;
+                pendingMakeBeforeBreak.remove(id,candidate);
+                if(migrateToHub && (anyInputLeaseActive() || anyCableConnected())){
+                    keptCandidate=false;
+                }else{
+                    DeskTouchSession previous=sessions.put(id,candidate);
+                    selectedFingerprint=id;
+                    if(previous!=null && previous!=candidate){
+                        if(previous.isBusyInLease())previous.releaseControl();
                         previous.close();
                     }
-                }else{
-                    sessions.put(id,candidate);
-                    selectedFingerprint=id;
+                    if(migrateToHub){
+                        for(Map.Entry<String,DeskTouchSession> entry:sessions.entrySet()){
+                            if(id.equals(entry.getKey()))continue;
+                            DeskTouchSession other=entry.getValue();
+                            if(!other.isCableSession()){
+                                sessions.remove(entry.getKey(),other);
+                                other.close();
+                            }
+                        }
+                    }
                 }
+            }
+            if(!keptCandidate){
+                candidate.close();
+                return;
             }
             notifyLiveStatusChanged();
         },()->{
             synchronized(DeskTouchRuntime.class){
-                pendingCableUpgrades.remove(id,candidate);
+                pendingMakeBeforeBreak.remove(id,candidate);
             }
             candidate.close();
             if(onFailure!=null)onFailure.run();
@@ -316,8 +350,8 @@ final class DeskTouchRuntime {
         if(observer!=null)observer.accept(lastStatus);
     }
     static synchronized void clear(){
-        for(DeskTouchSession s:pendingCableUpgrades.values())s.close();
-        pendingCableUpgrades.clear();
+        for(DeskTouchSession s:pendingMakeBeforeBreak.values())s.close();
+        pendingMakeBeforeBreak.clear();
         for(DeskTouchSession s:sessions.values())s.close();
         sessions.clear();
         selectedFingerprint=null;androidController=null;listener=null;

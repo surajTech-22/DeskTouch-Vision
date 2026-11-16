@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.53 — Unified Single Multi-PC & Phone Environment
+
+Ensures two Windows computers and your phone always rejoin and remain in the same shared environment instead of creating split, duplicate, or re-prompted environments:
+
+- **No split or opposing PC-to-PC environments (`DisplaySettingsForm`, `NetworkSessions`):** Prevents trusted auto-reconnect from opening a conflicting outgoing session when a Windows computer is already connected in the local hub, deterministically collapses simultaneous mutual connections into one shared environment hub by certificate identity, evicts stale half-open reconnect sessions for the same trusted PC without dropping active routing, and lets manual `Add devices` reconnects reuse saved cryptographic trust silently without nagging for a fresh approval prompt.
+- **Keep locally connected phone & hub computers unified (`DisplaySettingsForm`, `TrustedDeviceStore`):** Preserves locally connected Android devices (including via data cable) inside the same `"One environment"` layout and shortcut navigation (`Ctrl+Alt+M`) alongside a joined Windows hub without hiding them or wiping their custom saved display placement on hub sync.
+- **Android automatic hub convergence (`DesktopDiscovery`, `DeskTouchRuntime`, `AutoConnectService`):** Fixes fast cached IP probes to wait briefly for `DT1-HUB` so a leaf computer never bypasses the true Windows environment hub, and automatically migrates an idle wireless phone onto the active trusted hub whenever both computers are online so all three devices share one environment cleanly.
+
+---
+
 # DeskTouch Vision v0.3.52 — Smooth Zero-Skip 144Hz Cursor Motion & Wireless Stability
 
 Eliminates cursor frame-skipping, beat-frequency judder, velocity drift, high-refresh throttling, and wireless metric/cursor fallbacks:

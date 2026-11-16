@@ -110,6 +110,12 @@ internal sealed class TrustedDeviceStore
             x.AutoConnect && x.Fingerprint.Equals(fingerprint, StringComparison.OrdinalIgnoreCase));
     }
 
+    internal TrustedOutgoing? FindAnyOutgoing(string fingerprint)
+    {
+        lock (_lock) return _data.Outgoing.FirstOrDefault(x =>
+            x.Fingerprint.Equals(fingerprint, StringComparison.OrdinalIgnoreCase));
+    }
+
     internal TrustedIncoming? AuthenticateIncoming(string? token)
     {
         if (token == null || token.Length != 64 || !token.All(Uri.IsHexDigit))

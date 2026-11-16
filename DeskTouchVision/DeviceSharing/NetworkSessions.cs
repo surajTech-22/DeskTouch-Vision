@@ -96,6 +96,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int LinkSpeedMbps;
         internal int NetworkEpoch;
         internal string? KeyboardInfoJson;
+        internal string? TrustedTokenHash;
         internal readonly IDisposable HighResTimer = Win.EnterHighResolutionTimer();
         internal int ActiveReverseLease;
         internal int Lease;
@@ -427,6 +428,35 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             IsSameDevicePeer(other.Peer, cableSession.Peer));
         if (backup == null) return false;
         return Select(backup);
+    }
+
+    private bool EvictStaleDuplicateTrustedWindowsSessions(Session incoming, bool isLoopbackRemote)
+    {
+        if (isLoopbackRemote ||
+            string.IsNullOrWhiteSpace(incoming.TrustedTokenHash) ||
+            incoming.Peer.Platform != "Windows" ||
+            string.IsNullOrWhiteSpace(incoming.Peer.DeviceFingerprint))
+            return false;
+
+        bool replacedSelected = false;
+        foreach (var existing in _sessions.Values)
+        {
+            if (existing.Id == incoming.Id ||
+                existing.Peer.Platform != "Windows" ||
+                !string.Equals(existing.TrustedTokenHash, incoming.TrustedTokenHash, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(existing.Peer.DeviceFingerprint, incoming.Peer.DeviceFingerprint, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            lock (_authorityGate)
+            {
+                if (ReferenceEquals(_selected, existing))
+                    replacedSelected = true;
+            }
+            _sessions.TryRemove(existing.Id, out _);
+            try { existing.Client.Close(); }
+            catch (Exception) { }
+        }
+        return replacedSelected;
     }
 
     internal bool HasReadyAndroidPeer =>
@@ -1376,13 +1406,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // The authenticated hello carries the current Windows computer name.
         // A saved trusted-device alias may be stale after the PC was renamed;
         // keep the actual announced system name in the display diagram.
-        bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
-            client.Client.RemoteEndPoint is IPEndPoint remoteEp &&
+        bool isLoopbackRemote = client.Client.RemoteEndPoint is IPEndPoint remoteEp &&
             IPAddress.IsLoopback(remoteEp.Address);
+        bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
+            isLoopbackRemote;
         var session=new Session{
             Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable,
             LinkBand=isCable ? "cable" : "wireless",
-            LastPongTicks=Stopwatch.GetTimestamp()
+            LastPongTicks=Stopwatch.GetTimestamp(),
+            TrustedTokenHash=trustedSource?.TokenSha256
         };
         session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
         session.MovePacer = isCable
@@ -1431,6 +1463,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             _udpHub?.RemovePeer(session.UdpPeer);
             throw new InvalidOperationException("Duplicate peer session ID");
         }
+        bool replacedSelectedStaleSession = EvictStaleDuplicateTrustedWindowsSessions(session, isLoopbackRemote);
         PeerListChanged?.Invoke();
         using var linked=CancellationTokenSource.CreateLinkedTokenSource(token);
         var sendTask=Task.Run(()=>ReverseSendLoopAsync(session,linked.Token));
@@ -1438,20 +1471,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             bool shouldSelect;
             lock(_authorityGate)
-                shouldSelect = _selected==null ||
-                    (isCable && !_selected.IsCableSession &&
-                     ((!string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
-                       string.Equals(_selected.Peer.DeviceFingerprint,peer.DeviceFingerprint,
-                           StringComparison.OrdinalIgnoreCase)) ||
-                      (string.Equals(_selected.Peer.Platform,peer.Platform,StringComparison.Ordinal) &&
-                       string.Equals(_selected.Peer.Name,peer.Name,StringComparison.OrdinalIgnoreCase)))) ||
+                shouldSelect = _selected==null || replacedSelectedStaleSession ||
+                    (isCable && !_selected.IsCableSession && IsSameDevicePeer(_selected.Peer, peer)) ||
                     (!isCable && _selected.IsCableSession &&
                      Volatile.Read(ref _selected.CableDetachedOrUnresponsive) != 0 &&
-                     ((!string.IsNullOrWhiteSpace(peer.DeviceFingerprint) &&
-                       string.Equals(_selected.Peer.DeviceFingerprint,peer.DeviceFingerprint,
-                           StringComparison.OrdinalIgnoreCase)) ||
-                      (string.Equals(_selected.Peer.Platform,peer.Platform,StringComparison.Ordinal) &&
-                       string.Equals(_selected.Peer.Name,peer.Name,StringComparison.OrdinalIgnoreCase))));
+                     IsSameDevicePeer(_selected.Peer, peer));
             if(shouldSelect) Select(session);
             string versionSuffix = string.IsNullOrWhiteSpace(peer.AppVersion)
                 ? "" : " [v" + peer.AppVersion + "]";

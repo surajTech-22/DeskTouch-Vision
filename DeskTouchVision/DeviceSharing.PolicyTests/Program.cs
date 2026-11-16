@@ -2363,7 +2363,58 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
     wifiLossGap.RecordInboundPacket(20, true, 4140, 4140);
     Check(preGapLoss > 50.0 && wifiLossGap.InboundLossPermille < preGapLoss * 0.6,
         "Wireless loss tracker must decay stale outage spikes after quiet recovery gaps");
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, and v0.3.52 zero-skip UHID & wireless fixes verified.");
+
+    // Verify v0.3.53: single unified environment coordination across 2+ computers & local cable Android.
+    {
+        var sampleTopology = new MonitorTopology(new[] { new MonitorRect("DISPLAY1", 0, 0, 1920, 1080, true) });
+        string fpHub = new string('F', 64);
+        string fpLeaf = new string('1', 64);
+        var winPeer = new ConnectedPeer("SURAJ", sampleTopology, true, fpHub, "Windows");
+        var androidPeer = new ConnectedPeer("Xiaomi", sampleTopology, true, null, "Android");
+
+        Check(DisplaySettingsForm.ShouldBlockAutoConnectBecauseReceiverActive(new[] { winPeer }, new string('2', 64)),
+            "Windows hub already serving another PC must not split environment via auto-connect");
+        Check(DisplaySettingsForm.ShouldBlockAutoConnectBecauseReceiverActive(new[] { androidPeer }, fpHub) == false,
+            "PC holding only local Android peer may still join its distinct trusted Windows hub");
+        var androidWithFp = new ConnectedPeer("Phone", sampleTopology, true, fpHub, "Android");
+        Check(DisplaySettingsForm.ShouldBlockAutoConnectBecauseReceiverActive(new[] { androidWithFp }, fpHub),
+            "Must never open a second reverse connection to an already-connected fingerprint");
+
+        Check(DisplaySettingsForm.ShouldYieldOutboundToBecomeHub(fpHub, fpLeaf) &&
+              !DisplaySettingsForm.ShouldYieldOutboundToBecomeHub(fpLeaf, fpHub) &&
+              !DisplaySettingsForm.ShouldYieldOutboundToBecomeHub("short", fpLeaf),
+            "Mutual simultaneous connect must deterministically resolve to one hub");
+
+        var localOffsets = new Dictionary<string, System.Drawing.PointF>(StringComparer.Ordinal)
+        {
+            ["hub@Android|Xiaomi"] = new(5200f, 30f),
+            ["hub@" + fpLeaf] = new(100f, 20f)
+        };
+        var remoteOffsets = new Dictionary<string, System.Drawing.PointF>(StringComparer.Ordinal)
+        {
+            ["hub@" + fpLeaf] = new(300f, 40f)
+        };
+        var merged = DisplaySettingsForm.MergeRemoteEnvironmentOffsets(
+            remoteOffsets, localOffsets, new[] { androidPeer });
+        Check(merged.ContainsKey("hub@Android|Xiaomi") && merged["hub@" + fpLeaf].X == 300f,
+            "Hub layout sync must preserve locally connected receiver placements while applying hub coordinates");
+
+        string trustStoreTmp = Path.Combine(Path.GetTempPath(), "desktouch-findany-" + Guid.NewGuid().ToString("N") + ".dpapi");
+        try
+        {
+            var store = new TrustedDeviceStore(trustStoreTmp);
+            string tok = TrustedDeviceStore.NewSecret();
+            store.TrustOutgoing("SURAJ", fpHub, tok);
+            store.SetAutoConnect(fpHub, false);
+            Check(store.FindAutoConnect(fpHub) == null && store.FindAnyOutgoing(fpHub)?.Token == tok,
+                "Manual Add devices must still reuse existing trust even when auto-connect is paused");
+            store.ForgetOutgoing(fpHub);
+            Check(store.FindAnyOutgoing(fpHub) == null,
+                "Forgetting trusted computer must remove outgoing token");
+        }
+        finally { try { File.Delete(trustStoreTmp); } catch { } }
+    }
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, and v0.3.53 unified multi-PC environment verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

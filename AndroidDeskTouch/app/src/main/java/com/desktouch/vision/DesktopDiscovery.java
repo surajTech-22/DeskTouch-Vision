@@ -105,28 +105,53 @@ final class DesktopDiscovery {
         return probeLoopbackCable(InetAddress.getLoopbackAddress(), 37378);
     }
 
+    static String parseHubHintFingerprint(String message) {
+        if(message==null || !message.startsWith("DT1-HUB|")) return null;
+        String id=message.substring("DT1-HUB|".length()).trim();
+        return id.matches("[A-Fa-f0-9]{64}") ? id.toUpperCase(Locale.ROOT) : null;
+    }
+
     static Device probeDirectHost(String host, Set<String> eligibleFingerprints) {
         if(host==null || host.isBlank() || "127.0.0.1".equals(host)) return null;
         try(DatagramSocket socket=new DatagramSocket()) {
-            socket.setSoTimeout(180);
+            socket.setSoTimeout(90);
             InetAddress dest=InetAddress.getByName(host);
             byte[] probe="DT1-DISCOVER".getBytes(StandardCharsets.US_ASCII);
             socket.send(new DatagramPacket(probe,probe.length,dest,37378));
             byte[] buf=new byte[512];
+            Device candidate=null;
+            String matchedHubFp=null;
             long deadline=System.nanoTime()+260_000_000L;
             while(System.nanoTime()<deadline) {
                 DatagramPacket pkt=new DatagramPacket(buf,buf.length);
                 try { socket.receive(pkt); }
                 catch(SocketTimeoutException e) { break; }
                 String msg=new String(pkt.getData(),0,pkt.getLength(),StandardCharsets.US_ASCII);
+                String hubFp=parseHubHintFingerprint(msg);
+                if(hubFp!=null) {
+                    matchedHubFp=hubFp;
+                    if(candidate!=null && hubFp.equals(candidate.fingerprint)) {
+                        candidate.isHub=true;
+                        return candidate;
+                    }
+                    continue;
+                }
                 Device d=parse(msg,pkt.getAddress().getHostAddress());
                 if(d==null) d=parseOnline(msg,pkt.getAddress().getHostAddress());
                 if(d!=null && !d.android && d.ready &&
                     (eligibleFingerprints==null || eligibleFingerprints.isEmpty()
                         || eligibleFingerprints.contains(d.fingerprint))) {
-                    return d;
+                    candidate=d;
+                    if(candidate.fingerprint.equals(matchedHubFp)) {
+                        candidate.isHub=true;
+                        return candidate;
+                    }
+                    // Wait briefly for the trailing DT1-HUB packet so a leaf PC
+                    // is never mistaken for the active environment hub.
+                    deadline=Math.min(deadline,System.nanoTime()+90_000_000L);
                 }
             }
+            return candidate;
         } catch(Exception ignored) {}
         return null;
     }
@@ -157,10 +182,9 @@ final class DesktopDiscovery {
             if(raw==null) continue;
             String message=raw.trim();
             if(message.isEmpty()) continue;
-            if(message.startsWith("DT1-HUB|")) {
-                String id=message.substring("DT1-HUB|".length());
-                if(id.matches("[A-Fa-f0-9]{64}"))
-                    hubFingerprint=id.toUpperCase(Locale.ROOT);
+            String hubFp=parseHubHintFingerprint(message);
+            if(hubFp!=null) {
+                hubFingerprint=hubFp;
                 continue;
             }
             if(primary==null) {
@@ -246,11 +270,9 @@ final class DesktopDiscovery {
                 String message=new String(result.getData(),0,result.getLength(),
                     StandardCharsets.US_ASCII);
                 String ip=result.getAddress().getHostAddress();
-                if(message.startsWith("DT1-HUB|")){
-                    String id=message.substring("DT1-HUB|".length());
-                    if(id.matches("[A-Fa-f0-9]{64}"))
-                        hubHints.add(new String[]{
-                            id.toUpperCase(Locale.ROOT),ip});
+                String hubId=parseHubHintFingerprint(message);
+                if(hubId!=null){
+                    hubHints.add(new String[]{hubId,ip});
                     continue;
                 }
                 if(message.startsWith("DT1-LINK|")){

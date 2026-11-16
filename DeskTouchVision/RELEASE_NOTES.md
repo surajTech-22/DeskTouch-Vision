@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.55 — Antivirus-Clean Updater Extraction & v0.3.54 Unified Shared Environment
+
+Includes everything from v0.3.54 plus clean package extraction during updates:
+
+- **Antivirus-friendly package extraction (`Update-DeskTouch`, `RECOVER_DESKTOUCH`):** Uses Windows' built-in signed `tar.exe` archiver to unpack verified release ZIP packages before integrity verification instead of PowerShell/in-process ZIP extraction that triggered false-positive behavior heuristics on Quick Heal after its Nov 16 signature update.
+
+---
+
 # DeskTouch Vision v0.3.54 — Two-Way Mutual Trust, Size-Based Multi-Hub Merge & Seamless Tray Operation
 
 Completes bidirectional trust, deterministic multi-hub merging by device count, universal 3-device shared environments across any transport, and reliable unattended tray operation:

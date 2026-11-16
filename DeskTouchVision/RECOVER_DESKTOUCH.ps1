@@ -5,10 +5,10 @@
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$release = 'v0.3.54'
+$release = 'v0.3.55'
 $baseUrl = "https://github.com/surajTech-22/DeskTouch-Vision/releases/download/$release"
 $archiveName = 'DeskTouchVision-win-x64.zip'
-$expectedAppVersion = '0.3.54.0'
+$expectedAppVersion = '0.3.55.0'
 $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision'
 $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -57,7 +57,14 @@ try {
   Write-Record 'Package checksum verified.'
 
   $unpack = Join-Path $work 'extracted'
-  Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+  New-Item -ItemType Directory -Force -Path $unpack | Out-Null
+  $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+  if (Test-Path -LiteralPath $tarExe -PathType Leaf) {
+    & $tarExe -xf $zip -C $unpack
+    if ($LASTEXITCODE -ne 0) { throw "Package archive extraction failed with exit code $LASTEXITCODE" }
+  } else {
+    Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+  }
   $app = Join-Path $unpack 'app\DeviceSharing\DeskTouch.DeviceShare.exe'
   $installer = Join-Path $unpack 'Install-DeskTouch.ps1'
   if (-not (Test-Path -LiteralPath $app -PathType Leaf) -or

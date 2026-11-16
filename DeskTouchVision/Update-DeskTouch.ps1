@@ -110,11 +110,13 @@ try {
   }
   $stage = Join-Path $env:TEMP ('DeskTouchVision-Extract-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $stage | Out-Null
-  try {
+  $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+  if (Test-Path -LiteralPath $tarExe -PathType Leaf) {
+    & $tarExe -xf $pkg -C $stage
+    if ($LASTEXITCODE -ne 0) { throw "Package archive extraction failed with exit code $LASTEXITCODE" }
+  } else {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::ExtractToDirectory($pkg, $stage)
-  } catch {
-    Expand-Archive -LiteralPath $pkg -DestinationPath $stage -Force
   }
   $payload = Join-Path $stage 'app'
   if (-not (Test-Path (Join-Path $payload 'DeskTouchVision.exe') -PathType Leaf)) {

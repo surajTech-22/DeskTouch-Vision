@@ -9,7 +9,7 @@ namespace DeskTouch.DeviceShare;
 /// <summary>Discovery-only information. The advertised fingerprint is never
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
-    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false);
+    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false, int MemberCount = 1);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
@@ -29,6 +29,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly Func<bool> _canAcceptConnections;
     private readonly Func<IEnumerable<string>> _connectedFingerprints;
     private readonly Func<bool> _isEnvironmentHub;
+    private readonly Func<int>? _getEnvironmentMemberCount;
     private UdpClient? _listener;
     private Task? _loop;
     private TcpListener? _loopbackListener;
@@ -37,7 +38,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
 
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
         Func<IEnumerable<string>>? connectedFingerprints = null,
-        Func<bool>? isEnvironmentHub = null)
+        Func<bool>? isEnvironmentHub = null,
+        Func<int>? getEnvironmentMemberCount = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A stable TLS fingerprint is required.");
@@ -45,6 +47,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         _canAcceptConnections = canAcceptConnections ?? (() => true);
         _connectedFingerprints = connectedFingerprints ?? (() => Array.Empty<string>());
         _isEnvironmentHub = isEnvironmentHub ?? (() => true);
+        _getEnvironmentMemberCount = getEnvironmentMemberCount;
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -92,11 +95,27 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         catch (ObjectDisposedException) { }
         var prefix = accepting ? ReadyPrefix : BusyPrefix;
         var messages = new List<string>(8) { prefix + name + "|" + _fingerprint };
-        // A member with an outgoing hub connection is a LEAF, even if
-        // it keeps its own incoming listener. Android should prefer a
-        // real environment hub instead of creating a split network.
-        if (_isEnvironmentHub())
+        int memberCount = 1;
+        if (_getEnvironmentMemberCount != null)
+        {
+            try { memberCount = Math.Max(0, _getEnvironmentMemberCount()); }
+            catch (ObjectDisposedException) { memberCount = 0; }
+        }
+        else if (!_isEnvironmentHub())
+        {
+            memberCount = 0;
+        }
+        else
+        {
+            memberCount = 2;
+        }
+        // Only an actual active environment (>=2 devices, not a leaf or idle PC)
+        // advertises DT1-HUB + DT1-HUBCOUNT so larger environments attract smaller ones.
+        if (memberCount >= 2)
+        {
             messages.Add("DT1-HUB|" + _fingerprint);
+            messages.Add($"DT1-HUBCOUNT|{_fingerprint}|{memberCount}");
+        }
 
         // Optional second datagram announces connected PC membership.
         // The original READY/BUSY packet is untouched for older apps.
@@ -263,7 +282,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     {
         bool fastMode = targetFingerprints is { Count: > 0 };
         var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
-        var advertisedHubs = new ConcurrentDictionary<string,string>(
+        var advertisedHubs = new ConcurrentDictionary<string, (string Address, int Count)>(
             StringComparer.OrdinalIgnoreCase);
         using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
@@ -300,7 +319,25 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 {
                     string id=response["DT1-HUB|".Length..];
                     if(id.Length==64 && id.All(Uri.IsHexDigit))
-                        advertisedHubs[id]=packet.RemoteEndPoint.Address.ToString();
+                    {
+                        string senderIp = packet.RemoteEndPoint.Address.ToString();
+                        advertisedHubs.AddOrUpdate(id,
+                            _ => (senderIp, 2),
+                            (_, prev) => (senderIp, Math.Max(2, prev.Count)));
+                    }
+                    continue;
+                }
+                if (response.StartsWith("DT1-HUBCOUNT|", StringComparison.Ordinal))
+                {
+                    string[] hc = response.Split('|');
+                    if (hc.Length == 3 && hc[1].Length == 64 && hc[1].All(Uri.IsHexDigit) &&
+                        int.TryParse(hc[2], out int count) && count >= 1 && count <= 32)
+                    {
+                        string senderIp = packet.RemoteEndPoint.Address.ToString();
+                        advertisedHubs.AddOrUpdate(hc[1],
+                            _ => (senderIp, count),
+                            (_, prev) => (senderIp, count));
+                    }
                     continue;
                 }
                 var peer = ParseReply(response, packet.RemoteEndPoint.Address);
@@ -320,9 +357,15 @@ internal sealed class NearbyComputerDiscovery : IDisposable
             catch (SocketException) { break; }
         }
         return DistinctDevices(found.Values.Select(p =>
-            p with { IsHub = !p.IsAndroid &&
-                advertisedHubs.TryGetValue(p.Fingerprint,out var claimedAddress) &&
-                string.Equals(claimedAddress,p.Address,StringComparison.OrdinalIgnoreCase) }));
+        {
+            if (!p.IsAndroid &&
+                advertisedHubs.TryGetValue(p.Fingerprint, out var claimed) &&
+                string.Equals(claimed.Address, p.Address, StringComparison.OrdinalIgnoreCase))
+            {
+                return p with { IsHub = claimed.Count >= 2, MemberCount = claimed.Count };
+            }
+            return p;
+        }));
     }
 
     public void Dispose()

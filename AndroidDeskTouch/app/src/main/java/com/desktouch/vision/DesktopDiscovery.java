@@ -12,6 +12,7 @@ final class DesktopDiscovery {
         final boolean ready,android,cable;
         String groupId;
         boolean isHub;
+        int hubMemberCount = 1;
         Device(String n,String a,String f,boolean ready,boolean android) {
             this(n,a,f,ready,android,false);
         }
@@ -90,11 +91,22 @@ final class DesktopDiscovery {
     }
     static Device chooseGateway(List<Device> group,Set<String> connected,
             Set<String> trusted){
-        // A peer with its own outgoing session is a member, not the hub.
-        // Rejoining a member as another gateway would split the environment.
-        for(Device d:group)if(d.isHub&&connected.contains(d.fingerprint))return d;
-        for(Device d:group)if(d.isHub&&d.ready&&trusted.contains(d.fingerprint))return d;
-        for(Device d:group)if(d.isHub&&d.ready)return d;
+        // Prefer the hub already holding the most devices in the shared environment.
+        Device best=null;
+        for(Device d:group){
+            if(!d.isHub)continue;
+            boolean dConn=connected.contains(d.fingerprint);
+            boolean dTrust=trusted.contains(d.fingerprint);
+            if(best==null){best=d;continue;}
+            if(d.hubMemberCount!=best.hubMemberCount){
+                if(d.hubMemberCount>best.hubMemberCount)best=d;
+                continue;
+            }
+            if(dConn!=connected.contains(best.fingerprint)){if(dConn)best=d;continue;}
+            if(d.ready!=best.ready){if(d.ready)best=d;continue;}
+            if(dTrust&&!trusted.contains(best.fingerprint))best=d;
+        }
+        if(best!=null)return best;
         // Older Windows releases do not announce roles; retain safe fallback.
         for(Device d:group)if(connected.contains(d.fingerprint))return d;
         for(Device d:group)if(d.ready&&trusted.contains(d.fingerprint))return d;
@@ -111,6 +123,17 @@ final class DesktopDiscovery {
         return id.matches("[A-Fa-f0-9]{64}") ? id.toUpperCase(Locale.ROOT) : null;
     }
 
+    static String[] parseHubCountHint(String message) {
+        if(message==null || !message.startsWith("DT1-HUBCOUNT|")) return null;
+        String[] parts=message.trim().split("\\|",-1);
+        if(parts.length!=3 || !parts[1].matches("[A-Fa-f0-9]{64}")) return null;
+        try {
+            int cnt=Integer.parseInt(parts[2]);
+            if(cnt<1 || cnt>32) return null;
+            return new String[]{parts[1].toUpperCase(Locale.ROOT), Integer.toString(cnt)};
+        } catch(NumberFormatException ignored) { return null; }
+    }
+
     static Device probeDirectHost(String host, Set<String> eligibleFingerprints) {
         if(host==null || host.isBlank() || "127.0.0.1".equals(host)) return null;
         try(DatagramSocket socket=new DatagramSocket()) {
@@ -121,6 +144,7 @@ final class DesktopDiscovery {
             byte[] buf=new byte[512];
             Device candidate=null;
             String matchedHubFp=null;
+            int matchedHubCount=1;
             long deadline=System.nanoTime()+260_000_000L;
             while(System.nanoTime()<deadline) {
                 DatagramPacket pkt=new DatagramPacket(buf,buf.length);
@@ -130,8 +154,20 @@ final class DesktopDiscovery {
                 String hubFp=parseHubHintFingerprint(msg);
                 if(hubFp!=null) {
                     matchedHubFp=hubFp;
+                    matchedHubCount=Math.max(matchedHubCount,2);
                     if(candidate!=null && hubFp.equals(candidate.fingerprint)) {
                         candidate.isHub=true;
+                        candidate.hubMemberCount=Math.max(candidate.hubMemberCount,matchedHubCount);
+                    }
+                    continue;
+                }
+                String[] hubCount=parseHubCountHint(msg);
+                if(hubCount!=null) {
+                    matchedHubFp=hubCount[0];
+                    matchedHubCount=Math.max(1,Integer.parseInt(hubCount[1]));
+                    if(candidate!=null && hubCount[0].equals(candidate.fingerprint)) {
+                        candidate.isHub=matchedHubCount>=2;
+                        candidate.hubMemberCount=matchedHubCount;
                         return candidate;
                     }
                     continue;
@@ -143,11 +179,10 @@ final class DesktopDiscovery {
                         || eligibleFingerprints.contains(d.fingerprint))) {
                     candidate=d;
                     if(candidate.fingerprint.equals(matchedHubFp)) {
-                        candidate.isHub=true;
-                        return candidate;
+                        candidate.isHub=matchedHubCount>=2;
+                        candidate.hubMemberCount=matchedHubCount;
                     }
-                    // Wait briefly for the trailing DT1-HUB packet so a leaf PC
-                    // is never mistaken for the active environment hub.
+                    // Wait briefly for the trailing DT1-HUB/DT1-HUBCOUNT burst.
                     deadline=Math.min(deadline,System.nanoTime()+90_000_000L);
                 }
             }
@@ -178,6 +213,7 @@ final class DesktopDiscovery {
         if(lines==null || lines.isEmpty()) return null;
         Device primary=null;
         String hubFingerprint=null;
+        int hubCountVal=1;
         for(String raw:lines) {
             if(raw==null) continue;
             String message=raw.trim();
@@ -185,6 +221,13 @@ final class DesktopDiscovery {
             String hubFp=parseHubHintFingerprint(message);
             if(hubFp!=null) {
                 hubFingerprint=hubFp;
+                hubCountVal=Math.max(hubCountVal,2);
+                continue;
+            }
+            String[] hc=parseHubCountHint(message);
+            if(hc!=null) {
+                hubFingerprint=hc[0];
+                hubCountVal=Math.max(1,Integer.parseInt(hc[1]));
                 continue;
             }
             if(primary==null) {
@@ -194,8 +237,10 @@ final class DesktopDiscovery {
                         parsed.fingerprint,parsed.ready,false,true);
             }
         }
-        if(primary!=null && primary.fingerprint.equals(hubFingerprint))
-            primary.isHub=true;
+        if(primary!=null && primary.fingerprint.equals(hubFingerprint)) {
+            primary.isHub=hubCountVal>=2;
+            primary.hubMemberCount=hubCountVal;
+        }
         return primary;
     }
 
@@ -272,7 +317,12 @@ final class DesktopDiscovery {
                 String ip=result.getAddress().getHostAddress();
                 String hubId=parseHubHintFingerprint(message);
                 if(hubId!=null){
-                    hubHints.add(new String[]{hubId,ip});
+                    hubHints.add(new String[]{hubId,ip,"2"});
+                    continue;
+                }
+                String[] hubCount=parseHubCountHint(message);
+                if(hubCount!=null){
+                    hubHints.add(new String[]{hubCount[0],ip,hubCount[1]});
                     continue;
                 }
                 if(message.startsWith("DT1-LINK|")){
@@ -315,8 +365,11 @@ final class DesktopDiscovery {
         for(Device device:found)if(!device.android)
             for(String[] hint:hubHints)
                 if(hint[0].equals(device.fingerprint)&&
-                    hint[1].equals(sourceIpByFingerprint.get(device.fingerprint)))
-                    device.isHub=true;
+                    hint[1].equals(sourceIpByFingerprint.get(device.fingerprint))) {
+                    int cnt=hint.length>=3 ? Integer.parseInt(hint[2]) : 2;
+                    if(cnt>=2) device.isHub=true;
+                    device.hubMemberCount=Math.max(device.hubMemberCount,cnt);
+                }
         found.sort(Comparator.comparing((Device d)->d.android)
             .thenComparing(d->d.groupId,String.CASE_INSENSITIVE_ORDER)
             .thenComparing(d->d.name,String.CASE_INSENSITIVE_ORDER));

@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.54 — Two-Way Mutual Trust, Size-Based Multi-Hub Merge & Seamless Tray Operation
+
+Completes bidirectional trust, deterministic multi-hub merging by device count, universal 3-device shared environments across any transport, and reliable unattended tray operation:
+
+- **Two-way mutual trust pairing & auto-upgrade (`NetworkSessions`, `TrustedDeviceStore`, `DisplaySettingsForm`):** Approving `Trust device` in either direction now exchanges cryptographically signed mutual proposals so both Windows computers save reciprocal reconnect keys simultaneously, and existing one-way trusted installations automatically upgrade to two-way trust over an authenticated trusted session.
+- **Multi-hub merging by device count (`NearbyComputerDiscovery`, `DisplaySettingsForm`, `PairComputerDialog`, `DesktopDiscovery`, `AutoConnectService`):** Discovery now advertises active environment member counts (`DT1-HUBCOUNT`) only when 2+ devices are online; standalone 1-device computers never override active hubs, smaller hubs automatically merge into larger-count hubs (with deterministic fingerprint tie-breaking when sizes match), and Android phones automatically migrate to the largest reachable trusted hub.
+- **Unified shared environment across any connection path (`NetworkSessions`, `DisplaySettingsForm`):** A computer joined to a hub bridges any locally connected phone (including via data cable) up into the hub roster (`sub-peers` / `sub-route`) while retaining zero-hop direct cable input locally, so all connected computers and phones always appear and operate together inside `"One environment"`.
+- **Unattended Windows startup, tray icon & headless tray control (`DisplayArrangementControl`, `DisplaySettingsForm`, `WindowsStartup`, `Install-DeskTouch`, `Update-DeskTouch`):** Computes display arrangement geometry eagerly without requiring `OnPaint` or an open window so cursor edge-crossing and keyboard handoff work immediately while minimized to the tray at startup; restores the tray icon cleanly across Explorer restarts (`TaskbarCreated`); starts trusted scanning within 450 ms and across unlock events; repairs legacy Startup links cleanly without error; and replaces slow archive extraction in `Update-DeskTouch.ps1` with native .NET extraction.
+
+---
+
 # DeskTouch Vision v0.3.53 — Unified Single Multi-PC & Phone Environment
 
 Ensures two Windows computers and your phone always rejoin and remain in the same shared environment instead of creating split, duplicate, or re-prompted environments:

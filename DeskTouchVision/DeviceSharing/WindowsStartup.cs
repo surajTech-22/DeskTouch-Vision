@@ -25,7 +25,7 @@ internal static class WindowsStartup
     internal static string Command(string fullPath) =>
         "\"" + Path.GetFullPath(fullPath).Replace("\"", "") + "\" --tray";
 
-    private static string ExpectedExecutable => Path.GetFullPath(Application.ExecutablePath);
+    internal static string ExpectedExecutable => Path.GetFullPath(Application.ExecutablePath);
 
     private static bool OwnsLegacyEntry(string? command) =>
         command != null &&
@@ -36,6 +36,23 @@ internal static class WindowsStartup
     {
         using var key = Registry.CurrentUser.OpenSubKey(LegacyRunKey, false);
         return OwnsLegacyEntry(key?.GetValue(LegacyValueName) as string);
+    }
+
+    internal static bool IsOwnedExecutableTarget(string? target)
+    {
+        if (string.IsNullOrWhiteSpace(target)) return false;
+        try
+        {
+            string full = Path.GetFullPath(target);
+            if (string.Equals(full, ExpectedExecutable, StringComparison.OrdinalIgnoreCase))
+                return true;
+            string shareDir = Path.GetDirectoryName(ExpectedExecutable) ?? "";
+            string appDir = Path.GetDirectoryName(shareDir) ?? "";
+            string launcher = string.IsNullOrEmpty(appDir) ? "" : Path.Combine(appDir, "DeskTouchVision.exe");
+            return !string.IsNullOrEmpty(launcher) &&
+                   string.Equals(full, Path.GetFullPath(launcher), StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 
     // A link in the current user's Startup Apps folder, not a registry autorun.
@@ -58,6 +75,20 @@ internal static class WindowsStartup
             }
             catch { return false; }
         }
+    }
+
+    internal static bool IsOwnedShortcutPresent()
+    {
+        if (!File.Exists(ShortcutPath)) return false;
+        try
+        {
+            dynamic shell = Activator.CreateInstance(
+                Type.GetTypeFromProgID("WScript.Shell")
+                    ?? throw new InvalidOperationException("Windows shortcut service unavailable."))!;
+            dynamic link = shell.CreateShortcut(ShortcutPath);
+            return IsOwnedExecutableTarget(link.TargetPath);
+        }
+        catch { return false; }
     }
 
     internal static void EnsureDefault()
@@ -94,7 +125,7 @@ internal static class WindowsStartup
             Directory.CreateDirectory(directory);
 
             // Do not overwrite a link owned by a different application.
-            if (File.Exists(ShortcutPath) && !Enabled)
+            if (File.Exists(ShortcutPath) && !IsOwnedShortcutPresent())
                 throw new IOException("Startup shortcut already exists but does not belong to DeskTouch.");
             dynamic shell = Activator.CreateInstance(
                 Type.GetTypeFromProgID("WScript.Shell")
@@ -106,7 +137,7 @@ internal static class WindowsStartup
             shortcut.Description = "DeskTouch Vision — authorized device sharing in the system tray";
             shortcut.Save();
         }
-        else if (Enabled)
+        else if (Enabled || IsOwnedShortcutPresent())
         {
             File.Delete(ShortcutPath);
         }

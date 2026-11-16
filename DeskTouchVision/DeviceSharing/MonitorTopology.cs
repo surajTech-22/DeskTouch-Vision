@@ -55,9 +55,23 @@ internal sealed class MonitorTopology
         Bounds = Rectangle.FromLTRB(minX, minY, (int)maxX, (int)maxY);
     }
 
+    internal static string? CurrentAppVersion()
+    {
+        var ver = typeof(MonitorTopology).Assembly.GetName().Version;
+        return ver == null ? null : $"{ver.Major}.{ver.Minor}.{ver.Build}";
+    }
+
     internal static MonitorTopology Capture() => new(
         Screen.AllScreens.Select(s => new MonitorRect(
             s.DeviceName, s.Bounds.X, s.Bounds.Y, s.Bounds.Width, s.Bounds.Height, s.Primary)));
+
+    internal MonitorTopology WithPrimaryAppVersion(string? appVersion)
+    {
+        if (string.IsNullOrWhiteSpace(appVersion)) return this;
+        var primary = Monitors.FirstOrDefault(m => m.Primary) ?? Monitors[0];
+        return new MonitorTopology(Monitors.Select(m =>
+            ReferenceEquals(m, primary) ? m with { AppVersion = appVersion } : m));
+    }
 
     internal string ToWire() => JsonSerializer.Serialize(Monitors);
 

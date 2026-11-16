@@ -52,6 +52,89 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
         Math.Abs(p.X)<=80000 && Math.Abs(p.Y)<=80000;
 }
 
+internal sealed record SubPeerDescriptor(int LocalId, string StableIdentity, string Name,
+    string Platform, string Layout, bool SupportsReverseInput, string? AppVersion = null);
+
+internal sealed record SubRouteEnvelope(int LocalId, Packet Payload);
+
+internal sealed record MutualTrustProposal(
+    string OutgoingToken,
+    string ReciprocalToken,
+    string PeerFingerprint,
+    string CertBase64,
+    string SignatureBase64);
+
+internal static class MutualTrustCodec
+{
+    internal static bool SupportsBidirectionalProtocol(string? appVersion) =>
+        Version.TryParse(appVersion, out var v) && v >= new Version(0, 3, 54);
+
+    internal static string SignProposal(X509Certificate2 ownIdentity,
+        string targetFingerprint, string outgoingToken, string reciprocalToken)
+    {
+        if (string.IsNullOrWhiteSpace(targetFingerprint) || targetFingerprint.Length != 64 ||
+            !targetFingerprint.All(Uri.IsHexDigit))
+            throw new ArgumentException("Valid 64-hex target fingerprint required.");
+        string ownFp = Convert.ToHexString(SHA256.HashData(ownIdentity.RawData)).ToUpperInvariant();
+        string targetUpper = targetFingerprint.ToUpperInvariant();
+        byte[] message = System.Text.Encoding.UTF8.GetBytes(
+            $"DT1-MUTUAL-TRUST|{ownFp}|{targetUpper}|{outgoingToken.ToUpperInvariant()}|{reciprocalToken.ToUpperInvariant()}");
+        using RSA? rsa = ownIdentity.GetRSAPrivateKey();
+        if (rsa == null)
+            throw new InvalidOperationException("Local TLS identity lacks RSA private key.");
+        byte[] sig = rsa.SignData(message, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        return JsonSerializer.Serialize(new MutualTrustProposal(
+            outgoingToken.ToUpperInvariant(),
+            reciprocalToken.ToUpperInvariant(),
+            ownFp,
+            Convert.ToBase64String(ownIdentity.RawData),
+            Convert.ToBase64String(sig)));
+    }
+
+    internal static bool TryVerifyProposal(string? json, string expectedTargetFingerprint,
+        out MutualTrustProposal? verified)
+    {
+        verified = null;
+        if (string.IsNullOrWhiteSpace(json) || json.Length > 7500 ||
+            string.IsNullOrWhiteSpace(expectedTargetFingerprint) ||
+            expectedTargetFingerprint.Length != 64 || !expectedTargetFingerprint.All(Uri.IsHexDigit))
+            return false;
+        MutualTrustProposal? proposal;
+        try { proposal = JsonSerializer.Deserialize<MutualTrustProposal>(json); }
+        catch { return false; }
+        if (proposal == null ||
+            proposal.OutgoingToken is not { Length: 64 } || !proposal.OutgoingToken.All(Uri.IsHexDigit) ||
+            proposal.ReciprocalToken is not { Length: 64 } || !proposal.ReciprocalToken.All(Uri.IsHexDigit) ||
+            proposal.PeerFingerprint is not { Length: 64 } || !proposal.PeerFingerprint.All(Uri.IsHexDigit) ||
+            string.IsNullOrWhiteSpace(proposal.CertBase64) ||
+            string.IsNullOrWhiteSpace(proposal.SignatureBase64))
+            return false;
+        try
+        {
+            byte[] certBytes = Convert.FromBase64String(proposal.CertBase64);
+            using var cert = new X509Certificate2(certBytes);
+            string certFp = Convert.ToHexString(SHA256.HashData(cert.RawData)).ToUpperInvariant();
+            if (!certFp.Equals(proposal.PeerFingerprint, StringComparison.OrdinalIgnoreCase))
+                return false;
+            using RSA? rsa = cert.GetRSAPublicKey();
+            if (rsa == null) return false;
+            byte[] message = System.Text.Encoding.UTF8.GetBytes(
+                $"DT1-MUTUAL-TRUST|{certFp}|{expectedTargetFingerprint.ToUpperInvariant()}|{proposal.OutgoingToken.ToUpperInvariant()}|{proposal.ReciprocalToken.ToUpperInvariant()}");
+            byte[] sig = Convert.FromBase64String(proposal.SignatureBase64);
+            if (!rsa.VerifyData(message, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1))
+                return false;
+            verified = proposal with
+            {
+                OutgoingToken = proposal.OutgoingToken.ToUpperInvariant(),
+                ReciprocalToken = proposal.ReciprocalToken.ToUpperInvariant(),
+                PeerFingerprint = certFp
+            };
+            return true;
+        }
+        catch { return false; }
+    }
+}
+
 /// <summary>
 /// A small authenticated LAN hub. Up to eight Windows PCs can remain connected
 /// through the same existing TLS protocol. Only one peer holds the input lease.
@@ -117,6 +200,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int PendingOfferedTrustId;
         internal string? PendingOfferedTrustToken;
         internal TaskCompletionSource<bool>? PendingTrustOffer;
+        internal string? PendingOfferedTrustResponse;
+        internal int BridgedClaimLease;
+        internal Func<Packet, Task>? BridgedReplyAsync;
 
         internal int NextReverseActionSeq()
         {
@@ -210,6 +296,135 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     // must arbitrate against routed peers targeting the same device.
     private readonly Dictionary<int,int> _hubClaims = new();
     private FastUdpHub? _udpHub;
+    private sealed class BridgedSubPeer
+    {
+        internal required int VirtualId;
+        internal required Session BridgeSession;
+        internal required SubPeerDescriptor Descriptor;
+        internal required MonitorTopology Topology;
+    }
+
+    private readonly object _bridgedLock = new();
+    private readonly Dictionary<int, List<SubPeerDescriptor>> _subPeersBySession = new();
+    private readonly Dictionary<int, BridgedSubPeer> _bridgedByVirtualId = new();
+    private readonly Dictionary<string, int> _virtualIdByStableIdentity = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, (int Lease, Session BridgeSession, int LocalSubId)> _virtualHubClaims = new();
+    private readonly Dictionary<int, (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)> _virtualRelayBySource = new();
+    private int _nextVirtualSubId = 10000;
+    private int _selectedVirtualSubId;
+    private (EnvironmentMember[] Members, int OwnId)? _upstreamRosterOverlay;
+
+    internal event Action<string, int>? HubYieldRequested;
+    internal IReadOnlyList<(int VirtualId, ConnectedPeer Peer, int BridgeSessionId)> BridgedPeers
+    {
+        get
+        {
+            lock (_bridgedLock)
+                return _bridgedByVirtualId.Values
+                    .OrderBy(b => b.VirtualId)
+                    .Select(b => (b.VirtualId, BuildBridgedPeer(b), b.BridgeSession.Id))
+                    .ToArray();
+        }
+    }
+
+    private static ConnectedPeer BuildBridgedPeer(BridgedSubPeer b)
+    {
+        var mon = b.Topology.Monitors.FirstOrDefault();
+        return new ConnectedPeer(
+            b.Descriptor.Name,
+            b.Topology,
+            b.Descriptor.SupportsReverseInput,
+            b.Descriptor.StableIdentity,
+            b.Descriptor.Platform,
+            true,
+            mon?.OsVersion,
+            b.Descriptor.AppVersion ?? mon?.AppVersion,
+            mon?.DensityDpi,
+            mon?.RefreshHz,
+            mon?.RotationDegrees);
+    }
+
+    internal IReadOnlyList<SubPeerDescriptor> GetSubPeersSnapshotForUpstream()
+    {
+        var result = new List<SubPeerDescriptor>();
+        foreach (var s in _sessions.Values.OrderBy(p => p.Id))
+        {
+            if (s.Peer.Platform != "Android") continue;
+            result.Add(new SubPeerDescriptor(
+                s.Id,
+                LayoutIdentity(s.Peer),
+                s.Peer.Name,
+                s.Peer.Platform,
+                s.Peer.Monitors.ToWire(),
+                s.Peer.SupportsReverseInput,
+                s.Peer.AppVersion));
+        }
+        return result;
+    }
+
+    internal void ReleaseAllBridgedClaims()
+    {
+        var toReset = new List<Session>();
+        foreach (var s in _sessions.Values)
+        {
+            int lease = Interlocked.Exchange(ref s.BridgedClaimLease, 0);
+            if (lease > 0)
+            {
+                s.BridgedReplyAsync = null;
+                Volatile.Write(ref s.ActiveReverseLease, 0);
+                s.MovePacer?.SetWarmActive(false);
+                s.MovePacer?.ClearPending();
+                toReset.Add(s);
+            }
+        }
+        foreach (var s in toReset)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("reverse-reset"), _cancel.Token); }
+                catch (Exception) { }
+            });
+        }
+    }
+
+    internal int ActiveEnvironmentDeviceCount
+    {
+        get
+        {
+            var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var s in _sessions.Values)
+            {
+                string key = !string.IsNullOrWhiteSpace(s.Peer.DeviceFingerprint)
+                    ? s.Peer.DeviceFingerprint
+                    : s.Peer.Platform + "|" + s.Peer.Name;
+                unique.Add(key);
+            }
+            lock (_bridgedLock)
+            {
+                foreach (var b in _bridgedByVirtualId.Values)
+                {
+                    if (!string.IsNullOrWhiteSpace(b.Descriptor.StableIdentity))
+                        unique.Add(b.Descriptor.StableIdentity);
+                }
+            }
+            return 1 + unique.Count;
+        }
+    }
+
+    internal void SetUpstreamRosterOverlay(EnvironmentMember[]? upstreamMembers, int? ownUpstreamId)
+    {
+        lock (_bridgedLock)
+        {
+            _upstreamRosterOverlay = upstreamMembers is { Length: > 0 }
+                ? (upstreamMembers.ToArray(), ownUpstreamId ?? 0)
+                : null;
+        }
+        _ = Task.Run(async () =>
+        {
+            try { await PublishEnvironmentAsync(_cancel.Token); }
+            catch (Exception) { }
+        });
+    }
     private Task? _serverTask;
     private int _nextClientId;
     private int _pendingAndActive;
@@ -234,11 +449,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         peer.Platform != "Android" || peer.SupportsForwardInput;
     internal IReadOnlyList<(int Id, ConnectedPeer Peer)> ConnectedPeers =>
         _sessions.Values.OrderBy(s => s.Id).Select(s => (s.Id, s.Peer)).ToArray();
-    internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? 0;
+    internal int SelectedPeerId => Volatile.Read(ref _selected)?.Id ?? Volatile.Read(ref _selectedVirtualSubId);
 
     internal static string LayoutIdentity(ConnectedPeer peer) =>
         string.IsNullOrWhiteSpace(peer.DeviceFingerprint) ?
             peer.Platform+"|"+peer.Name : peer.DeviceFingerprint;
+    internal bool OwnsAnyPlacement(string key) =>
+        _sessions.Values.Any(x => OwnsPlacement(x.Peer, key)) ||
+        BridgedPeers.Any(b => OwnsPlacement(b.Peer, key));
     internal static bool OwnsPlacement(ConnectedPeer peer,string key)=>
         key==LayoutIdentity(peer) || key=="hub@"+LayoutIdentity(peer);
 
@@ -283,7 +501,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var placement=new EnvironmentPosition(key,point.X,point.Y);
         if(!EnvironmentPosition.Valid(placement))return false;
         // Only a current, authenticated member can acquire a drag position.
-        if(!_sessions.Values.Any(x=>OwnsPlacement(x.Peer,key)))return false;
+        if(!OwnsAnyPlacement(key))return false;
         ApplyEnvironmentPosition(placement);
         return true;
     }
@@ -483,10 +701,252 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         target.SupportsReverseInput;
     internal bool SelectConnectedPeer(int id)
     {
-        if (!_sessions.TryGetValue(id, out var session)) return false;
-        // Selection is ONLY routing over the already authenticated TLS stream.
-        // It cannot grant authority and it never initiates another connection.
-        return Select(session);
+        if (_sessions.TryGetValue(id, out var session))
+        {
+            // Selection is ONLY routing over the already authenticated TLS stream.
+            // It cannot grant authority and it never initiates another connection.
+            return Select(session);
+        }
+        BridgedSubPeer? bridged;
+        lock (_bridgedLock)
+            _bridgedByVirtualId.TryGetValue(id, out bridged);
+        if (bridged == null) return false;
+        return SelectVirtualPeer(bridged);
+    }
+
+    private void SetSessionSubPeers(Session bridgeSession, string? json)
+    {
+        SubPeerDescriptor[] parsed;
+        if (string.IsNullOrWhiteSpace(json))
+            parsed = [];
+        else
+        {
+            if (json.Length > 7500) return;
+            try { parsed = JsonSerializer.Deserialize<SubPeerDescriptor[]>(json) ?? []; }
+            catch { return; }
+        }
+        if (parsed.Length > 4) return;
+        lock (_bridgedLock)
+        {
+            var oldVirtuals = _bridgedByVirtualId.Values
+                .Where(b => b.BridgeSession.Id == bridgeSession.Id)
+                .Select(b => b.VirtualId)
+                .ToList();
+            foreach (int vid in oldVirtuals)
+                _bridgedByVirtualId.Remove(vid);
+
+            var validList = new List<SubPeerDescriptor>();
+            foreach (var item in parsed)
+            {
+                if (item.LocalId <= 0 || string.IsNullOrWhiteSpace(item.Name) ||
+                    item.Name.Length > 60 || item.Name.Any(char.IsControl) ||
+                    string.IsNullOrWhiteSpace(item.StableIdentity) ||
+                    item.Platform is not ("Windows" or "Android"))
+                    continue;
+                MonitorTopology topo;
+                try { topo = MonitorTopology.FromWire(item.Layout); }
+                catch { continue; }
+                validList.Add(item);
+                if (!_virtualIdByStableIdentity.TryGetValue(item.StableIdentity, out int vid))
+                {
+                    vid = Interlocked.Increment(ref _nextVirtualSubId);
+                    _virtualIdByStableIdentity[item.StableIdentity] = vid;
+                }
+                _bridgedByVirtualId[vid] = new BridgedSubPeer
+                {
+                    VirtualId = vid,
+                    BridgeSession = bridgeSession,
+                    Descriptor = item,
+                    Topology = topo
+                };
+            }
+            _subPeersBySession[bridgeSession.Id] = validList;
+            int selectedVirt = Volatile.Read(ref _selectedVirtualSubId);
+            if (selectedVirt > 0 && !_bridgedByVirtualId.ContainsKey(selectedVirt))
+                Volatile.Write(ref _selectedVirtualSubId, 0);
+        }
+        lock (_authorityGate)
+        {
+            foreach (int key in _virtualHubClaims.Where(kv => kv.Value.BridgeSession.Id == bridgeSession.Id).Select(kv => kv.Key).ToArray())
+            {
+                bool stillPresent;
+                lock (_bridgedLock) stillPresent = _bridgedByVirtualId.ContainsKey(key);
+                if (!stillPresent) _virtualHubClaims.Remove(key);
+            }
+        }
+        PeerListChanged?.Invoke();
+    }
+
+    private void ClearSessionSubPeers(Session bridgeSession)
+    {
+        List<int> removedVirtuals = [];
+        lock (_bridgedLock)
+        {
+            _subPeersBySession.Remove(bridgeSession.Id);
+            foreach (var b in _bridgedByVirtualId.Values.Where(v => v.BridgeSession.Id == bridgeSession.Id).ToArray())
+            {
+                _bridgedByVirtualId.Remove(b.VirtualId);
+                removedVirtuals.Add(b.VirtualId);
+            }
+            int selectedVirt = Volatile.Read(ref _selectedVirtualSubId);
+            if (removedVirtuals.Contains(selectedVirt))
+                Volatile.Write(ref _selectedVirtualSubId, 0);
+        }
+        List<(Session Source, int Claim)> orphanedRelays = [];
+        lock (_authorityGate)
+        {
+            foreach (int vid in removedVirtuals)
+                _virtualHubClaims.Remove(vid);
+            foreach (var kv in _virtualRelayBySource.Where(kv => kv.Value.BridgeSession.Id == bridgeSession.Id).ToArray())
+            {
+                _virtualRelayBySource.Remove(kv.Key);
+                orphanedRelays.Add((kv.Value.Source, kv.Value.Claim));
+            }
+        }
+        foreach (var (source, claim) in orphanedRelays)
+        {
+            if (source.EnvironmentTargetId >= 10000)
+                source.EnvironmentTargetId = 0;
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(source, new Packet("local-active", claim), _cancel.Token); }
+                catch (Exception) { }
+            });
+        }
+    }
+
+    internal async Task DispatchBridgedCommandAsync(
+        int localSubId, Packet inner, Func<Packet, Task> replyAsync)
+    {
+        if (!_sessions.TryGetValue(localSubId, out var target))
+        {
+            if (inner.Type == "claim" && inner.A > 0)
+            {
+                try { await replyAsync(new Packet("reverse-busy", inner.A)); }
+                catch (Exception) { }
+            }
+            return;
+        }
+        if (inner.Type == "claim")
+        {
+            bool granted = false;
+            int dispatchSeq = 0;
+            lock (_authorityGate)
+            {
+                if (inner.A > 0 && !_hubClaims.ContainsKey(target.Id) &&
+                    !_relayByTarget.ContainsKey(target.Id) &&
+                    Volatile.Read(ref target.BridgedClaimLease) == 0 &&
+                    target.Peer.SupportsReverseInput)
+                {
+                    Volatile.Write(ref target.BridgedClaimLease, inner.A);
+                    target.BridgedReplyAsync = replyAsync;
+                    target.HubGrantedAcked = false;
+                    target.HubActiveAcked = false;
+                    Volatile.Write(ref target.PendingFirstCursorAck, 1);
+                    Volatile.Write(ref target.ActiveReverseLease, inner.A);
+                    target.MovePacer?.SetWarmActive(true);
+                    dispatchSeq = target.NextReverseClaimDispatchSeq();
+                    granted = true;
+                }
+            }
+            if (!granted)
+            {
+                try { await replyAsync(new Packet("reverse-busy", inner.A)); }
+                catch (Exception) { }
+                return;
+            }
+            var claimPacket = inner with { C = dispatchSeq };
+            if (!target.ReverseQueue.Writer.TryWrite(claimPacket))
+            {
+                Volatile.Write(ref target.BridgedClaimLease, 0);
+                target.BridgedReplyAsync = null;
+                Volatile.Write(ref target.ActiveReverseLease, 0);
+                target.MovePacer?.SetWarmActive(false);
+                try { await replyAsync(new Packet("reverse-busy", inner.A)); }
+                catch (Exception) { }
+            }
+            return;
+        }
+        if (inner.Type is "release" or "reset")
+        {
+            int cur = Volatile.Read(ref target.BridgedClaimLease);
+            if (inner.Type == "reset" || (inner.A > 0 && inner.A == cur))
+            {
+                Volatile.Write(ref target.BridgedClaimLease, 0);
+                target.BridgedReplyAsync = null;
+                Volatile.Write(ref target.ActiveReverseLease, 0);
+                Volatile.Write(ref target.PendingFirstCursorAck, 0);
+                target.MovePacer?.SetWarmActive(false);
+                target.MovePacer?.ClearPending();
+                target.ReverseQueue.Writer.TryWrite(inner);
+            }
+            return;
+        }
+        if (Volatile.Read(ref target.BridgedClaimLease) <= 0)
+            return;
+        if (inner.Type == "move")
+        {
+            if (target.MovePacer?.TryHandleMove(inner) == true)
+            {
+                if (!target.IsCableSession)
+                    Interlocked.Exchange(ref target.LatestReverseMove, null);
+                return;
+            }
+            QueueTcpReverseMove(target, inner, countAsFallback: !target.IsCableSession);
+            return;
+        }
+        if (inner.Type is "button" or "wheel")
+            SendFastControlAndAssignSeq(target, Volatile.Read(ref target.BridgedClaimLease), ref inner);
+        if (inner.Type is ("button" or "wheel" or "key" or "text"))
+            target.ReverseQueue.Writer.TryWrite(inner);
+    }
+
+    private async Task HandleSubReplyAsync(Session bridgeSession, string? json, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(json) || json.Length > 4096) return;
+        SubRouteEnvelope? env;
+        try { env = JsonSerializer.Deserialize<SubRouteEnvelope>(json); }
+        catch { return; }
+        if (env == null || env.LocalId <= 0) return;
+        BridgedSubPeer? bridged = null;
+        lock (_bridgedLock)
+        {
+            bridged = _bridgedByVirtualId.Values.FirstOrDefault(b =>
+                b.BridgeSession.Id == bridgeSession.Id && b.Descriptor.LocalId == env.LocalId);
+        }
+        if (bridged == null) return;
+        var inner = env.Payload;
+        Session? relaySource = null;
+        bool notifyHub = false;
+        lock (_authorityGate)
+        {
+            var relayKv = _virtualRelayBySource.FirstOrDefault(kv =>
+                kv.Value.VirtualTargetId == bridged.VirtualId &&
+                (kv.Value.Claim == inner.A || inner.Type == "reverse-local-active"));
+            if (relayKv.Value.Source != null)
+            {
+                relaySource = relayKv.Value.Source;
+                if (inner.Type is ("reverse-busy" or "reverse-local-active"))
+                    _virtualRelayBySource.Remove(relayKv.Key);
+            }
+            else if (_virtualHubClaims.TryGetValue(bridged.VirtualId, out var hubClaim) &&
+                (hubClaim.Lease == inner.A || inner.Type == "reverse-local-active"))
+            {
+                if (inner.Type is ("reverse-busy" or "reverse-local-active"))
+                    _virtualHubClaims.Remove(bridged.VirtualId);
+                notifyHub = true;
+            }
+        }
+        if (relaySource != null && inner.Type.StartsWith("reverse-", StringComparison.Ordinal))
+        {
+            string response = inner.Type["reverse-".Length..];
+            try { await SendToAsync(relaySource, new Packet(response, inner.A), token); }
+            catch (Exception) { }
+        }
+        else if (notifyHub)
+        {
+            ReverseControlMessage?.Invoke(inner);
+        }
     }
     // Only labels for LAN display grouping; individual peer trust remains
     // pinned to its own approved TLS certificate/fingerprint.
@@ -594,7 +1054,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     {
         Session? target = Volatile.Read(ref _selected) ?? _sessions.Values.FirstOrDefault();
         if (target == null) return false;
-        string token = TrustedDeviceStore.NewSecret();
+        string tokenForClient = TrustedDeviceStore.NewSecret();
+        string tokenForHub = TrustedDeviceStore.NewSecret();
+        bool isWindowsMutual = string.Equals(target.Peer.Platform, "Windows", StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(target.Peer.DeviceFingerprint) &&
+            MutualTrustCodec.SupportsBidirectionalProtocol(target.Peer.AppVersion);
         int offerId = Interlocked.Increment(ref target.PendingOfferedTrustId);
         if (offerId <= 0)
         {
@@ -606,12 +1070,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         lock (_authorityGate)
         {
             target.PendingTrustOffer?.TrySetResult(false);
-            target.PendingOfferedTrustToken = token;
+            target.PendingOfferedTrustToken = tokenForClient;
+            target.PendingOfferedTrustResponse = null;
             target.PendingTrustOffer = offerTcs;
         }
         try
         {
-            string payload = $"{Fingerprint}\n{token}";
+            string payload = isWindowsMutual
+                ? MutualTrustCodec.SignProposal(_certificate, target.Peer.DeviceFingerprint!, tokenForClient, tokenForHub)
+                : $"{Fingerprint}\n{tokenForClient}";
             await SendToAsync(target, new Packet("trust-offer", offerId, 0, 0, 0, payload), cancellation);
             using var cancelReg = cancellation.Register(() => offerTcs.TrySetCanceled(cancellation));
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
@@ -619,7 +1086,20 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             using var timeoutReg = timeout.Token.Register(() => offerTcs.TrySetResult(false));
             bool accepted = await offerTcs.Task;
             if (!accepted) return false;
-            trusted.AllowIncoming(target.Peer.Name, token, target.Peer.DeviceFingerprint);
+            trusted.AllowIncoming(target.Peer.Name, tokenForClient, target.Peer.DeviceFingerprint);
+            if (isWindowsMutual)
+            {
+                string? counterJson;
+                lock (_authorityGate)
+                    counterJson = target.PendingOfferedTrustResponse;
+                if (MutualTrustCodec.TryVerifyProposal(counterJson, Fingerprint, out var counter) && counter != null)
+                {
+                    trusted.TrustOutgoing(target.Peer.Name, counter.PeerFingerprint, counter.ReciprocalToken);
+                    trusted.AutoConnectEnabled = true;
+                    _status($"Two-way trusted device saved: {target.Peer.Name}");
+                    return true;
+                }
+            }
             _status($"Trusted incoming device saved: {target.Peer.Name}");
             return true;
         }
@@ -631,6 +1111,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     target.PendingTrustOffer = null;
                     target.PendingOfferedTrustToken = null;
+                    target.PendingOfferedTrustResponse = null;
                 }
             }
         }
@@ -640,8 +1121,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         Session session, int requestId, string? proposalText, CancellationToken token)
     {
         bool allowed = false;
+        MutualTrustProposal? mutual = null;
         if (_trusted != null && _requestTrustApproval != null &&
-            proposalText is { Length: 64 } proposal && proposal.All(Uri.IsHexDigit))
+            MutualTrustCodec.TryVerifyProposal(proposalText, Fingerprint, out var parsedMutual) &&
+            parsedMutual != null)
+        {
+            mutual = parsedMutual;
+        }
+        bool isLegacyToken = mutual == null &&
+            proposalText is { Length: 64 } legacy && legacy.All(Uri.IsHexDigit);
+
+        if (_trusted != null && _requestTrustApproval != null && (mutual != null || isLegacyToken))
         {
             if (Interlocked.CompareExchange(ref session.PendingTrustRequest, 1, 0) != 0)
             {
@@ -659,8 +1149,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 allowed = await _requestTrustApproval(session.Peer.Name, trustLimit.Token);
                 if (allowed)
                 {
-                    _trusted.AllowIncoming(session.Peer.Name, proposal, session.Peer.DeviceFingerprint);
-                    _status($"Trusted incoming device saved: {session.Peer.Name}");
+                    if (mutual != null)
+                    {
+                        _trusted.AllowIncoming(session.Peer.Name, mutual.OutgoingToken, mutual.PeerFingerprint);
+                        _trusted.TrustOutgoing(session.Peer.Name, mutual.PeerFingerprint, mutual.ReciprocalToken);
+                        _trusted.AutoConnectEnabled = true;
+                        _status($"Two-way trusted device saved: {session.Peer.Name}");
+                    }
+                    else
+                    {
+                        _trusted.AllowIncoming(session.Peer.Name, proposalText!, session.Peer.DeviceFingerprint);
+                        _status($"Trusted incoming device saved: {session.Peer.Name}");
+                    }
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1022,12 +1522,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // session IDs are ephemeral and may never authorize a new pairing.
         var members = new List<EnvironmentMember> {
             new(0, Environment.MachineName, "Windows",
-                MonitorTopology.Capture().ToWire(), true,Fingerprint)
+                MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
+                true, Fingerprint)
         };
         foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
                 LayoutIdentity(peer.Peer)));
+        var knownIdentities = new HashSet<string>(
+            members.Select(m => m.StableIdentity).OfType<string>().Where(s => !string.IsNullOrWhiteSpace(s)),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var bridged in BridgedPeers)
+        {
+            string identity = LayoutIdentity(bridged.Peer);
+            if (!knownIdentities.Add(identity)) continue;
+            members.Add(new(bridged.VirtualId, bridged.Peer.Name, bridged.Peer.Platform,
+                bridged.Peer.Monitors.ToWire(), bridged.Peer.SupportsReverseInput,
+                identity));
+        }
         // Migrate names written by v0.3.16's local-only UI into stable
         // authenticated certificate identities whenever one is available.
         lock(_layoutGate)
@@ -1049,10 +1561,43 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             _status("Environment roster too large; refusing to advertise incomplete routes.");
             return;
         }
+        (EnvironmentMember[] Members, int OwnId)? upstreamOverlay;
+        lock (_bridgedLock)
+            upstreamOverlay = _upstreamRosterOverlay;
         foreach (var recipient in _sessions.Values)
+        {
+            string sendPayload = payload;
+            if (recipient.Peer.Platform == "Android" && upstreamOverlay is { } overlay)
+            {
+                var combined = new List<EnvironmentMember>
+                {
+                    new(0, Environment.MachineName, "Windows",
+                        MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
+                        true, Fingerprint)
+                };
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Fingerprint };
+                foreach (var p in _sessions.Values.OrderBy(s => s.Id))
+                {
+                    string id = LayoutIdentity(p.Peer);
+                    if (seen.Add(id))
+                        combined.Add(new(p.Id, p.Peer.Name, p.Peer.Platform,
+                            p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id));
+                }
+                int extraId = 9900;
+                foreach (var up in overlay.Members)
+                {
+                    if (string.IsNullOrWhiteSpace(up.StableIdentity) || !seen.Add(up.StableIdentity))
+                        continue;
+                    combined.Add(up with { Id = ++extraId, SupportsReverseInput = false });
+                }
+                string candidate = JsonSerializer.Serialize(combined);
+                if (System.Text.Encoding.UTF8.GetByteCount(candidate) <= 7800)
+                    sendPayload = candidate;
+            }
             try { await SendToAsync(recipient,
-                new Packet("environment-roster", recipient.Id, Text: payload), token); }
+                new Packet("environment-roster", recipient.Id, Text: sendPayload), token); }
             catch (Exception) { /* peer may have disconnected */ }
+        }
         await PublishEnvironmentLayoutAsync(token);
     }
 
@@ -1063,20 +1608,58 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (next != null) PeerConnected?.Invoke(next.Peer);
     }
 
+    private bool SelectVirtualPeer(BridgedSubPeer bridged)
+    {
+        Session? previousDirect;
+        int prevVirtual;
+        lock (_authorityGate)
+        {
+            lock (_bridgedLock)
+            {
+                if (!_bridgedByVirtualId.ContainsKey(bridged.VirtualId)) return false;
+            }
+            previousDirect = _selected;
+            prevVirtual = _selectedVirtualSubId;
+            if (previousDirect == null && prevVirtual == bridged.VirtualId) return true;
+            _selected = null;
+            Volatile.Write(ref _selectedVirtualSubId, bridged.VirtualId);
+        }
+        if (previousDirect != null)
+        {
+            TrySendReverseTo(previousDirect.Id, new Packet("reset"));
+            PeerDisconnected?.Invoke();
+        }
+        else if (prevVirtual > 0)
+        {
+            TrySendVirtualReverse(prevVirtual, new Packet("reset"));
+            PeerDisconnected?.Invoke();
+        }
+        PeerConnected?.Invoke(BuildBridgedPeer(bridged));
+        return true;
+    }
+
     private bool Select(Session candidate)
     {
         Session? previous;
+        int prevVirtual;
         lock (_authorityGate)
         {
             if (!_sessions.ContainsKey(candidate.Id)) return false;
             previous = _selected;
+            prevVirtual = _selectedVirtualSubId;
             if (ReferenceEquals(previous, candidate)) return true;
             _selected = candidate;
+            Volatile.Write(ref _selectedVirtualSubId, 0);
         }
         // A target change must revoke the previous reverse input lease on
         // the PREVIOUS authenticated TLS stream, not on the newly selected PC
         // or phone. This prevents keyboard ownership lingering after switching.
         if (previous != null) TrySendReverseTo(previous.Id, new Packet("reset"));
+        else if (prevVirtual > 0)
+        {
+            TrySendVirtualReverse(prevVirtual, new Packet("reset"));
+            PeerDisconnected?.Invoke();
+        }
         NotifySelection(previous, candidate);
         return true;
     }
@@ -1105,10 +1688,58 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         _status("Physical keyboard/mouse reclaimed control from remote device.");
     }
 
-    internal void DisconnectPeer() => Volatile.Read(ref _selected)?.Client.Close();
-    internal MonitorTopology RemoteMonitors =>
-        Volatile.Read(ref _selected)?.Peer.Monitors ??
-        throw new InvalidOperationException("No authenticated peer layout.");
+    internal void DisconnectPeer()
+    {
+        Session? direct = Volatile.Read(ref _selected);
+        if (direct != null)
+        {
+            direct.Client.Close();
+            return;
+        }
+        int virtualId = Volatile.Read(ref _selectedVirtualSubId);
+        if (virtualId > 0)
+        {
+            lock (_bridgedLock)
+            {
+                if (_bridgedByVirtualId.TryGetValue(virtualId, out var bridged))
+                    bridged.BridgeSession.Client.Close();
+            }
+        }
+    }
+
+    internal bool DisconnectPeerByFingerprint(string? fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint)) return false;
+        bool closed = false;
+        foreach (var s in _sessions.Values)
+        {
+            if (string.Equals(s.Peer.DeviceFingerprint, fingerprint, StringComparison.OrdinalIgnoreCase))
+            {
+                try { s.Client.Close(); closed = true; }
+                catch { }
+            }
+        }
+        return closed;
+    }
+
+    internal MonitorTopology RemoteMonitors
+    {
+        get
+        {
+            Session? direct = Volatile.Read(ref _selected);
+            if (direct != null) return direct.Peer.Monitors;
+            int virtualId = Volatile.Read(ref _selectedVirtualSubId);
+            if (virtualId > 0)
+            {
+                lock (_bridgedLock)
+                {
+                    if (_bridgedByVirtualId.TryGetValue(virtualId, out var bridged))
+                        return bridged.Topology;
+                }
+            }
+            throw new InvalidOperationException("No authenticated peer layout.");
+        }
+    }
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySendReverse(packet);
 
@@ -1128,17 +1759,91 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             _server.TrySendReverseTo(_peerId, packet);
     }
 
+    private sealed class BoundVirtualSubPeerSession : IInputSession
+    {
+        private readonly ReceiverServer _server;
+        private readonly int _virtualId;
+        internal BoundVirtualSubPeerSession(ReceiverServer server, int virtualId)
+        {
+            _server = server; _virtualId = virtualId;
+        }
+        public MonitorTopology RemoteMonitors
+        {
+            get
+            {
+                lock (_server._bridgedLock)
+                {
+                    if (_server._bridgedByVirtualId.TryGetValue(_virtualId, out var bridged))
+                        return bridged.Topology;
+                }
+                throw new InvalidOperationException("Selected bridged peer disconnected.");
+            }
+        }
+        public bool TrySend(Packet packet) =>
+            _server.TrySendVirtualReverse(_virtualId, packet);
+    }
+
     internal IInputSession BindSelectedInput()
     {
-        Session selected = Volatile.Read(ref _selected) ??
-            throw new InvalidOperationException("No authenticated input target.");
-        return new BoundPeerInputSession(this, selected.Id);
+        Session? selected = Volatile.Read(ref _selected);
+        if (selected != null) return new BoundPeerInputSession(this, selected.Id);
+        int virtualId = Volatile.Read(ref _selectedVirtualSubId);
+        if (virtualId > 0)
+        {
+            lock (_bridgedLock)
+            {
+                if (_bridgedByVirtualId.ContainsKey(virtualId))
+                    return new BoundVirtualSubPeerSession(this, virtualId);
+            }
+        }
+        throw new InvalidOperationException("No authenticated input target.");
     }
 
     internal bool TrySendReverse(Packet packet)
     {
         Session? selected = Volatile.Read(ref _selected);
-        return selected != null && TrySendReverseTo(selected.Id, packet);
+        if (selected != null) return TrySendReverseTo(selected.Id, packet);
+        int virtualId = Volatile.Read(ref _selectedVirtualSubId);
+        return virtualId > 0 && TrySendVirtualReverse(virtualId, packet);
+    }
+
+    private bool TrySendVirtualReverse(int virtualId, Packet packet)
+    {
+        BridgedSubPeer? bridged;
+        lock (_bridgedLock)
+            _bridgedByVirtualId.TryGetValue(virtualId, out bridged);
+        if (bridged == null || !_sessions.ContainsKey(bridged.BridgeSession.Id))
+            return false;
+        if (packet.Type == "warm")
+        {
+            if (_udpHub != null && bridged.BridgeSession.UdpPeer is { HasEndpoint: true } udpPeer)
+                _udpHub.Send(udpPeer, FastUdpOp.Warm, 0, 0, 0);
+            return true;
+        }
+        lock (_authorityGate)
+        {
+            if (packet.Type == "claim")
+            {
+                if (packet.A <= 0 || _virtualHubClaims.ContainsKey(virtualId))
+                    return false;
+                if (_virtualRelayBySource.Values.Any(r => r.VirtualTargetId == virtualId))
+                    return false;
+                _virtualHubClaims[virtualId] = (packet.A, bridged.BridgeSession, bridged.Descriptor.LocalId);
+            }
+            else if (packet.Type is ("reset" or "release"))
+            {
+                if (_virtualHubClaims.TryGetValue(virtualId, out var active) &&
+                    (packet.Type == "reset" || packet.A == active.Lease))
+                    _virtualHubClaims.Remove(virtualId);
+            }
+            else if (!_virtualHubClaims.ContainsKey(virtualId))
+            {
+                return false;
+            }
+        }
+        string envelope = JsonSerializer.Serialize(new SubRouteEnvelope(bridged.Descriptor.LocalId, packet));
+        return bridged.BridgeSession.ReverseQueue.Writer.TryWrite(
+            new Packet("sub-route", bridged.VirtualId, Text: envelope));
     }
 
     private static bool QueueTcpReverseMove(Session selected, Packet packet,
@@ -1166,7 +1871,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         lock (_authorityGate)
         {
             if (!_sessions.ContainsKey(session.Id)) return;
-            if (_hubClaims.ContainsKey(session.Id))
+            if (_hubClaims.ContainsKey(session.Id) || Volatile.Read(ref session.BridgedClaimLease) > 0)
                 hubOwned = true;
             else if (_relayByTarget.TryGetValue(session.Id, out relay) && relay.Granted)
             {
@@ -1194,7 +1899,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (packet.Type=="claim")
             {
                 if (packet.A<=0 || _relayByTarget.ContainsKey(id) ||
-                    _hubClaims.ContainsKey(id))
+                    _hubClaims.ContainsKey(id) || Volatile.Read(ref selected.BridgedClaimLease) > 0)
                     return false;
                 _hubClaims[id]=packet.A;
                 selected.HubGrantedAcked = false;
@@ -1262,10 +1967,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             await foreach (var p in session.ReverseQueue.Reader.ReadAllAsync(token))
             {
+                if (p.Type == "sub-route")
+                {
+                    await SendToAsync(session, p, token);
+                    continue;
+                }
                 // Old target movements/buttons must never leak after a
                 // selection change. Its pending RELEASE/RESET must still be
                 // delivered on the ORIGINAL authenticated TLS stream.
-                bool stillSelected=ReferenceEquals(Volatile.Read(ref _selected),session);
+                bool stillSelected = ReferenceEquals(Volatile.Read(ref _selected), session) ||
+                    Volatile.Read(ref session.BridgedClaimLease) > 0;
                 if(!stillSelected)
                 {
                     session.MovePacer?.ClearPending();
@@ -1393,7 +2104,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             await Wire.WriteAsync(ssl,new Packet("denied"),token);
             return;
         }
-        var topology=MonitorTopology.Capture();
+        var topology=MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion());
         var bounds=topology.Bounds;
         await Wire.WriteAsync(ssl,new Packet("ready",bounds.Left,bounds.Top,
             bounds.Width,bounds.Height,topology.ToWire()),token);
@@ -1553,8 +2264,52 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     TaskCompletionSource<bool>? pendingOffer;
                     lock (_authorityGate)
+                    {
                         pendingOffer = session.PendingTrustOffer;
+                        if (p.Type == "trust-accepted" && !string.IsNullOrWhiteSpace(p.Text))
+                            session.PendingOfferedTrustResponse = p.Text;
+                    }
                     pendingOffer?.TrySetResult(p.Type == "trust-accepted");
+                    continue;
+                }
+                if (p.Type == "mutual-trust-sync")
+                {
+                    // Auto-upgrade 1-way trust ONLY over an already-authenticated
+                    // trusted-token connection ("auth-trusted") from a Windows peer.
+                    if (session.TrustedTokenHash != null &&
+                        _trusted != null &&
+                        session.Peer.Platform == "Windows" &&
+                        MutualTrustCodec.TryVerifyProposal(p.Text, Fingerprint, out var proposal) &&
+                        proposal != null)
+                    {
+                        _trusted.TrustOutgoing(session.Peer.Name, proposal.PeerFingerprint, proposal.ReciprocalToken);
+                        _trusted.AutoConnectEnabled = true;
+                        _status($"Two-way trusted device upgraded: {session.Peer.Name}");
+                        await SendToAsync(session, new Packet("mutual-trust-synced", Text: proposal.OutgoingToken), token);
+                    }
+                    continue;
+                }
+                if (p.Type == "hub-yield-invite")
+                {
+                    if (session.TrustedTokenHash != null &&
+                        _trusted?.AutoConnectEnabled == true &&
+                        !string.IsNullOrWhiteSpace(session.Peer.DeviceFingerprint) &&
+                        _trusted.FindAutoConnect(session.Peer.DeviceFingerprint) != null &&
+                        p.A >= ActiveEnvironmentDeviceCount)
+                    {
+                        HubYieldRequested?.Invoke(session.Peer.DeviceFingerprint, p.A);
+                    }
+                    continue;
+                }
+                if (p.Type == "sub-peers")
+                {
+                    SetSessionSubPeers(session, p.Text);
+                    await PublishEnvironmentAsync(token);
+                    continue;
+                }
+                if (p.Type == "sub-reply")
+                {
+                    await HandleSubReplyAsync(session, p.Text, token);
                     continue;
                 }
                 if(p.Type=="topology")
@@ -1699,8 +2454,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     try { placement=JsonSerializer.Deserialize<EnvironmentPosition>(p.Text); }
                     catch(JsonException){continue;}
                     if(!EnvironmentPosition.Valid(placement) ||
-                        !_sessions.Values.Any(other=>
-                            OwnsPlacement(other.Peer,placement!.Key)))continue;
+                        !OwnsAnyPlacement(placement!.Key))continue;
                     ApplyEnvironmentPosition(placement!);
                     continue;
                 }
@@ -1710,9 +2464,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     // only connection IDs issued on this authenticated link.
                     Session? target=p.A==0 ? null :
                         _sessions.TryGetValue(p.A,out var targetPeer)?targetPeer:null;
-                    bool valid=p.A==0 ||
-                        (target!=null && !ReferenceEquals(target,session) &&
-                         target.Peer.SupportsReverseInput);
+                    BridgedSubPeer? bridgedTarget = null;
+                    if (target == null && p.A >= 10000)
+                    {
+                        lock (_bridgedLock)
+                            _bridgedByVirtualId.TryGetValue(p.A, out bridgedTarget);
+                    }
+                    bool valid = p.A == 0 ||
+                        (target != null && !ReferenceEquals(target, session) &&
+                         target.Peer.SupportsReverseInput) ||
+                        (bridgedTarget != null && !ReferenceEquals(bridgedTarget.BridgeSession, session) &&
+                         bridgedTarget.Descriptor.SupportsReverseInput);
                     if(!valid)
                     {
                         await SendToAsync(session,new Packet("environment-unavailable",p.A),token);
@@ -1721,9 +2483,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     var previous=RemoveRelayFromSource(session.Id);
                     if(previous!=null)
                         await RevokeRelayAsync(previous,false,token);
+                    (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? prevVirtual = null;
                     bool localOwner=false;
                     lock(_authorityGate)
                     {
+                        if (_virtualRelayBySource.Remove(session.Id, out var vr))
+                            prevVirtual = vr;
                         if(ReferenceEquals(_owner,session))
                         {
                             _owner=null;session.Lease=0;session.AppliedLease=0;
@@ -1731,10 +2496,46 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         }
                         session.EnvironmentTargetId=p.A;
                     }
+                    if (prevVirtual is { } oldV)
+                    {
+                        string resetEnv = JsonSerializer.Serialize(new SubRouteEnvelope(oldV.LocalSubId, new Packet("reset")));
+                        oldV.BridgeSession.ReverseQueue.Writer.TryWrite(new Packet("sub-route", oldV.VirtualTargetId, Text: resetEnv));
+                    }
                     if(localOwner)lock(session.InputLock)session.Injector.ReleaseAll();
                     if(target?.UdpPeer is { Confirmed: true } targetUdp)
                         _udpHub?.Send(targetUdp, FastUdpOp.Warm, 0, 0, 0);
                     await SendToAsync(session,new Packet("environment-selected",p.A),token);
+                    continue;
+                }
+                if (p.Type == "claim" && session.EnvironmentTargetId >= 10000)
+                {
+                    BridgedSubPeer? bTarget = null;
+                    lock (_bridgedLock)
+                        _bridgedByVirtualId.TryGetValue(session.EnvironmentTargetId, out bTarget);
+                    bool queued = false;
+                    lock (_authorityGate)
+                    {
+                        if (bTarget != null && p.A > 0 &&
+                            AllowsForwardInput(session.Peer) &&
+                            bTarget.Descriptor.SupportsReverseInput &&
+                            !ReferenceEquals(bTarget.BridgeSession, session) &&
+                            !_relayBySource.ContainsKey(session.Id) &&
+                            !_relayByTarget.ContainsKey(session.Id) &&
+                            !_virtualRelayBySource.ContainsKey(session.Id) &&
+                            !_virtualRelayBySource.Values.Any(v => v.VirtualTargetId == bTarget.VirtualId) &&
+                            !_virtualHubClaims.ContainsKey(bTarget.VirtualId) &&
+                            !ReferenceEquals(_owner, session))
+                        {
+                            _virtualRelayBySource[session.Id] = (bTarget.VirtualId, p.A, session, bTarget.BridgeSession, bTarget.Descriptor.LocalId);
+                            string env = JsonSerializer.Serialize(new SubRouteEnvelope(bTarget.Descriptor.LocalId, p));
+                            queued = bTarget.BridgeSession.ReverseQueue.Writer.TryWrite(
+                                new Packet("sub-route", bTarget.VirtualId, Text: env));
+                            if (!queued)
+                                _virtualRelayBySource.Remove(session.Id);
+                        }
+                    }
+                    if (!queued)
+                        await SendToAsync(session, new Packet("busy", p.A), token);
                     continue;
                 }
                 if(p.Type=="claim" && session.EnvironmentTargetId!=0)
@@ -1837,11 +2638,27 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if(p.Type=="reset" || p.Type=="release")
                 {
+                    (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? activeVirtual = null;
                     RelayLease? activeRelay=null;
                     lock(_authorityGate)
-                        if(_relayBySource.TryGetValue(session.Id,out var candidate) &&
+                    {
+                        if (_virtualRelayBySource.TryGetValue(session.Id, out var vCandidate) &&
+                            (p.Type == "reset" || p.A == vCandidate.Claim))
+                        {
+                            _virtualRelayBySource.Remove(session.Id);
+                            activeVirtual = vCandidate;
+                        }
+                        else if(_relayBySource.TryGetValue(session.Id,out var candidate) &&
                             (p.Type=="reset" || p.A==candidate.Claim))
                             activeRelay=candidate;
+                    }
+                    if (activeVirtual is { } vRel)
+                    {
+                        string env = JsonSerializer.Serialize(new SubRouteEnvelope(vRel.LocalSubId, p));
+                        vRel.BridgeSession.ReverseQueue.Writer.TryWrite(
+                            new Packet("sub-route", vRel.VirtualTargetId, Text: env));
+                        continue;
+                    }
                     if(activeRelay!=null)
                     {
                         var removed=RemoveRelayFromSource(session.Id);
@@ -1890,9 +2707,25 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     BroadcastWarmToConfirmedTargets(session.Id);
                     continue;
                 }
+                (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;
                 RelayLease? forward=null;
                 lock(_authorityGate)
-                    _relayBySource.TryGetValue(session.Id,out forward);
+                {
+                    if (!_virtualRelayBySource.TryGetValue(session.Id, out var vFwd))
+                        _relayBySource.TryGetValue(session.Id,out forward);
+                    else
+                        virtualForward = vFwd;
+                }
+                if (virtualForward is { } vForward)
+                {
+                    if (p.Type is ("move" or "button" or "key" or "wheel" or "text"))
+                    {
+                        string env = JsonSerializer.Serialize(new SubRouteEnvelope(vForward.LocalSubId, p));
+                        vForward.BridgeSession.ReverseQueue.Writer.TryWrite(
+                            new Packet("sub-route", vForward.VirtualTargetId, Text: env));
+                    }
+                    continue;
+                }
                 if(forward!=null)
                 {
                     if(forward.Granted &&
@@ -1950,13 +2783,22 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         finally
         {
             linked.Cancel();
+            ClearSessionSubPeers(session);
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
             lock(_authorityGate)
             {
                 _hubClaims.Remove(id);
+                if (_virtualRelayBySource.Remove(id, out var closedVRelay))
+                {
+                    string env = JsonSerializer.Serialize(new SubRouteEnvelope(closedVRelay.LocalSubId, new Packet("reset")));
+                    closedVRelay.BridgeSession.ReverseQueue.Writer.TryWrite(
+                        new Packet("sub-route", closedVRelay.VirtualTargetId, Text: env));
+                }
                 Volatile.Write(ref session.ActiveReverseLease, 0);
                 Volatile.Write(ref session.PendingFirstCursorAck, 0);
+                Volatile.Write(ref session.BridgedClaimLease, 0);
+                session.BridgedReplyAsync = null;
             }
             session.MovePacer?.Dispose();
             session.HighResTimer.Dispose();
@@ -2084,6 +2926,42 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 notifySelected = true;
             }
+            else if (Volatile.Read(ref session.BridgedClaimLease) is int bridgedClaim && bridgedClaim > 0)
+            {
+                bool matchesBridged = bridgedClaim == claim;
+                if (stateType == "reverse-granted")
+                {
+                    if (!matchesBridged || session.HubGrantedAcked) return;
+                    session.HubGrantedAcked = true;
+                }
+                else if (stateType == "reverse-active")
+                {
+                    if (!matchesBridged || session.HubActiveAcked) return;
+                    session.HubActiveAcked = true;
+                    Volatile.Write(ref session.PendingFirstCursorAck, 0);
+                }
+                else if (matchesBridged || stateType == "reverse-local-active")
+                {
+                    Volatile.Write(ref session.BridgedClaimLease, 0);
+                    Volatile.Write(ref session.ActiveReverseLease, 0);
+                    Volatile.Write(ref session.PendingFirstCursorAck, 0);
+                    session.MovePacer?.SetWarmActive(false);
+                    session.MovePacer?.ClearPending();
+                }
+                else return;
+                if (session.BridgedReplyAsync is { } bridgedReply)
+                {
+                    var captureReply = bridgedReply;
+                    if (stateType is ("reverse-busy" or "reverse-local-active"))
+                        session.BridgedReplyAsync = null;
+                    _ = Task.Run(async () =>
+                    {
+                        try { await captureReply(new Packet(stateType, claim)); }
+                        catch (Exception) { }
+                    });
+                }
+                return;
+            }
         }
         if (forwardRelay && relay != null)
         {
@@ -2134,9 +3012,30 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
         if (msg.Op is not (FastUdpOp.Move or FastUdpOp.Warm)) return;
 
+        (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;
         RelayLease? forward = null;
         lock (_authorityGate)
-            _relayBySource.TryGetValue(session.Id, out forward);
+        {
+            if (_virtualRelayBySource.TryGetValue(session.Id, out var vFwd))
+                virtualForward = vFwd;
+            else
+                _relayBySource.TryGetValue(session.Id, out forward);
+        }
+        if (virtualForward is { } vForward)
+        {
+            if (msg.Op == FastUdpOp.Warm)
+            {
+                var bridgeUdp = vForward.BridgeSession.UdpPeer;
+                if (bridgeUdp is { HasEndpoint: true } && _udpHub != null)
+                    _udpHub.Send(bridgeUdp, FastUdpOp.Warm, 0, 0, 0);
+                return;
+            }
+            string env = JsonSerializer.Serialize(
+                new SubRouteEnvelope(vForward.LocalSubId, new Packet("move", msg.A, msg.B)));
+            vForward.BridgeSession.ReverseQueue.Writer.TryWrite(
+                new Packet("sub-route", vForward.VirtualTargetId, Text: env));
+            return;
+        }
         if (forward != null)
         {
             if (!forward.Granted) return;
@@ -2379,9 +3278,16 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal string? RemoteSystemName => Volatile.Read(ref _remoteSystemName);
     internal event Action<MonitorEdge>? RemotePlacementChanged;
     private MonitorTopology _remoteMonitors;
+    private readonly string _pinnedFingerprint;
+    private readonly bool _isTrustedConnection;
+    private string? _remoteAppVersion;
     private Packet? _latestMove;
     private int _moveSignaled;
     private TaskCompletionSource<bool>? _pendingTrust;
+    private TaskCompletionSource<string?>? _pendingMutualSync;
+    private int _mutualSyncStarted;
+    internal event Action<int, Packet, Func<Packet, Task>>? SubRoutePacketReceived;
+    internal Func<string, string, string, string, CancellationToken, Task<bool>>? MutualTrustOfferRequested;
     private LocalInputPriority? _reversePriority;
     private Func<bool>? _allowReverseClaim;
     private readonly object _reverseInputGate = new();
@@ -2606,9 +3512,13 @@ internal sealed class HostSession : IInputSession, IDisposable
     }
 
     private HostSession(TcpClient client, SslStream ssl, IPAddress serverAddress,
+        string pinnedFingerprint, bool trustedConnection,
         MonitorTopology monitors, Action<string> onFailure)
     {
         _client = client; _ssl = ssl; _serverAddress = serverAddress;
+        _pinnedFingerprint = pinnedFingerprint;
+        _isTrustedConnection = trustedConnection;
+        _remoteAppVersion = monitors.Monitors.FirstOrDefault()?.AppVersion;
         _remoteMonitors = monitors;
         _environmentHubMonitors = monitors; _onFailure = onFailure;
         _movePacer = new FastMovePacer(
@@ -2676,6 +3586,162 @@ internal sealed class HostSession : IInputSession, IDisposable
         finally { Interlocked.CompareExchange(ref _pendingTrust, null, pending); }
     }
 
+    internal bool SupportsBidirectionalProtocol =>
+        MutualTrustCodec.SupportsBidirectionalProtocol(_remoteAppVersion);
+
+    internal string RemotePinnedFingerprint => _pinnedFingerprint;
+
+    internal async Task<bool> RequestMutualTrustAsync(
+        TrustedDeviceStore trusted, string remoteName, CancellationToken cancellation,
+        string? identityPath = null)
+    {
+        if (Volatile.Read(ref _closed) != 0) return false;
+        if (!SupportsBidirectionalProtocol)
+        {
+            string? token = await RequestTrustAsync(cancellation);
+            if (token == null) return false;
+            trusted.TrustOutgoing(remoteName, _pinnedFingerprint, token);
+            return true;
+        }
+        string outgoingToken = TrustedDeviceStore.NewSecret();
+        string reciprocalToken = TrustedDeviceStore.NewSecret();
+        string payload;
+        using (var ownIdentity = PersistentReceiverIdentity.LoadOrCreate(identityPath))
+            payload = MutualTrustCodec.SignProposal(ownIdentity, _pinnedFingerprint, outgoingToken, reciprocalToken);
+        var pending = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref _pendingTrust, pending, null) != null)
+            throw new InvalidOperationException("A trust request is already pending.");
+        try
+        {
+            if (!TrySend(new Packet("trust-request", Text: payload))) return false;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(55));
+            if (!await pending.Task.WaitAsync(deadline.Token))
+                return false;
+            trusted.TrustOutgoing(remoteName, _pinnedFingerprint, outgoingToken);
+            trusted.AllowIncoming(remoteName, reciprocalToken, _pinnedFingerprint);
+            trusted.AutoConnectEnabled = true;
+            return true;
+        }
+        finally { Interlocked.CompareExchange(ref _pendingTrust, null, pending); }
+    }
+
+    internal async Task<bool> TryEnsureMutualTrustAsync(
+        TrustedDeviceStore trusted, string remoteName, CancellationToken cancellation,
+        string? identityPath = null)
+    {
+        if (Volatile.Read(ref _closed) != 0 || !_isTrustedConnection || !SupportsBidirectionalProtocol)
+            return false;
+        if (trusted.HasBidirectionalTrust(remoteName, _pinnedFingerprint))
+            return true;
+        if (Interlocked.CompareExchange(ref _mutualSyncStarted, 1, 0) != 0)
+            return false;
+        string existingOutgoing = trusted.FindAutoConnect(_pinnedFingerprint)?.Token ?? TrustedDeviceStore.NewSecret();
+        string reciprocalToken = TrustedDeviceStore.NewSecret();
+        var syncTcs = new TaskCompletionSource<string?>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _pendingMutualSync, syncTcs);
+        try
+        {
+            string payload;
+            using (var ownIdentity = PersistentReceiverIdentity.LoadOrCreate(identityPath))
+                payload = MutualTrustCodec.SignProposal(ownIdentity, _pinnedFingerprint, reciprocalToken, existingOutgoing);
+            if (!TrySend(new Packet("mutual-trust-sync", Text: payload)))
+                return false;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            deadline.CancelAfter(TimeSpan.FromSeconds(12));
+            string? ackToken = await syncTcs.Task.WaitAsync(deadline.Token);
+            if (!string.Equals(ackToken, reciprocalToken, StringComparison.OrdinalIgnoreCase))
+                return false;
+            trusted.AllowIncoming(remoteName, reciprocalToken, _pinnedFingerprint);
+            trusted.AutoConnectEnabled = true;
+            DiagnosticLog?.Invoke($"Two-way trusted pairing synchronized automatically with {remoteName}.");
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _pendingMutualSync, null, syncTcs);
+        }
+    }
+
+    internal bool PublishSubPeers(IReadOnlyList<SubPeerDescriptor> peers)
+    {
+        if (Volatile.Read(ref _closed) != 0) return false;
+        string payload = JsonSerializer.Serialize(peers);
+        if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7500) return false;
+        return TrySend(new Packet("sub-peers", peers.Count, Text: payload));
+    }
+
+    internal bool SendSubReply(int localId, Packet inner)
+    {
+        if (Volatile.Read(ref _closed) != 0) return false;
+        string payload = JsonSerializer.Serialize(new SubRouteEnvelope(localId, inner));
+        return TrySend(new Packet("sub-reply", localId, Text: payload));
+    }
+
+    internal bool SendHubYieldInvite(int localMemberCount) =>
+        Volatile.Read(ref _closed) == 0 &&
+        TrySend(new Packet("hub-yield-invite", localMemberCount));
+
+    private async Task HandleIncomingTrustOfferAsync(int offerId, string? payload)
+    {
+        bool accepted = false;
+        string? counterPayload = null;
+        try
+        {
+            if (MutualTrustCodec.TryVerifyProposal(payload, _pinnedFingerprint, out var proposal) &&
+                proposal != null &&
+                MutualTrustOfferRequested != null)
+            {
+                using var limit = CancellationTokenSource.CreateLinkedTokenSource(_cancel.Token);
+                limit.CancelAfter(TimeSpan.FromSeconds(45));
+                string displayName = _remoteSystemName ?? "Remote computer";
+                string tokenForRemoteToLocal = TrustedDeviceStore.NewSecret();
+                accepted = await MutualTrustOfferRequested(
+                    displayName,
+                    proposal.PeerFingerprint,
+                    proposal.OutgoingToken,
+                    tokenForRemoteToLocal,
+                    limit.Token);
+                if (accepted)
+                {
+                    using var ownIdentity = PersistentReceiverIdentity.LoadOrCreate();
+                    counterPayload = MutualTrustCodec.SignProposal(
+                        ownIdentity, _pinnedFingerprint, proposal.OutgoingToken, tokenForRemoteToLocal);
+                }
+            }
+            else if (MutualTrustOfferRequested != null &&
+                !string.IsNullOrWhiteSpace(payload) &&
+                payload.Contains('\n'))
+            {
+                // Backward-compatible legacy trust-offer fallback.
+                int nl = payload.IndexOf('\n');
+                string fp = payload[..nl].Trim();
+                string tok = payload[(nl + 1)..].Trim();
+                if (fp.Equals(_pinnedFingerprint, StringComparison.OrdinalIgnoreCase) &&
+                    tok.Length == 64 && tok.All(Uri.IsHexDigit) &&
+                    MutualTrustOfferRequested != null)
+                {
+                    using var limit = CancellationTokenSource.CreateLinkedTokenSource(_cancel.Token);
+                    limit.CancelAfter(TimeSpan.FromSeconds(45));
+                    string displayName = _remoteSystemName ?? "Remote computer";
+                    accepted = await MutualTrustOfferRequested(
+                        displayName, fp, tok, "", limit.Token);
+                }
+            }
+        }
+        catch (Exception)
+        {
+            accepted = false;
+        }
+        TrySend(new Packet(accepted ? "trust-accepted" : "trust-denied", offerId, Text: counterPayload));
+    }
+
     private static async Task<HostSession> ConnectCoreAsync(
         string ip, string pinnedFingerprint, string secret, bool askReceiver,
         Action<string> onFailure, CancellationToken cancellation,
@@ -2735,15 +3801,16 @@ internal sealed class HostSession : IInputSession, IDisposable
             // Send the SOURCE topology too so the receiver can display an
             // identical two-computer arrangement without initiating a second
             // TCP connection (which would race the existing receiver).
-            var mine = MonitorTopology.Capture();
+            var mine = MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion());
             using var identity = PersistentReceiverIdentity.LoadOrCreate();
             string sourceId = Convert.ToHexString(
                 SHA256.HashData(identity.RawData));
             var hello = JsonSerializer.Serialize(
-                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId, "Windows"));
+                new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId, "Windows",
+                    AppVersion: MonitorTopology.CurrentAppVersion()));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
-            return new HostSession(client, ssl, address, monitors, onFailure);
+            return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure);
         }
         catch (Exception ex)
         {
@@ -2931,6 +3998,24 @@ internal sealed class HostSession : IInputSession, IDisposable
                 }
                 else if (p.Type is "trust-granted" or "trust-denied")
                     Volatile.Read(ref _pendingTrust)?.TrySetResult(p.Type == "trust-granted");
+                else if (p.Type == "mutual-trust-synced")
+                    Volatile.Read(ref _pendingMutualSync)?.TrySetResult(p.Text);
+                else if (p.Type == "trust-offer")
+                    _ = HandleIncomingTrustOfferAsync(p.A, p.Text);
+                else if (p.Type == "sub-route" && p.Text is { Length: > 1 and <= 4096 })
+                {
+                    try
+                    {
+                        var env = JsonSerializer.Deserialize<SubRouteEnvelope>(p.Text);
+                        if (env != null && env.LocalId > 0)
+                            SubRoutePacketReceived?.Invoke(env.LocalId, env.Payload, reply =>
+                            {
+                                SendSubReply(env.LocalId, reply);
+                                return Task.CompletedTask;
+                            });
+                    }
+                    catch { }
+                }
                 else if (p.Type == "android-keyboard-unavailable")
                     InputDeliveryWarning?.Invoke(
                         "Android has no supported focused text field. Tap an editable field on the phone, then type. Check DeskTouch Accessibility if paused.");

@@ -152,6 +152,18 @@ internal sealed class TrustedDeviceStore
         }
     }
 
+    internal bool HasTrustedIncomingFingerprint(string? fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint)) return false;
+        lock (_lock)
+            return _data.Incoming.Any(x => string.Equals(x.Fingerprint, fingerprint, StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal bool HasBidirectionalTrust(string? name, string? fingerprint) =>
+        !string.IsNullOrWhiteSpace(fingerprint) &&
+        IsTrustedReceiver(fingerprint) &&
+        HasTrustedIncomingFingerprint(fingerprint);
+
     internal void AllowIncoming(string name, string token, string? fingerprint = null)
     {
         string hash = HashToken(token);

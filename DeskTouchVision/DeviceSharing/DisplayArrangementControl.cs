@@ -122,7 +122,18 @@ internal sealed class DisplayArrangementControl : Control
     private float _layoutScale=1f;
     private System.Drawing.Point _hubWorldOrigin;
     private readonly Dictionary<int,Rectangle> _worldMemberRects=new();
-    internal bool LocalIsEnvironmentHub { get; set; } = true;
+    private bool _localIsEnvironmentHub = true;
+    internal bool LocalIsEnvironmentHub
+    {
+        get => _localIsEnvironmentHub;
+        set
+        {
+            if (_localIsEnvironmentHub == value) return;
+            _localIsEnvironmentHub = value;
+            ComputeLayout(EffectiveCanvasSize());
+            Invalidate();
+        }
+    }
     internal static Rectangle ResolveMemberWorld(Rectangle defaultWorld,
         Rectangle hubBounds,PointF? canonical,PointF? legacy)
     {
@@ -151,6 +162,7 @@ internal sealed class DisplayArrangementControl : Control
                 float.IsFinite(pair.Value.X) && float.IsFinite(pair.Value.Y) &&
                 Math.Abs(pair.Value.X)<90000 && Math.Abs(pair.Value.Y)<90000)
                 _memberOffsets[pair.Key]=pair.Value;
+        ComputeLayout(EffectiveCanvasSize());
         Invalidate();
     }
     internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
@@ -187,6 +199,7 @@ internal sealed class DisplayArrangementControl : Control
     internal int? AdjacentTarget(int currentId,MonitorEdge direction,
         int baseTargetId,double fraction=0.5)
     {
+        EnsureLayoutComputed();
         // Only the ACTUAL shared screen edge can grant a transition. A screen
         // somewhere in a direction is not a neighbor. Resolve each physical
         // monitor edge (including uneven dual-monitor heights/tops) while
@@ -274,6 +287,7 @@ internal sealed class DisplayArrangementControl : Control
 
     internal MonitorEdge? EdgeToward(int fromId, int toId, int baseTargetId)
     {
+        EnsureLayoutComputed();
         RectangleF? FindBounds(int id)
         {
             if (id == EnvironmentRouteOrder.Local) return _localHit;
@@ -363,6 +377,7 @@ internal sealed class DisplayArrangementControl : Control
 
     internal IReadOnlyList<int> ArrangedTargetOrder(int baseTargetId)
     {
+        EnsureLayoutComputed();
         // A physical screen is at most one input destination; all its native
         // monitors remain inside the same peer and aren't separate pairings.
         var arranged=new List<(int Id,float Center)> {
@@ -383,6 +398,7 @@ internal sealed class DisplayArrangementControl : Control
         get => _environmentDevices;
         set {
             _environmentDevices=value?.ToArray() ?? Array.Empty<EnvironmentDisplayTile>();
+            ComputeLayout(EffectiveCanvasSize());
             Invalidate();
         }
     }
@@ -407,17 +423,35 @@ internal sealed class DisplayArrangementControl : Control
     internal MonitorTopology? Local
     {
         get => _local;
-        set { _local = value; Invalidate(); }
+        set { _local = value; ComputeLayout(EffectiveCanvasSize()); Invalidate(); }
     }
     internal MonitorTopology? Remote
     {
         get => _remote;
-        set { _remote = value; Invalidate(); }
+        set { _remote = value; ComputeLayout(EffectiveCanvasSize()); Invalidate(); }
     }
     internal MonitorEdge RemoteEdge
     {
         get => _remoteEdge;
-        set { _remoteEdge = value; Invalidate(); }
+        set { _remoteEdge = value; ComputeLayout(EffectiveCanvasSize()); Invalidate(); }
+    }
+
+    private Size EffectiveCanvasSize() =>
+        ClientSize.Width >= 120 && ClientSize.Height >= 90
+            ? ClientSize
+            : new Size(904, 240);
+
+    internal void EnsureLayoutComputed()
+    {
+        if (_local != null && _localHit.Width <= 0)
+            ComputeLayout(EffectiveCanvasSize());
+    }
+
+    protected override void OnSizeChanged(EventArgs e)
+    {
+        base.OnSizeChanged(e);
+        if (_local != null)
+            ComputeLayout(EffectiveCanvasSize());
     }
 
     internal DisplayArrangementControl()
@@ -591,13 +625,16 @@ internal sealed class DisplayArrangementControl : Control
         return false;
     }
 
-    protected override void OnPaint(PaintEventArgs e)
+    private sealed record ComputedDiagramLayout(
+        Rectangle Full,
+        float Scale,
+        float OffsetX,
+        float OffsetY,
+        Rectangle RemotePos,
+        (EnvironmentDisplayTile Device, Rectangle World)[] Extras);
+
+    private ComputedDiagramLayout? ComputeLayout(Size canvasSize)
     {
-        base.OnPaint(e);
-        var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-        g.Clear(BackColor);
         _remoteHit = RectangleF.Empty;
         _remoteBaseHit = RectangleF.Empty;
         _localHit = RectangleF.Empty;
@@ -608,11 +645,10 @@ internal sealed class DisplayArrangementControl : Control
         _worldMemberRects.Clear();
 
         if (_local == null)
-        {
-            DrawCenter(g, "Windows display information is unavailable", ClientRectangle,
-                Brushes.Gainsboro, 12f);
-            return;
-        }
+            return null;
+
+        int viewWidth = Math.Max(120, canvasSize.Width);
+        int viewHeight = Math.Max(90, canvasSize.Height);
 
         var l = _local.Bounds;
         var r = _remote?.Bounds;
@@ -625,11 +661,9 @@ internal sealed class DisplayArrangementControl : Control
         // Their preview rectangles are visual placements only: Android is
         // never registered as a native Windows monitor or virtual driver.
         var core = Rectangle.Union(l, remotePos);
-        // Both Windows hosts use the SAME physical SURAJ hub screen origin.
-        // Local/remote Windows screen preview origins can otherwise differ
-        // even when every peer has received the identical drag offset.
-        var hubBounds=LocalIsEnvironmentHub ? l : remotePos;
-        _hubWorldOrigin=hubBounds.Location;
+        // Both Windows hosts use the SAME physical hub screen origin.
+        var hubBounds = LocalIsEnvironmentHub ? l : remotePos;
+        _hubWorldOrigin = hubBounds.Location;
         var placedWorld = new List<Rectangle>(_local.Monitors.Select(m => m.Bounds));
         if (_remote is { } remoteTopology && r is { } remoteRawBounds)
         {
@@ -657,8 +691,6 @@ internal sealed class DisplayArrangementControl : Control
                 extra.Device.LayoutKey, out var old) ? old : null;
             var moved = ResolveMemberWorld(extra.World, hubBounds,
                 canonical, legacy);
-            // Auto-heal stale/detached saved offsets (e.g., from older snap gaps or
-            // after moving the linked Windows PC) so tiles never float unreachable.
             if ((canonical != null || legacy != null) &&
                 !IsAttachedWithoutOverlap(moved, placedWorld))
             {
@@ -671,28 +703,21 @@ internal sealed class DisplayArrangementControl : Control
         }
         var extras = extrasList.ToArray();
         var full = core;
-        foreach(var additional in extras)
-            full = Rectangle.Union(full,additional.World);
+        foreach (var additional in extras)
+            full = Rectangle.Union(full, additional.World);
 
         const float pad = 36;
-        float scale = Math.Min(Math.Max(70, Width - pad * 2) / Math.Max(1, full.Width),
-            Math.Max(60, Height - pad * 2) / Math.Max(1, full.Height));
-        scale = Math.Max(.001f,scale);
-        _layoutScale=scale;
-        float offsetX = (Width - full.Width * scale) / 2f;
-        float offsetY = (Height - full.Height * scale) / 2f;
+        float scale = Math.Min(Math.Max(70, viewWidth - pad * 2) / Math.Max(1, full.Width),
+            Math.Max(60, viewHeight - pad * 2) / Math.Max(1, full.Height));
+        scale = Math.Max(.001f, scale);
+        _layoutScale = scale;
+        float offsetX = (viewWidth - full.Width * scale) / 2f;
+        float offsetY = (viewHeight - full.Height * scale) / 2f;
 
-        _localHit = Fit(l,full,scale,offsetX,offsetY);
+        _localHit = Fit(l, full, scale, offsetX, offsetY);
         var localHits = new List<RectangleF>(_local.Monitors.Count);
-        int localOrdinal = 0;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
-        {
-            var tile = Fit(m.Bounds, full, scale, offsetX, offsetY);
-            localHits.Add(tile);
-            DrawScreen(g, tile, LocalDeviceName,
-                DisplayNumber(m, ++localOrdinal), m.Primary, true,
-                resolution: m.Bounds.Size);
-        }
+            localHits.Add(Fit(m.Bounds, full, scale, offsetX, offsetY));
         _localMonitorHits = localHits.ToArray();
 
         if (_remote is { } remote)
@@ -719,23 +744,65 @@ internal sealed class DisplayArrangementControl : Control
                     Math.Max(6, m.Width / bw * group.Width),
                     Math.Max(6, m.Height / bh * group.Height))).ToArray();
             }
-            DrawTopologyMonitors(g, group, remote, RemoteDeviceName,
-                _remotePlatform, _remoteScreenDetails);
         }
-        else if(extras.Length == 0)
+        else if (extras.Length == 0)
         {
             _placeholderHit = Fit(remotePos, full, scale, offsetX, offsetY);
+        }
+
+        foreach (var extra in extras)
+        {
+            var group = Fit(extra.World, full, scale, offsetX, offsetY);
+            if (extra.Device.TargetId == _draggingMemberId)
+                group.Offset(_dragCurrent.X - _dragOrigin.X,
+                    _dragCurrent.Y - _dragOrigin.Y);
+            _environmentHits.Add((group, extra.Device.TargetId));
+        }
+
+        return new ComputedDiagramLayout(full, scale, offsetX, offsetY, remotePos, extras);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        g.Clear(BackColor);
+
+        var layout = ComputeLayout(ClientSize);
+        if (layout == null || _local == null)
+        {
+            DrawCenter(g, "Windows display information is unavailable", ClientRectangle,
+                Brushes.Gainsboro, 12f);
+            return;
+        }
+
+        int localOrdinal = 0;
+        foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
+        {
+            var tile = Fit(m.Bounds, layout.Full, layout.Scale, layout.OffsetX, layout.OffsetY);
+            DrawScreen(g, tile, LocalDeviceName,
+                DisplayNumber(m, ++localOrdinal), m.Primary, true,
+                resolution: m.Bounds.Size);
+        }
+
+        if (_remote is { } remote)
+        {
+            DrawTopologyMonitors(g, _remoteHit, remote, RemoteDeviceName,
+                _remotePlatform, _remoteScreenDetails);
+        }
+        else if (layout.Extras.Length == 0)
+        {
             DrawPlaceholder(g, _placeholderHit);
         }
 
         // Extra Windows PCs and Android phones use the exact same screen
         // tiles/labels as native and selected displays, never a footer/deck.
-        foreach(var extra in extras)
+        for (int i = 0; i < layout.Extras.Length; i++)
         {
-            var group = Fit(extra.World,full,scale,offsetX,offsetY);
-            if(extra.Device.TargetId==_draggingMemberId)
-                group.Offset(_dragCurrent.X-_dragOrigin.X,
-                    _dragCurrent.Y-_dragOrigin.Y);
+            var extra = layout.Extras[i];
+            var group = _environmentHits[i].Hit;
             if (extra.Device.Topology is { } extraTopo)
             {
                 DrawTopologyMonitors(g, group, extraTopo, extra.Device.Name,
@@ -744,19 +811,18 @@ internal sealed class DisplayArrangementControl : Control
             }
             else
             {
-                int count=Math.Clamp(extra.Device.ScreenCount,1,8);
-                float gap=Math.Min(7,group.Width / Math.Max(3,count*8));
-                float screenWidth=(group.Width-gap*(count-1))/count;
-                for(int index=0;index<count;index++)
+                int count = Math.Clamp(extra.Device.ScreenCount, 1, 8);
+                float gap = Math.Min(7, group.Width / Math.Max(3, count * 8));
+                float screenWidth = (group.Width - gap * (count - 1)) / count;
+                for (int index = 0; index < count; index++)
                 {
-                    var screen=new RectangleF(group.Left+(screenWidth+gap)*index,
-                        group.Top,screenWidth,group.Height);
-                    DrawScreen(g,screen,extra.Device.Name,index+1,false,false,
-                        extra.Device.IsAndroid?"Android":null,
-                        details: index==0 ? extra.Device.ScreenDetails : null);
+                    var screen = new RectangleF(group.Left + (screenWidth + gap) * index,
+                        group.Top, screenWidth, group.Height);
+                    DrawScreen(g, screen, extra.Device.Name, index + 1, false, false,
+                        extra.Device.IsAndroid ? "Android" : null,
+                        details: index == 0 ? extra.Device.ScreenDetails : null);
                 }
             }
-            _environmentHits.Add((group,extra.Device.TargetId));
         }
     }
 

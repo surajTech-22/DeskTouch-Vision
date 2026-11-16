@@ -1107,5 +1107,26 @@ public final class ProtocolSourceTest {
             AutoConnectService.shouldSwitchWirelessPeerToHub(false, true, 2, leaf, hub));
         assertFalse("Already connected to the hub must not re-migrate",
             AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 2, hub, leaf));
+
+        // Verify v0.3.54: DT1-HUBCOUNT parsing & merging smaller hub into larger hub.
+        String bigHubFp = "C".repeat(64);
+        String[] parsedHint =
+            DesktopDiscovery.parseHubCountHint("DT1-HUBCOUNT|" + bigHubFp.toLowerCase() + "|3");
+        assertNotNull(parsedHint);
+        assertEquals(bigHubFp, parsedHint[0]);
+        assertEquals("3", parsedHint[1]);
+        assertNull(DesktopDiscovery.parseHubCountHint("DT1-HUBCOUNT|" + bigHubFp + "|0"));
+
+        DesktopDiscovery.Device smallHub = new DesktopDiscovery.Device("SURAJ", "192.168.1.11", hubFp, true, false);
+        smallHub.isHub = true;
+        smallHub.hubMemberCount = 2;
+        DesktopDiscovery.Device largeHub = new DesktopDiscovery.Device("DESKTOP", "192.168.1.10", bigHubFp, true, false);
+        largeHub.isHub = true;
+        largeHub.hubMemberCount = 3;
+
+        assertTrue("Smaller 2-device hub must migrate to larger 3-device hub",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 3, smallHub, largeHub));
+        assertFalse("Must never downgrade from 3-device hub to smaller 2-device hub",
+            AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 3, largeHub, smallHub));
     }
 }

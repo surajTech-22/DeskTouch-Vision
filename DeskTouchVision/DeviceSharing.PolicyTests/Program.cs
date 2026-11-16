@@ -2414,7 +2414,111 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         }
         finally { try { File.Delete(trustStoreTmp); } catch { } }
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, and v0.3.53 unified multi-PC environment verified.");
+
+    // Verify v0.3.54: headless tray display arrangement (no window/Paint), two-way mutual trust,
+    // count-based multi-hub merging, and startup shortcut ownership check.
+    {
+        var mon1920 = new MonitorTopology(new[] { new MonitorRect("DISPLAY1", 0, 0, 1920, 1080, true) });
+        var phoneMon = new MonitorTopology(new[] { new MonitorRect("PHONE", 0, 0, 1080, 2400, true) });
+        using var hiddenCtrl = new DisplayArrangementControl();
+        hiddenCtrl.Local = mon1920;
+        hiddenCtrl.Remote = mon1920;
+        hiddenCtrl.RemoteEdge = MonitorEdge.Right;
+        hiddenCtrl.EnvironmentDevices = DisplayArrangementControl.ProjectEnvironment(
+            new[]
+            {
+                new EnvironmentDisplayTile(10001, "Xiaomi", "Android", 1, true, "ANDROIDFP", phoneMon, "1080x2400")
+            }, 1);
+        Check(hiddenCtrl.AdjacentTarget(EnvironmentRouteOrder.Local, MonitorEdge.Right, 1, 0.5) == 1,
+            "Tray/hidden DisplayArrangementControl must compute AdjacentTarget cleanly before any Paint event");
+        Check(hiddenCtrl.AdjacentTarget(1, MonitorEdge.Left, 1, 0.5) == EnvironmentRouteOrder.Local &&
+              hiddenCtrl.EdgeToward(EnvironmentRouteOrder.Local, 1, 1) == MonitorEdge.Right,
+            "Headless EdgeToward and reverse cursor return edge must work in tray mode");
+
+        string certTmp = Path.Combine(Path.GetTempPath(), "desktouch-certA-" + Guid.NewGuid().ToString("N") + ".pfx");
+        string fpA;
+        string fpB = new string('B', 64);
+        string tok1 = TrustedDeviceStore.NewSecret();
+        string tok2 = TrustedDeviceStore.NewSecret();
+        string proposalJson;
+        try
+        {
+            using var certA = PersistentReceiverIdentity.LoadOrCreate(certTmp);
+            fpA = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(certA.RawData)).ToUpperInvariant();
+            proposalJson = MutualTrustCodec.SignProposal(certA, fpB, tok1, tok2);
+        }
+        finally { try { File.Delete(certTmp); } catch { } }
+        Check(MutualTrustCodec.TryVerifyProposal(proposalJson, fpB, out var verified) &&
+              verified != null && verified.PeerFingerprint == fpA &&
+              verified.OutgoingToken == tok1 && verified.ReciprocalToken == tok2,
+            "Signed MutualTrustProposal must verify cryptographically against sender certificate and target fingerprint");
+        Check(!MutualTrustCodec.TryVerifyProposal(proposalJson, new string('C', 64), out _),
+            "MutualTrustProposal bound to one target fingerprint must fail for a different target fingerprint");
+        Check(!MutualTrustCodec.TryVerifyProposal(proposalJson.Replace(tok1, TrustedDeviceStore.NewSecret()), fpB, out _),
+            "Tampered MutualTrustProposal must fail signature verification");
+
+        string bidirTmp = Path.Combine(Path.GetTempPath(), "desktouch-bidir-" + Guid.NewGuid().ToString("N") + ".dpapi");
+        try
+        {
+            var store = new TrustedDeviceStore(bidirTmp);
+            store.TrustOutgoing("SURAJ", fpA, tok1);
+            Check(!store.HasBidirectionalTrust("SURAJ", fpA),
+                "One-way outgoing trust alone must not satisfy HasBidirectionalTrust");
+            store.AllowIncoming("SURAJ", tok2, fpA);
+            Check(store.HasBidirectionalTrust("SURAJ", fpA),
+                "Matching outgoing + incoming trust entries must satisfy HasBidirectionalTrust");
+        }
+        finally { try { File.Delete(bidirTmp); } catch { } }
+
+        string fpLow = new string('1', 64);
+        string fpHigh = new string('E', 64);
+        var candIdle = new NearbyComputer("SURAJ", "192.168.1.20", fpLow, false, true, false, 1);
+        var candHub2 = new NearbyComputer("SURAJ", "192.168.1.20", fpLow, false, true, true, 2);
+        var candHub3 = new NearbyComputer("SURAJ", "192.168.1.20", fpLow, false, true, true, 3);
+        var androidConnected = new ConnectedPeer("Xiaomi", phoneMon, true, "PHONEFP", "Android");
+
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                2, false, fpHigh, new[] { androidConnected }, candIdle, allowLegacyIdleSolicitation: false) ==
+              DisplaySettingsForm.HubAutoConnectDecision.KeepLocalHubWaitForRemote,
+            "2-device local hub must not subordinate to an idle 1-device computer");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                2, false, fpHigh, new[] { androidConnected }, candIdle, allowLegacyIdleSolicitation: true) ==
+              DisplaySettingsForm.HubAutoConnectDecision.SolicitRemoteToYieldToLocalHub,
+            "Larger local hub may solicit idle 1-way computer after initial wait");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                1, false, fpHigh, Array.Empty<ConnectedPeer>(), candHub2) ==
+              DisplaySettingsForm.HubAutoConnectDecision.JoinRemoteHub,
+            "Idle 1-device computer must join a 2-device environment hub");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                2, false, fpHigh, new[] { androidConnected }, candHub3) ==
+              DisplaySettingsForm.HubAutoConnectDecision.JoinRemoteHub,
+            "Smaller 2-device hub must merge into a larger 3-device hub");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                3, false, fpLow, new[] { androidConnected }, candHub2) ==
+              DisplaySettingsForm.HubAutoConnectDecision.KeepLocalHubWaitForRemote,
+            "Larger 3-device hub must stay hub regardless of fingerprint tie-breaker");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                2, false, fpHigh, new[] { androidConnected }, candHub2) ==
+              DisplaySettingsForm.HubAutoConnectDecision.KeepLocalHubWaitForRemote,
+            "Equal-size hub with higher fingerprint stays hub");
+        Check(DisplaySettingsForm.EvaluateHubAutoConnect(
+                2, false, fpLow, new[] { androidConnected },
+                candHub2 with { Fingerprint = fpHigh }) ==
+              DisplaySettingsForm.HubAutoConnectDecision.JoinRemoteHub,
+            "Equal-size hub with lower fingerprint joins higher-fingerprint hub");
+
+        string shareDir = Path.GetDirectoryName(WindowsStartup.ExpectedExecutable)!;
+        string launcherExe = Path.GetFullPath(Path.Combine(shareDir, "..", "DeskTouchVision.exe"));
+        Check(WindowsStartup.IsOwnedExecutableTarget(WindowsStartup.ExpectedExecutable) &&
+              WindowsStartup.IsOwnedExecutableTarget(launcherExe) &&
+              !WindowsStartup.IsOwnedExecutableTarget(@"C:\Windows\System32\notepad.exe"),
+            "WindowsStartup must recognize both tray executable and launcher while rejecting external programs");
+
+        var stamped = mon1920.WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion());
+        Check(stamped.Bounds == mon1920.Bounds && !string.IsNullOrWhiteSpace(stamped.Monitors[0].AppVersion),
+            "MonitorTopology.WithPrimaryAppVersion must preserve bounds and stamp app version");
+    }
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, and v0.3.54 mutual-trust/multi-hub/headless tray verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

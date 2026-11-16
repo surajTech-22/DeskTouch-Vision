@@ -84,6 +84,24 @@ try {
     $shortcut.Description = 'DeskTouch Vision - Displays & Device Sharing'
     $shortcut.Save()
   }
+  try {
+    $choiceFile = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\windows-startup.choice'
+    $startupDisabled = (Test-Path -LiteralPath $choiceFile -PathType Leaf) -and
+      ((Get-Content -LiteralPath $choiceFile -Raw -ErrorAction SilentlyContinue).Trim().Equals('disabled', [StringComparison]::OrdinalIgnoreCase))
+    if (-not $startupDisabled) {
+      $startupDir = [Environment]::GetFolderPath('Startup')
+      if ($startupDir) {
+        New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+        $trayExe = Join-Path $target 'DeviceSharing\DeskTouch.DeviceShare.exe'
+        $sc = $wsh.CreateShortcut((Join-Path $startupDir 'DeskTouch Vision.lnk'))
+        $sc.TargetPath = $trayExe
+        $sc.Arguments = '--tray'
+        $sc.WorkingDirectory = (Split-Path -Path $trayExe -Parent)
+        $sc.Description = 'DeskTouch Vision - Keep Windows device sharing available in tray'
+        $sc.Save()
+      }
+    }
+  } catch { Log ("Startup entry skipped: {0}" -f $_.Exception.Message) }
   Start-Process -FilePath $exe -ErrorAction Stop
   $activated = $true
   Log "Verified and installed Windows Displays application from package under $target"

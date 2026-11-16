@@ -110,7 +110,12 @@ try {
   }
   $stage = Join-Path $env:TEMP ('DeskTouchVision-Extract-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force -Path $stage | Out-Null
-  Expand-Archive -LiteralPath $pkg -DestinationPath $stage -Force
+  try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($pkg, $stage)
+  } catch {
+    Expand-Archive -LiteralPath $pkg -DestinationPath $stage -Force
+  }
   $payload = Join-Path $stage 'app'
   if (-not (Test-Path (Join-Path $payload 'DeskTouchVision.exe') -PathType Leaf)) {
     throw 'Invalid package: missing DeskTouchVision.exe'
@@ -142,6 +147,25 @@ try {
   # A late antivirus quarantine must not be treated as update success:
   # restore the previous directory under the existing rollback path.
   & (Join-Path $targetFull 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $targetFull
+  try {
+    $choiceFile = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\windows-startup.choice'
+    $startupDisabled = (Test-Path -LiteralPath $choiceFile -PathType Leaf) -and
+      ((Get-Content -LiteralPath $choiceFile -Raw -ErrorAction SilentlyContinue).Trim().Equals('disabled', [StringComparison]::OrdinalIgnoreCase))
+    if (-not $startupDisabled) {
+      $startupDir = [Environment]::GetFolderPath('Startup')
+      if ($startupDir) {
+        New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+        $trayExe = Join-Path $targetFull 'DeviceSharing\DeskTouch.DeviceShare.exe'
+        $wsh = New-Object -ComObject WScript.Shell
+        $sc = $wsh.CreateShortcut((Join-Path $startupDir 'DeskTouch Vision.lnk'))
+        $sc.TargetPath = $trayExe
+        $sc.Arguments = '--tray'
+        $sc.WorkingDirectory = (Split-Path -Path $trayExe -Parent)
+        $sc.Description = 'DeskTouch Vision - Keep Windows device sharing available in tray'
+        $sc.Save()
+      }
+    }
+  } catch { Log ("Startup entry sync skipped: {0}" -f $_.Exception.Message) }
   $restartArgs = if ($StartInTray) { @('--tray') } else { @() }
   if ($restartArgs.Count -gt 0) {
     Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ArgumentList $restartArgs

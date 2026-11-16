@@ -497,10 +497,13 @@ public final class AutoConnectService extends Service {
     static boolean shouldSwitchWirelessPeerToHub(
             boolean cableConnected, boolean leaseActive, int eligibleCount,
             DesktopDiscovery.Device currentDirect, DesktopDiscovery.Device gateway) {
-        return !cableConnected && !leaseActive && eligibleCount > 1
-            && currentDirect != null && !currentDirect.isHub
-            && gateway != null && gateway.isHub && gateway.ready
-            && !gateway.fingerprint.equalsIgnoreCase(currentDirect.fingerprint);
+        if (cableConnected || leaseActive || eligibleCount <= 1 || currentDirect == null || gateway == null || !gateway.ready)
+            return false;
+        if (gateway.fingerprint.equalsIgnoreCase(currentDirect.fingerprint))
+            return false;
+        if (!currentDirect.isHub && gateway.isHub)
+            return true;
+        return gateway.isHub && gateway.hubMemberCount > currentDirect.hubMemberCount;
     }
 
     private DesktopDiscovery.Device findCachedDirectHub(Set<String> eligible) {
@@ -554,7 +557,7 @@ public final class AutoConnectService extends Service {
                             String currentFp=DeskTouchRuntime.connectedNonCableFingerprint();
                             String currentIp=currentFp==null ? null : DeskTouchRuntime.getLastKnownPeerHost(currentFp);
                             DesktopDiscovery.Device currentDirect=DesktopDiscovery.probeDirectHost(currentIp,eligible);
-                            if(currentDirect!=null && !currentDirect.isHub) {
+                            if(currentDirect!=null) {
                                 java.util.LinkedHashMap<String,java.util.List<DesktopDiscovery.Device>> groups=
                                     DesktopDiscovery.windowsGroups(DesktopDiscovery.scanFast(eligible));
                                 for(java.util.List<DesktopDiscovery.Device> members:groups.values()) {

@@ -11,7 +11,7 @@ internal sealed class PairComputerDialog : Form
     private sealed record NearbyItem(NearbyComputer Peer)
     {
         public override string ToString() =>
-            $"{(Peer.IsAndroid ? "Android" : Peer.IsHub ? "Environment hub" : "Windows member")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
+            $"{(Peer.IsAndroid ? "Android" : Peer.IsHub ? $"Environment hub ({Peer.MemberCount} devices)" : "Windows member")}  •  {Peer.Name}  •  {Peer.Address}  •  " +
             (Peer.IsAndroid ? "Join from phone" :
              Peer.CanReceive ? "Accepting members" : "At capacity");
     }
@@ -178,10 +178,21 @@ internal sealed class PairComputerDialog : Form
                 _error.Text = "That Windows endpoint is at capacity. The existing environment stays connected.";
                 return;
             }
-            if(!selected.Peer.IsHub && _nearby.Items.Cast<NearbyItem>()
-                .Any(item=>item.Peer.IsHub && item.Peer.CanReceive))
+            int maxHubCount = _nearby.Items.Cast<NearbyItem>()
+                .Where(item => !item.Peer.IsAndroid && item.Peer.CanReceive)
+                .Select(item => item.Peer.IsHub ? Math.Max(2, item.Peer.MemberCount) : 1)
+                .DefaultIfEmpty(1)
+                .Max();
+            int chosenCount = selected.Peer.IsHub ? Math.Max(2, selected.Peer.MemberCount) : 1;
+            if (!selected.Peer.IsHub && _nearby.Items.Cast<NearbyItem>()
+                .Any(item => item.Peer.IsHub && item.Peer.CanReceive))
             {
                 _error.Text = "Join the available environment hub, not an already joined member PC.";
+                return;
+            }
+            if (maxHubCount >= 2 && chosenCount < maxHubCount)
+            {
+                _error.Text = $"Join the larger {maxHubCount}-device environment hub so all devices stay together.";
                 return;
             }
             Address = selected.Peer.Address;

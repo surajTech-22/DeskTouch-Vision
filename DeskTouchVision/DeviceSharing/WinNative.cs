@@ -44,6 +44,8 @@ internal static class Win
     internal static extern IntPtr GetForegroundWindow();
     internal const uint ASFW_ANY = 0xFFFFFFFF;
     internal const int SW_SHOW = 5, SW_RESTORE = 9;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegisterWindowMessageW", SetLastError = true)]
+    internal static extern uint RegisterWindowMessage(string lpString);
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool AllowSetForegroundWindow(uint processId);

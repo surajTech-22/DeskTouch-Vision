@@ -1055,6 +1055,26 @@ internal sealed class FastMovePacer : IDisposable
     internal static (int PushX, int PushY) UnpackEdgePush(int packed) =>
         ((short)(packed >> 16), (short)(packed & 0xFFFF));
 
+    /// <summary>
+    /// Packs the previous (-) and current (+) screen coordinate of one axis into one int:
+    /// low 16 bits = current, high 16 bits = previous + 1 (0 = no previous). A plain
+    /// non-negative coordinate decodes unchanged, so older senders stay compatible.
+    /// </summary>
+    internal static int PackDualCoord(int prevCoord, int currCoord)
+    {
+        if (currCoord is < 0 or > 16383) return currCoord;
+        if (prevCoord is < 0 or > 16383 || prevCoord == currCoord) return currCoord;
+        return ((prevCoord + 1) << 16) | currCoord;
+    }
+
+    internal static (int Prev, int Curr) UnpackDualCoord(int packed)
+    {
+        int hi = (int)((uint)packed >> 16);
+        if (hi == 0 || hi > 16384) return (packed, packed);
+        int curr = packed & 0xFFFF;
+        return (hi - 1, curr);
+    }
+
     private const double MinUdpIntervalMs = 1.5;
     private const int TrailingTcpSyncDelayMs = 130;
     private const int WarmKeepaliveIntervalMs = 22;

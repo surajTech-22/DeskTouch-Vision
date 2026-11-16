@@ -1140,5 +1140,32 @@ public final class ProtocolSourceTest {
             wakeTracker.getSmoothedRttMs() < 10.0);
         assertTrue("Awake wireless link must stay <5ms jitter despite isolated sleep spike",
             wakeTracker.getEffectiveJitterMs() < 5.0);
+
+        // Verify v0.3.57 dual-coordinate packing / unpacking and waypoint recovery.
+        int packedDual = ((100 + 1) << 16) | 150;
+        assertEquals(150, FastUdpChannel.unpackCurr(packedDual));
+        assertEquals(100, FastUdpChannel.unpackPrev(packedDual));
+
+        // Legacy / single coordinate unpacking returns identity.
+        assertEquals(300, FastUdpChannel.unpackCurr(300));
+        assertEquals(300, FastUdpChannel.unpackPrev(300));
+
+        // SubFrameGlide waypoint progression.
+        ShellPointerMath.SubFrameGlide glide = new ShellPointerMath.SubFrameGlide();
+        glide.configure(120);
+        int[] out = new int[2];
+        long t = 100_000_000L;
+        glide.onTarget(10, 10, 10, 10, 0, 0, t);
+        assertTrue(glide.sampleNext(t, out));
+        assertEquals(10, out[0]);
+        assertEquals(10, out[1]);
+
+        // Simulating packet drop: cursor is at 10,10, but next packet carries waypoint prev=(25,25) and target=(40,40).
+        t += 16_000_000L;
+        glide.onTarget(25, 25, 40, 40, 0, 0, t);
+        assertTrue(glide.isActive());
+        // First sub-frame tick must move towards waypoint (25, 25), NOT snap to 40, 40.
+        glide.sampleNext(t + 4_000_000L, out);
+        assertTrue("Subframe coordinate must advance through intermediate waypoint", out[0] > 10 && out[0] <= 25);
     }
 }

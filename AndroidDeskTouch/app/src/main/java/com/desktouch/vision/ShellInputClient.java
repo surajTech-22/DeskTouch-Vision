@@ -55,6 +55,8 @@ final class ShellInputClient {
     private static boolean hasPendingMove;
     private static int pendingMoveX;
     private static int pendingMoveY;
+    private static int pendingPrevX = -1;
+    private static int pendingPrevY = -1;
     private static int pendingPushX;
     private static int pendingPushY;
     private static Runnable pendingMoveAck;
@@ -316,14 +318,22 @@ final class ShellInputClient {
     }
 
     static boolean movePointer(int x, int y, Runnable ack) {
-        return movePointer(x, y, 0, 0, ack);
+        return movePointer(x, y, x, y, 0, 0, ack);
     }
 
     static boolean movePointer(int x, int y, int pushX, int pushY, Runnable ack) {
+        return movePointer(x, y, x, y, pushX, pushY, ack);
+    }
+
+    static boolean movePointer(int prevX, int prevY, int x, int y, int pushX, int pushY, Runnable ack) {
         if (!connectedReady && !hasBridgeConfig(appContext)) return false;
         synchronized (MOVE_LOCK) {
             boolean sameX = hasPendingMove && pendingMoveX == x;
             boolean sameY = hasPendingMove && pendingMoveY == y;
+            if (!hasPendingMove) {
+                pendingPrevX = prevX;
+                pendingPrevY = prevY;
+            }
             pendingMoveX = x;
             pendingMoveY = y;
             if (pushX != 0) {
@@ -349,7 +359,7 @@ final class ShellInputClient {
 
     private static void drainPendingMove() {
         while (true) {
-            int x, y, pushX, pushY;
+            int x, y, prevX, prevY, pushX, pushY;
             Runnable ack;
             synchronized (MOVE_LOCK) {
                 if (!hasPendingMove) {
@@ -361,16 +371,20 @@ final class ShellInputClient {
                 }
                 x = pendingMoveX;
                 y = pendingMoveY;
+                prevX = pendingPrevX >= 0 ? pendingPrevX : x;
+                prevY = pendingPrevY >= 0 ? pendingPrevY : y;
                 pushX = pendingPushX;
                 pushY = pendingPushY;
                 ack = pendingMoveAck;
                 hasPendingMove = false;
+                pendingPrevX = -1;
+                pendingPrevY = -1;
                 pendingPushX = 0;
                 pendingPushY = 0;
                 pendingMoveAck = null;
             }
-            if (pushX != 0 || pushY != 0) {
-                sendLine("MOVETO " + x + " " + y + " " + pushX + " " + pushY);
+            if (prevX != x || prevY != y || pushX != 0 || pushY != 0) {
+                sendLine("MOVETO " + x + " " + y + " " + pushX + " " + pushY + " " + prevX + " " + prevY);
             } else {
                 sendLine("MOVETO " + x + " " + y);
             }

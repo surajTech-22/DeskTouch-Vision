@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.57 — Dual-Position (- / +) Waypoint Recovery & Zero-Collision Mouse Streaming
+
+Eliminates cursor skips, packet-loss teleportation, and wireless air collisions across both wireless and data cable connections:
+
+- **Dual-position (- / +) coordinate recovery (`FastMovePacer`, `FastUdpChannel`, `DeskTouchSession`, `NetworkSessions`):** Every mouse motion packet sent over wireless and data cable packs both the previous (-) waypoint and current (+) destination into each coordinate. When intermediate wireless or coalesced cable frames are dropped, the receiver unpacks the intermediate waypoint and smoothly traverses it rather than skipping across the screen.
+- **Waypoint glide and extended dropout tolerance (`ShellPointerMath`, `ShellInputDaemon`, `ShellInputClient`):** Teaches the sub-frame glide engine to progress through recovered intermediate waypoints during packet-loss bursts, and extends the jitter reset gap from 35 ms to 120 ms so transient wireless dropouts do not snap or reset cursor smoothing.
+- **Zero-collision wireless mouse streaming (`NetworkSessions`, `FastUdpChannel`, `DeskTouchSession`):** Suppresses bidirectional keepalive pulses and wake-up pings while mouse motion packets are actively streaming across the 802.11 half-duplex air interface, preventing upstream packets from colliding with downstream cursor frames.
+- **Tuned 2.4 GHz pacing on high-refresh screens (`NetworkSessions`):** Unlocks 8.5 ms / 120 Hz cursor pacing on clean 2.4 GHz links when the phone display is configured for 90 Hz or 120 Hz.
+
+---
+
 # DeskTouch Vision v0.3.56 — Wireless Low-Latency Wake-Primed Probing, Persistent Radio Locks & Jitter Filtering
 
 Reduces wireless ping and jitter between Windows computers and Android phones down to single-digit / low-teen milliseconds:

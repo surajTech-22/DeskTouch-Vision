@@ -438,6 +438,8 @@ public final class ShellInputDaemon {
         if (y < 0) return;
         int pushX = 0;
         int pushY = 0;
+        int prevX = x;
+        int prevY = y;
         if (yEnd + 1 < len) {
             int pxStart = yEnd + 1;
             int pxEnd = findSpaceOrEnd(line, pxStart, len);
@@ -446,6 +448,16 @@ public final class ShellInputDaemon {
                 int pyStart = pxEnd + 1;
                 int pyEnd = findSpaceOrEnd(line, pyStart, len);
                 pushY = parseAsciiBoundedInt(line, pyStart, pyEnd, -240, 240, 0);
+                if (pyEnd + 1 < len) {
+                    int pvxStart = pyEnd + 1;
+                    int pvxEnd = findSpaceOrEnd(line, pvxStart, len);
+                    prevX = parseAsciiBoundedInt(line, pvxStart, pvxEnd, 0, screenWidth - 1, x);
+                    if (pvxEnd + 1 < len) {
+                        int pvyStart = pvxEnd + 1;
+                        int pvyEnd = findSpaceOrEnd(line, pvyStart, len);
+                        prevY = parseAsciiBoundedInt(line, pvyStart, pvyEnd, 0, screenHeight - 1, y);
+                    }
+                }
             }
         }
         long nowNs = System.nanoTime();
@@ -464,7 +476,7 @@ public final class ShellInputDaemon {
             } else if (!sameY) {
                 pendingPushY = 0;
             }
-            subFrameGlide.onTarget(x, y, pendingPushX, pendingPushY, nowNs);
+            subFrameGlide.onTarget(prevX, prevY, x, y, pendingPushX, pendingPushY, nowNs);
             pendingMoveSeq = ++nextMoveSeq;
             pendingMoveCoasting = false;
             hasPendingMove = true;

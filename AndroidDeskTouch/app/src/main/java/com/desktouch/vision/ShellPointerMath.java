@@ -339,6 +339,9 @@ final class ShellPointerMath {
         private boolean hasTarget;
         private boolean active;
         private boolean urgentSnap;
+        private boolean hasMidpoint;
+        private double midX;
+        private double midY;
         private double curX;
         private double curY;
         private int targetX;
@@ -361,6 +364,7 @@ final class ShellPointerMath {
             hasTarget = false;
             active = false;
             urgentSnap = false;
+            hasMidpoint = false;
             pushX = 0;
             pushY = 0;
             lastPacketNs = 0L;
@@ -369,9 +373,13 @@ final class ShellPointerMath {
         }
 
         void onTarget(int tx, int ty, int px, int py, long nowNs) {
+            onTarget(tx, ty, tx, ty, px, py, nowNs);
+        }
+
+        void onTarget(int prevX, int prevY, int tx, int ty, int px, int py, long nowNs) {
             if (lastPacketNs > 0L && nowNs > lastPacketNs) {
                 long gap = nowNs - lastPacketNs;
-                if (gap <= 35_000_000L) {
+                if (gap <= 120_000_000L) {
                     long clamped = Math.max(2_000_000L, Math.min(28_000_000L, gap));
                     emaInputGapNs = emaInputGapNs == 0L ? clamped : (emaInputGapNs * 3L + clamped) / 4L;
                 } else {
@@ -380,20 +388,33 @@ final class ShellPointerMath {
             }
             lastPacketNs = nowNs;
 
+            boolean waypointValid = prevX >= 0 && prevY >= 0 && (prevX != tx || prevY != ty);
             if (!hasTarget) {
                 curX = tx;
                 curY = ty;
                 hasTarget = true;
                 glideDeadlineNs = nowNs;
+                hasMidpoint = false;
             } else {
                 double dist = Math.hypot(tx - curX, ty - curY);
-                if (px != 0 || py != 0 || dist <= 2.2 || emaInputGapNs == 0L ||
-                        emaInputGapNs <= (long) (subFrameNs * 1.65)) {
-                    glideDeadlineNs = nowNs;
-                } else {
-                    long horizonNs = Math.min(16_000_000L,
-                        Math.max(subFrameNs, Math.round(emaInputGapNs * 0.90)));
+                double prevDist = waypointValid ? Math.hypot(prevX - curX, prevY - curY) : 0.0;
+                if (waypointValid && prevDist >= 1.2 && dist >= 2.5) {
+                    hasMidpoint = true;
+                    midX = prevX;
+                    midY = prevY;
+                    long horizonNs = Math.min(24_000_000L,
+                        Math.max(subFrameNs * 2L, Math.round((emaInputGapNs == 0L ? subFrameNs * 2L : emaInputGapNs) * 1.05)));
                     glideDeadlineNs = nowNs + horizonNs;
+                } else {
+                    hasMidpoint = false;
+                    if (px != 0 || py != 0 || dist <= 2.2 || emaInputGapNs == 0L ||
+                            emaInputGapNs <= (long) (subFrameNs * 1.65)) {
+                        glideDeadlineNs = nowNs;
+                    } else {
+                        long horizonNs = Math.min(16_000_000L,
+                            Math.max(subFrameNs, Math.round(emaInputGapNs * 0.90)));
+                        glideDeadlineNs = nowNs + horizonNs;
+                    }
                 }
             }
             targetX = tx;
@@ -406,6 +427,7 @@ final class ShellPointerMath {
 
         void snapToTarget() {
             urgentSnap = true;
+            hasMidpoint = false;
             glideDeadlineNs = 0L;
         }
 
@@ -428,16 +450,27 @@ final class ShellPointerMath {
                 curY = targetY;
                 active = false;
                 urgentSnap = false;
+                hasMidpoint = false;
                 pushX = 0;
                 pushY = 0;
             } else {
                 int ticksLeft = Math.max(1, (int) Math.round((glideDeadlineNs - nowNs) / (double) subFrameNs) + 1);
-                curX += (targetX - curX) / ticksLeft;
-                curY += (targetY - curY) / ticksLeft;
+                if (hasMidpoint) {
+                    int midTicks = Math.max(1, ticksLeft / 2);
+                    curX += (midX - curX) / midTicks;
+                    curY += (midY - curY) / midTicks;
+                    if (Math.hypot(midX - curX, midY - curY) < 1.2 || ticksLeft <= 2) {
+                        hasMidpoint = false;
+                    }
+                } else {
+                    curX += (targetX - curX) / ticksLeft;
+                    curY += (targetY - curY) / ticksLeft;
+                }
                 if (Math.abs(targetX - curX) < 0.5 && Math.abs(targetY - curY) < 0.5) {
                     curX = targetX;
                     curY = targetY;
                     active = false;
+                    hasMidpoint = false;
                 }
             }
             outCoords[0] = (int) Math.round(curX);

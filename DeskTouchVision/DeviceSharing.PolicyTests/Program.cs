@@ -2530,8 +2530,17 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         double clean24Pace = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 5.5, 4.0, 2.0, 0.0, "2.4GHz");
         Check(clean24Pace is >= 8.0 and <= 9.5,
             "Clean awake 2.4GHz link must unlock fast <9.5ms cursor pacing instead of locking at 16.5ms");
+
+        // Verify v0.3.57 dual-coordinate packing / unpacking and waypoint recovery.
+        int packedDual = FastMovePacer.PackDualCoord(100, 150);
+        var (unpackedPrev, unpackedCurr) = FastMovePacer.UnpackDualCoord(packedDual);
+        Check(unpackedPrev == 100 && unpackedCurr == 150, "Dual coord packing must preserve both prev (-) and curr (+)");
+        var (singlePrev, singleCurr) = FastMovePacer.UnpackDualCoord(FastMovePacer.PackDualCoord(-1, 200));
+        Check(singlePrev == 200 && singleCurr == 200, "Unspecified prev must decode as single coordinate");
+        Check(ReceiverServer.SupportsDualMovePacket("0.3.57") && !ReceiverServer.SupportsDualMovePacket("0.3.56"),
+            "Dual-position packets must only target peers running 0.3.57 or newer");
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, and v0.3.56 wireless low-latency verified.");
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, v0.3.56 wireless low-latency, and v0.3.57 dual-position recovery verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

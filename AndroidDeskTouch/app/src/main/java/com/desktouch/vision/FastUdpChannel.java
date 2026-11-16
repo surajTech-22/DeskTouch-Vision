@@ -38,6 +38,18 @@ final class FastUdpChannel implements Closeable {
     static final byte OP_LINK_FEEDBACK = 12;
     static final byte OP_REVERSE_EDGE_PUSH = 13;
 
+    static int unpackCurr(int packed) {
+        int hi = (packed >>> 16) & 0xFFFF;
+        if (hi == 0 || hi > 16384) return packed;
+        return packed & 0xFFFF;
+    }
+
+    static int unpackPrev(int packed) {
+        int hi = (packed >>> 16) & 0xFFFF;
+        if (hi == 0 || hi > 16384) return packed;
+        return hi - 1;
+    }
+
     static final class Message {
         final byte op;
         final int peerId;
@@ -204,6 +216,9 @@ final class FastUdpChannel implements Closeable {
         default void onReverseMove(int x, int y, int pushX, int pushY, int lease, int moveSeq) {
             onReverseMove(x, y, lease, moveSeq);
         }
+        default void onReverseDualMove(int prevX, int prevY, int x, int y, int pushX, int pushY, int lease, int moveSeq) {
+            onReverseMove(x, y, pushX, pushY, lease, moveSeq);
+        }
         default void onReverseClaim(int claim, int dispatchSeq) {}
         default void onReverseButton(int button, int down, int lease, int actionSeq) {}
         default void onReverseWheel(int amount, int horizontal, int lease, int actionSeq) {}
@@ -353,7 +368,7 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_WARM) {
                     markConfirmed();
-                    if (msg.a == 1 || (msg.a == 0 && nowMs - lastSentMs >= 14L && nowMs - lastWarmEchoSentMs >= 16L)) {
+                    if (msg.a == 1) {
                         lastWarmEchoSentMs = nowMs;
                         send(OP_WARM, 2, 0, 0);
                     }
@@ -377,9 +392,13 @@ final class FastUdpChannel implements Closeable {
                             int pushX = (short) (msg.a >> 16);
                             int y = (short) (msg.b & 0xFFFF);
                             int pushY = (short) (msg.b >> 16);
-                            listener.onReverseMove(x, y, pushX, pushY, msg.lease, msg.timestampMs);
+                            listener.onReverseDualMove(x, y, x, y, pushX, pushY, msg.lease, msg.timestampMs);
                         } else {
-                            listener.onReverseMove(msg.a, msg.b, msg.lease, msg.timestampMs);
+                            int currX = unpackCurr(msg.a);
+                            int prevX = unpackPrev(msg.a);
+                            int currY = unpackCurr(msg.b);
+                            int prevY = unpackPrev(msg.b);
+                            listener.onReverseDualMove(prevX, prevY, currX, currY, 0, 0, msg.lease, msg.timestampMs);
                         }
                     }
                 } else if (msg.op == OP_REVERSE_CLAIM) {

@@ -226,7 +226,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return seq;
         }
 
-        internal void SetLatestReverseMoveOrdered(ref Packet? slot, Packet move)
+        // Last cursor position actually written to this phone (any transport) and
+        // the most recent position that was coalesced away before reaching the wire.
+        // Every move packet to a >= 0.3.57 phone carries BOTH the previous (-) and
+        // current (+) position so a lost/merged packet is reconstructed, not skipped.
+        internal int LastWireMoveX = -1, LastWireMoveY = -1, LastWireMoveLease;
+        internal int TcpWaypointX = -1, TcpWaypointY = -1;
+
+        internal void SetLatestReverseMoveOrdered(ref Packet? slot, Packet move, bool trackWaypoint = false)
         {
             lock (ReverseMoveOrderLock)
             {
@@ -234,7 +241,42 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if (slot == null)
                     slot = stamped;
                 else if (stamped.C >= slot.C)
+                {
+                    if (trackWaypoint && (slot.A != stamped.A || slot.B != stamped.B))
+                    {
+                        TcpWaypointX = slot.A;
+                        TcpWaypointY = slot.B;
+                    }
                     slot = FastMovePacer.MergeCoalescedMove(slot, stamped);
+                }
+            }
+        }
+
+        /// <summary>Returns the (-) position for a move about to be written and records (+) as sent.</summary>
+        internal (int PrevX, int PrevY) TakeWirePrevious(int currX, int currY, bool preferWaypoint)
+        {
+            lock (ReverseMoveOrderLock)
+            {
+                int lease = Volatile.Read(ref ActiveReverseLease);
+                int prevX = -1, prevY = -1;
+                if (lease == LastWireMoveLease)
+                {
+                    if (preferWaypoint && TcpWaypointX >= 0)
+                    {
+                        prevX = TcpWaypointX;
+                        prevY = TcpWaypointY;
+                    }
+                    else
+                    {
+                        prevX = LastWireMoveX;
+                        prevY = LastWireMoveY;
+                    }
+                }
+                TcpWaypointX = TcpWaypointY = -1;
+                LastWireMoveX = currX;
+                LastWireMoveY = currY;
+                LastWireMoveLease = lease;
+                return (prevX, prevY);
             }
         }
 
@@ -1239,14 +1281,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     else if (peer is { Confirmed: true } && _udpHub != null)
                     {
+                        double sinceMoveMs = double.MaxValue;
                         if (controlActive)
                         {
                             long nowTicks = Stopwatch.GetTimestamp();
                             long lastSentTicks = Volatile.Read(ref peer.LastMoveSentTicks);
-                            double sinceMoveMs = lastSentTicks > 0
+                            sinceMoveMs = lastSentTicks > 0
                                 ? (nowTicks - lastSentTicks) * 1000.0 / Stopwatch.Frequency
                                 : double.MaxValue;
-                            if (sinceMoveMs >= 18.0 && nowMs - peer.LastWakePrimerMs >= 18)
+                            // Never inject heartbeats between live cursor packets: the moves
+                            // already keep the radio awake and extra frames collide on air.
+                            if (sinceMoveMs >= 26.0 && nowMs - peer.LastWakePrimerMs >= 18)
                             {
                                 peer.LastWakePrimerMs = nowMs;
                                 _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
@@ -1256,7 +1301,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         if (nowMs - peer.LastLinkPingMs >= probeGapMs)
                         {
                             long lastArriveMs = peer.LinkTracker.LastArriveMs;
-                            bool radioRecentlyAwake = lastArriveMs > 0 && nowMs - lastArriveMs <= 18;
+                            bool radioRecentlyAwake = (lastArriveMs > 0 && nowMs - lastArriveMs <= 25) ||
+                                (controlActive && sinceMoveMs < 35.0);
                             if (radioRecentlyAwake)
                             {
                                 Volatile.Write(ref peer.PendingWakePing, 0);
@@ -1887,7 +1933,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             Interlocked.Increment(ref selected.CableMoves);
         else if (countAsFallback)
             Interlocked.Increment(ref selected.TcpFallbackMoves);
-        selected.SetLatestReverseMoveOrdered(ref selected.LatestReverseMove, packet);
+        selected.SetLatestReverseMoveOrdered(ref selected.LatestReverseMove, packet, trackWaypoint: true);
         if (Interlocked.CompareExchange(ref selected.ReverseMoveSignaled, 1, 0) == 0 &&
             !selected.ReverseQueue.Writer.TryWrite(new Packet("move-flush")))
         {
@@ -2026,7 +2072,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     Interlocked.Exchange(ref session.ReverseMoveSignaled, 0);
                     var move = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (move != null)
-                        await SendMoveToAsync(session, ReverseInputProtocol.Encode(move), token);
+                        await SendMoveToAsync(session, EncodeMoveForWire(session, move), token);
                     continue;
                 }
                 if (p.Type is "release" or "reset")
@@ -2034,7 +2080,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     session.MovePacer?.ClearPending();
                     var staleMove = Interlocked.Exchange(ref session.LatestReverseMove, null);
                     if (staleMove != null)
-                        await SendMoveToAsync(session, ReverseInputProtocol.Encode(staleMove), token);
+                        await SendMoveToAsync(session, EncodeMoveForWire(session, staleMove), token);
                     await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
                     continue;
                 }
@@ -2045,7 +2091,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var prior = udpSync ?? (isImmediateControl && session.UdpPeer is { Confirmed: true }
                     ? null : tcpPrior);
                 if (prior != null)
-                    await SendMoveToAsync(session, ReverseInputProtocol.Encode(prior), token);
+                    await SendMoveToAsync(session, EncodeMoveForWire(session, prior), token);
                 await SendMoveToAsync(session, ReverseInputProtocol.Encode(p), token);
             }
         }
@@ -3168,7 +3214,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (isAndroid)
         {
             if (isSlow24Ghz)
-                baseMs = liveRefreshHz is >= 24 and < 65 ? 13.0 : 11.0;
+                baseMs = liveRefreshHz is >= 24 and < 65 ? 13.0 : (liveRefreshHz is >= 90 && lossPermille < 20.0 ? 8.5 : 11.0);
             else if (liveRefreshHz is >= 24)
                 baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.55), 4.2, 13.0);
             else
@@ -3185,7 +3231,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return baseMs;
 
         double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
-        double floorMs = isSlow24Ghz ? 8.0 : (isAndroid ? 4.2 : 1.8);
+        double floorMs = isSlow24Ghz ? 7.5 : (isAndroid ? 4.2 : 1.8);
         if (!isSlow24Ghz && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
         if (isSlow24Ghz && rttMs <= 12.0 && queueDelay <= 4.0 && jitterMs <= 4.5 && lossPermille < 2.0)
@@ -3231,11 +3277,29 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static bool SupportsUdpEdgePush(string? appVersion) =>
         Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 50);
 
+    internal static bool SupportsDualMovePacket(string? appVersion) =>
+        Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 57);
+
+    /// <summary>Encodes a reliable (wired / fallback) move carrying both (-) and (+) positions.</summary>
+    private static Packet EncodeMoveForWire(Session session, Packet move)
+    {
+        var encoded = ReverseInputProtocol.Encode(move);
+        if (move.Type != "move") return encoded;
+        var (prevX, prevY) = session.TakeWirePrevious(move.A, move.B, preferWaypoint: true);
+        if (!SupportsDualMovePacket(session.Peer.AppVersion)) return encoded;
+        return encoded with
+        {
+            A = FastMovePacer.PackDualCoord(prevX, move.A),
+            B = FastMovePacer.PackDualCoord(prevY, move.B)
+        };
+    }
+
     private bool SendReverseMoveUdp(Session session, FastUdpHub.Peer? peerUdp, int lease, Packet move)
     {
         if (_udpHub == null || peerUdp is not { Confirmed: true } || lease <= 0)
             return false;
         int? tag = move.C > 0 ? move.C : null;
+        var (wirePrevX, wirePrevY) = session.TakeWirePrevious(move.A, move.B, preferWaypoint: false);
         if (move.D != 0 &&
             move.A is >= short.MinValue and <= short.MaxValue &&
             move.B is >= short.MinValue and <= short.MaxValue &&
@@ -3249,6 +3313,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 return _udpHub.Send(peerUdp, FastUdpOp.ReverseEdgePush, packedA, packedB, lease, tag);
             }
         }
+        if (SupportsDualMovePacket(session.Peer.AppVersion))
+            return _udpHub.Send(peerUdp, FastUdpOp.ReverseMove,
+                FastMovePacer.PackDualCoord(wirePrevX, move.A),
+                FastMovePacer.PackDualCoord(wirePrevY, move.B), lease, tag);
         return _udpHub.Send(peerUdp, FastUdpOp.ReverseMove, move.A, move.B, lease, tag);
     }
 

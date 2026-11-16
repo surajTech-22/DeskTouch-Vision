@@ -906,7 +906,11 @@ final class DeskTouchSession implements AutoCloseable {
                 SystemClock.uptimeMillis()-lastUdpReverseMoveAtMs<40){
                 return;
             }
-            applyReversePointerMove(p.a,p.b,(short)(p.d>>>16),(short)(p.d&0xFFFF),reverseLease,p.c,false);
+            int currX = FastUdpChannel.unpackCurr(p.a);
+            int prevX = FastUdpChannel.unpackPrev(p.a);
+            int currY = FastUdpChannel.unpackCurr(p.b);
+            int prevY = FastUdpChannel.unpackPrev(p.b);
+            applyReversePointerMove(prevX,prevY,currX,currY,(short)(p.d>>>16),(short)(p.d&0xFFFF),reverseLease,p.c,false);
         }else if("reverse-button".equals(p.type)){
             dispatchReverseButton(p.a,p.b!=0,p.c,false);
         }else if("reverse-wheel".equals(p.type)){
@@ -963,9 +967,12 @@ final class DeskTouchSession implements AutoCloseable {
         };
     }
     private void applyReversePointerMove(int x,int y,int lease,int moveSeq,boolean fromUdp){
-        applyReversePointerMove(x,y,0,0,lease,moveSeq,fromUdp);
+        applyReversePointerMove(x,y,x,y,0,0,lease,moveSeq,fromUdp);
     }
     private void applyReversePointerMove(int x,int y,int pushX,int pushY,int lease,int moveSeq,boolean fromUdp){
+        applyReversePointerMove(x,y,x,y,pushX,pushY,lease,moveSeq,fromUdp);
+    }
+    private void applyReversePointerMove(int prevX,int prevY,int x,int y,int pushX,int pushY,int lease,int moveSeq,boolean fromUdp){
         final boolean posted;
         synchronized(reverseDedup){
             if(!running || lease<=0 || lease!=reverseLease
@@ -974,7 +981,7 @@ final class DeskTouchSession implements AutoCloseable {
             if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
             Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
             posted=reverseUsingShell
-                ? ShellInputClient.movePointer(x,y,pushX,pushY,ack)
+                ? ShellInputClient.movePointer(prevX,prevY,x,y,pushX,pushY,ack)
                 : DeskTouchAccessibilityService.pointer(x,y,ack);
         }
         if(!posted)revokeRemoteFromNative();
@@ -1317,10 +1324,13 @@ final class DeskTouchSession implements AutoCloseable {
                     if(running) send(new Packet("udp-ack"));
                 }
                 @Override public void onReverseMove(int x,int y,int lease,int moveSeq){
-                    applyReversePointerMove(x,y,lease,moveSeq,true);
+                    applyReversePointerMove(x,y,x,y,0,0,lease,moveSeq,true);
                 }
                 @Override public void onReverseMove(int x,int y,int pushX,int pushY,int lease,int moveSeq){
-                    applyReversePointerMove(x,y,pushX,pushY,lease,moveSeq,true);
+                    applyReversePointerMove(x,y,x,y,pushX,pushY,lease,moveSeq,true);
+                }
+                @Override public void onReverseDualMove(int prevX,int prevY,int x,int y,int pushX,int pushY,int lease,int moveSeq){
+                    applyReversePointerMove(prevX,prevY,x,y,pushX,pushY,lease,moveSeq,true);
                 }
                 @Override public void onReverseClaim(int claim,int dispatchSeq){
                     if(!running) return;
@@ -1380,7 +1390,7 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS){
+                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS && now-lastUdpReverseMoveAtMs>=30L){
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }

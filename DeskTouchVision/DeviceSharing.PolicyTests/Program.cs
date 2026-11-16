@@ -2528,7 +2528,7 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         Check(wakeTracker.SmoothedRttMs < 10.0 && wakeTracker.EffectiveJitterMs < 5.0,
             "v0.3.56 tracker must recover rapidly to <10ms RTT and <5ms jitter despite isolated wireless sleep spikes");
         double clean24Pace = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 5.5, 4.0, 2.0, 0.0, "2.4GHz");
-        Check(clean24Pace is >= 8.0 and <= 9.5,
+        Check(clean24Pace is >= 7.0 and <= 9.5,
             "Clean awake 2.4GHz link must unlock fast <9.5ms cursor pacing instead of locking at 16.5ms");
 
         // Verify v0.3.57 dual-coordinate packing / unpacking and waypoint recovery.

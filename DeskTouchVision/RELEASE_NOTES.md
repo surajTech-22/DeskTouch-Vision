@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.60 — Windows Direct Pixel Coordinates & Wired Ethernet Link Preservation
+
+Resolves computer-to-computer cursor lag, drops, and corrects status bar link classification:
+
+- **Windows direct pixel coordinates (`NetworkSessions`, `InputInjector`, `WinNative`):** Dual-position waypoint packing is restricted exclusively to Android mobile devices (`platform == "Android"`). Computer-to-computer movement streams clean, 1:1 raw screen coordinates with zero midpoint packing overhead. Additionally, the Windows input injector safely unmarshals dual coordinates and clamps coordinates within the active virtual screen bounds, eliminating out-of-bounds coordinate rejections.
+- **Wired Ethernet media preservation (`FastUdpChannel`, `NetworkSessions`):** Passes detected physical Ethernet adapter information into UDP hub peer registration and client connection initialization. Prevents the default wireless tracker state from overriding confirmed wired Ethernet links in the status display across both host and client computers.
+- **Bidirectional wired link exchange (`NetworkSessions`):** Exchanges network media profile packets during session setup and handshake loops so both connected computers consistently identify and report high-speed wired Ethernet connections.
+
+---
+
 # DeskTouch Vision v0.3.59 — Computer Peer Link Prioritization & Client-Side Wired Network Display
 
 Enhances multi-device status reporting and client-side link transparency across simultaneous connections:

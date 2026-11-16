@@ -2538,8 +2538,10 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         Check(unpackedPrev == 100 && unpackedCurr == 150, "Dual coord packing must preserve both prev (-) and curr (+)");
         var (singlePrev, singleCurr) = FastMovePacer.UnpackDualCoord(FastMovePacer.PackDualCoord(-1, 200));
         Check(singlePrev == 200 && singleCurr == 200, "Unspecified prev must decode as single coordinate");
-        Check(ReceiverServer.SupportsDualMovePacket("0.3.57") && !ReceiverServer.SupportsDualMovePacket("0.3.56"),
-            "Dual-position packets must only target peers running 0.3.57 or newer");
+        Check(ReceiverServer.SupportsDualMovePacket("Android", "0.3.57") && !ReceiverServer.SupportsDualMovePacket("Android", "0.3.56"),
+            "Dual-position packets must only target Android peers running 0.3.57 or newer");
+        Check(!ReceiverServer.SupportsDualMovePacket("Windows", "0.3.57"),
+            "Windows peers must never receive dual-position packets");
 
         // Verify v0.3.58 Ethernet interface detection and link band normalization.
         Check(AdaptiveLinkTracker.NormalizeBand("ethernet") == "ethernet",

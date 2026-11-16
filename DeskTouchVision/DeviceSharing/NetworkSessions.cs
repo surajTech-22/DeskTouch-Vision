@@ -596,11 +596,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Volatile.Read(ref session.KeyboardInfoJson));
         }
         var peer = session.UdpPeer;
+        string band = session.LinkBand;
+        if (band != "ethernet" && band != "cable")
+        {
+            string? trackerBand = peer?.LinkTracker.Band;
+            if (!string.IsNullOrWhiteSpace(trackerBand) && trackerBand != "wireless")
+                band = trackerBand;
+            else if (string.IsNullOrWhiteSpace(band))
+                band = "wireless";
+        }
+        int speed = Volatile.Read(ref session.LinkSpeedMbps);
+        if (speed <= 0 && peer != null && peer.LinkTracker.LinkSpeedMbps > 0)
+            speed = peer.LinkTracker.LinkSpeedMbps;
+
         return new ActiveLinkSnapshot(
             true,
             session.Peer.Name,
-            peer?.LinkTracker.Band ?? session.LinkBand,
-            Volatile.Read(ref session.LinkSpeedMbps),
+            band,
+            speed,
             peer?.LinkTracker.SmoothedRttMs ?? 0,
             peer?.LinkTracker.EffectiveJitterMs ?? 0,
             peer?.LinkTracker.CombinedLossPermille ?? 0,
@@ -2256,7 +2269,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             LastPongTicks=Stopwatch.GetTimestamp(),
             TrustedTokenHash=trustedSource?.TokenSha256
         };
-        session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint);
+        session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint, initialBand, initialSpeed);
         session.MovePacer = isCable
             ? new FastMovePacer(
                 canSendUdp: () => Volatile.Read(ref session.ActiveReverseLease) > 0,
@@ -2325,6 +2338,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             // pairing. Do not rely on a stale saved alias on the other PC.
             await SendToAsync(session,new Packet("peer-name",
                 Text:Environment.MachineName),token);
+            if (initialBand == "ethernet")
+            {
+                await SendToAsync(session, new Packet("link-info", Text: initialBand, A: initialSpeed), token);
+            }
             if (_udpHub != null && session.UdpPeer != null)
             {
                 await SendToAsync(session, new Packet("udp-channel",
@@ -3218,7 +3235,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 if (ReferenceEquals(_owner, session) && lease == session.Lease &&
                     _priority.CanApplyRemote)
-                    applied = session.Injector.Handle(new Packet("move", msg.A, msg.B));
+                {
+                    var (_, currX) = FastMovePacer.UnpackDualCoord(msg.A);
+                    var (_, currY) = FastMovePacer.UnpackDualCoord(msg.B);
+                    applied = session.Injector.Handle(new Packet("move", currX, currY));
+                }
             }
         }
         if (applied && _priority.CanApplyRemote &&
@@ -3326,8 +3347,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static bool SupportsUdpEdgePush(string? appVersion) =>
         Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 50);
 
-    internal static bool SupportsDualMovePacket(string? appVersion) =>
+    internal static bool SupportsDualMovePacket(string? platform, string? appVersion) =>
+        string.Equals(platform, "Android", StringComparison.Ordinal) &&
         Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 57);
+
+    internal static bool SupportsDualMovePacket(string? appVersion) =>
+        SupportsDualMovePacket("Android", appVersion);
 
     /// <summary>Encodes a reliable (wired / fallback) move carrying both (-) and (+) positions.</summary>
     private static Packet EncodeMoveForWire(Session session, Packet move)
@@ -3335,7 +3360,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var encoded = ReverseInputProtocol.Encode(move);
         if (move.Type != "move") return encoded;
         var (prevX, prevY) = session.TakeWirePrevious(move.A, move.B, preferWaypoint: true);
-        if (!SupportsDualMovePacket(session.Peer.AppVersion)) return encoded;
+        if (!SupportsDualMovePacket(session.Peer.Platform, session.Peer.AppVersion)) return encoded;
         return encoded with
         {
             A = FastMovePacer.PackDualCoord(prevX, move.A),
@@ -3362,7 +3387,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 return _udpHub.Send(peerUdp, FastUdpOp.ReverseEdgePush, packedA, packedB, lease, tag);
             }
         }
-        if (SupportsDualMovePacket(session.Peer.AppVersion))
+        if (SupportsDualMovePacket(session.Peer.Platform, session.Peer.AppVersion))
             return _udpHub.Send(peerUdp, FastUdpOp.ReverseMove,
                 FastMovePacer.PackDualCoord(wirePrevX, move.A),
                 FastMovePacer.PackDualCoord(wirePrevY, move.B), lease, tag);
@@ -3458,8 +3483,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     private LocalInputPriority? _reversePriority;
     private Func<bool>? _allowReverseClaim;
     private readonly object _reverseInputGate = new();
-    private readonly string _linkBand;
-    private readonly int _linkSpeedMbps;
+    private volatile string _linkBand;
+    private int _linkSpeedMbps;
     private InputInjector? _reverseInjector;
     private int _reverseLease;
     private int _reverseAppliedLease;
@@ -3730,8 +3755,18 @@ internal sealed class HostSession : IInputSession, IDisposable
             return new ReceiverServer.ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
         string name = RemoteSystemName ?? _environmentHubName ?? _serverAddress.ToString();
         var udp = Volatile.Read(ref _udpClient);
-        string band = udp?.LinkTracker.Band ?? _linkBand;
+        string band = _linkBand;
+        if (band != "ethernet" && band != "cable")
+        {
+            string? trackerBand = udp?.LinkTracker.Band;
+            if (!string.IsNullOrWhiteSpace(trackerBand) && trackerBand != "wireless")
+                band = trackerBand;
+            else if (string.IsNullOrWhiteSpace(band))
+                band = "wireless";
+        }
         int speed = _linkSpeedMbps;
+        if (speed <= 0 && udp != null && udp.LinkTracker.LinkSpeedMbps > 0)
+            speed = udp.LinkTracker.LinkSpeedMbps;
         double rtt = udp?.LinkTracker.SmoothedRttMs ?? Volatile.Read(ref _lastRttMs);
         double jitter = udp?.LinkTracker.EffectiveJitterMs ?? 0;
         double loss = udp?.LinkTracker.CombinedLossPermille ?? 0;
@@ -4223,6 +4258,17 @@ internal sealed class HostSession : IInputSession, IDisposable
                     InputDeliveryWarning?.Invoke("The receiving Windows PC rejected keyboard " +
                         "input. Click a normal text field on that PC and check whether " +
                         "the target program is running as Administrator.");
+                else if (p.Type == "link-info")
+                {
+                    string band = AdaptiveLinkTracker.NormalizeBand(p.Text);
+                    int speedMbps = p.A > 0 ? p.A : 0;
+                    if (band == "ethernet")
+                    {
+                        _linkBand = band;
+                        if (speedMbps > 0) _linkSpeedMbps = speedMbps;
+                        Volatile.Read(ref _udpClient)?.LinkTracker.OnLinkProfileChanged(band, speedMbps, 0);
+                    }
+                }
                 else if (p.Type == "udp-channel" && p.A is > 0 and <= 65535 &&
                     !string.IsNullOrEmpty(p.Text))
                 {
@@ -4386,7 +4432,7 @@ internal sealed class HostSession : IInputSession, IDisposable
         {
             byte[] key = Convert.FromBase64String(encodedKey);
             if (key.Length != FastUdpCodec.KeySize) return;
-            var client = new FastUdpClient(_serverAddress, serverPort, peerId, key);
+            var client = new FastUdpClient(_serverAddress, serverPort, peerId, key, _linkBand, _linkSpeedMbps);
             client.ConfirmedChanged += () =>
             {
                 if (Interlocked.CompareExchange(ref _udpConfirmedLogged, 1, 0) == 0)
@@ -4421,7 +4467,11 @@ internal sealed class HostSession : IInputSession, IDisposable
                 {
                     int active = Volatile.Read(ref _reverseLease);
                     if (active > 0 && msg.Lease == active)
-                        ProcessReverseInput(new Packet("reverse-move", msg.A, msg.B));
+                    {
+                        var (_, currX) = FastMovePacer.UnpackDualCoord(msg.A);
+                        var (_, currY) = FastMovePacer.UnpackDualCoord(msg.B);
+                        ProcessReverseInput(new Packet("reverse-move", currX, currY));
+                    }
                 }
                 else if (msg.Op == FastUdpOp.ReverseButton)
                 {

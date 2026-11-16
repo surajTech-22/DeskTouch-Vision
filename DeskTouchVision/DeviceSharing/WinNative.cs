@@ -237,6 +237,11 @@ internal sealed class InputInjector
         // SendInput marks synthetic pointer movement as injected, so local
         // physical-activity monitoring can distinguish actual touchpad motion.
         var v = System.Windows.Forms.SystemInformation.VirtualScreen;
+        if (v.Width > 0 && v.Height > 0)
+        {
+            x = Math.Clamp(x, v.Left, v.Left + v.Width - 1);
+            y = Math.Clamp(y, v.Top, v.Top + v.Height - 1);
+        }
         var point = new System.Drawing.Point(x, y);
         var screens = System.Windows.Forms.Screen.AllScreens;
         if (screens.Length > 0 && !screens.Any(s => s.Bounds.Contains(point)) && (v.Width <= 0 || !v.Contains(point)))
@@ -258,7 +263,9 @@ internal sealed class InputInjector
         switch (p.Type)
         {
             case "move":
-                return InjectAbsolutePosition(p.A, p.B);
+                var (_, currX) = FastMovePacer.UnpackDualCoord(p.A);
+                var (_, currY) = FastMovePacer.UnpackDualCoord(p.B);
+                return InjectAbsolutePosition(currX, currY);
             case "key":
             {
                 if (p.A is < 0 or > 255 || p.D is < 0 or > 255) return false;

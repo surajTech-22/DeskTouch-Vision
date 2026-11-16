@@ -691,7 +691,7 @@ internal sealed class FastUdpHub : IDisposable
         private IPAddress _expectedAddress;
         internal readonly byte[] Key;
         internal readonly FastUdpCodec Codec;
-        internal readonly AdaptiveLinkTracker LinkTracker = new();
+        internal readonly AdaptiveLinkTracker LinkTracker;
         private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
         private IPEndPoint? _remoteEndPoint;
         internal volatile bool Confirmed;
@@ -707,13 +707,16 @@ internal sealed class FastUdpHub : IDisposable
 
         internal IPAddress ExpectedAddress => Volatile.Read(ref _expectedAddress);
 
-        internal Peer(int sessionId, IPAddress expectedAddress)
+        internal Peer(int sessionId, IPAddress expectedAddress, string initialBand = "wireless", int initialSpeedMbps = 0)
         {
             SessionId = sessionId;
             WirePeerId = unchecked((ushort)sessionId);
             _expectedAddress = FastUdpSocketOptions.NormalizeAddress(expectedAddress);
             Key = RandomNumberGenerator.GetBytes(FastUdpCodec.KeySize);
             Codec = new FastUdpCodec(Key, WirePeerId, isServer: true);
+            LinkTracker = new AdaptiveLinkTracker(initialBand);
+            if (initialSpeedMbps > 0)
+                LinkTracker.OnLinkProfileChanged(initialBand, initialSpeedMbps, 0);
         }
 
         internal void UpdateEndpointOnAuthenticatedPacket(IPAddress normalized, int port)
@@ -790,10 +793,10 @@ internal sealed class FastUdpHub : IDisposable
         _recvThread.Start();
     }
 
-    internal Peer? AddPeer(int sessionId, EndPoint? remoteEndPoint)
+    internal Peer? AddPeer(int sessionId, EndPoint? remoteEndPoint, string initialBand = "wireless", int initialSpeedMbps = 0)
     {
         if (remoteEndPoint is not IPEndPoint ipEp) return null;
-        var peer = new Peer(sessionId, ipEp.Address);
+        var peer = new Peer(sessionId, ipEp.Address, initialBand, initialSpeedMbps);
         _peers[peer.WirePeerId] = peer;
         return peer;
     }
@@ -902,7 +905,7 @@ internal sealed class FastUdpClient : IDisposable
     private readonly Socket _socket;
     private volatile IPEndPoint _serverEndPoint;
     private readonly FastUdpCodec _codec;
-    internal readonly AdaptiveLinkTracker LinkTracker = new();
+    internal readonly AdaptiveLinkTracker LinkTracker;
     private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
     private readonly Thread _recvThread;
     private volatile bool _disposed;
@@ -914,11 +917,15 @@ internal sealed class FastUdpClient : IDisposable
     internal event Action<FastUdpMessage>? MessageReceived;
     internal event Action? ConfirmedChanged;
 
-    internal FastUdpClient(IPAddress serverAddress, int serverPort, int peerId, byte[] key)
+    internal FastUdpClient(IPAddress serverAddress, int serverPort, int peerId, byte[] key,
+        string initialBand = "wireless", int initialSpeedMbps = 0)
     {
         IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(serverAddress);
         _serverEndPoint = new IPEndPoint(normalized, serverPort);
         _codec = new FastUdpCodec(key, unchecked((ushort)peerId), isServer: false);
+        LinkTracker = new AdaptiveLinkTracker(initialBand);
+        if (initialSpeedMbps > 0)
+            LinkTracker.OnLinkProfileChanged(initialBand, initialSpeedMbps, 0);
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         FastUdpSocketOptions.ConfigureLowLatency(_socket);
         _socket.Bind(new IPEndPoint(IPAddress.Any, 0));

@@ -14,6 +14,7 @@ import android.util.Log;
 final class RemoteInputPower {
     private static PowerManager.WakeLock cpu;
     private static WifiManager.WifiLock lowLatencyWifi;
+    private static WifiManager.WifiLock highPerfWifi;
     private RemoteInputPower() {}
 
     static synchronized void begin(Context app) {
@@ -30,25 +31,36 @@ final class RemoteInputPower {
         }
         try {if(cpu!=null&&!cpu.isHeld())cpu.acquire();}
         catch(RuntimeException e){Log.w("DeskTouchPower","CPU wake lock denied",e);}
-        if(lowLatencyWifi==null) {
+        if(lowLatencyWifi==null || highPerfWifi==null) {
             try {
                 WifiManager wifi=(WifiManager)context.getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
                 if(wifi!=null) {
-                    int mode=Build.VERSION.SDK_INT>=29
-                        ?WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                        :WifiManager.WIFI_MODE_FULL_HIGH_PERF;
-                    lowLatencyWifi=wifi.createWifiLock(mode,
-                        "DeskTouchVision:LowLatencyRemoteInput");
-                    lowLatencyWifi.setReferenceCounted(false);
+                    if(lowLatencyWifi==null) {
+                        int mode=Build.VERSION.SDK_INT>=29
+                            ?WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                            :WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                        lowLatencyWifi=wifi.createWifiLock(mode,
+                            "DeskTouchVision:LowLatencyRemoteInput");
+                        lowLatencyWifi.setReferenceCounted(false);
+                    }
+                    if(highPerfWifi==null) {
+                        highPerfWifi=wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                            "DeskTouchVision:HighPerfRemoteInput");
+                        highPerfWifi.setReferenceCounted(false);
+                    }
                 }
             }catch(RuntimeException e){Log.w("DeskTouchPower","Wi-Fi lock unavailable",e);}
         }
         try {if(lowLatencyWifi!=null&&!lowLatencyWifi.isHeld())lowLatencyWifi.acquire();}
         catch(RuntimeException e){Log.w("DeskTouchPower","Wi-Fi low-latency mode denied",e);}
+        try {if(highPerfWifi!=null&&!highPerfWifi.isHeld())highPerfWifi.acquire();}
+        catch(RuntimeException e){Log.w("DeskTouchPower","Wi-Fi high-perf mode denied",e);}
     }
 
     static synchronized void end() {
+        try {if(highPerfWifi!=null&&highPerfWifi.isHeld())highPerfWifi.release();}
+        catch(RuntimeException e){Log.w("DeskTouchPower","Wi-Fi high-perf release failed",e);}
         try {if(lowLatencyWifi!=null&&lowLatencyWifi.isHeld())lowLatencyWifi.release();}
         catch(RuntimeException e){Log.w("DeskTouchPower","Wi-Fi release failed",e);}
         try {if(cpu!=null&&cpu.isHeld())cpu.release();}

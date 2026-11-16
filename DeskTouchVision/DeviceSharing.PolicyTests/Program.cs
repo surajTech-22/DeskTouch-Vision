@@ -2517,8 +2517,21 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         var stamped = mon1920.WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion());
         Check(stamped.Bounds == mon1920.Bounds && !string.IsNullOrWhiteSpace(stamped.Monitors[0].AppVersion),
             "MonitorTopology.WithPrimaryAppVersion must preserve bounds and stamp app version");
+
+        // Verify v0.3.56 wireless ping/jitter outlier filtering and fast awake recovery.
+        var wakeTracker = new AdaptiveLinkTracker("5GHz");
+        wakeTracker.RecordRttSample(62.0, 1000); // cold initial beacon wake-up
+        wakeTracker.RecordRttSample(4.2, 1100);  // awake wake-primed sample
+        wakeTracker.RecordRttSample(4.5, 1200);
+        wakeTracker.RecordRttSample(58.0, 1300); // isolated power-save / scan spike
+        wakeTracker.RecordRttSample(4.0, 1400);
+        Check(wakeTracker.SmoothedRttMs < 10.0 && wakeTracker.EffectiveJitterMs < 5.0,
+            "v0.3.56 tracker must recover rapidly to <10ms RTT and <5ms jitter despite isolated wireless sleep spikes");
+        double clean24Pace = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 5.5, 4.0, 2.0, 0.0, "2.4GHz");
+        Check(clean24Pace is >= 8.0 and <= 9.5,
+            "Clean awake 2.4GHz link must unlock fast <9.5ms cursor pacing instead of locking at 16.5ms");
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, and v0.3.54 mutual-trust/multi-hub/headless tray verified.");
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, and v0.3.56 wireless low-latency verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

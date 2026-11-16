@@ -223,6 +223,12 @@ final class FastUdpChannel implements Closeable {
     private volatile boolean closed;
     volatile boolean confirmed;
     private long highestReverseMoveSeq;
+    private volatile long lastSentMs;
+    private volatile long lastWarmEchoSentMs;
+    private volatile boolean pendingWakePing;
+    private volatile int pendingPingPaceTenths;
+    private volatile int pendingPingLease;
+    private volatile long lastWakePrimerMs;
 
     FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener)
             throws Exception {
@@ -260,6 +266,19 @@ final class FastUdpChannel implements Closeable {
         send(OP_WARM, 0, 0, 0);
     }
 
+    void requestWakePrimedPing(long nowMs, int paceTenths, int lease) {
+        if (!pendingWakePing) {
+            pendingWakePing = true;
+            pendingPingPaceTenths = paceTenths;
+            pendingPingLease = lease;
+            lastWakePrimerMs = nowMs;
+            send(OP_WARM, 1, 0, 0);
+        } else if (nowMs - lastWakePrimerMs >= 140L) {
+            pendingWakePing = false;
+            sendLinkPing(linkTracker.nextPingToken(nowMs), paceTenths, lease);
+        }
+    }
+
     void sendReverseGranted(int lease, boolean granted) {
         send(OP_REVERSE_GRANTED, lease, granted ? 1 : 0, lease);
     }
@@ -269,6 +288,7 @@ final class FastUdpChannel implements Closeable {
     }
 
     boolean sendLinkPing(int pingToken, int paceTenths, int lease) {
+        pendingWakePing = false;
         return send(OP_LINK_PING, pingToken, paceTenths, lease);
     }
 
@@ -289,6 +309,7 @@ final class FastUdpChannel implements Closeable {
                 if (len <= 0) return false;
                 sendPacket.setLength(len);
                 socket.send(sendPacket);
+                lastSentMs = SystemClock.uptimeMillis();
                 return true;
             } catch (Exception ignored) {
                 return false;
@@ -332,6 +353,14 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_WARM) {
                     markConfirmed();
+                    if (msg.a == 1 || (msg.a == 0 && nowMs - lastSentMs >= 14L && nowMs - lastWarmEchoSentMs >= 16L)) {
+                        lastWarmEchoSentMs = nowMs;
+                        send(OP_WARM, 2, 0, 0);
+                    }
+                    if (pendingWakePing) {
+                        pendingWakePing = false;
+                        sendLinkPing(linkTracker.nextPingToken(nowMs), pendingPingPaceTenths, pendingPingLease);
+                    }
                 } else if (msg.op == OP_LINK_PING) {
                     markConfirmed();
                     listener.onLinkPing(msg.a, msg.b, msg.lease, msg.timestampMs);

@@ -184,6 +184,7 @@ public final class ShellInputDaemon {
             }
             System.out.println("DESKTOUCH_SHELL_PORT=" + port);
             System.out.flush();
+            applyLowLatencyWifiConfigAsync();
             startMousePacer();
 
             try {
@@ -253,6 +254,7 @@ public final class ShellInputDaemon {
                     continue;
                 }
                 if (line.startsWith("BEGIN ")) {
+                    applyLowLatencyWifiConfigAsync();
                     String[] parts = line.split(" ");
                     int w = parts.length >= 3 ? parseBoundedInt(parts[1], 200, 16384, 1080) : 1080;
                     int h = parts.length >= 3 ? parseBoundedInt(parts[2], 200, 16384, 2400) : 2400;
@@ -950,6 +952,26 @@ public final class ShellInputDaemon {
         if (signed < min) return min;
         if (signed > max) return max;
         return (int) signed;
+    }
+
+    private volatile long lastWifiConfigNs;
+
+    private void applyLowLatencyWifiConfigAsync() {
+        long now = System.nanoTime();
+        if (lastWifiConfigNs != 0L && now - lastWifiConfigNs < 60_000_000_000L) return;
+        lastWifiConfigNs = now;
+        Thread t = new Thread(() -> {
+            try {
+                new ProcessBuilder("cmd", "wifi", "set-network-selection-config", "disabled", "disabled", "-a", "2")
+                    .redirectErrorStream(true).start().waitFor();
+            } catch (Throwable ignored) {}
+            try {
+                new ProcessBuilder("cmd", "wifi", "set-scan-always-available", "disabled")
+                    .redirectErrorStream(true).start().waitFor();
+            } catch (Throwable ignored) {}
+        }, "DeskTouch-WifiLowLatency");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static int parseBoundedInt(String raw, int min, int max, int fallback) {

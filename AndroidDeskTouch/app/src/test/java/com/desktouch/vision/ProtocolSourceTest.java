@@ -1128,5 +1128,17 @@ public final class ProtocolSourceTest {
             AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 3, smallHub, largeHub));
         assertFalse("Must never downgrade from 3-device hub to smaller 2-device hub",
             AutoConnectService.shouldSwitchWirelessPeerToHub(false, false, 3, largeHub, smallHub));
+
+        // Verify v0.3.56 wireless outlier filtering & fast awake recovery.
+        AdaptiveLinkTracker wakeTracker = new AdaptiveLinkTracker("5GHz");
+        wakeTracker.recordRttSample(62.0, 1000L);
+        wakeTracker.recordRttSample(4.2, 1100L);
+        wakeTracker.recordRttSample(4.5, 1200L);
+        wakeTracker.recordRttSample(58.0, 1300L);
+        wakeTracker.recordRttSample(4.0, 1400L);
+        assertTrue("Awake wireless link must stay <10ms RTT despite isolated sleep spike",
+            wakeTracker.getSmoothedRttMs() < 10.0);
+        assertTrue("Awake wireless link must stay <5ms jitter despite isolated sleep spike",
+            wakeTracker.getEffectiveJitterMs() < 5.0);
     }
 }

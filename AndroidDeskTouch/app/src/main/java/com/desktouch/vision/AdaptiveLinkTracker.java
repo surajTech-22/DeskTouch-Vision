@@ -75,6 +75,14 @@ public final class AdaptiveLinkTracker {
         }
     }
 
+    public long getLastArriveMs() {
+        synchronized (recvGate) {
+            return lastArriveMs;
+        }
+    }
+
+    private int consecutiveHighRttCount;
+
     public boolean onLinkProfileChanged(String band, int speedMbps, int epoch) {
         String normalized = normalizeBand(band);
         boolean changed;
@@ -93,6 +101,7 @@ public final class AdaptiveLinkTracker {
                 windowStartMs = 0L;
                 peerLossPermille = 0.0;
                 peerJitterMs = 0.0;
+                consecutiveHighRttCount = 0;
             }
         }
         if (changed) {
@@ -178,19 +187,34 @@ public final class AdaptiveLinkTracker {
         if (sampleRtt < minRttWindowA) {
             minRttWindowA = sampleRtt;
         }
+        double minBest = Math.min(minRttWindowA, minRttWindowB);
+
+        double effectiveRtt = sampleRtt;
+        if (minBest < 25.0 && sampleRtt > minBest + 10.0) {
+            consecutiveHighRttCount++;
+            if (consecutiveHighRttCount <= 3) {
+                effectiveRtt = minBest + Math.min(6.0, (sampleRtt - minBest) * 0.12);
+            }
+        } else {
+            consecutiveHighRttCount = 0;
+        }
 
         if (smoothedRttMs <= 0.0) {
-            smoothedRttMs = sampleRtt;
+            smoothedRttMs = effectiveRtt;
             rttJitterMs = 0.0;
+        } else if (effectiveRtt <= smoothedRttMs) {
+            double baseDev = minBest < Double.MAX_VALUE ? Math.abs(effectiveRtt - minBest) : 0.0;
+            double clampedDev = Math.min(baseDev, 6.0);
+            rttJitterMs += 0.42 * (clampedDev - rttJitterMs);
+            double alpha = effectiveRtt < smoothedRttMs * 0.65 ? 0.82 : 0.55;
+            smoothedRttMs += alpha * (effectiveRtt - smoothedRttMs);
         } else {
-            double rawDev = Math.abs(sampleRtt - smoothedRttMs);
-            double clampedDev = Math.min(rawDev, Math.max(25.0, smoothedRttMs * 1.8));
-            rttJitterMs += (clampedDev > rttJitterMs ? 0.14 : 0.25) * (clampedDev - rttJitterMs);
-            // Adapt down fast when a better band/link arrives; damp isolated upward spikes.
-            double alpha = sampleRtt < smoothedRttMs
-                ? (sampleRtt < smoothedRttMs * 0.65 ? 0.55 : 0.42)
-                : 0.15;
-            smoothedRttMs += alpha * (sampleRtt - smoothedRttMs);
+            double rawDev = Math.abs(effectiveRtt - smoothedRttMs);
+            double maxDevCap = minBest < 25.0 ? 8.0 : Math.max(25.0, smoothedRttMs * 1.8);
+            double clampedDev = Math.min(rawDev, maxDevCap);
+            rttJitterMs += (clampedDev > rttJitterMs ? 0.10 : 0.35) * (clampedDev - rttJitterMs);
+            double alpha = (minBest < 25.0 && consecutiveHighRttCount <= 3) ? 0.08 : 0.15;
+            smoothedRttMs += alpha * (effectiveRtt - smoothedRttMs);
         }
     }
 
@@ -220,11 +244,11 @@ public final class AdaptiveLinkTracker {
                 if (hasLastTransit) {
                     long recvDelta = nowMs - lastTransitRecvMs;
                     long sendDelta = senderTimestampMs - lastTransitSenderMs;
-                    if (recvDelta >= 0L && recvDelta <= 400L && sendDelta >= 0L && sendDelta <= 400L) {
+                    if (recvDelta >= 0L && recvDelta <= 250L && sendDelta >= 0L && sendDelta <= 45L) {
                         double transitDiff = Math.min(110.0, Math.abs((double) recvDelta - (double) sendDelta));
-                        inboundJitterMs += (transitDiff > inboundJitterMs ? 0.22 : 0.28) * (transitDiff - inboundJitterMs);
-                    } else if (recvDelta > 400L) {
-                        inboundJitterMs *= 0.80;
+                        inboundJitterMs += (transitDiff > inboundJitterMs ? 0.22 : 0.36) * (transitDiff - inboundJitterMs);
+                    } else if (recvDelta > 50L || sendDelta > 45L) {
+                        inboundJitterMs *= 0.78;
                     }
                 }
                 lastTransitSenderMs = senderTimestampMs;

@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.56 — Wireless Low-Latency Wake-Primed Probing, Persistent Radio Locks & Jitter Filtering
+
+Reduces wireless ping and jitter between Windows computers and Android phones down to single-digit / low-teen milliseconds:
+
+- **Persistent dual-mode Android wireless locks (`RemoteInputPower`, `DeskTouchSession`):** Holds both `WIFI_MODE_FULL_LOW_LATENCY` and `WIFI_MODE_FULL_HIGH_PERF` simultaneously so background wireless power-save remains suppressed when DeskTouch is minimized on Android 10+, and prevents closing secondary or make-before-break sessions from releasing the active session's wireless and CPU wake locks.
+- **System-level background roam-scan suppression (`ShellInputDaemon`):** Applies shell-privileged wireless network-selection and background scan overrides (`set-network-selection-config` / `set-scan-always-available`) when the virtual input bridge is active to prevent periodic 40–150 ms off-channel roaming scans.
+- **Bidirectional wake-primed probing & 20 ms active keepalive (`NetworkSessions`, `FastUdpChannel`, `DeskTouchSession`):** Keeps upstream and downstream packet spacing at 20 ms during active control (below the 30 ms 802.11 power-save sleep threshold) and precedes idle link probes with a two-way `Warm` wake-up handshake so `LinkPing` measures the awake wireless link rather than router beacon sleep wait.
+- **Baseline-anchored outlier & stream-only jitter filtering (`FastUdpChannel`, `AdaptiveLinkTracker`, `NetworkSessions`):** Prevents isolated wireless beacon/scan spikes and fast recovery drops from inflating smoothed RTT or jitter, filters inbound transit jitter to continuous stream intervals (`<= 45 ms`), and unlocks smooth 125 Hz+ cursor pacing on clean 2.4 GHz and 5 GHz wireless links.
+
+---
+
 # DeskTouch Vision v0.3.55 — Antivirus-Clean Updater Extraction & v0.3.54 Unified Shared Environment
 
 Includes everything from v0.3.54 plus clean package extraction during updates:

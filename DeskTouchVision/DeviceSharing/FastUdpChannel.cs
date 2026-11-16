@@ -244,6 +244,7 @@ internal sealed class AdaptiveLinkTracker
     private string _band = "wireless";
     private int _linkSpeedMbps;
     private int _networkEpoch;
+    private int _consecutiveHighRttCount;
 
     internal AdaptiveLinkTracker(string initialBand = "wireless")
     {
@@ -253,6 +254,7 @@ internal sealed class AdaptiveLinkTracker
     internal string Band { get { lock (_rttGate) return _band; } }
     internal int LinkSpeedMbps { get { lock (_rttGate) return _linkSpeedMbps; } }
     internal int NetworkEpoch { get { lock (_rttGate) return _networkEpoch; } }
+    internal long LastArriveMs { get { lock (_recvGate) return _lastArriveMs; } }
 
     internal static string NormalizeBand(string? raw)
     {
@@ -289,6 +291,7 @@ internal sealed class AdaptiveLinkTracker
                 _windowStartMs = 0;
                 _peerLossPermille = 0;
                 _peerJitterMs = 0;
+                _consecutiveHighRttCount = 0;
             }
         }
         if (changed)
@@ -405,23 +408,44 @@ internal sealed class AdaptiveLinkTracker
             _windowStartMs = nowMs;
         }
         if (sampleRtt < _minRttWindowA) _minRttWindowA = sampleRtt;
+        double minBest = Math.Min(_minRttWindowA, _minRttWindowB);
 
-        if (_smoothedRttMs <= 0)
+        double effectiveRtt = sampleRtt;
+        if (minBest < 25.0 && sampleRtt > minBest + 10.0)
         {
-            _smoothedRttMs = sampleRtt;
-            _rttJitterMs = 0;
+            _consecutiveHighRttCount++;
+            if (_consecutiveHighRttCount <= 3)
+            {
+                effectiveRtt = minBest + Math.Min(6.0, (sampleRtt - minBest) * 0.12);
+            }
         }
         else
         {
-            double rawDev = Math.Abs(sampleRtt - _smoothedRttMs);
-            double clampedDev = Math.Min(rawDev, Math.Max(25.0, _smoothedRttMs * 1.8));
-            _rttJitterMs += (clampedDev > _rttJitterMs ? 0.14 : 0.25) * (clampedDev - _rttJitterMs);
-            // Adapt down rapidly when a faster link/band becomes available,
-            // while damping isolated upward Wi-Fi retry spikes.
-            double alpha = sampleRtt < _smoothedRttMs
-                ? (sampleRtt < _smoothedRttMs * 0.65 ? 0.55 : 0.42)
-                : 0.15;
-            _smoothedRttMs += alpha * (sampleRtt - _smoothedRttMs);
+            _consecutiveHighRttCount = 0;
+        }
+
+        if (_smoothedRttMs <= 0)
+        {
+            _smoothedRttMs = effectiveRtt;
+            _rttJitterMs = 0;
+        }
+        else if (effectiveRtt <= _smoothedRttMs)
+        {
+            double baseDev = minBest < double.MaxValue ? Math.Abs(effectiveRtt - minBest) : 0.0;
+            double clampedDev = Math.Min(baseDev, 6.0);
+            _rttJitterMs += 0.42 * (clampedDev - _rttJitterMs);
+            // Adapt down rapidly when an awake radio sample arrives without counting recovery as jitter.
+            double alpha = effectiveRtt < _smoothedRttMs * 0.65 ? 0.82 : 0.55;
+            _smoothedRttMs += alpha * (effectiveRtt - _smoothedRttMs);
+        }
+        else
+        {
+            double rawDev = Math.Abs(effectiveRtt - _smoothedRttMs);
+            double maxDevCap = minBest < 25.0 ? 8.0 : Math.Max(25.0, _smoothedRttMs * 1.8);
+            double clampedDev = Math.Min(rawDev, maxDevCap);
+            _rttJitterMs += (clampedDev > _rttJitterMs ? 0.10 : 0.35) * (clampedDev - _rttJitterMs);
+            double alpha = (minBest < 25.0 && _consecutiveHighRttCount <= 3) ? 0.08 : 0.15;
+            _smoothedRttMs += alpha * (effectiveRtt - _smoothedRttMs);
         }
     }
 
@@ -452,14 +476,14 @@ internal sealed class AdaptiveLinkTracker
                 {
                     long recvDelta = nowMs - _lastTransitRecvMs;
                     long sendDelta = unchecked(senderTimestampMs - _lastTransitSenderMs);
-                    if (recvDelta is >= 0 and <= 400 && sendDelta is >= 0 and <= 400)
+                    if (recvDelta is >= 0 and <= 250 && sendDelta is >= 0 and <= 45)
                     {
                         double transitDiff = Math.Min(110.0, Math.Abs((double)recvDelta - (double)sendDelta));
-                        _inboundJitterMs += (transitDiff > _inboundJitterMs ? 0.22 : 0.28) * (transitDiff - _inboundJitterMs);
+                        _inboundJitterMs += (transitDiff > _inboundJitterMs ? 0.22 : 0.36) * (transitDiff - _inboundJitterMs);
                     }
-                    else if (recvDelta > 400)
+                    else if (recvDelta > 50 || sendDelta > 45)
                     {
-                        _inboundJitterMs *= 0.80;
+                        _inboundJitterMs *= 0.78;
                     }
                 }
                 _lastTransitSenderMs = senderTimestampMs;
@@ -673,6 +697,8 @@ internal sealed class FastUdpHub : IDisposable
         private int _confirmedLogged;
         internal long LastMoveSentTicks;
         internal long LastLinkPingMs;
+        internal int PendingWakePing;
+        internal long LastWakePrimerMs;
         internal ulong HighestMoveSeq;
 
         internal bool TryMarkConfirmedLogged() =>

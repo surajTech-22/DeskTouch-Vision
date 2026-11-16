@@ -1380,30 +1380,36 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        boolean slow24=WifiLinkMonitor.BAND_24_GHZ.equals(ch.linkTracker.getBand())
-                            || WifiLinkMonitor.BAND_24_GHZ.equals(liveLinkBand);
-                        long baseWarm=hasClaim()
-                            ? (slow24 ? 60L : INTERACTIVE_KEEPALIVE_MS)
-                            : (slow24 ? 180L : 95L);
-                        int warmGapMs=(int)Math.min(hasClaim() ? (slow24 ? 95L : 44L) : 220L,
-                            Math.max(baseWarm, Math.round((slow24 ? 50.0 : 20.0)+ch.linkTracker.getQueueDelayMs()*0.6)));
-                        if(now-lastWarmSentMs>=warmGapMs){
+                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS){
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }
                         long probeGapMs=ch.linkTracker.computeProbeIntervalMs(true);
                         if(now-lastUdpLinkPingMs>=probeGapMs){
-                            lastUdpLinkPingMs=now;
                             int paceTenths=(int)Math.round(lastAdaptiveMoveIntervalMs*10.0);
-                            ch.sendLinkPing(ch.linkTracker.nextPingToken(now),paceTenths,claim>0?claim:reverseLease);
+                            int pingLease=claim>0?claim:reverseLease;
+                            long lastArr=ch.linkTracker.getLastArriveMs();
+                            if(lastArr>0 && now-lastArr<=18L){
+                                lastUdpLinkPingMs=now;
+                                ch.sendLinkPing(ch.linkTracker.nextPingToken(now),paceTenths,pingLease);
+                            }else{
+                                lastUdpLinkPingMs=now;
+                                ch.requestWakePrimedPing(now,paceTenths,pingLease);
+                            }
                         }
                     }else{
                         long idlePingGapMs=screenInteractive
                             ? ch.linkTracker.computeProbeIntervalMs(false)
                             : Math.max(2200L,ch.linkTracker.computeProbeIntervalMs(false));
                         if(now-lastUdpLinkPingMs>=idlePingGapMs){
-                            lastUdpLinkPingMs=now;
-                            ch.sendLinkPing(ch.linkTracker.nextPingToken(now),0,0);
+                            long lastArr=ch.linkTracker.getLastArriveMs();
+                            if(lastArr>0 && now-lastArr<=18L){
+                                lastUdpLinkPingMs=now;
+                                ch.sendLinkPing(ch.linkTracker.nextPingToken(now),0,0);
+                            }else{
+                                lastUdpLinkPingMs=now;
+                                ch.requestWakePrimedPing(now,0,0);
+                            }
                         }
                     }
                 },INTERACTIVE_KEEPALIVE_MS,INTERACTIVE_KEEPALIVE_MS,TimeUnit.MILLISECONDS);
@@ -1539,7 +1545,6 @@ final class DeskTouchSession implements AutoCloseable {
         closeUdpChannel();
         clearReverseControl(false);
         reverseDedup.reset();
-        RemoteInputPower.end();
         synchronized(trustLock){
             pendingTrust=null;pendingTrustId=0;pendingTrustAtMs=0L;
         }
@@ -1548,6 +1553,8 @@ final class DeskTouchSession implements AutoCloseable {
         lastPongReceivedMs=0L;connectedAtMs=0L;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
+        if(DeskTouchRuntime.connectedCount()==0) RemoteInputPower.end();
+        else RemoteInputPower.begin(application);
         AutoConnectService.onConnectionCountChanged(application);
         DeskTouchRuntime.notifyLiveStatusChanged();
         SSLSocket sock=socket;socket=null;

@@ -1210,7 +1210,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int tick = 0;
             while (!token.IsCancellationRequested)
             {
-                await Task.Delay(40, token);
+                await Task.Delay(20, token);
                 long nowMs = Environment.TickCount64;
                 foreach (var session in _sessions.Values)
                 {
@@ -1239,18 +1239,52 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     else if (peer is { Confirmed: true } && _udpHub != null)
                     {
+                        if (controlActive)
+                        {
+                            long nowTicks = Stopwatch.GetTimestamp();
+                            long lastSentTicks = Volatile.Read(ref peer.LastMoveSentTicks);
+                            double sinceMoveMs = lastSentTicks > 0
+                                ? (nowTicks - lastSentTicks) * 1000.0 / Stopwatch.Frequency
+                                : double.MaxValue;
+                            if (sinceMoveMs >= 18.0 && nowMs - peer.LastWakePrimerMs >= 18)
+                            {
+                                peer.LastWakePrimerMs = nowMs;
+                                _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
+                            }
+                        }
                         long probeGapMs = peer.LinkTracker.ComputeProbeIntervalMs(controlActive);
                         if (nowMs - peer.LastLinkPingMs >= probeGapMs)
                         {
-                            peer.LastLinkPingMs = nowMs;
-                            int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
-                            _udpHub.Send(peer, FastUdpOp.LinkPing,
-                                peer.LinkTracker.NextPingToken(nowMs), paceTenths,
-                                Volatile.Read(ref session.ActiveReverseLease));
+                            long lastArriveMs = peer.LinkTracker.LastArriveMs;
+                            bool radioRecentlyAwake = lastArriveMs > 0 && nowMs - lastArriveMs <= 18;
+                            if (radioRecentlyAwake)
+                            {
+                                Volatile.Write(ref peer.PendingWakePing, 0);
+                                peer.LastLinkPingMs = nowMs;
+                                int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
+                                _udpHub.Send(peer, FastUdpOp.LinkPing,
+                                    peer.LinkTracker.NextPingToken(nowMs), paceTenths,
+                                    Volatile.Read(ref session.ActiveReverseLease));
+                            }
+                            else if (Volatile.Read(ref peer.PendingWakePing) == 0)
+                            {
+                                Volatile.Write(ref peer.PendingWakePing, 1);
+                                peer.LastWakePrimerMs = nowMs;
+                                _udpHub.Send(peer, FastUdpOp.Warm, 1, 0, 0);
+                            }
+                            else if (nowMs - peer.LastWakePrimerMs >= 140)
+                            {
+                                Volatile.Write(ref peer.PendingWakePing, 0);
+                                peer.LastLinkPingMs = nowMs;
+                                int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
+                                _udpHub.Send(peer, FastUdpOp.LinkPing,
+                                    peer.LinkTracker.NextPingToken(nowMs), paceTenths,
+                                    Volatile.Read(ref session.ActiveReverseLease));
+                            }
                         }
                     }
 
-                    if ((tick % 75) != 74) continue;
+                    if ((tick % 150) != 149) continue;
                     int liveHz = Volatile.Read(ref session.LiveRefreshHz);
                     int effectiveHz = liveHz >= 24 ? liveHz : (session.Peer.RefreshHz ?? 0);
                     if (session.IsCableSession)
@@ -3051,6 +3085,20 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
         if (msg.Op == FastUdpOp.Warm)
         {
+            if (msg.A == 1 && _udpHub != null && peer.Confirmed)
+            {
+                _udpHub.Send(peer, FastUdpOp.Warm, 2, 0, 0);
+            }
+            if (Interlocked.Exchange(ref peer.PendingWakePing, 0) != 0 && _udpHub != null && peer.Confirmed)
+            {
+                long nowMs = Environment.TickCount64;
+                peer.LastLinkPingMs = nowMs;
+                int paceTenths = (int)Math.Round((session.MovePacer?.EffectiveMinIntervalMs ?? 0) * 10.0);
+                _udpHub.Send(peer, FastUdpOp.LinkPing,
+                    peer.LinkTracker.NextPingToken(nowMs), paceTenths,
+                    Volatile.Read(ref session.ActiveReverseLease));
+                return;
+            }
             if (session.Peer.Platform == "Windows")
                 BroadcastWarmToConfirmedTargets(session.Id);
             else if (ShouldEchoAndroidWarm(session.Peer.Platform) &&
@@ -3137,9 +3185,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return baseMs;
 
         double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
-        double floorMs = isSlow24Ghz ? 10.0 : (isAndroid ? 4.2 : 1.8);
+        double floorMs = isSlow24Ghz ? 8.0 : (isAndroid ? 4.2 : 1.8);
         if (!isSlow24Ghz && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
+        if (isSlow24Ghz && rttMs <= 12.0 && queueDelay <= 4.0 && jitterMs <= 4.5 && lossPermille < 2.0)
+            return Math.Max(floorMs, baseMs * 0.78);
 
         double rttPressure = Math.Max(0.0, rttMs - 18.0) * 0.08;
         double bloatPressure = Math.Max(0.0, queueDelay - 8.0) * 0.16;

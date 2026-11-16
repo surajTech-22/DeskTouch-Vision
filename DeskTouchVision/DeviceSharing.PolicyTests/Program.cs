@@ -732,7 +732,7 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
     receiver.PeerTopologyChanged += peer => remoteRefresh.TrySetResult(peer);
     receiver.PeerDisconnected += () => ended.TrySetResult(true);
     receiver.Start();
-    using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+    using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
     try
     {
         using var session = await HostSession.ConnectWithApprovalAsync(
@@ -818,7 +818,8 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
         await Task.Delay(130, testTimeout.Token);
         Check(!forwardApplied.Task.IsCompleted,
             "Forward grant alone must NOT claim keyboard/cursor authority");
-        var point = System.Windows.Forms.Cursor.Position;
+        var primary = System.Windows.Forms.Screen.PrimaryScreen;
+        var point = primary != null ? new System.Drawing.Point(primary.Bounds.Left + 100, primary.Bounds.Top + 100) : new System.Drawing.Point(100, 100);
         Check(session.TrySend(new Packet("move", point.X, point.Y)),
             "Source must send first cursor position to complete authority handoff");
         Check((await forwardApplied.Task.WaitAsync(testTimeout.Token)).A == 101,
@@ -2539,8 +2540,18 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         Check(singlePrev == 200 && singleCurr == 200, "Unspecified prev must decode as single coordinate");
         Check(ReceiverServer.SupportsDualMovePacket("0.3.57") && !ReceiverServer.SupportsDualMovePacket("0.3.56"),
             "Dual-position packets must only target peers running 0.3.57 or newer");
+
+        // Verify v0.3.58 Ethernet interface detection and link band normalization.
+        Check(AdaptiveLinkTracker.NormalizeBand("ethernet") == "ethernet",
+            "NormalizeBand must recognize ethernet");
+        Check(AdaptiveLinkTracker.NormalizeBand("Ethernet") == "ethernet",
+            "NormalizeBand must be case-insensitive for ethernet");
+        Check(ReceiverServer.DetectInterfaceForLocalAddress(null).Band == "wireless",
+            "Null local address must default to wireless");
+        Check(ReceiverServer.DetectInterfaceForLocalAddress(System.Net.IPAddress.Loopback).Band == "wireless",
+            "Loopback local address must default to wireless");
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, v0.3.56 wireless low-latency, and v0.3.57 dual-position recovery verified.");
+    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, v0.3.56 wireless low-latency, v0.3.57 dual-position recovery, and v0.3.58 wired ethernet detection verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

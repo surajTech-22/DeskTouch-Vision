@@ -762,12 +762,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
         string bandText = snap.TransportBand switch
         {
+            "cable" => "Data cable",
+            "ethernet" => "Wired network (Ethernet)",
             "5GHz" => "5 GHz wireless",
             "6GHz" => "6 GHz wireless",
             "2.4GHz" => "2.4 GHz wireless",
             _ => "Wireless"
         };
-        string speedText = snap.LinkSpeedMbps > 0 ? $" ({snap.LinkSpeedMbps} Mbps)" : "";
+        string speedText = snap.LinkSpeedMbps >= 1000
+            ? $" ({(snap.LinkSpeedMbps % 1000 == 0 ? (snap.LinkSpeedMbps / 1000).ToString() : (snap.LinkSpeedMbps / 1000.0).ToString("F1"))} Gbps)"
+            : (snap.LinkSpeedMbps > 0 ? $" ({snap.LinkSpeedMbps} Mbps)" : "");
         string pingText = snap.RttMs > 0 ? $"{snap.RttMs:F1} ms ping" : "measuring ping...";
         string lossText = snap.LossPermille >= 1.0 ? $"  •  loss {snap.LossPermille / 10.0:F1}%" : "";
         Color color = snap.RttMs is > 0 and <= 20

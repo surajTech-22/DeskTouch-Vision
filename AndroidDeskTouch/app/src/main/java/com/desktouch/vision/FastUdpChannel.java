@@ -368,7 +368,7 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_WARM) {
                     markConfirmed();
-                    if (msg.a == 1) {
+                    if (msg.a == 1 || (msg.a == 0 && nowMs - lastSentMs >= 14L && nowMs - lastWarmEchoSentMs >= 16L)) {
                         lastWarmEchoSentMs = nowMs;
                         send(OP_WARM, 2, 0, 0);
                     }

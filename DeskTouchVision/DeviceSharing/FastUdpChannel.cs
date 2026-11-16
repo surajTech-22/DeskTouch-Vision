@@ -261,6 +261,7 @@ internal sealed class AdaptiveLinkTracker
         if (string.IsNullOrWhiteSpace(raw)) return "wireless";
         string b = raw.Trim();
         if (b.Equals("cable", StringComparison.OrdinalIgnoreCase)) return "cable";
+        if (b.Equals("ethernet", StringComparison.OrdinalIgnoreCase)) return "ethernet";
         if (b.Equals("2.4GHz", StringComparison.OrdinalIgnoreCase)) return "2.4GHz";
         if (b.Equals("5GHz", StringComparison.OrdinalIgnoreCase)) return "5GHz";
         if (b.Equals("6GHz", StringComparison.OrdinalIgnoreCase)) return "6GHz";

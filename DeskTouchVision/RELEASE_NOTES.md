@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.58 — Wired Ethernet Media Classification & Instant-Glide Pointer Restoration
+
+Corrects physical network adapter classification for computer-to-computer connections and restores instant, responsive cursor glide:
+
+- **Wired Ethernet adapter detection & UI classification (`NetworkSessions`, `FastUdpChannel`, `DisplaySettingsForm`):** Inspects the local network interface bound to the peer connection to identify physical Ethernet adapters (`802.3`). When two computers connect over a wired cable, the link is correctly classified and displayed as `Wired network (Ethernet) (1 Gbps)` instead of defaulting to `"Wireless"`.
+- **Dropout-only waypoint glide (`ShellPointerMath`):** Restores immediate, sub-frame cursor response during normal continuous mouse streaming with zero midpoint lag or rubber-banding. Dual-position (- / +) waypoint traversal is engaged only when a genuine transmission gap or packet drop occurs (`>= 14 ms`), recovering dropped trajectories without delaying normal movement.
+- **Continuous 16–18 ms radio keepalive & warm echo (`DeskTouchSession`, `FastUdpChannel`, `NetworkSessions`):** Restores continuous background keepalive pulses and uplink echo responses during mouse motion, keeping the mobile Wi-Fi radio in Continuous Active Mode (CAM) and preventing sleep spikes and bufferbloat.
+
+---
+
 # DeskTouch Vision v0.3.57 — Dual-Position (- / +) Waypoint Recovery & Zero-Collision Mouse Streaming
 
 Eliminates cursor skips, packet-loss teleportation, and wireless air collisions across both wireless and data cable connections:

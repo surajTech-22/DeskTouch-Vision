@@ -1390,7 +1390,7 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS && now-lastUdpReverseMoveAtMs>=30L){
+                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS){
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }

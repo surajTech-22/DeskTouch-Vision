@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -1289,9 +1290,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             sinceMoveMs = lastSentTicks > 0
                                 ? (nowTicks - lastSentTicks) * 1000.0 / Stopwatch.Frequency
                                 : double.MaxValue;
-                            // Never inject heartbeats between live cursor packets: the moves
-                            // already keep the radio awake and extra frames collide on air.
-                            if (sinceMoveMs >= 26.0 && nowMs - peer.LastWakePrimerMs >= 18)
+                            // Maintain keepalive pulse when mouse pauses or between bursts (>= 18ms)
+                            // so the remote phone radio stays awake in Continuous Active Mode (CAM).
+                            if (sinceMoveMs >= 18.0 && nowMs - peer.LastWakePrimerMs >= 18)
                             {
                                 peer.LastWakePrimerMs = nowMs;
                                 _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
@@ -2152,6 +2153,44 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             hello.RotationDegrees ?? primaryMon.RotationDegrees);
     }
 
+    internal static (string Band, int SpeedMbps) DetectInterfaceForLocalAddress(IPAddress? localAddress)
+    {
+        if (localAddress == null || IPAddress.IsLoopback(localAddress))
+            return ("wireless", 0);
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up)
+                    continue;
+                var ipProps = nic.GetIPProperties();
+                foreach (var unicast in ipProps.UnicastAddresses)
+                {
+                    if (unicast.Address.Equals(localAddress))
+                    {
+                        int speedMbps = nic.Speed > 0 ? (int)(nic.Speed / 1_000_000L) : 0;
+                        if (nic.NetworkInterfaceType is NetworkInterfaceType.Ethernet
+                            or NetworkInterfaceType.GigabitEthernet
+                            or NetworkInterfaceType.FastEthernetFx
+                            or NetworkInterfaceType.FastEthernetT)
+                        {
+                            return ("ethernet", speedMbps);
+                        }
+                        if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                        {
+                            return ("wireless", speedMbps);
+                        }
+                        return (nic.NetworkInterfaceType.ToString().ToLowerInvariant(), speedMbps);
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        return ("wireless", 0);
+    }
+
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
     {
         using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen:false);
@@ -2201,9 +2240,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             IPAddress.IsLoopback(remoteEp.Address);
         bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
             isLoopbackRemote;
+        var (localBand, localSpeed) = DetectInterfaceForLocalAddress(
+            client.Client.LocalEndPoint is IPEndPoint localEp ? localEp.Address : null);
+        string initialBand = isCable
+            ? "cable"
+            : (localBand == "ethernet" && string.Equals(peer.Platform, "Windows", StringComparison.Ordinal)
+                ? "ethernet"
+                : "wireless");
+        int initialSpeed = isCable ? 0 : localSpeed;
         var session=new Session{
             Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable,
-            LinkBand=isCable ? "cable" : "wireless",
+            LinkBand=initialBand,
+            LinkSpeedMbps=initialSpeed,
             LastPongTicks=Stopwatch.GetTimestamp(),
             TrustedTokenHash=trustedSource?.TokenSha256
         };
@@ -3928,6 +3976,12 @@ internal sealed class HostSession : IInputSession, IDisposable
                     AppVersion: MonitorTopology.CurrentAppVersion()));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
+            var (outBand, outSpeed) = ReceiverServer.DetectInterfaceForLocalAddress(
+                client.Client.LocalEndPoint is IPEndPoint outEp ? outEp.Address : null);
+            if (outBand == "ethernet")
+            {
+                await Wire.WriteAsync(ssl, new Packet("link-info", Text: outBand, A: outSpeed), acceptedLimit.Token);
+            }
             return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure);
         }
         catch (Exception ex)

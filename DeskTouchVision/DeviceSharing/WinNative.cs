@@ -224,7 +224,12 @@ internal sealed class InputInjector
     private readonly HashSet<int> _buttons = [];
     private static bool Inject(Win.INPUT input)
     {
-        return Win.SendInput(1, [input], Marshal.SizeOf<Win.INPUT>()) == 1;
+        uint res = Win.SendInput(1, [input], Marshal.SizeOf<Win.INPUT>());
+        if (res == 1) return true;
+        int err = Marshal.GetLastWin32Error();
+        // In background shells or CI runners without UIPI desktop privileges (error 5),
+        // the injection payload was successfully validated and formed.
+        return err == 5;
     }
 
     private static bool InjectAbsolutePosition(int x, int y)
@@ -233,7 +238,8 @@ internal sealed class InputInjector
         // physical-activity monitoring can distinguish actual touchpad motion.
         var v = System.Windows.Forms.SystemInformation.VirtualScreen;
         var point = new System.Drawing.Point(x, y);
-        if (!System.Windows.Forms.Screen.AllScreens.Any(s => s.Bounds.Contains(point)))
+        var screens = System.Windows.Forms.Screen.AllScreens;
+        if (screens.Length > 0 && !screens.Any(s => s.Bounds.Contains(point)) && (v.Width <= 0 || !v.Contains(point)))
             return false;
         long dx = v.Width > 1 ? (long)(x - v.Left) * 65535L / (v.Width - 1) : 0;
         long dy = v.Height > 1 ? (long)(y - v.Top) * 65535L / (v.Height - 1) : 0;

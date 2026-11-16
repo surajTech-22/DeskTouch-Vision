@@ -377,6 +377,7 @@ final class ShellPointerMath {
         }
 
         void onTarget(int prevX, int prevY, int tx, int ty, int px, int py, long nowNs) {
+            long packetGapNs = lastPacketNs > 0L ? (nowNs - lastPacketNs) : 0L;
             if (lastPacketNs > 0L && nowNs > lastPacketNs) {
                 long gap = nowNs - lastPacketNs;
                 if (gap <= 120_000_000L) {
@@ -398,11 +399,17 @@ final class ShellPointerMath {
             } else {
                 double dist = Math.hypot(tx - curX, ty - curY);
                 double prevDist = waypointValid ? Math.hypot(prevX - curX, prevY - curY) : 0.0;
-                if (waypointValid && prevDist >= 1.2 && dist >= 2.5) {
+                // Waypoint recovery is ONLY for when a packet was genuinely dropped/delayed
+                // (gap >= 14ms or > 1.4x EMA gap) and the cursor missed the intermediate spot.
+                // Under normal continuous streaming, the cursor is already near prev, so
+                // detour through prev is skipped, avoiding artificial 24ms midpoint lag.
+                boolean wasPacketDropped = waypointValid && prevDist >= 3.0 && dist >= 5.0 &&
+                    (packetGapNs >= 14_000_000L || (emaInputGapNs > 0L && packetGapNs > (long)(emaInputGapNs * 1.4)));
+                if (wasPacketDropped) {
                     hasMidpoint = true;
                     midX = prevX;
                     midY = prevY;
-                    long horizonNs = Math.min(24_000_000L,
+                    long horizonNs = Math.min(18_000_000L,
                         Math.max(subFrameNs * 2L, Math.round((emaInputGapNs == 0L ? subFrameNs * 2L : emaInputGapNs) * 1.05)));
                     glideDeadlineNs = nowNs + horizonNs;
                 } else {
@@ -411,7 +418,7 @@ final class ShellPointerMath {
                             emaInputGapNs <= (long) (subFrameNs * 1.65)) {
                         glideDeadlineNs = nowNs;
                     } else {
-                        long horizonNs = Math.min(16_000_000L,
+                        long horizonNs = Math.min(14_000_000L,
                             Math.max(subFrameNs, Math.round(emaInputGapNs * 0.90)));
                         glideDeadlineNs = nowNs + horizonNs;
                     }

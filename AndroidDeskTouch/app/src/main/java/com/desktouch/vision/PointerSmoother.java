@@ -15,6 +15,9 @@ public final class PointerSmoother {
 
     private boolean initialized;
     private boolean settled = true;
+    private boolean hasWaypoint;
+    private float waypointX;
+    private float waypointY;
     private float curX;
     private float curY;
     private float targetX;
@@ -47,6 +50,7 @@ public final class PointerSmoother {
     public synchronized void reset(float x, float y, long nowNs) {
         this.initialized = true;
         this.settled = true;
+        this.hasWaypoint = false;
         this.curX = x;
         this.curY = y;
         this.targetX = x;
@@ -59,6 +63,7 @@ public final class PointerSmoother {
     public synchronized void clear() {
         this.initialized = false;
         this.settled = true;
+        this.hasWaypoint = false;
         this.lastTargetNs = 0L;
         this.lastFrameNs = 0L;
         this.consecutiveActiveFrames = 0;
@@ -71,6 +76,14 @@ public final class PointerSmoother {
      * @return {@code true} if the display cursor needs rendering/interpolation toward target.
      */
     public synchronized boolean onTarget(float x, float y, long nowNs) {
+        return onTarget(x, y, x, y, nowNs);
+    }
+
+    /**
+     * Records a newly received remote pointer target along with the previous (-) waypoint
+     * carried in the packet so dropped wireless frames are smoothly traversed instead of skipped.
+     */
+    public synchronized boolean onTarget(float prevX, float prevY, float x, float y, long nowNs) {
         if (!initialized) {
             reset(x, y, nowNs);
             return false;
@@ -89,13 +102,26 @@ public final class PointerSmoother {
             }
         }
         lastTargetNs = nowNs;
+
+        boolean waypointValid = prevX >= 0f && prevY >= 0f && (prevX != x || prevY != y);
+        boolean missedPreviousTarget = Math.abs(prevX - targetX) > 0.5f || Math.abs(prevY - targetY) > 0.5f;
+        double dist = Math.hypot(x - curX, y - curY);
+        double prevDist = waypointValid ? Math.hypot(prevX - curX, prevY - curY) : 0.0;
+        if (waypointValid && missedPreviousTarget && prevDist >= 3.0 && dist >= 5.0) {
+            hasWaypoint = true;
+            waypointX = prevX;
+            waypointY = prevY;
+        } else {
+            hasWaypoint = false;
+        }
+
         targetX = x;
         targetY = y;
 
-        double dist = Math.hypot(targetX - curX, targetY - curY);
         if (dist <= 0.01) {
             curX = targetX;
             curY = targetY;
+            hasWaypoint = false;
             settled = true;
             return false;
         }
@@ -144,7 +170,26 @@ public final class PointerSmoother {
         }
 
         double tauMs = computeTauMsLocked(nominalFrameMs);
-        if (tauMs <= 0.01 || dist <= 0.45) {
+        if (hasWaypoint) {
+            double wdx = waypointX - curX;
+            double wdy = waypointY - curY;
+            double wdist = Math.hypot(wdx, wdy);
+            if (tauMs <= 0.01 || wdist <= 1.5) {
+                curX = waypointX;
+                curY = waypointY;
+                hasWaypoint = false;
+                settled = Math.hypot(targetX - curX, targetY - curY) <= 0.45;
+            } else {
+                double clampedDt = Math.max(2.0, Math.min(35.0, dtMs));
+                double alpha = Math.min(0.95, (1.0 - Math.exp(-clampedDt / tauMs)) * 1.65);
+                curX += (float) (wdx * alpha);
+                curY += (float) (wdy * alpha);
+                if (Math.hypot(waypointX - curX, waypointY - curY) <= 2.0) {
+                    hasWaypoint = false;
+                }
+                settled = false;
+            }
+        } else if (tauMs <= 0.01 || dist <= 0.45) {
             curX = targetX;
             curY = targetY;
             settled = true;
@@ -199,6 +244,7 @@ public final class PointerSmoother {
         }
         curX = targetX;
         curY = targetY;
+        hasWaypoint = false;
         settled = true;
         if (outXY != null && outXY.length >= 2) {
             outXY[0] = curX;

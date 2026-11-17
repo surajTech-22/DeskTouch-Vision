@@ -1167,5 +1167,19 @@ public final class ProtocolSourceTest {
         // First sub-frame tick must move towards waypoint (25, 25), NOT snap to 40, 40.
         glide.sampleNext(t + 4_000_000L, out);
         assertTrue("Subframe coordinate must advance through intermediate waypoint", out[0] > 10 && out[0] <= 25);
+
+        // PointerSmoother (wireless Accessibility mode) must also traverse dropped (-) waypoint.
+        PointerSmoother smoother = new PointerSmoother();
+        smoother.setDisplayRefreshHz(120);
+        smoother.reset(10f, 10f, t);
+        float[] sOut = new float[2];
+        assertTrue(smoother.onTarget(25f, 25f, 40f, 40f, t + 16_000_000L));
+        assertTrue(smoother.stepFrame(t + 24_000_000L, sOut));
+        assertEquals(25, Math.round(sOut[0]));
+        assertEquals(25, Math.round(sOut[1]));
+        assertFalse("PointerSmoother must remain unsettled until reaching (+) target after (-) waypoint", smoother.isSettled());
+        assertTrue(smoother.stepFrame(t + 32_000_000L, sOut));
+        assertEquals(40, Math.round(sOut[0]));
+        assertEquals(40, Math.round(sOut[1]));
     }
 }

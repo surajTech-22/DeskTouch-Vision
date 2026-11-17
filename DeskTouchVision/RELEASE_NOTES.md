@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.61 — Wireless Accessibility Dual-Position Recovery & System-to-System Edge/Status Fixes
+
+Resolves recent update regressions across computer-to-computer and mobile wireless connections:
+
+- **Screen-edge movement continuity on Windows peers (`NetworkSessions`, `FastUdpChannel`):** Restricts mobile `ReverseEdgePush` packets exclusively to Android targets (`platform == "Android"`) so cursor movements touching or sliding along the screen edges of a destination Windows computer are never converted into mobile edge-push frames or dropped.
+- **Active-lease status bar computer prioritization (`NetworkSessions`, `DisplaySettingsForm`):** Updates `GetActiveLinkSummary` and client status bar selection to check whether a non-Windows target holds an active control lease, ensuring the computer-to-computer wired Ethernet link is always prioritized in the status bar whenever the cursor is local or controlling the other computer.
+- **Movement timestamp tracking, unstarved ping probes & sub-millisecond wired jitter (`FastUdpChannel`, `NetworkSessions`):** Records `LastMoveSentTicks` on outbound fast-channel movements, separates the mobile Continuous Active Mode keepalive timer from the wake-primed ping timer so live ping probes are never starved, and prevents coarse 15.6 ms system tick quantization from reporting false jitter on wired Ethernet connections.
+- **Wireless Accessibility mode dual-position (`-` / `+`) waypoint recovery (`DeskTouchSession`, `DeskTouchAccessibilityService`, `PointerSmoother`, `ShellPointerMath`, `ShellInputDaemon`):** Threads unpacked previous (`-`) and current (`+`) mouse positions into Android Accessibility pointer rendering (`PointerSmoother`) so dropped wireless packets are smoothly traversed in both Accessibility and Virtual Bridge modes, and removes the destabilizing network-selection override command on Android.
+
+---
+
 # DeskTouch Vision v0.3.60 — Windows Direct Pixel Coordinates & Wired Ethernet Link Preservation
 
 Resolves computer-to-computer cursor lag, drops, and corrects status bar link classification:

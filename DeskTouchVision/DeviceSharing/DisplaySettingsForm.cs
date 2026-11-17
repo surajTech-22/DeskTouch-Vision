@@ -733,7 +733,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void UpdateLiveLinkDisplay()
     {
         if (IsDisposed) return;
-        var snap = (_host != null && !_captureUsesInbound)
+        var snap = (_host != null && !(_captureUsesInbound && _capture?.RemoteActive == true))
             ? _host.GetActiveLinkSummary()
             : _receiver?.GetActiveLinkSummary();
         var (color, text) = FormatLiveLinkDisplay(
@@ -788,7 +788,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void ShowConnectedShortcuts()
     {
-        var snap = (_host != null && !_captureUsesInbound)
+        var snap = (_host != null && !(_captureUsesInbound && _capture?.RemoteActive == true))
             ? _host.GetActiveLinkSummary()
             : _receiver?.GetActiveLinkSummary();
         var phoneSummary = KeyboardLayoutHelper.TryParseWireSummary(snap?.KeyboardInfoJson);

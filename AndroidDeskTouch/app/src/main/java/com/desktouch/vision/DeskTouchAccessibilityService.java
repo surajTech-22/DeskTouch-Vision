@@ -64,6 +64,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private volatile int x,y;
     private final java.util.concurrent.atomic.AtomicLong pendingPos =
         new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong pendingPrevPos =
+        new java.util.concurrent.atomic.AtomicLong(packCoords(-1, -1));
     static long packCoords(int px,int py){
         return (((long)px)<<32)|(py & 0xFFFFFFFFL);
     }
@@ -621,25 +623,38 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     }
 
     static boolean pointer(int px,int py,Runnable applied){
+        return pointer(px,py,px,py,applied);
+    }
+    static boolean pointer(int prevX,int prevY,int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return false;
         service.remoteActive=true;
         // Retain the newest position on fast mice/touchpads instead of
         // filling Android's UI queue with hundreds of obsolete moves.
-        service.pendingPos.set(packCoords(px,py));
+        long priorPacked=service.pendingPos.getAndSet(packCoords(px,py));
         service.pendingArrivalNanos.set(SystemClock.elapsedRealtimeNanos());
         if(applied!=null)service.pendingApplied.set(applied);
         if(service.moveScheduled.compareAndSet(false,true)){
+            service.pendingPrevPos.set(packCoords(prevX,prevY));
             if(!service.pointerVisible() || applied!=null)
                 service.ui.post(()->service.flushPointer(System.nanoTime(),false));
             else service.schedulePointerFrame();
         }
-        else service.coalescedMoves.incrementAndGet();
+        else{
+            int oldX=unpackX(priorPacked),oldY=unpackY(priorPacked);
+            if(oldX>=0 && oldY>=0 && (oldX!=px || oldY!=py)){
+                service.pendingPrevPos.compareAndSet(packCoords(-1,-1),packCoords(oldX,oldY));
+            }
+            service.coalescedMoves.incrementAndGet();
+        }
         return true;
     }
     private void flushPointer(long frameTimeNs,boolean fromVsync){
         long packed=pendingPos.get();
         int px=unpackX(packed),py=unpackY(packed);
+        long prevPacked=pendingPrevPos.getAndSet(packCoords(-1,-1));
+        int prevX=unpackX(prevPacked),prevY=unpackY(prevPacked);
+        if(prevX<0 || prevY<0){ prevX=px; prevY=py; }
         long arrival=pendingArrivalNanos.getAndSet(0L);
         long now=SystemClock.elapsedRealtimeNanos();
         if(remoteActive&&ready(this)){
@@ -652,7 +667,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             }else{
                 if(px!=lastFedTargetX || py!=lastFedTargetY){
                     lastFedTargetX=px;lastFedTargetY=py;
-                    smoother.onTarget(px,py,frameTimeNs);
+                    smoother.onTarget(prevX,prevY,px,py,frameTimeNs);
                 }
                 if(smoother.stepFrame(frameTimeNs,smoothedXY,fromVsync)){
                     drawX=Math.round(smoothedXY[0]);

@@ -461,6 +461,7 @@ internal sealed class AdaptiveLinkTracker
 
     internal void RecordInboundPacket(ulong seq, bool hasSenderTimestamp, int senderTimestampMs, long nowMs)
     {
+        bool isWiredEthernet = string.Equals(Band, "ethernet", StringComparison.Ordinal);
         lock (_recvGate)
         {
             if (nowMs > 0 && _lastArriveMs > 0 && nowMs > _lastArriveMs)
@@ -471,6 +472,15 @@ internal sealed class AdaptiveLinkTracker
             }
             RecordSeqLocked(seq);
             if (nowMs <= 0) return;
+            if (isWiredEthernet)
+            {
+                _inboundJitterMs = 0;
+                _lastTransitSenderMs = senderTimestampMs;
+                _lastTransitRecvMs = nowMs;
+                _hasLastTransit = hasSenderTimestamp;
+                _lastArriveMs = nowMs;
+                return;
+            }
             if (hasSenderTimestamp)
             {
                 if (_hasLastTransit)
@@ -700,6 +710,7 @@ internal sealed class FastUdpHub : IDisposable
         internal long LastLinkPingMs;
         internal int PendingWakePing;
         internal long LastWakePrimerMs;
+        internal long LastCamPulseMs;
         internal ulong HighestMoveSeq;
 
         internal bool TryMarkConfirmedLogged() =>
@@ -754,7 +765,10 @@ internal sealed class FastUdpHub : IDisposable
                 if (len <= 0) return false;
                 try
                 {
-                    return socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, target) == len;
+                    bool sent = socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, target) == len;
+                    if (sent && op is FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush or FastUdpOp.Move)
+                        Volatile.Write(ref LastMoveSentTicks, Stopwatch.GetTimestamp());
+                    return sent;
                 }
                 catch (Exception)
                 {
@@ -862,7 +876,7 @@ internal sealed class FastUdpHub : IDisposable
                     peer.LinkTracker.OnFeedbackReceived(msg.A, msg.B, msg.TimestampMs, nowMs);
                     MessageReceived?.Invoke(peer, msg);
                 }
-                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove)
+                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush)
                 {
                     if (msg.Seq <= peer.HighestMoveSeq) continue;
                     peer.HighestMoveSeq = msg.Seq;
@@ -1010,7 +1024,7 @@ internal sealed class FastUdpClient : IDisposable
                     LinkTracker.OnFeedbackReceived(msg.A, msg.B, msg.TimestampMs, nowMs);
                     MessageReceived?.Invoke(msg);
                 }
-                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove)
+                else if (msg.Op is FastUdpOp.Move or FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush)
                 {
                     if (msg.Seq <= _highestMoveSeq) continue;
                     _highestMoveSeq = msg.Seq;

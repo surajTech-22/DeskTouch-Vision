@@ -974,10 +974,6 @@ public final class ShellInputDaemon {
         lastWifiConfigNs = now;
         Thread t = new Thread(() -> {
             try {
-                new ProcessBuilder("cmd", "wifi", "set-network-selection-config", "disabled", "disabled", "-a", "2")
-                    .redirectErrorStream(true).start().waitFor();
-            } catch (Throwable ignored) {}
-            try {
                 new ProcessBuilder("cmd", "wifi", "set-scan-always-available", "disabled")
                     .redirectErrorStream(true).start().waitFor();
             } catch (Throwable ignored) {}

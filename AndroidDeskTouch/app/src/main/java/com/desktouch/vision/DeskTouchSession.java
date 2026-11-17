@@ -982,7 +982,7 @@ final class DeskTouchSession implements AutoCloseable {
             Runnable ack=reverseApplied==lease ? null : ()->emitReverseActive(lease);
             posted=reverseUsingShell
                 ? ShellInputClient.movePointer(prevX,prevY,x,y,pushX,pushY,ack)
-                : DeskTouchAccessibilityService.pointer(x,y,ack);
+                : DeskTouchAccessibilityService.pointer(prevX,prevY,x,y,ack);
         }
         if(!posted)revokeRemoteFromNative();
     }

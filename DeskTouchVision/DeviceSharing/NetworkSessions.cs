@@ -579,8 +579,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal ActiveLinkSnapshot GetActiveLinkSummary()
     {
-        var session = Volatile.Read(ref _selected) ??
-            _sessions.Values.OrderByDescending(s => s.Peer.Platform == "Windows").ThenBy(s => s.Id).FirstOrDefault();
+        var selected = Volatile.Read(ref _selected);
+        Session? activeLeaseSession = (selected != null && Volatile.Read(ref selected.ActiveReverseLease) > 0)
+            ? selected
+            : _sessions.Values.FirstOrDefault(s => Volatile.Read(ref s.ActiveReverseLease) > 0);
+        var session = activeLeaseSession ??
+            _sessions.Values
+                .OrderByDescending(s => string.Equals(s.Peer.Platform, "Windows", StringComparison.Ordinal))
+                .ThenByDescending(s => s.IsCableSession)
+                .ThenBy(s => s.Id)
+                .FirstOrDefault();
         if (session == null)
             return new ActiveLinkSnapshot(false, "", "offline", 0, 0, 0, 0, null);
         if (session.IsCableSession)
@@ -1297,6 +1305,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     else if (peer is { Confirmed: true } && _udpHub != null)
                     {
                         double sinceMoveMs = double.MaxValue;
+                        bool isAndroidPeer = string.Equals(session.Peer.Platform, "Android", StringComparison.Ordinal);
                         if (controlActive)
                         {
                             long nowTicks = Stopwatch.GetTimestamp();
@@ -1306,9 +1315,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                                 : double.MaxValue;
                             // Maintain keepalive pulse when mouse pauses or between bursts (>= 18ms)
                             // so the remote phone radio stays awake in Continuous Active Mode (CAM).
-                            if (sinceMoveMs >= 18.0 && nowMs - peer.LastWakePrimerMs >= 18)
+                            if (isAndroidPeer && sinceMoveMs >= 18.0 && nowMs - peer.LastCamPulseMs >= 18)
                             {
-                                peer.LastWakePrimerMs = nowMs;
+                                peer.LastCamPulseMs = nowMs;
                                 _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
                             }
                         }
@@ -1316,7 +1325,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         if (nowMs - peer.LastLinkPingMs >= probeGapMs)
                         {
                             long lastArriveMs = peer.LinkTracker.LastArriveMs;
-                            bool radioRecentlyAwake = (lastArriveMs > 0 && nowMs - lastArriveMs <= 25) ||
+                            bool radioRecentlyAwake = !isAndroidPeer ||
+                                session.LinkBand == "ethernet" ||
+                                (lastArriveMs > 0 && nowMs - lastArriveMs <= 25) ||
                                 (controlActive && sinceMoveMs < 35.0);
                             if (radioRecentlyAwake)
                             {
@@ -2325,6 +2336,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             bool shouldSelect;
             lock(_authorityGate)
                 shouldSelect = _selected==null || replacedSelectedStaleSession ||
+                    (string.Equals(peer.Platform, "Windows", StringComparison.Ordinal) &&
+                     !string.Equals(_selected.Peer.Platform, "Windows", StringComparison.Ordinal) &&
+                     Volatile.Read(ref _selected.ActiveReverseLease) == 0) ||
                     (isCable && !_selected.IsCableSession && IsSameDevicePeer(_selected.Peer, peer)) ||
                     (!isCable && _selected.IsCableSession &&
                      Volatile.Read(ref _selected.CableDetachedOrUnresponsive) != 0 &&
@@ -2983,7 +2997,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(ReferenceEquals(_selected,session))
                 {
                     previous=session;
-                    next=_sessions.Values.OrderByDescending(s=>s.IsCableSession)
+                    next=_sessions.Values
+                        .OrderByDescending(s=>string.Equals(s.Peer.Platform, "Windows", StringComparison.Ordinal))
+                        .ThenByDescending(s=>s.IsCableSession)
                         .ThenBy(s=>s.Id).FirstOrDefault();
                     _selected=next;
                 }
@@ -3344,8 +3360,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return Math.Clamp((int)Math.Round(baseMs + queueDelayMs * 0.65 + lossPermille * 0.25), minMs, maxMs);
     }
 
-    internal static bool SupportsUdpEdgePush(string? appVersion) =>
+    internal static bool SupportsUdpEdgePush(string? platform, string? appVersion) =>
+        string.Equals(platform, "Android", StringComparison.Ordinal) &&
         Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 50);
+
+    internal static bool SupportsUdpEdgePush(string? appVersion) =>
+        SupportsUdpEdgePush("Android", appVersion);
 
     internal static bool SupportsDualMovePacket(string? platform, string? appVersion) =>
         string.Equals(platform, "Android", StringComparison.Ordinal) &&
@@ -3377,7 +3397,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (move.D != 0 &&
             move.A is >= short.MinValue and <= short.MaxValue &&
             move.B is >= short.MinValue and <= short.MaxValue &&
-            SupportsUdpEdgePush(session.Peer.AppVersion))
+            SupportsUdpEdgePush(session.Peer.Platform, session.Peer.AppVersion))
         {
             var (pushX, pushY) = FastMovePacer.UnpackEdgePush(move.D);
             if (pushX != 0 || pushY != 0)
@@ -4470,6 +4490,16 @@ internal sealed class HostSession : IInputSession, IDisposable
                     {
                         var (_, currX) = FastMovePacer.UnpackDualCoord(msg.A);
                         var (_, currY) = FastMovePacer.UnpackDualCoord(msg.B);
+                        ProcessReverseInput(new Packet("reverse-move", currX, currY));
+                    }
+                }
+                else if (msg.Op == FastUdpOp.ReverseEdgePush)
+                {
+                    int active = Volatile.Read(ref _reverseLease);
+                    if (active > 0 && msg.Lease == active)
+                    {
+                        int currX = (short)(msg.A & 0xFFFF);
+                        int currY = (short)(msg.B & 0xFFFF);
                         ProcessReverseInput(new Packet("reverse-move", currX, currY));
                     }
                 }

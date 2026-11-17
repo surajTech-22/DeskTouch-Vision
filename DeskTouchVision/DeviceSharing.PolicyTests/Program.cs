@@ -2542,6 +2542,8 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
             "Dual-position packets must only target Android peers running 0.3.57 or newer");
         Check(!ReceiverServer.SupportsDualMovePacket("Windows", "0.3.57"),
             "Windows peers must never receive dual-position packets");
+        Check(ReceiverServer.SupportsUdpEdgePush("Android", "0.3.61") && !ReceiverServer.SupportsUdpEdgePush("Windows", "0.3.61"),
+            "UDP ReverseEdgePush must only target Android peers and never Windows computers");
 
         // Verify v0.3.58 Ethernet interface detection and link band normalization.
         Check(AdaptiveLinkTracker.NormalizeBand("ethernet") == "ethernet",

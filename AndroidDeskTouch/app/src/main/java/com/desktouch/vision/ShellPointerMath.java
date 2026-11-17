@@ -377,7 +377,6 @@ final class ShellPointerMath {
         }
 
         void onTarget(int prevX, int prevY, int tx, int ty, int px, int py, long nowNs) {
-            long packetGapNs = lastPacketNs > 0L ? (nowNs - lastPacketNs) : 0L;
             if (lastPacketNs > 0L && nowNs > lastPacketNs) {
                 long gap = nowNs - lastPacketNs;
                 if (gap <= 120_000_000L) {
@@ -399,12 +398,10 @@ final class ShellPointerMath {
             } else {
                 double dist = Math.hypot(tx - curX, ty - curY);
                 double prevDist = waypointValid ? Math.hypot(prevX - curX, prevY - curY) : 0.0;
-                // Waypoint recovery is ONLY for when a packet was genuinely dropped/delayed
-                // (gap >= 14ms or > 1.4x EMA gap) and the cursor missed the intermediate spot.
-                // Under normal continuous streaming, the cursor is already near prev, so
-                // detour through prev is skipped, avoiding artificial 24ms midpoint lag.
-                boolean wasPacketDropped = waypointValid && prevDist >= 3.0 && dist >= 5.0 &&
-                    (packetGapNs >= 14_000_000L || (emaInputGapNs > 0L && packetGapNs > (long)(emaInputGapNs * 1.4)));
+                // Waypoint recovery is ONLY for when a packet was genuinely dropped
+                // (prev differs from the last received target) and the cursor missed the intermediate spot.
+                boolean missedPreviousTarget = (prevX != targetX || prevY != targetY);
+                boolean wasPacketDropped = waypointValid && missedPreviousTarget && prevDist >= 3.0 && dist >= 5.0;
                 if (wasPacketDropped) {
                     hasMidpoint = true;
                     midX = prevX;

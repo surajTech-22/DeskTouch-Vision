@@ -1441,6 +1441,8 @@ public final class ProtocolSourceTest {
 
         assertFalse(DeskTouchNotificationListener.isPermissionGranted(null));
         assertEquals(-1, DeskTouchNotificationListener.readActiveCount(null));
+        DeskTouchNotificationListener.openAppInfo(null);
+        DeskTouchNotificationListener.openSettings(null);
         assertNotNull(DeskTouchRuntime.connectedNotificationSummary(null));
     }
 }

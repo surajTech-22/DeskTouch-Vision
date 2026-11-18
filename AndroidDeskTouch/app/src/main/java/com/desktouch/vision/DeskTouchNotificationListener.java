@@ -62,6 +62,19 @@ public final class DeskTouchNotificationListener extends NotificationListenerSer
         }
     }
 
+    static void openAppInfo(Context context) {
+        if (context == null) return;
+        try {
+            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.fromParts("package", context.getPackageName(), null));
+            if (!(context instanceof android.app.Activity)) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            }
+            context.startActivity(intent);
+        } catch (Exception ignored) {
+        }
+    }
+
     @Override
     public void onListenerConnected() {
         activeListener = this;

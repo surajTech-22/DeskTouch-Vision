@@ -1174,11 +1174,8 @@ public final class MainActivity extends Activity {
         stopLp.topMargin=dp(8);
         safetyCard.addView(stopCtrlBtn,stopLp);
 
-        notifAccessBtn=PhoneUiKit.createButton(this,"Notification Count: Off",palette,PhoneUiKit.BTN_SUBTLE);
-        notifAccessBtn.setOnClickListener(v->{
-            DeskTouchNotificationListener.openSettings(this);
-            setFeedback("Allow DeskTouch Notification Badge to share your notification count across connected devices.",true);
-        });
+        notifAccessBtn=PhoneUiKit.createButton(this,"Enable Notification Count Badge",palette,PhoneUiKit.BTN_SUBTLE);
+        notifAccessBtn.setOnClickListener(v->onNotificationAccessClicked());
         LinearLayout.LayoutParams nLp=new LinearLayout.LayoutParams(-1,-2);
         nLp.topMargin=dp(8);
         safetyCard.addView(notifAccessBtn,nLp);
@@ -1563,9 +1560,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.72";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.73";
         }catch(Exception ignored){
-            return "0.3.72";
+            return "0.3.73";
         }
     }
 
@@ -2042,6 +2039,22 @@ public final class MainActivity extends Activity {
             (DeskTouchInputMethod.isSelected(this)
                 ? "selected for focused-field typing."
                 : "not selected (optional when Accessibility is used)."));
+    }
+
+    private void onNotificationAccessClicked(){
+        if(DeskTouchNotificationListener.isPermissionGranted(this)){
+            DeskTouchNotificationListener.openSettings(this);
+            return;
+        }
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("Enable Notification Count")
+            .setMessage("On Xiaomi / Android 13+, Notification Access shows \"Restricted setting\" until enabled for DeskTouch Vision:\n\n"
+                +"1. Tap \"1. Open App Info\" -> tap ⋮ (top right) or scroll down and tap \"Allow restricted settings\".\n"
+                +"2. Come back and tap \"2. Notification Access\" -> enable \"DeskTouch Notification Badge\".")
+            .setPositiveButton("1. Open App Info",(d,w)->DeskTouchNotificationListener.openAppInfo(this))
+            .setNeutralButton("2. Notification Access",(d,w)->DeskTouchNotificationListener.openSettings(this))
+            .setNegativeButton("Cancel",null)
+            .show();
     }
 
     private void refreshNotificationAccessButton(){

@@ -481,7 +481,7 @@ public final class AutoConnectService extends Service {
         long now=android.os.SystemClock.uptimeMillis();
         if(now-lastUsbFollowUpMs<400L) return;
         lastUsbFollowUpMs=now;
-        int[] delaysMs={150,600,1300,2400};
+        int[] delaysMs={150,600,1300,2400,4000,6500};
         for(int delay:delaysMs) {
             pool.schedule(()->{
                 if(!DeskTouchRuntime.anyCableConnected()) autoConnect();
@@ -734,7 +734,7 @@ public final class AutoConnectService extends Service {
 
         // Fallback only when Wi-Fi is completely disconnected/unavailable (Case 3).
         if(DeskTouchRuntime.anyInputLeaseActive() || DeskTouchRuntime.connectedCount()>0) return;
-        if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<60_000L) return;
+        if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<20_000L) return;
         PhoneScreenGeometry.Info phone=PhoneScreenGeometry.readInfo(this);
         for(String fp:DeskTouchRuntime.endpointFingerprints()) {
             if(!allowed.contains(fp) || paused.contains(fp)) continue;

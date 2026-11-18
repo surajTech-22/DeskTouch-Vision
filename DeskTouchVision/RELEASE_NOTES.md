@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.73 — Faster Phone Startup Auto-Connect & Xiaomi Restricted Notification Access Guide
+
+- **Faster initial phone startup & USB cable attach (`AutoConnectService`):** Extends the initial USB cable attach probe window up to 6.5 s so cold ADB reverse bridges connect immediately without waiting for the 10 s periodic sweep, and reduces cellular failover probe backoff from 60 s to 20 s for faster startup recovery when switching networks.
+- **2-step Xiaomi / Android 13+ Notification Count permission guide (`MainActivity`, `DeskTouchNotificationListener`):** Tapping `Enable Notification Count Badge` now opens a clear 2-step dialog with direct `1. Open App Info` (to tap ⋮ → `Allow restricted settings`) and `2. Notification Access` shortcuts so notification counts can be granted without hitting the greyed-out "Restricted setting" dead end.
+
+---
+
 # DeskTouch Vision v0.3.72 — Numeric Device Notification Badges, Tray Switcher Flyout, DeskSpace Bridge & Phone-to-System Fast Input
 
 - **Numeric notification counts across all connected devices (`DeskTouchNotificationListener`, `WindowsNotificationCounter`, `NetworkSessions`, `DisplayArrangementControl`):** Shares active notification counts (strictly numeric totals only — never notification titles, bodies, or app identities) across connected Windows and Android devices, displaying counts directly above each device in the Android app, ongoing phone notification, tray flyout, Displays diagram, and DeskSpace Deck.

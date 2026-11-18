@@ -1222,5 +1222,29 @@ public final class ProtocolSourceTest {
         assertTrue(smoother.stepFrame(t + 32_000_000L, sOut));
         assertEquals(40, Math.round(sOut[0]));
         assertEquals(40, Math.round(sOut[1]));
+
+        // Verify v0.3.64: Clean-jitter RF drops stay crisp; cellular scoring & cooldowns work cleanly.
+        PointerSmoother rfSmoother = new PointerSmoother();
+        rfSmoother.setDisplayRefreshHz(144);
+        rfSmoother.setLinkMetrics(2.0, 150.0);
+        assertTrue("Clean-jitter RF drops must stay crisp (<= 3.5 ms tau)",
+            rfSmoother.getCurrentTauMs() <= 3.5);
+
+        assertEquals("cellular", AdaptiveLinkTracker.normalizeBand("cellular"));
+        assertEquals("cellular", AdaptiveLinkTracker.normalizeBand("Mobile"));
+        AdaptiveLinkTracker dropTracker = new AdaptiveLinkTracker("2.4GHz");
+        dropTracker.recordRttSample(4.5, 1000L);
+        dropTracker.recordRttSample(6.0, 1020L);
+        assertTrue("Clean-jitter low-RTT RF drops on 2.4GHz must stay <= 10.5ms pace",
+            dropTracker.computeAdaptiveSendIntervalMs(144, "2.4GHz") <= 10.5);
+
+        assertTrue("Degraded 2.4 GHz Wi-Fi (8% loss) must prefer clean 30ms Mobile network",
+            CellularLinkHelper.shouldPreferCellular(5.0, 3.0, 80.0, 30.0, 4.0, 0.0, 60_000L, 0L));
+        assertFalse("Clean 5 GHz Wi-Fi must never switch to 30ms Mobile network",
+            CellularLinkHelper.shouldPreferCellular(4.0, 1.5, 0.0, 30.0, 4.0, 0.0, 60_000L, 0L));
+        assertFalse("Cooldown window must prevent rapid transport flapping",
+            CellularLinkHelper.shouldPreferCellular(5.0, 3.0, 80.0, 30.0, 4.0, 0.0, 65_000L, 55_000L));
+        assertTrue("Healthy low-latency Wi-Fi returning must beat 35ms Mobile network after cooldown",
+            CellularLinkHelper.shouldReturnToWifi(35.0, 4.0, 0.0, 4.5, 1.5, 0.0, 90_000L, 50_000L));
     }
 }

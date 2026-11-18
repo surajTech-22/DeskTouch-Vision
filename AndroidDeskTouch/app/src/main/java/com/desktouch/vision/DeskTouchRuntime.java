@@ -143,6 +143,16 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isCableSession())return true;
         return false;
     }
+    static synchronized boolean anyCellularConnected(){
+        for(DeskTouchSession s:sessions.values())if(s.isCellularSession())return true;
+        return false;
+    }
+    static synchronized String connectedCellularFingerprint(){
+        for(DeskTouchSession s:sessions.values()){
+            if(s.isCellularSession()) return s.connectedFingerprint();
+        }
+        return null;
+    }
     static synchronized boolean anyInputLeaseActive(){
         for(DeskTouchSession s:sessions.values())if(s.isBusyInLease())return true;
         return false;
@@ -161,16 +171,24 @@ final class DeskTouchRuntime {
     static boolean upgradeToCableMakeBeforeBreak(
             Context context, DesktopDiscovery.Device cableDevice,
             int width, int height, Runnable onFailure){
-        return connectMakeBeforeBreak(context,cableDevice,width,height,false,onFailure);
+        return connectMakeBeforeBreak(context,cableDevice,width,height,false,false,null,false,null,onFailure);
     }
     static boolean switchToHubMakeBeforeBreak(
             Context context, DesktopDiscovery.Device hubDevice,
             int width, int height, Runnable onFailure){
-        return connectMakeBeforeBreak(context,hubDevice,width,height,true,onFailure);
+        return connectMakeBeforeBreak(context,hubDevice,width,height,true,false,null,false,null,onFailure);
+    }
+    static boolean switchTransportMakeBeforeBreak(
+            Context context, DesktopDiscovery.Device targetDevice,
+            int width, int height, android.net.Network boundNetwork, boolean cellular,
+            Runnable onConnected, Runnable onFailure){
+        return connectMakeBeforeBreak(context,targetDevice,width,height,false,true,boundNetwork,cellular,onConnected,onFailure);
     }
     private static boolean connectMakeBeforeBreak(
             Context context, DesktopDiscovery.Device targetDevice,
-            int width, int height, boolean migrateToHub, Runnable onFailure){
+            int width, int height, boolean migrateToHub, boolean replaceTransport,
+            android.net.Network boundNetwork, boolean cellular,
+            Runnable onConnected, Runnable onFailure){
         if(context==null || targetDevice==null || targetDevice.fingerprint==null)return false;
         String id=targetDevice.fingerprint.toUpperCase(Locale.ROOT);
         DeskTouchSession candidate;
@@ -180,6 +198,9 @@ final class DeskTouchRuntime {
             if(migrateToHub){
                 if(anyCableConnected())return false;
                 if(current!=null && current.isConnected())return false;
+            }else if(replaceTransport){
+                if(anyCableConnected())return false;
+                if(current!=null && current.isConnected() && current.isCellularSession()==cellular)return false;
             }else if(current!=null && current.isConnected() && current.isCableSession()){
                 return false;
             }
@@ -188,11 +209,11 @@ final class DeskTouchRuntime {
             candidate=newSession(context,id);
             pendingMakeBeforeBreak.put(id,candidate);
         }
-        candidate.connect(targetDevice,width,height,false,()->{
+        candidate.connect(targetDevice,width,height,false,boundNetwork,cellular,()->{
             boolean keptCandidate=true;
             synchronized(DeskTouchRuntime.class){
                 pendingMakeBeforeBreak.remove(id,candidate);
-                if(migrateToHub && (anyInputLeaseActive() || anyCableConnected())){
+                if((migrateToHub || replaceTransport) && (anyInputLeaseActive() || anyCableConnected())){
                     keptCandidate=false;
                 }else{
                     DeskTouchSession previous=sessions.put(id,candidate);
@@ -218,6 +239,7 @@ final class DeskTouchRuntime {
                 return;
             }
             notifyLiveStatusChanged();
+            if(onConnected!=null)onConnected.run();
         },()->{
             synchronized(DeskTouchRuntime.class){
                 pendingMakeBeforeBreak.remove(id,candidate);
@@ -349,7 +371,39 @@ final class DeskTouchRuntime {
         listener=observer;
         if(observer!=null)observer.accept(lastStatus);
     }
+    private static final java.util.Map<String, java.util.List<String>> PEER_ENDPOINTS =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    static void rememberPeerEndpoints(String fingerprint, java.util.List<String> ipv6Endpoints) {
+        if (fingerprint == null || fingerprint.isEmpty() || ipv6Endpoints == null || ipv6Endpoints.isEmpty()) return;
+        java.util.ArrayList<String> copy = new java.util.ArrayList<>();
+        for (String s : ipv6Endpoints) {
+            if (s != null && !s.trim().isEmpty()) copy.add(s.trim());
+        }
+        if (!copy.isEmpty()) {
+            PEER_ENDPOINTS.put(fingerprint.toUpperCase(java.util.Locale.ROOT),
+                java.util.Collections.unmodifiableList(copy));
+        }
+    }
+
+    static java.util.List<String> peerEndpoints(String fingerprint) {
+        if (fingerprint == null || fingerprint.isEmpty()) return java.util.Collections.emptyList();
+        java.util.List<String> list = PEER_ENDPOINTS.get(fingerprint.toUpperCase(java.util.Locale.ROOT));
+        return list != null ? list : java.util.Collections.emptyList();
+    }
+
+    static java.util.Set<String> endpointFingerprints() {
+        return new java.util.HashSet<>(PEER_ENDPOINTS.keySet());
+    }
+
+    static synchronized DeskTouchSession.LiveStatusSnapshot liveSnapshotForPeer(String fingerprint) {
+        if (fingerprint == null || fingerprint.isEmpty()) return null;
+        DeskTouchSession s = sessions.get(fingerprint.toUpperCase(java.util.Locale.ROOT));
+        return s != null && s.isConnected() ? s.getLiveSnapshot() : null;
+    }
+
     static synchronized void clear(){
+        PEER_ENDPOINTS.clear();
         for(DeskTouchSession s:pendingMakeBeforeBreak.values())s.close();
         pendingMakeBeforeBreak.clear();
         for(DeskTouchSession s:sessions.values())s.close();

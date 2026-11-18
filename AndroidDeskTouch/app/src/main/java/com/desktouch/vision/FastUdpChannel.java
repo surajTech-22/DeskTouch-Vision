@@ -246,11 +246,22 @@ final class FastUdpChannel implements Closeable {
 
     FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener)
             throws Exception {
+        this(serverAddress, serverPort, peerId, key, listener, null);
+    }
+
+    FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener,
+            android.net.Network boundNetwork) throws Exception {
         this.serverAddress = serverAddress;
         this.serverPort = serverPort;
         this.listener = listener;
         this.codec = new Codec(key, peerId, false);
-        this.socket = new DatagramSocket(0);
+        if (boundNetwork != null) {
+            this.socket = new DatagramSocket(null);
+            boundNetwork.bindSocket(this.socket);
+            this.socket.bind(new java.net.InetSocketAddress(0));
+        } else {
+            this.socket = new DatagramSocket(0);
+        }
         try {
             this.socket.setTrafficClass(0xB8);
         } catch (Exception ignored) {

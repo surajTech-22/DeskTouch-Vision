@@ -289,6 +289,13 @@ public final class PointerSmoother {
         if (jitter <= 6.5 && lossPermille <= 4.0) {
             return 0.0;
         }
+        // When arrival jitter is clean (<= 4.5 ms), isolated RF drops do not
+        // indicate bufferbloat; keep smoothing light so cursor stays crisp.
+        if (jitter <= 4.5) {
+            double lightTau = Math.min(3.2,
+                nominalFrameMs * 0.12 + Math.max(0.0, lossPermille - 4.0) * 0.012);
+            return Math.min(lightTau, Math.min(10.0, nominalFrameMs * 1.15));
+        }
         double rawTau = Math.max(2.0,
             Math.max(0.0, jitter - 6.0) * 0.35
                 + Math.max(0.0, lossPermille - 4.0) * 0.08

@@ -270,7 +270,10 @@ internal sealed class AdaptiveLinkTracker
         if (string.IsNullOrWhiteSpace(raw)) return "wireless";
         string b = raw.Trim();
         if (b.Equals("cable", StringComparison.OrdinalIgnoreCase)) return "cable";
-        if (b.Equals("ethernet", StringComparison.OrdinalIgnoreCase)) return "ethernet";
+        if (b.Equals("ethernet", StringComparison.OrdinalIgnoreCase) ||
+            b.Equals("wired", StringComparison.OrdinalIgnoreCase)) return "ethernet";
+        if (b.Equals("cellular", StringComparison.OrdinalIgnoreCase) ||
+            b.Equals("mobile", StringComparison.OrdinalIgnoreCase)) return "cellular";
         if (b.Equals("2.4GHz", StringComparison.OrdinalIgnoreCase)) return "2.4GHz";
         if (b.Equals("5GHz", StringComparison.OrdinalIgnoreCase)) return "5GHz";
         if (b.Equals("6GHz", StringComparison.OrdinalIgnoreCase)) return "6GHz";
@@ -322,6 +325,7 @@ internal sealed class AdaptiveLinkTracker
         return band switch
         {
             "cable" => controlActive ? 38 : 120,
+            "cellular" => controlActive ? 22 : 85,
             "5GHz" or "6GHz" => controlActive ? 120 : 500,
             "2.4GHz" => controlActive ? 350 : 900,
             _ => controlActive ? 220 : 750
@@ -738,12 +742,24 @@ internal static class FastUdpSocketOptions
         catch (Exception) { }
         try { socket.SendBufferSize = 262144; } catch (Exception) { }
         try { socket.ReceiveBufferSize = 262144; } catch (Exception) { }
-        try { socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8); }
+        try
+        {
+            if (socket.AddressFamily == AddressFamily.InterNetworkV6)
+                socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.TypeOfService, 0xB8);
+            else
+                socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8);
+        }
         catch (Exception) { }
     }
 
     internal static IPAddress NormalizeAddress(IPAddress ip) =>
         ip.IsIPv4MappedToIPv6 ? ip.MapToIPv4() : ip;
+
+    internal static IPEndPoint MapForSocket(Socket socket, IPEndPoint ep) =>
+        socket.AddressFamily == AddressFamily.InterNetworkV6 &&
+        ep.Address.AddressFamily == AddressFamily.InterNetwork
+            ? new IPEndPoint(ep.Address.MapToIPv6(), ep.Port)
+            : ep;
 }
 
 internal sealed class FastUdpHub : IDisposable
@@ -818,7 +834,8 @@ internal sealed class FastUdpHub : IDisposable
                 if (len <= 0) return false;
                 try
                 {
-                    bool sent = socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, target) == len;
+                    var dest = FastUdpSocketOptions.MapForSocket(socket, target);
+                    bool sent = socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, dest) == len;
                     if (sent && op is FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush or FastUdpOp.Move)
                         Volatile.Write(ref LastMoveSentTicks, Stopwatch.GetTimestamp());
                     return sent;
@@ -847,9 +864,21 @@ internal sealed class FastUdpHub : IDisposable
 
     internal FastUdpHub()
     {
-        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        FastUdpSocketOptions.ConfigureLowLatency(_socket);
-        _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        try
+        {
+            _socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp)
+            {
+                DualMode = true
+            };
+            FastUdpSocketOptions.ConfigureLowLatency(_socket);
+            _socket.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
+        }
+        catch (Exception)
+        {
+            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            FastUdpSocketOptions.ConfigureLowLatency(_socket);
+            _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        }
         Port = ((IPEndPoint)_socket.LocalEndPoint!).Port;
         _recvThread = new Thread(ReceiveLoop)
         {
@@ -895,7 +924,9 @@ internal sealed class FastUdpHub : IDisposable
     private void ReceiveLoop()
     {
         byte[] buffer = new byte[256];
-        EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+        EndPoint remote = new IPEndPoint(
+            _socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any,
+            0);
         while (!_disposed)
         {
             try
@@ -994,9 +1025,21 @@ internal sealed class FastUdpClient : IDisposable
         LinkTracker = new AdaptiveLinkTracker(initialBand);
         if (initialSpeedMbps > 0)
             LinkTracker.OnLinkProfileChanged(initialBand, initialSpeedMbps, 0);
-        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        FastUdpSocketOptions.ConfigureLowLatency(_socket);
-        _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        if (normalized.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            _socket = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp)
+            {
+                DualMode = true
+            };
+            FastUdpSocketOptions.ConfigureLowLatency(_socket);
+            _socket.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
+        }
+        else
+        {
+            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            FastUdpSocketOptions.ConfigureLowLatency(_socket);
+            _socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        }
         LocalPort = ((IPEndPoint)_socket.LocalEndPoint!).Port;
         _recvThread = new Thread(ReceiveLoop)
         {
@@ -1024,7 +1067,8 @@ internal sealed class FastUdpClient : IDisposable
             if (len <= 0) return false;
             try
             {
-                return _socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, _serverEndPoint) == len;
+                var dest = FastUdpSocketOptions.MapForSocket(_socket, _serverEndPoint);
+                return _socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, dest) == len;
             }
             catch (Exception)
             {
@@ -1036,7 +1080,9 @@ internal sealed class FastUdpClient : IDisposable
     private void ReceiveLoop()
     {
         byte[] buffer = new byte[256];
-        EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+        EndPoint remote = new IPEndPoint(
+            _socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any,
+            0);
         while (!_disposed)
         {
             try
@@ -1153,7 +1199,7 @@ internal sealed class FastMovePacer : IDisposable
     }
 
     private const double MinUdpIntervalMs = 1.5;
-    private const int TrailingTcpSyncDelayMs = 130;
+    private const int TrailingTcpSyncDelayMs = 45;
     private const int WarmKeepaliveIntervalMs = 22;
     private const int WarmCooldownSeconds = 1;
 

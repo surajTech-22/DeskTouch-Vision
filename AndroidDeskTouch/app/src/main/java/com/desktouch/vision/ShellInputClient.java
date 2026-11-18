@@ -357,8 +357,29 @@ final class ShellInputClient {
         return true;
     }
 
+    private static final java.util.concurrent.atomic.AtomicInteger URGENT_CONTROL_PENDING =
+        new java.util.concurrent.atomic.AtomicInteger();
+
     private static void drainPendingMove() {
         while (true) {
+            if (URGENT_CONTROL_PENDING.get() > 0) {
+                boolean requeue = false;
+                synchronized (MOVE_LOCK) {
+                    if (hasPendingMove) {
+                        moveDrainScheduled.set(false);
+                        requeue = moveDrainScheduled.compareAndSet(false, true);
+                    } else {
+                        moveDrainScheduled.set(false);
+                        if (hasPendingMove && moveDrainScheduled.compareAndSet(false, true)) {
+                            requeue = true;
+                        }
+                    }
+                }
+                if (requeue) {
+                    WORKER.execute(ShellInputClient::drainPendingMove);
+                }
+                return;
+            }
             int x, y, prevX, prevY, pushX, pushY;
             Runnable ack;
             synchronized (MOVE_LOCK) {
@@ -392,14 +413,57 @@ final class ShellInputClient {
         }
     }
 
+    private static void flushLatestPendingMoveForControl() {
+        int x, y, prevX, prevY, pushX, pushY;
+        Runnable ack;
+        synchronized (MOVE_LOCK) {
+            if (!hasPendingMove) return;
+            x = pendingMoveX;
+            y = pendingMoveY;
+            prevX = pendingPrevX >= 0 ? pendingPrevX : x;
+            prevY = pendingPrevY >= 0 ? pendingPrevY : y;
+            pushX = pendingPushX;
+            pushY = pendingPushY;
+            ack = pendingMoveAck;
+            hasPendingMove = false;
+            pendingPrevX = -1;
+            pendingPrevY = -1;
+            pendingPushX = 0;
+            pendingPushY = 0;
+            pendingMoveAck = null;
+        }
+        if (prevX != x || prevY != y || pushX != 0 || pushY != 0) {
+            sendLine("MOVETO " + x + " " + y + " " + pushX + " " + pushY + " " + prevX + " " + prevY);
+        } else {
+            sendLine("MOVETO " + x + " " + y);
+        }
+        if (ack != null) ack.run();
+    }
+
     static void mouseButton(int button, boolean pressed) {
         if ((!connectedReady && !hasBridgeConfig(appContext)) || button < 1 || button > 5) return;
-        WORKER.execute(() -> sendLine("BTN " + button + " " + (pressed ? "1" : "0")));
+        URGENT_CONTROL_PENDING.incrementAndGet();
+        WORKER.execute(() -> {
+            try {
+                flushLatestPendingMoveForControl();
+                sendLine("BTN " + button + " " + (pressed ? "1" : "0"));
+            } finally {
+                URGENT_CONTROL_PENDING.decrementAndGet();
+            }
+        });
     }
 
     static void wheel(int amount, boolean horizontal) {
         if ((!connectedReady && !hasBridgeConfig(appContext)) || amount == 0) return;
-        WORKER.execute(() -> sendLine("WHEEL " + amount + " " + (horizontal ? "1" : "0")));
+        URGENT_CONTROL_PENDING.incrementAndGet();
+        WORKER.execute(() -> {
+            try {
+                flushLatestPendingMoveForControl();
+                sendLine("WHEEL " + amount + " " + (horizontal ? "1" : "0"));
+            } finally {
+                URGENT_CONTROL_PENDING.decrementAndGet();
+            }
+        });
     }
 
     static void key(int vk, boolean pressed, Runnable accepted, Runnable rejected) {
@@ -413,11 +477,16 @@ final class ShellInputClient {
             if (rejected != null) rejected.run();
             return;
         }
+        URGENT_CONTROL_PENDING.incrementAndGet();
         WORKER.execute(() -> {
-            if (sendLine("KEY " + vk + " " + (pressed ? "1" : "0"))) {
-                if (accepted != null) accepted.run();
-            } else if (rejected != null) {
-                rejected.run();
+            try {
+                if (sendLine("KEY " + vk + " " + (pressed ? "1" : "0"))) {
+                    if (accepted != null) accepted.run();
+                } else if (rejected != null) {
+                    rejected.run();
+                }
+            } finally {
+                URGENT_CONTROL_PENDING.decrementAndGet();
             }
         });
     }

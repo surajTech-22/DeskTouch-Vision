@@ -48,6 +48,13 @@ public final class AutoConnectService extends Service {
     private volatile String lastAutoConnectSkipReason="";
     private volatile long lastHubCheckAtMs;
     private volatile WifiLinkMonitor.LinkSnapshot lastLinkSnapshot;
+    private CellularLinkHelper cellularHelper;
+    private ExecutorService cellularExecutor;
+    private final java.util.concurrent.atomic.AtomicBoolean cellularProbeInFlight =
+        new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile long lastCellularProbeAtMs;
+    private volatile long lastTransportSwitchAtMs;
+    private volatile String lastCellularProbeSummary = "";
     private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
         new java.util.concurrent.atomic.AtomicInteger();
     private ScheduledFuture<?> disconnectAutoPauseFuture;
@@ -273,6 +280,12 @@ public final class AutoConnectService extends Service {
         super.onCreate();
         activeInstance=this;
         trust=new TrustedWindows(this);
+        cellularHelper=new CellularLinkHelper(this);
+        cellularExecutor=Executors.newSingleThreadExecutor(r->{
+            Thread t=new Thread(r,"DeskTouch CellularProbe");
+            t.setDaemon(true);
+            return t;
+        });
         hadConnectedWithAccessibility=
             DeskTouchRuntime.connectedCount()>0 &&
             PermissionContinuity.systemAccessibilityEnabled(this);
@@ -625,6 +638,7 @@ public final class AutoConnectService extends Service {
             Log.w("DeskTouch","Trusted LAN reconnect deferred",error);
         }finally{
             scanning=false;
+            scheduleCellularEvaluation();
             if(!connectedNow) {
                 if(pendingWake) {
                     pendingWake=false;
@@ -635,6 +649,166 @@ public final class AutoConnectService extends Service {
             } else {
                 pendingWake=false;
             }
+        }
+    }
+
+    private void scheduleCellularEvaluation() {
+        ExecutorService exec=cellularExecutor;
+        if(exec==null || exec.isShutdown() || !enabled(this) || !reconnectEnabled(this)) return;
+        if(DeskTouchRuntime.anyCableConnected() || DeskTouchRuntime.anyInputLeaseActive()) return;
+        if(!cellularProbeInFlight.compareAndSet(false,true)) return;
+        exec.execute(()->{
+            try {
+                evaluateCellularFailoverOrReturn();
+            } catch(Throwable err) {
+                Log.w("DeskTouch","Mobile network check skipped",err);
+            } finally {
+                cellularProbeInFlight.set(false);
+            }
+        });
+    }
+
+    private void evaluateCellularFailoverOrReturn() {
+        if(cellularHelper==null) return;
+        if(!DeskTouchRuntime.anyCellularConnected() && cellularHelper.getActiveNetwork()!=null) {
+            cellularHelper.releaseCellularNetwork();
+        }
+        if(trust==null || !enabled(this) || !reconnectEnabled(this)) return;
+        if(DeskTouchRuntime.anyCableConnected() || DeskTouchRuntime.anyInputLeaseActive()) return;
+        Set<String> allowed=trust.fingerprints();
+        if(allowed.isEmpty()) return;
+        Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
+            .getStringSet("pausedPeers",java.util.Collections.emptySet());
+        long now=SystemClock.uptimeMillis();
+        PhoneScreenGeometry.Info phone=PhoneScreenGeometry.readInfo(this);
+
+        // Case 1: Currently on Mobile network -> switch back to Wi-Fi once healthy & faster
+        String activeCellularFp=DeskTouchRuntime.connectedCellularFingerprint();
+        if(activeCellularFp!=null) {
+            if(lastTransportSwitchAtMs>0L && now-lastTransportSwitchAtMs<CellularLinkHelper.SWITCH_COOLDOWN_MS) return;
+            WifiLinkMonitor.LinkSnapshot wifiSnap=WifiLinkMonitor.inspect(this,false,0);
+            if(!("wifi".equals(wifiSnap.transport) || "ethernet".equals(wifiSnap.transport))) return;
+            String lanHost=DeskTouchRuntime.getLastKnownPeerHost(activeCellularFp);
+            if(lanHost==null || lanHost.isEmpty() || "127.0.0.1".equals(lanHost)) {
+                try {
+                    java.util.List<DesktopDiscovery.Device> found=DesktopDiscovery.scanFast(
+                        java.util.Collections.singleton(activeCellularFp));
+                    for(DesktopDiscovery.Device d:found) {
+                        if(activeCellularFp.equalsIgnoreCase(d.fingerprint) && !d.cable) {
+                            lanHost=d.address;
+                            break;
+                        }
+                    }
+                } catch(Exception ignored) {}
+            }
+            if(lanHost==null || lanHost.isEmpty() || "127.0.0.1".equals(lanHost)) return;
+            final String targetWifiHost=lanHost;
+            CellularLinkHelper.ProbeResult wifiProbe=CellularLinkHelper.probeDirectEndpoints(
+                null,activeCellularFp,trust,java.util.Collections.singletonList(targetWifiHost),1500);
+            if(!wifiProbe.reachable) return;
+            DeskTouchSession.LiveStatusSnapshot cellSnap=DeskTouchRuntime.liveSnapshotForPeer(activeCellularFp);
+            double cellRtt=cellSnap!=null && cellSnap.rttMs>0 ? cellSnap.rttMs : 35.0;
+            double cellJitter=cellSnap!=null ? cellSnap.jitterMs : 4.0;
+            double cellLoss=cellSnap!=null ? cellSnap.lossPermille : 0.0;
+            if(CellularLinkHelper.shouldReturnToWifi(
+                cellRtt,cellJitter,cellLoss,wifiProbe.rttMs,2.0,0.0,now,lastTransportSwitchAtMs)) {
+                DesktopDiscovery.Device wifiDev=new DesktopDiscovery.Device(
+                    cellSnap!=null && !cellSnap.peerName.isEmpty() ? cellSnap.peerName : "DeskTouch PC",
+                    targetWifiHost,activeCellularFp,true,false);
+                if(DeskTouchRuntime.switchTransportMakeBeforeBreak(
+                    this,wifiDev,phone.width,phone.height,null,false,
+                    ()->{
+                        lastTransportSwitchAtMs=SystemClock.uptimeMillis();
+                        cellularHelper.releaseCellularNetwork();
+                        Log.i("DeskTouch","Switched back from Mobile network to healthy Wi-Fi ("+targetWifiHost+")");
+                    },null)) {
+                    lastTransportSwitchAtMs=now;
+                }
+            }
+            return;
+        }
+
+        // Case 2: Currently on Wi-Fi -> test Mobile network IPv6 and promote if cleaner/faster
+        String nonCableFp=DeskTouchRuntime.connectedNonCableFingerprint();
+        if(nonCableFp!=null) {
+            if(paused.contains(nonCableFp)) return;
+            java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(nonCableFp);
+            if(ipv6Endpoints.isEmpty()) return;
+            DeskTouchSession.LiveStatusSnapshot wifiSnap=DeskTouchRuntime.liveSnapshotForPeer(nonCableFp);
+            if(wifiSnap==null || !wifiSnap.connected) return;
+            boolean wifiDegraded=wifiSnap.lossPermille>=20.0 || wifiSnap.jitterMs>=6.5 || wifiSnap.rttMs>=25.0;
+            long minProbeGap=wifiDegraded ? 12_000L : 45_000L;
+            if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<minProbeGap) return;
+            lastCellularProbeAtMs=now;
+
+            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(2500L);
+            if(cellNet==null) {
+                Log.i("DeskTouch","Mobile network benchmark skipped: cellular data inactive or unavailable");
+                return;
+            }
+            CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
+                cellNet,nonCableFp,trust,ipv6Endpoints,2200);
+            if(!cellProbe.reachable) {
+                lastCellularProbeSummary="Mobile IPv6 blocked/unreachable: "+cellProbe.errorMessage;
+                Log.i("DeskTouch","Direct mobile network probe unreachable ("+cellProbe.errorMessage+"); keeping Wi-Fi");
+                cellularHelper.releaseCellularNetwork();
+                return;
+            }
+            double wifiRtt=wifiSnap.rttMs>0 ? wifiSnap.rttMs : 12.0;
+            lastCellularProbeSummary=String.format(java.util.Locale.US,
+                "Wi-Fi %.1fms/%.1f%% vs Mobile %.1fms",
+                wifiRtt,wifiSnap.lossPermille/10.0,cellProbe.rttMs);
+            Log.i("DeskTouch","Path benchmark: "+lastCellularProbeSummary+" ("+cellProbe.address+")");
+            if(CellularLinkHelper.shouldPreferCellular(
+                wifiRtt,wifiSnap.jitterMs,wifiSnap.lossPermille,
+                cellProbe.rttMs,4.0,0.0,now,lastTransportSwitchAtMs)) {
+                DesktopDiscovery.Device cellDev=new DesktopDiscovery.Device(
+                    wifiSnap.peerName.isEmpty() ? "DeskTouch PC" : wifiSnap.peerName,
+                    cellProbe.address,nonCableFp,true,false);
+                if(!DeskTouchRuntime.switchTransportMakeBeforeBreak(
+                    this,cellDev,phone.width,phone.height,cellNet,true,
+                    ()->{
+                        lastTransportSwitchAtMs=SystemClock.uptimeMillis();
+                        Log.i("DeskTouch","Switched active link to Mobile network ("+cellProbe.address+")");
+                    },
+                    ()->cellularHelper.releaseCellularNetwork())) {
+                    cellularHelper.releaseCellularNetwork();
+                }
+            } else {
+                cellularHelper.releaseCellularNetwork();
+            }
+            return;
+        }
+
+        // Case 3: No active session (e.g. Wi-Fi turned off) -> connect directly via Mobile network if cached IPv6 exists
+        if(DeskTouchRuntime.connectedCount()>0) return;
+        if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<10_000L) return;
+        for(String fp:DeskTouchRuntime.endpointFingerprints()) {
+            if(!allowed.contains(fp) || paused.contains(fp)) continue;
+            java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(fp);
+            if(ipv6Endpoints.isEmpty()) continue;
+            lastCellularProbeAtMs=now;
+            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(2500L);
+            if(cellNet==null) return;
+            CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
+                cellNet,fp,trust,ipv6Endpoints,2400);
+            if(!cellProbe.reachable) {
+                Log.i("DeskTouch","Offline mobile reconnect failed ("+cellProbe.errorMessage+")");
+                cellularHelper.releaseCellularNetwork();
+                continue;
+            }
+            DesktopDiscovery.Device cellDev=new DesktopDiscovery.Device(
+                "DeskTouch PC",cellProbe.address,fp,true,false);
+            if(!DeskTouchRuntime.switchTransportMakeBeforeBreak(
+                this,cellDev,phone.width,phone.height,cellNet,true,
+                ()->{
+                    lastTransportSwitchAtMs=SystemClock.uptimeMillis();
+                    Log.i("DeskTouch","Connected directly via Mobile network ("+cellProbe.address+")");
+                },
+                ()->cellularHelper.releaseCellularNetwork())) {
+                cellularHelper.releaseCellularNetwork();
+            }
+            return;
         }
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId) {
@@ -659,6 +833,8 @@ public final class AutoConnectService extends Service {
     @Override public void onDestroy() {
         if(activeInstance==this)activeInstance=null;
         cancelDisconnectAutoPauseLocked();
+        if(cellularExecutor!=null)cellularExecutor.shutdownNow();
+        if(cellularHelper!=null)cellularHelper.releaseCellularNetwork();
         if(connectivityManager!=null && wifiCallback!=null) {
             try { connectivityManager.unregisterNetworkCallback(wifiCallback); }
             catch(Exception ignored) {}

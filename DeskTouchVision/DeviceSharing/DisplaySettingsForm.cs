@@ -766,6 +766,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         string bandText = snap.TransportBand switch
         {
             "cable" => "Data cable",
+            "cellular" => "Mobile network",
             "ethernet" => "Wired network (Ethernet)",
             "5GHz" => "5 GHz wireless",
             "6GHz" => "6 GHz wireless",

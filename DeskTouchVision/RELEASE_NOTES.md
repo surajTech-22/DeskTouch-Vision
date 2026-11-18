@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.64 — Instant Cable Clicks, Smooth Low-RTT Wireless & Direct Mobile Network Auto-Switching
+
+Eliminates USB cable mouse-click stalls, smooths local 2.4 GHz cursor feel without false pace throttling, and adds automatic dual-stack IPv6 + mobile cellular path switching:
+
+- **Zero-lag mouse clicks over USB cable & Virtual Bridge (`ShellInputClient`, `ShellInputDaemon`, `NetworkSessions`):** Unblocks urgent `BTN` / `WHEEL` / `KEY` commands from starving behind continuous `144 Hz` `drainPendingMove()` loops, eliminates 12-step pre-click cursor animation loops and `DeskTouch-UhidPacer` lock stalls (`LockSupport.parkNanos`) on click down/up, dispatches button/wheel clicks on Windows with `SendUrgentAsync` ahead of queued background moves/cable pings, and skips redundant pre-click wire move flushes when the cursor is already at the target coordinate.
+- **Smooth local 2.4 GHz cursor responsiveness (`NetworkSessions`, `FastUdpChannel`, `AdaptiveLinkTracker`, `PointerSmoother`):** Prevents isolated RF packet drops on low-RTT clean-jitter wireless links (`<= 18 ms` RTT, `<= 5.5 ms` jitter) from slamming cursor interval down to `16.5 ms` or injecting excessive smoothing drag (`tau <= 3.5 ms`), and aligns Windows `TrailingTcpSyncDelayMs` to `45 ms`.
+- **Direct Mobile Network + Wi-Fi best-path switcher (`CellularLinkHelper`, `AutoConnectService`, `DeskTouchRuntime`, `DeskTouchSession`, `NetworkSessions`, `FastUdpChannel`):** Upgrades Windows TCP (`37377`) and UDP (`FastUdpHub` / `FastUdpClient`) to dual-stack IPv6 + IPv4 (`UnmapAddress` keeps USB cable detection exact), advertises global IPv6 endpoints in volatile memory only (never persisted to disk), adds stateless `"auth-trusted-probe"` benchmarking, acquires `TRANSPORT_CELLULAR` on Android via `ConnectivityManager.requestNetwork`, and automatically promotes whichever path (Wi-Fi or Mobile Network) is cleaner/faster with hysteresis & cooldown while keeping USB data cable highest priority.
+
+---
+
 # DeskTouch Vision v0.3.63 — Clean Mobile Wireless Streaming, Zero Keepalive Echo Storms & Synced Android Build
 
 Fixes the wireless packet-loss/jitter inflation and restores a complete matching Android and Windows release:

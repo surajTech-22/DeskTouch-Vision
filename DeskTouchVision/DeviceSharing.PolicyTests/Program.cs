@@ -2613,8 +2613,34 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
             "Null local address must default to wireless");
         Check(ReceiverServer.DetectInterfaceForLocalAddress(System.Net.IPAddress.Loopback).Band == "wireless",
             "Loopback local address must default to wireless");
+
+        // Verify v0.3.64: Low-RTT clean-jitter RF drops, cellular pacing, DualMode unmapping, and IPv6 endpoints.
+        double cleanDrop24 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 6.0, 4.0, 2.5, 120.0, "2.4GHz");
+        Check(cleanDrop24 is >= 7.5 and <= 10.5,
+            "Clean-jitter low-RTT 2.4 GHz RF drops must not slam cursor pacing to 16.5ms");
+        double bloated24 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 48.0, 12.0, 15.0, 60.0, "2.4GHz");
+        Check(bloated24 >= 12.5,
+            "True bloated high-RTT 2.4 GHz link must still back off");
+        Check(AdaptiveLinkTracker.NormalizeBand("cellular") == "cellular" &&
+              AdaptiveLinkTracker.NormalizeBand("Mobile") == "cellular",
+            "NormalizeBand must recognize cellular / mobile transport");
+        double cellBase144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 0, 0, 0, 0, "cellular");
+        Check(cellBase144 is >= 8.0 and <= 10.5,
+            "Cellular 144 Hz initial pacing must stay responsive around 9.5ms");
+        int cellWarm = ReceiverServer.ComputeWarmIntervalMs("cellular", 2.0, 10.0);
+        Check(cellWarm is >= 20 and <= 38,
+            "Cellular warm interval must keep radio awake cleanly");
+        var mappedLoopback = System.Net.IPAddress.Loopback.MapToIPv6();
+        Check(Equals(ReceiverServer.UnmapAddress(mappedLoopback), System.Net.IPAddress.Loopback),
+            "DualMode IPv4-mapped loopback must unmap cleanly for USB cable detection");
+        var v6List = ReceiverServer.CollectReachableGlobalIpv6Addresses();
+        Check(v6List.All(s => System.Net.IPAddress.TryParse(s, out var parsed) &&
+                              parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 &&
+                              !parsed.IsIPv6LinkLocal &&
+                              !System.Net.IPAddress.IsLoopback(parsed)),
+            "Collected global IPv6 endpoints must only contain reachable unicast IPv6 addresses");
     }
-    Console.WriteLine("PASS: Cable display ping suppression, UDP ReverseEdgePush, reorder loss accounting, 2.4 GHz backoff, v0.3.52 fixes, v0.3.53 multi-PC environment, v0.3.54 mutual-trust/multi-hub/headless tray, v0.3.56 wireless low-latency, v0.3.57 dual-position recovery, and v0.3.58 wired ethernet detection verified.");
+    Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 
 internal sealed class RecordingInputSession : IInputSession

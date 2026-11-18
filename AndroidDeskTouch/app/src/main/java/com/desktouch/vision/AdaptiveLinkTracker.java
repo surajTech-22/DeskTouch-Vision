@@ -60,6 +60,8 @@ public final class AdaptiveLinkTracker {
         String b = raw.trim();
         if (b.isEmpty()) return "wireless";
         if ("cable".equalsIgnoreCase(b)) return "cable";
+        if ("ethernet".equalsIgnoreCase(b) || "wired".equalsIgnoreCase(b)) return "ethernet";
+        if ("cellular".equalsIgnoreCase(b) || "mobile".equalsIgnoreCase(b)) return "cellular";
         if ("2.4GHz".equalsIgnoreCase(b)) return "2.4GHz";
         if ("5GHz".equalsIgnoreCase(b)) return "5GHz";
         if ("6GHz".equalsIgnoreCase(b)) return "6GHz";
@@ -494,9 +496,13 @@ public final class AdaptiveLinkTracker {
 
         String normalized = normalizeBand(bandHint);
         boolean slow24 = "2.4GHz".equals(normalized);
+        boolean cellular = "cellular".equals(normalized);
         double baseMs = 2.5;
         if (slow24) {
-            baseMs = targetRefreshHz > 0 && targetRefreshHz < 65 ? 13.0 : 11.0;
+            boolean cleanTiming = rtt > 0.0 && rtt <= 18.0 && jitter <= 5.5 && (minRtt <= 0.0 || rtt - minRtt <= 6.0);
+            baseMs = targetRefreshHz > 0 && targetRefreshHz < 65 ? 13.0 : (cleanTiming || lossP < 20.0 ? 8.5 : 11.0);
+        } else if (cellular) {
+            baseMs = targetRefreshHz > 0 && targetRefreshHz < 65 ? 13.0 : 9.5;
         } else if (targetRefreshHz > 0) {
             baseMs = Math.max(2.0, Math.min(8.5, 1000.0 / (Math.min(240, Math.max(30, targetRefreshHz)) * 1.55)));
         }
@@ -504,18 +510,23 @@ public final class AdaptiveLinkTracker {
             return baseMs;
         }
         double queueDelay = Math.max(0.0, rtt - minRtt);
-        if (!slow24 && rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
+        if (!slow24 && !cellular && rtt <= 7.0 && queueDelay <= 2.5 && jitter <= 3.5 && lossP < 2.0) {
             return Math.max(1.8, baseMs * 0.85);
+        }
+        if (!cellular && rtt <= 18.0 && queueDelay <= 6.0 && jitter <= 5.5 && lossP >= 4.0) {
+            double dropPenalty = Math.min(2.0, Math.max(0.0, lossP - 8.0) * 0.015);
+            return Math.max(baseMs, Math.min(slow24 ? 10.5 : 10.0, baseMs + dropPenalty));
         }
         double penalty = Math.max(0.0, rtt - 18.0) * 0.08
             + Math.max(0.0, queueDelay - 8.0) * 0.16
             + Math.max(0.0, jitter - 8.0) * 0.11
             + Math.max(0.0, lossP - 8.0) * 0.10;
         int effHz = targetRefreshHz > 0 ? targetRefreshHz : 90;
-        double maxCap = slow24 ? 24.0
+        double maxCap = slow24 ? 16.5
+            : (cellular ? 18.0
             : (effHz >= 115 ? 14.0
             : (effHz >= 85 ? 16.0
-            : (effHz >= 55 ? 18.5 : 20.0)));
+            : (effHz >= 55 ? 18.5 : 20.0))));
         maxCap = Math.max(baseMs, maxCap);
         return Math.max(baseMs, Math.min(maxCap, baseMs + penalty));
     }

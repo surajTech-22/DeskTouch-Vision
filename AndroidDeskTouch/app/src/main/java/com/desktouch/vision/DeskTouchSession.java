@@ -198,6 +198,8 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile String peerName;
     private volatile String peerHostAddress;
     private volatile boolean cableSession;
+    private volatile boolean cellularSession;
+    private volatile android.net.Network boundNetwork;
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
     private volatile DataOutputStream output;
@@ -256,6 +258,7 @@ final class DeskTouchSession implements AutoCloseable {
     static long computeHeartbeatIntervalMs(boolean cable, boolean activeSession, String band) {
         if (cable) return activeSession ? 450L : 850L;
         if (WifiLinkMonitor.BAND_24_GHZ.equals(band)) return activeSession ? 1100L : 1700L;
+        if (WifiLinkMonitor.BAND_CELLULAR.equals(band)) return activeSession ? 900L : 1500L;
         return activeSession ? 750L : 1200L;
     }
     static boolean shouldFastFailDeadSession(long nowMs, long lastPongMs, long connectedAtMs,
@@ -298,7 +301,38 @@ final class DeskTouchSession implements AutoCloseable {
     boolean isActive(){return active;}
     boolean hasClaim(){return claim>0||active;}
     boolean isCableSession(){return running && cableSession;}
+    boolean isCellularSession(){return running && cellularSession;}
     boolean isBusyInLease(){return running && (claim>0 || active || reverseLease>0);}
+
+    static javax.net.ssl.SSLSocketFactory createPinnedSslFactory(String pinnedFingerprint) throws Exception {
+        final byte[] expected = hex(pinnedFingerprint.toUpperCase(Locale.ROOT));
+        javax.net.ssl.TrustManager[] managers = new javax.net.ssl.TrustManager[] {
+            new javax.net.ssl.X509TrustManager() {
+                @Override public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                    return new java.security.cert.X509Certificate[0];
+                }
+                @Override public void checkClientTrusted(java.security.cert.X509Certificate[] c, String t) throws CertificateException {
+                    throw new CertificateException("Client certificates not used");
+                }
+                @Override public void checkServerTrusted(java.security.cert.X509Certificate[] c, String t)
+                        throws java.security.cert.CertificateException {
+                    try {
+                        if (c == null || c.length == 0) throw new java.security.cert.CertificateException("Missing TLS certificate");
+                        byte[] actual = java.security.MessageDigest.getInstance("SHA-256").digest(c[0].getEncoded());
+                        if (!java.security.MessageDigest.isEqual(actual, expected))
+                            throw new java.security.cert.CertificateException("Fingerprint mismatch");
+                    } catch (java.security.cert.CertificateException ce) {
+                        throw ce;
+                    } catch (Exception ex) {
+                        throw new java.security.cert.CertificateException(ex);
+                    }
+                }
+            }
+        };
+        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
+        ctx.init(null, managers, new java.security.SecureRandom());
+        return ctx.getSocketFactory();
+    }
     String connectedFingerprint(){return running ? fingerprint : null;}
     java.util.List<EnvironmentTarget> environmentTargets(){
         return environmentTargets;
@@ -392,38 +426,40 @@ final class DeskTouchSession implements AutoCloseable {
     }
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
             boolean interactiveUser,Runnable onConnected,Runnable onFailure) {
+        connect(device,androidWidth,androidHeight,interactiveUser,null,false,onConnected,onFailure);
+    }
+    void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
+            boolean interactiveUser,android.net.Network networkOverride,boolean cellular,
+            Runnable onConnected,Runnable onFailure) {
         sender.execute(()->{
             if(running || connecting) {status("Already connected or connecting");return;}
             connecting=true;
+            boundNetwork = networkOverride;
+            cellularSession = cellular && !device.cable;
             try {
                 String pinned=device.fingerprint.toUpperCase(Locale.ROOT);
                 if(!pinned.matches("[A-F0-9]{64}")) throw new SecurityException("Invalid TLS fingerprint");
                 String saved=trust.get(pinned);
-                TrustManager manager=new X509TrustManager(){
-                    public X509Certificate[] getAcceptedIssuers(){return new X509Certificate[0];}
-                    public void checkClientTrusted(X509Certificate[] chain,String auth) throws CertificateException {
-                        throw new CertificateException("Client certificates not used");
-                    }
-                    public void checkServerTrusted(X509Certificate[] chain,String auth) throws CertificateException {
-                        if(chain==null||chain.length==0) throw new CertificateException("Missing TLS certificate");
-                        try {
-                            byte[] sha=MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded());
-                            if(!MessageDigest.isEqual(sha,hex(pinned)))
-                                throw new CertificateException("Fingerprint mismatch");
-                        } catch(CertificateException e){throw e;}
-                        catch(Exception e){throw new CertificateException(e);}
-                    }
-                };
-                SSLContext context=SSLContext.getInstance("TLS");
-                context.init(null,new TrustManager[]{manager},new SecureRandom());
+                SSLSocketFactory pinnedFactory = createPinnedSslFactory(pinned);
                 SSLSocket ssl=null;
                 DataInputStream in=null;
                 DataOutputStream out=null;
                 Packet ready=null;
                 for(int attempt=0;attempt<2;attempt++){
                     boolean tryTrusted=attempt==0 && saved!=null;
-                    ssl=(SSLSocket)context.getSocketFactory().createSocket();
-                    ssl.connect(new java.net.InetSocketAddress(device.address,37377),5000);
+                    if (networkOverride != null) {
+                        java.net.Socket raw = new java.net.Socket();
+                        networkOverride.bindSocket(raw);
+                        raw.setTcpNoDelay(true);
+                        raw.setKeepAlive(true);
+                        raw.connect(new java.net.InetSocketAddress(
+                            java.net.InetAddress.getByName(device.address), 37377),
+                            cellular ? 3500 : 5000);
+                        ssl = (SSLSocket) pinnedFactory.createSocket(raw, device.address, 37377, true);
+                    } else {
+                        ssl = (SSLSocket) pinnedFactory.createSocket();
+                        ssl.connect(new java.net.InetSocketAddress(device.address, 37377), 5000);
+                    }
                     ssl.setTcpNoDelay(true);
                     ssl.setKeepAlive(true);
                     try { ssl.setTrafficClass(0x10); } catch (Exception ignored) {}
@@ -511,7 +547,9 @@ final class DeskTouchSession implements AutoCloseable {
                     && !"127.0.0.1".equals(peerHostAddress)) {
                     DeskTouchRuntime.rememberPeerHost(pinned,peerHostAddress);
                 }
-                liveLinkBand=cableSession ? WifiLinkMonitor.BAND_CABLE : WifiLinkMonitor.BAND_WIRELESS;
+                liveLinkBand=cableSession
+                    ? WifiLinkMonitor.BAND_CABLE
+                    : (cellularSession ? WifiLinkMonitor.BAND_CELLULAR : WifiLinkMonitor.BAND_WIRELESS);
                 liveLinkSpeedMbps=0;
                 liveRttMs=0.0;
                 missedPings=0;
@@ -530,8 +568,14 @@ final class DeskTouchSession implements AutoCloseable {
                 // Keep TLS timeout moderate (~15s); heartbeat fast-fail catches dead cable/Wi-Fi in ~4s.
                 ssl.setSoTimeout(15000);
                 if(cableSession) DeskTouchAccessibilityService.setLinkMetrics(0.0,0.0);
-                status("Connected to "+device.name+(cableSession?" via data cable":"")+". Windows approved pairing.");
-                if(!cableSession) {
+                String transportLabel = cableSession
+                    ? " via data cable"
+                    : (cellularSession ? " via mobile network" : "");
+                status("Connected to "+device.name+transportLabel+". Windows approved pairing.");
+                if(cellularSession) {
+                    liveLinkBand=WifiLinkMonitor.BAND_CELLULAR;
+                    send(new Packet("link-info",0,0,0,0,WifiLinkMonitor.BAND_CELLULAR));
+                } else if(!cableSession) {
                     WifiLinkMonitor.LinkSnapshot snap=WifiLinkMonitor.inspect(application,false,0);
                     publishLinkProfile(snap);
                 }
@@ -580,7 +624,22 @@ final class DeskTouchSession implements AutoCloseable {
                 Packet p=Packet.read(input);
                 lastPongReceivedMs=SystemClock.uptimeMillis();
                 missedPings=0;
-                if("udp-channel".equals(p.type)){
+                if("endpoints".equals(p.type)){
+            if(p.text!=null && !p.text.isEmpty() && fingerprint!=null){
+                try {
+                    JSONObject obj=new JSONObject(p.text);
+                    JSONArray arr=obj.optJSONArray("v6");
+                    if(arr!=null){
+                        ArrayList<String> list=new ArrayList<>();
+                        for(int i=0;i<arr.length();i++){
+                            String ip=arr.optString(i,"");
+                            if(!ip.isEmpty()) list.add(ip);
+                        }
+                        if(!list.isEmpty()) DeskTouchRuntime.rememberPeerEndpoints(fingerprint,list);
+                    }
+                } catch(Exception ignored) {}
+            }
+        }else if("udp-channel".equals(p.type)){
                     if(!cableSession) setupUdpChannel(p);
                 } else if("ping".equals(p.type)){
                     if(!controlSender.isShutdown()){
@@ -1083,6 +1142,12 @@ final class DeskTouchSession implements AutoCloseable {
             DeskTouchRuntime.notifyLiveStatusChanged();
             return;
         }
+        if(cellularSession){
+            liveLinkBand=WifiLinkMonitor.BAND_CELLULAR;
+            liveLinkSpeedMbps=0;
+            DeskTouchRuntime.notifyLiveStatusChanged();
+            return;
+        }
         String newBand=AdaptiveLinkTracker.normalizeBand(snap.band);
         boolean wasDifferent=!newBand.equals(liveLinkBand);
         liveLinkBand=newBand;
@@ -1366,7 +1431,7 @@ final class DeskTouchSession implements AutoCloseable {
                         DeskTouchRuntime.notifyLiveStatusChanged();
                     }
                 }
-            });
+            }, boundNetwork);
             ch.linkTracker.onLinkProfileChanged(liveLinkBand,liveLinkSpeedMbps,0);
             udpChannel=ch;
             send(new Packet("udp-ready",ch.localPort()));
@@ -1561,6 +1626,7 @@ final class DeskTouchSession implements AutoCloseable {
             pendingTrust=null;pendingTrustId=0;pendingTrustAtMs=0L;
         }
         running=false;active=false;claim=0;peerInetAddress=null;cableSession=false;
+        cellularSession=false;boundNetwork=null;
         peerName=null;peerHostAddress=null;liveRttMs=0.0;liveLinkSpeedMbps=0;missedPings=0;
         lastPongReceivedMs=0L;connectedAtMs=0L;
         environmentTargets=java.util.Collections.emptyList();

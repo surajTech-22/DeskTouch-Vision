@@ -128,6 +128,7 @@ public final class ShellInputDaemon {
     private long lastMouseWriteNs;
     private long nextSubFrameTickNs;
     private volatile boolean daemonRunning = true;
+    private volatile boolean urgentControlPending;
     private Thread mousePacerThread;
     private int buttonMask;
     private boolean mousePrimedForReader;
@@ -274,8 +275,16 @@ public final class ShellInputDaemon {
                     if (parts.length >= 3) {
                         int btn = parseBoundedInt(parts[1], 1, 5, 1);
                         boolean down = "1".equals(parts[2]);
-                        flushPendingMouseNow();
-                        setMouseButton(btn, down);
+                        urgentControlPending = true;
+                        try {
+                            flushPendingMouseNow(down ? 2 : 1, !down);
+                            setMouseButton(btn, down);
+                        } finally {
+                            urgentControlPending = false;
+                            synchronized (mouseQueueLock) {
+                                mouseQueueLock.notifyAll();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -284,8 +293,16 @@ public final class ShellInputDaemon {
                     if (parts.length >= 3) {
                         int amount = parseBoundedInt(parts[1], -12000, 12000, 0);
                         boolean horizontal = "1".equals(parts[2]);
-                        flushPendingMouseNow();
-                        scrollWheel(amount, horizontal);
+                        urgentControlPending = true;
+                        try {
+                            flushPendingMouseNow(2, false);
+                            scrollWheel(amount, horizontal);
+                        } finally {
+                            urgentControlPending = false;
+                            synchronized (mouseQueueLock) {
+                                mouseQueueLock.notifyAll();
+                            }
+                        }
                     }
                     continue;
                 }
@@ -326,10 +343,12 @@ public final class ShellInputDaemon {
                 boolean allowSameSeq;
                 long subFrameNs;
                 synchronized (mouseQueueLock) {
-                    while (daemonRunning && !hasPendingMove && !subFrameGlide.isActive()) {
-                        nextSubFrameTickNs = 0L;
+                    while (daemonRunning && ((!hasPendingMove && !subFrameGlide.isActive()) || urgentControlPending)) {
+                        if (!hasPendingMove && !subFrameGlide.isActive()) {
+                            nextSubFrameTickNs = 0L;
+                        }
                         try {
-                            mouseQueueLock.wait();
+                            mouseQueueLock.wait(urgentControlPending ? 4L : 0L);
                         } catch (InterruptedException ignored) {}
                     }
                     if (!daemonRunning) break;
@@ -484,7 +503,7 @@ public final class ShellInputDaemon {
         }
     }
 
-    private void flushPendingMouseNow() {
+    private void flushPendingMouseNow(int maxSteps, boolean onlyIfMoveQueued) {
         boolean have = false;
         int tx = 0;
         int ty = 0;
@@ -492,7 +511,10 @@ public final class ShellInputDaemon {
         int py = 0;
         long seq = 0L;
         synchronized (mouseQueueLock) {
-            if (hasPendingMove || subFrameGlide.isActive()) {
+            boolean shouldFlush = onlyIfMoveQueued
+                ? hasPendingMove
+                : (hasPendingMove || subFrameGlide.isActive());
+            if (shouldFlush) {
                 px = Math.abs(pendingPushX) >= Math.abs(subFrameGlide.currentPushX())
                     ? pendingPushX : subFrameGlide.currentPushX();
                 py = Math.abs(pendingPushY) >= Math.abs(subFrameGlide.currentPushY())
@@ -514,8 +536,8 @@ public final class ShellInputDaemon {
                 have = true;
             }
         }
-        if (have) {
-            for (int step = 0; step < 12; step++) {
+        if (have && maxSteps > 0) {
+            for (int step = 0; step < maxSteps; step++) {
                 int outcome = moveTo(tx, ty, step == 0 ? px : 0, step == 0 ? py : 0, seq, true);
                 if (outcome == MOVE_DONE_IDLE) break;
                 synchronized (mouseQueueLock) {

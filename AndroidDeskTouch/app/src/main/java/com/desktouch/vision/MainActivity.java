@@ -613,6 +613,8 @@ public final class MainActivity extends Activity {
         if(WifiLinkMonitor.BAND_24_GHZ.equals(band)) base="2.4 GHz wireless";
         else if(WifiLinkMonitor.BAND_5_GHZ.equals(band)) base="5 GHz wireless";
         else if(WifiLinkMonitor.BAND_6_GHZ.equals(band)) base="6 GHz wireless";
+        else if(WifiLinkMonitor.BAND_CELLULAR.equals(band)) base="Mobile network";
+        else if("ethernet".equals(band)) base="Wired network";
         else base="Wireless";
         return speedMbps>0 ? base+" ("+speedMbps+" Mbps)" : base;
     }

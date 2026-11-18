@@ -234,6 +234,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int LastWireMoveX = -1, LastWireMoveY = -1, LastWireMoveLease;
         internal int TcpWaypointX = -1, TcpWaypointY = -1;
 
+        internal bool MatchesLastWireMove(Packet move)
+        {
+            if (move.Type != "move" || move.D != 0) return false;
+            lock (ReverseMoveOrderLock)
+            {
+                return Volatile.Read(ref ActiveReverseLease) == LastWireMoveLease &&
+                       LastWireMoveX == move.A &&
+                       LastWireMoveY == move.B;
+            }
+        }
+
         internal void SetLatestReverseMoveOrdered(ref Packet? slot, Packet move, bool trackWaypoint = false)
         {
             lock (ReverseMoveOrderLock)
@@ -314,7 +325,22 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private readonly Action<string> _status;
     private readonly CancellationTokenSource _cancel = new();
-    private readonly TcpListener _listener = new(IPAddress.Any, Wire.Port);
+    private readonly TcpListener _listener = CreateDualStackListener(Wire.Port);
+
+    private static TcpListener CreateDualStackListener(int port)
+    {
+        try
+        {
+            return TcpListener.Create(port);
+        }
+        catch (Exception)
+        {
+            return new TcpListener(IPAddress.Any, port);
+        }
+    }
+
+    internal static IPAddress? UnmapAddress(IPAddress? address) =>
+        address != null && address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
     private readonly X509Certificate2 _certificate;
     private readonly TrustedDeviceStore? _trusted;
     private readonly LocalInputPriority _priority;
@@ -1397,7 +1423,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var id = Interlocked.Increment(ref _nextClientId);
                 _clients[id] = client;
                 client.NoDelay = true;
-                try { client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8); }
+                try
+                {
+                    if (client.Client.AddressFamily == AddressFamily.InterNetworkV6)
+                        client.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.TypeOfService, 0xB8);
+                    else
+                        client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0xB8);
+                }
                 catch (Exception) { }
                 client.Client.SetSocketOption(SocketOptionLevel.Socket,
                     SocketOptionName.KeepAlive,true);
@@ -1471,6 +1503,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private static async Task SendCablePingAsync(Session session, CancellationToken token)
     {
+        if (Volatile.Read(ref session.UrgentControlWaiters) > 0)
+            return;
         if (Interlocked.CompareExchange(ref session.CablePingInFlight, 1, 0) != 0)
             return;
         try
@@ -2111,9 +2145,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 var tcpPrior = Interlocked.Exchange(ref session.LatestReverseMove, null);
                 var prior = udpSync ?? (isImmediateControl && session.UdpPeer is { Confirmed: true }
                     ? null : tcpPrior);
-                if (prior != null)
-                    await SendMoveToAsync(session, EncodeMoveForWire(session, prior), token);
-                await SendMoveToAsync(session, ReverseInputProtocol.Encode(p), token);
+                if (prior != null && !(isImmediateControl && session.MatchesLastWireMove(prior)))
+                    await SendUrgentAsync(session, EncodeMoveForWire(session, prior), token);
+                if (isImmediateControl || p.Type is "key" or "text")
+                    await SendUrgentAsync(session, ReverseInputProtocol.Encode(p), token);
+                else
+                    await SendMoveToAsync(session, ReverseInputProtocol.Encode(p), token);
             }
         }
         catch (OperationCanceledException) { }
@@ -2175,6 +2212,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal static (string Band, int SpeedMbps) DetectInterfaceForLocalAddress(IPAddress? localAddress)
     {
+        localAddress = UnmapAddress(localAddress);
         if (localAddress == null || IPAddress.IsLoopback(localAddress))
             return ("wireless", 0);
         try
@@ -2211,6 +2249,65 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return ("wireless", 0);
     }
 
+    internal static IReadOnlyList<string> CollectReachableGlobalIpv6Addresses()
+    {
+        var primary = new List<string>();
+        var secondary = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up)
+                    continue;
+                if (nic.NetworkInterfaceType is NetworkInterfaceType.Loopback
+                    or NetworkInterfaceType.Tunnel)
+                    continue;
+                var ipProps = nic.GetIPProperties();
+                if (ipProps.GatewayAddresses.Count == 0)
+                    continue;
+                foreach (var uni in ipProps.UnicastAddresses)
+                {
+                    var ip = uni.Address;
+                    if (ip.AddressFamily != AddressFamily.InterNetworkV6)
+                        continue;
+                    if (ip.IsIPv6LinkLocal || ip.IsIPv6Multicast || ip.IsIPv6SiteLocal ||
+                        ip.IsIPv6Teredo || ip.IsIPv4MappedToIPv6 || IPAddress.IsLoopback(ip))
+                        continue;
+                    byte[] bytes = ip.GetAddressBytes();
+                    // Skip ULA fc00::/7 (only globally routable 2000::/3 or non-ULA).
+                    if ((bytes[0] & 0xFE) == 0xFC)
+                        continue;
+                    if (uni.DuplicateAddressDetectionState != DuplicateAddressDetectionState.Preferred)
+                        continue;
+                    string text = ip.ToString();
+                    int zoneIdx = text.IndexOf('%');
+                    if (zoneIdx >= 0) text = text[..zoneIdx];
+                    if (!seen.Add(text))
+                        continue;
+                    if (uni.SuffixOrigin == SuffixOrigin.Random)
+                        secondary.Add(text);
+                    else
+                        primary.Add(text);
+                }
+            }
+        }
+        catch
+        {
+        }
+        primary.AddRange(secondary);
+        if (primary.Count > 3)
+            primary.RemoveRange(3, primary.Count - 3);
+        return primary;
+    }
+
+    internal static string? BuildEndpointsJson()
+    {
+        var v6 = CollectReachableGlobalIpv6Addresses();
+        if (v6.Count == 0) return null;
+        return JsonSerializer.Serialize(new { v6, port = Wire.Port });
+    }
+
     private async Task ServeAsync(int id, TcpClient client, CancellationToken token)
     {
         using var ssl = new SslStream(client.GetStream(), leaveInnerStreamOpen:false);
@@ -2224,15 +2321,31 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             CertificateRevocationCheckMode=X509RevocationMode.NoCheck
         },handshakeLimit.Token);
         var request=await Wire.ReadAsync(ssl,handshakeLimit.Token);
-        var trustedSource=request.Type=="auth-trusted" ?
-            _trusted?.AuthenticateIncoming(request.Text) : null;
+        bool requestProbe = request.Type == "auth-trusted-probe";
+        var trustedSource = request.Type is "auth-trusted" or "auth-trusted-probe"
+            ? _trusted?.AuthenticateIncoming(request.Text)
+            : null;
+        if (requestProbe)
+        {
+            if (trustedSource != null)
+            {
+                await Wire.WriteAsync(ssl,
+                    new Packet("probe-ok", Wire.Port, Text: _udpHub?.Port > 0 ? _udpHub.Port.ToString() : ""),
+                    token);
+            }
+            else
+            {
+                await Wire.WriteAsync(ssl, new Packet("denied"), token);
+            }
+            return;
+        }
         bool approved=trustedSource!=null ||
             (request.Type=="auth" && ConstantTimeSecret(request.Text,Secret));
         if (!approved && request.Type=="auth-request" && _requestApproval!=null)
         {
             using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
             approvalLimit.CancelAfter(TimeSpan.FromSeconds(40));
-            string ip=(client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString() ?? "?";
+            string ip = UnmapAddress((client.Client.RemoteEndPoint as IPEndPoint)?.Address)?.ToString() ?? "?";
             string name=(request.Text ?? "Unknown device").Trim();
             if (name.Length>60)name=name[..60];
             try { approved=await _requestApproval(name+" ("+ip+")",approvalLimit.Token); }
@@ -2256,12 +2369,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // The authenticated hello carries the current Windows computer name.
         // A saved trusted-device alias may be stale after the PC was renamed;
         // keep the actual announced system name in the display diagram.
-        bool isLoopbackRemote = client.Client.RemoteEndPoint is IPEndPoint remoteEp &&
-            IPAddress.IsLoopback(remoteEp.Address);
+        IPAddress? remoteAddress = UnmapAddress((client.Client.RemoteEndPoint as IPEndPoint)?.Address);
+        bool isLoopbackRemote = remoteAddress != null && IPAddress.IsLoopback(remoteAddress);
         bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
             isLoopbackRemote;
         var (localBand, localSpeed) = DetectInterfaceForLocalAddress(
-            client.Client.LocalEndPoint is IPEndPoint localEp ? localEp.Address : null);
+            client.Client.LocalEndPoint is IPEndPoint localEp ? UnmapAddress(localEp.Address) : null);
         string initialBand = isCable
             ? "cable"
             : (localBand == "ethernet" && string.Equals(peer.Platform, "Windows", StringComparison.Ordinal)
@@ -2355,6 +2468,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 await SendToAsync(session, new Packet("udp-channel",
                     _udpHub.Port, session.Id, Text: session.UdpPeer.Base64Key), token);
+            }
+            if (string.Equals(peer.Platform, "Android", StringComparison.Ordinal))
+            {
+                string? endpointsJson = BuildEndpointsJson();
+                if (!string.IsNullOrEmpty(endpointsJson))
+                    await SendToAsync(session, new Packet("endpoints", Wire.Port, Text: endpointsJson), token);
             }
             if (peer.Platform == "Android")
             {
@@ -3292,15 +3411,30 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             ? null
             : AdaptiveLinkTracker.NormalizeBand(linkBand);
         bool isSlow24Ghz = isAndroid && string.Equals(normalizedBand, "2.4GHz", StringComparison.Ordinal);
+        bool isCellular = isAndroid && string.Equals(normalizedBand, "cellular", StringComparison.Ordinal);
         double baseMs;
         if (isAndroid)
         {
             if (isSlow24Ghz)
-                baseMs = liveRefreshHz is >= 24 and < 65 ? 13.0 : (liveRefreshHz is >= 90 && lossPermille < 20.0 ? 8.5 : 11.0);
+            {
+                bool cleanRadioTiming = rttMs > 0 && rttMs <= 18.0 && jitterMs <= 5.5 &&
+                    (minRttMs <= 0 || rttMs - minRttMs <= 6.0);
+                baseMs = liveRefreshHz is >= 24 and < 65
+                    ? 13.0
+                    : (liveRefreshHz is >= 90 && (lossPermille < 20.0 || cleanRadioTiming) ? 8.5 : 11.0);
+            }
+            else if (isCellular)
+            {
+                baseMs = liveRefreshHz is >= 24 and < 65 ? 13.0 : 9.5;
+            }
             else if (liveRefreshHz is >= 24)
+            {
                 baseMs = Math.Clamp(1000.0 / (Math.Min(240, liveRefreshHz.Value) * 1.55), 4.2, 13.0);
+            }
             else
+            {
                 baseMs = AndroidUdpMinIntervalMs;
+            }
         }
         else
         {
@@ -3313,11 +3447,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return baseMs;
 
         double queueDelay = (minRttMs > 0 && rttMs > minRttMs) ? (rttMs - minRttMs) : 0.0;
-        double floorMs = isSlow24Ghz ? 7.5 : (isAndroid ? 4.2 : 1.8);
-        if (!isSlow24Ghz && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
+        double floorMs = isSlow24Ghz ? 7.5 : (isCellular ? 6.5 : (isAndroid ? 4.2 : 1.8));
+        if (!isSlow24Ghz && !isCellular && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
         if (isSlow24Ghz && rttMs <= 12.0 && queueDelay <= 4.0 && jitterMs <= 4.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.78);
+        if (!isCellular && rttMs <= 18.0 && queueDelay <= 6.0 && jitterMs <= 5.5 && lossPermille >= 4.0)
+        {
+            double dropPenalty = Math.Min(2.0, Math.Max(0.0, lossPermille - 8.0) * 0.015);
+            return Math.Clamp(baseMs + dropPenalty, Math.Max(floorMs, baseMs), isSlow24Ghz ? 10.5 : Math.Max(baseMs + 2.0, 10.0));
+        }
 
         double rttPressure = Math.Max(0.0, rttMs - 18.0) * 0.08;
         double bloatPressure = Math.Max(0.0, queueDelay - 8.0) * 0.16;
@@ -3327,10 +3466,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             ? 12.0
             : (isSlow24Ghz
                 ? 16.5
-                : (liveRefreshHz is >= 115 ? 14.0
-                    : liveRefreshHz is >= 85 ? 16.0
-                    : liveRefreshHz is >= 55 ? 18.5
-                    : 20.0));
+                : (isCellular
+                    ? 18.0
+                    : (liveRefreshHz is >= 115 ? 14.0
+                        : liveRefreshHz is >= 85 ? 16.0
+                        : liveRefreshHz is >= 55 ? 18.5
+                        : 20.0)));
         maxCap = Math.Max(baseMs, maxCap);
         return Math.Clamp(baseMs + rttPressure + bloatPressure + jitterPressure + lossPressure, baseMs, maxCap);
     }
@@ -3349,12 +3490,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal static int ComputeWarmIntervalMs(string? linkBand, double queueDelayMs, double lossPermille)
     {
-        bool isSlow24 = string.Equals(AdaptiveLinkTracker.NormalizeBand(linkBand), "2.4GHz", StringComparison.Ordinal);
+        string normalized = AdaptiveLinkTracker.NormalizeBand(linkBand);
+        bool isSlow24 = string.Equals(normalized, "2.4GHz", StringComparison.Ordinal);
+        bool isCellular = string.Equals(normalized, "cellular", StringComparison.Ordinal);
         // On 2.4 GHz idle pauses, keep CAM awake below the 50-100 ms power-save threshold
         // without causing 100 Hz half-duplex keepalive storms.
         if (isSlow24)
         {
             return Math.Clamp((int)Math.Round(22.0 + queueDelayMs * 0.55 + lossPermille * 0.15), 20, 36);
+        }
+        if (isCellular)
+        {
+            return Math.Clamp((int)Math.Round(22.0 + queueDelayMs * 0.50 + lossPermille * 0.12), 20, 38);
         }
         int minMs = 24;
         int maxMs = 52;
@@ -4062,7 +4209,7 @@ internal sealed class HostSession : IInputSession, IDisposable
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             var (outBand, outSpeed) = ReceiverServer.DetectInterfaceForLocalAddress(
-                client.Client.LocalEndPoint is IPEndPoint outEp ? outEp.Address : null);
+                client.Client.LocalEndPoint is IPEndPoint outEp ? ReceiverServer.UnmapAddress(outEp.Address) : null);
             if (outBand == "ethernet")
             {
                 await Wire.WriteAsync(ssl, new Packet("link-info", Text: outBand, A: outSpeed), acceptedLimit.Token);

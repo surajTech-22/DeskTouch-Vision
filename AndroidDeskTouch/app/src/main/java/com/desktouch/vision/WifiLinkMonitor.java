@@ -23,6 +23,7 @@ final class WifiLinkMonitor {
     static final String BAND_24_GHZ = "2.4GHz";
     static final String BAND_5_GHZ = "5GHz";
     static final String BAND_6_GHZ = "6GHz";
+    static final String BAND_CELLULAR = "cellular";
     static final String BAND_WIRELESS = "wireless";
     static final String BAND_NONE = "none";
 
@@ -83,7 +84,7 @@ final class WifiLinkMonitor {
                     : "Wireless";
             }
             if ("ethernet".equals(transport)) return "Wired network";
-            if ("cellular".equals(transport)) return "Mobile data";
+            if ("cellular".equals(transport) || BAND_CELLULAR.equals(band)) return "Mobile network";
             return "Network offline";
         }
     }

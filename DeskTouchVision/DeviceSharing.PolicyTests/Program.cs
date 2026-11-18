@@ -2832,6 +2832,43 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         bridge.DispatchCommand("SHOW");
         Check(bridgeSwitched == -2 && bridgeReturned && bridgePayPeer == 5 && bridgeShown,
               "DeskSpaceDeckBridge must dispatch SWITCH, RETURN, TOGGLE_PAY, and SHOW commands accurately");
+
+        var rawItems = new[]
+        {
+            new BridgeDeviceItemDto(EnvironmentRouteOrder.Local, "DESKTOP-IQ1KSJ9", "Windows", true, false, false, true, 1, "Click to return"),
+            new BridgeDeviceItemDto(0, "SURAJ", "Windows", false, false, false, true, 3, "Connected"),
+            new BridgeDeviceItemDto(3, "Xiaomi", "Android", false, true, true, true, -1, "Controlling")
+        };
+        var arrangedRects = new Dictionary<int, System.Drawing.RectangleF>
+        {
+            [0] = new System.Drawing.RectangleF(10, 40, 120, 68),                    // SURAJ on Left
+            [EnvironmentRouteOrder.Local] = new System.Drawing.RectangleF(138, 40, 150, 68), // Hub in Center
+            [3] = new System.Drawing.RectangleF(296, 28, 54, 92)                    // Xiaomi on Right
+        };
+        var normalized = DeskSpaceDeckBridge.NormalizeAndOrderDevices(rawItems, arrangedRects);
+        Check(normalized.Count == 3 &&
+              normalized[0].Id == 0 &&
+              normalized[1].Id == EnvironmentRouteOrder.Local &&
+              normalized[2].Id == 3 &&
+              normalized[0].ArrangementOrder == 0 &&
+              normalized[1].ArrangementOrder == 1 &&
+              normalized[2].ArrangementOrder == 2 &&
+              normalized[0].LayoutX < normalized[1].LayoutX &&
+              normalized[1].LayoutX < normalized[2].LayoutX &&
+              normalized[2].LayoutH > normalized[0].LayoutH,
+              "DeskSpaceDeckBridge must sort and normalize spatial bounds left-to-right matching DisplayArrangementControl");
+
+        var stackedRects = new Dictionary<int, System.Drawing.RectangleF>
+        {
+            [0] = new System.Drawing.RectangleF(140, 120, 120, 68),
+            [EnvironmentRouteOrder.Local] = new System.Drawing.RectangleF(140, 40, 120, 68),
+            [3] = new System.Drawing.RectangleF(268, 30, 54, 92)
+        };
+        var stacked = DeskSpaceDeckBridge.NormalizeAndOrderDevices(rawItems, stackedRects);
+        Check(stacked[0].Id == EnvironmentRouteOrder.Local &&
+              stacked[1].Id == 3 &&
+              stacked[2].Id == 0,
+              "DeskSpaceDeckBridge must order stacked rows top-to-bottom and left-to-right within rows");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

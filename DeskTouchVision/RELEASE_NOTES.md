@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.75 — Exact App Display Arrangement Order, Fast Background Update Cleanup & Live Bridge Coords
+
+- **Spatial display placement & order published to Deck and Tray (`DisplayArrangementControl`, `DeskSpaceDeckBridge`, `DisplaySettingsForm`):** Orders all connected devices by their real arranged spatial position in the DeskTouch Displays diagram (left-to-right within rows, top-to-bottom across rows), includes normalized 2D display layout bounds on every bridge snapshot, and republishes immediately whenever display placement changes.
+- **Fast post-update background cleanup (`Update-DeskTouch.ps1`):** Uses direct directory deletion after releasing the installer lock so detached background updater processes exit within seconds after upgrading.
+
+---
+
 # DeskTouch Vision v0.3.74 — Android Trackpad Control, Windows-Format Linked Displays & Dedicated Find Hubs Panel
 
 - **Control PC Screen moved to Trackpad tab (`MainActivity`, `PhoneUiKit`):** Moves `Control PC Screen` and `Return to Phone` into a dedicated control banner at the top of the `Trackpad` tab alongside the live active-link status pill, keeping Home focused on connection health and display arrangement.

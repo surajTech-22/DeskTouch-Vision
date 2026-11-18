@@ -14,7 +14,12 @@ internal sealed record BridgeDeviceItemDto(
     bool IsControlling,
     bool SupportsInput,
     int NotificationCount,
-    string StatusText);
+    string StatusText,
+    double LayoutX = 0,
+    double LayoutY = 0,
+    double LayoutW = 0,
+    double LayoutH = 0,
+    int ArrangementOrder = 0);
 
 internal sealed record BridgeDeviceSnapshotDto(
     int Version,
@@ -126,9 +131,66 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
                 .Append(d.IsControlling ? '1' : '0')
                 .Append(d.SupportsInput ? '1' : '0').Append(':')
                 .Append(d.NotificationCount).Append(':')
+                .Append(d.ArrangementOrder).Append(':')
+                .Append(Math.Round(d.LayoutX, 3)).Append(',')
+                .Append(Math.Round(d.LayoutY, 3)).Append(',')
+                .Append(Math.Round(d.LayoutW, 3)).Append(',')
+                .Append(Math.Round(d.LayoutH, 3)).Append(':')
                 .Append(d.StatusText);
         }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
+    }
+
+    internal static IReadOnlyList<BridgeDeviceItemDto> NormalizeAndOrderDevices(
+        IReadOnlyList<BridgeDeviceItemDto> raw,
+        IReadOnlyDictionary<int, System.Drawing.RectangleF> arrangedBounds)
+    {
+        if (raw.Count == 0) return raw;
+        if (arrangedBounds.Count == 0)
+        {
+            return raw.Select((d, idx) => d with { ArrangementOrder = idx }).ToArray();
+        }
+        var ordered = DisplayArrangementControl.SortBySpatialArrangement(
+            raw, d => arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0 ? r : null);
+
+        var matchedRects = ordered
+            .Select(d => arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0 ? (System.Drawing.RectangleF?)r : null)
+            .Where(r => r.HasValue)
+            .Select(r => r!.Value)
+            .ToArray();
+        if (matchedRects.Length == 0)
+        {
+            return ordered.Select((d, idx) => d with { ArrangementOrder = idx }).ToArray();
+        }
+
+        float minX = matchedRects.Min(r => r.Left);
+        float minY = matchedRects.Min(r => r.Top);
+        float maxX = matchedRects.Max(r => r.Right);
+        float maxY = matchedRects.Max(r => r.Bottom);
+        double spanW = Math.Max(1.0, maxX - minX);
+        double spanH = Math.Max(1.0, maxY - minY);
+
+        var result = new BridgeDeviceItemDto[ordered.Count];
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            var d = ordered[i];
+            if (arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0)
+            {
+                result[i] = d with
+                {
+                    LayoutX = Math.Round((r.Left - minX) / spanW, 4),
+                    LayoutY = Math.Round((r.Top - minY) / spanH, 4),
+                    LayoutW = Math.Round(r.Width / spanW, 4),
+                    LayoutH = Math.Round(r.Height / spanH, 4),
+                    ArrangementOrder = i
+                };
+            }
+            else
+            {
+                result[i] = d with { ArrangementOrder = i };
+            }
+        }
+        return result;
     }
 
     internal BridgeDeviceSnapshotDto CurrentSnapshot

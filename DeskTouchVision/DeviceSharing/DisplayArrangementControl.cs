@@ -193,6 +193,58 @@ internal sealed class DisplayArrangementControl : Control
     internal IReadOnlyList<(int TargetId,RectangleF Hit)> OnlineHitRegions =>
         _environmentHits.Select(x=>(x.TargetId,x.Hit)).ToArray();
 
+    internal IReadOnlyList<(int TargetId, RectangleF Bounds)> GetArrangedDeviceBounds(int baseTargetId)
+    {
+        EnsureLayoutComputed();
+        var result = new List<(int TargetId, RectangleF Bounds)>();
+        if (_localHit.Width > 0 && _localHit.Height > 0)
+            result.Add((EnvironmentRouteOrder.Local, _localHit));
+        if (baseTargetId != EnvironmentRouteOrder.Local &&
+            _remoteHit.Width > 0 && _remoteHit.Height > 0)
+            result.Add((baseTargetId, _remoteHit));
+        foreach (var (hit, id) in _environmentHits)
+        {
+            if (hit.Width > 0 && hit.Height > 0 && result.All(x => x.TargetId != id))
+                result.Add((id, hit));
+        }
+        return result;
+    }
+
+    internal static IReadOnlyList<T> SortBySpatialArrangement<T>(
+        IEnumerable<T> items, Func<T, RectangleF?> boundsOf)
+    {
+        var list = items.ToList();
+        if (list.Count <= 1) return list;
+        var indexed = new List<(T Item, int OriginalIndex, RectangleF? Bounds)>(list.Count);
+        for (int i = 0; i < list.Count; i++)
+            indexed.Add((list[i], i, boundsOf(list[i])));
+        indexed.Sort((a, b) =>
+        {
+            bool aValid = a.Bounds is { Width: > 0, Height: > 0 };
+            bool bValid = b.Bounds is { Width: > 0, Height: > 0 };
+            if (!aValid && !bValid) return a.OriginalIndex.CompareTo(b.OriginalIndex);
+            if (!aValid) return 1;
+            if (!bValid) return -1;
+            var ra = a.Bounds!.Value;
+            var rb = b.Bounds!.Value;
+            float overlapY = Math.Min(ra.Bottom, rb.Bottom) - Math.Max(ra.Top, rb.Top);
+            float minH = Math.Min(ra.Height, rb.Height);
+            bool sameRow = minH <= 0 || overlapY >= minH * 0.35f;
+            if (!sameRow)
+            {
+                float cyA = ra.Top + ra.Height / 2f;
+                float cyB = rb.Top + rb.Height / 2f;
+                int rowCmp = cyA.CompareTo(cyB);
+                if (rowCmp != 0) return rowCmp;
+            }
+            float cxA = ra.Left + ra.Width / 2f;
+            float cxB = rb.Left + rb.Width / 2f;
+            int colCmp = cxA.CompareTo(cxB);
+            return colCmp != 0 ? colCmp : a.OriginalIndex.CompareTo(b.OriginalIndex);
+        });
+        return indexed.Select(x => x.Item).ToArray();
+    }
+
     private static RectangleF SelectExposedOriginRect(
         RectangleF groupBounds, IReadOnlyList<RectangleF> monitors,
         MonitorEdge direction, float cross)

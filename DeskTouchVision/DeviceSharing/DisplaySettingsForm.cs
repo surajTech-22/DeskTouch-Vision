@@ -301,7 +301,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             await UpdateClient.CheckManuallyAsync(this);
         _display.AddComputerRequested += async () => await AddComputerAsync();
         _display.EnvironmentDeviceSelected += SelectConnectedTarget;
-        _display.EnvironmentArrangementChanged += SavePreferredEdge;
+        _display.EnvironmentArrangementChanged += () =>
+        {
+            SavePreferredEdge();
+            PublishDeckBridgeSnapshot();
+            RefreshTrayFlyoutIfVisible();
+        };
         _display.EnvironmentMemberMoved += OnEnvironmentMemberMoved;
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
 
@@ -1632,6 +1637,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.RemoteEdge = _preferredEdge;
             SavePreferredEdge();
             _capture?.SetEdge(_preferredEdge);
+            PublishDeckBridgeSnapshot();
+            RefreshTrayFlyoutIfVisible();
             Status("Both computers' outside-edge handoff positions synchronized.");
         });
     }
@@ -2416,6 +2423,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (!_captureUsesInbound) _host?.PublishSourcePlacement(edge);
         if (_captureUsesInbound || _host == null)
             _receiver?.PublishPlacement(Opposite(edge));
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
         Status($"Connected computer placed {_preferredEdge.ToString().ToLowerInvariant()}. " +
                "Move to that outside edge to switch between computers.");
     }
@@ -2921,10 +2930,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
         }
 
-        int connectedCount = Math.Max(0, items.Count - 1);
-        bool hasKnown = items.Any(d => d.NotificationCount >= 0);
-        int totalNotif = items.Where(d => d.NotificationCount >= 0).Sum(d => d.NotificationCount);
-        string activeName = items.FirstOrDefault(d => d.IsControlling)?.Name ?? Environment.MachineName;
+        var arrangedBounds = _display.GetArrangedDeviceBounds(CurrentBaseTargetId())
+            .ToDictionary(x => x.TargetId, x => x.Bounds);
+        var orderedItems = DeskSpaceDeckBridge.NormalizeAndOrderDevices(items, arrangedBounds);
+
+        int connectedCount = Math.Max(0, orderedItems.Count - 1);
+        bool hasKnown = orderedItems.Any(d => d.NotificationCount >= 0);
+        int totalNotif = orderedItems.Where(d => d.NotificationCount >= 0).Sum(d => d.NotificationCount);
+        string activeName = orderedItems.FirstOrDefault(d => d.IsControlling)?.Name ?? Environment.MachineName;
 
         return new BridgeDeviceSnapshotDto(
             Version: 1,
@@ -2937,6 +2950,6 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ConnectedCount: connectedCount,
             TotalNotificationCount: totalNotif,
             HasAnyKnownNotificationCount: hasKnown,
-            Devices: items);
+            Devices: orderedItems);
     }
 }

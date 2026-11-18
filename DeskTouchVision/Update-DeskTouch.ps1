@@ -17,6 +17,14 @@ $logs = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\logs'
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 $log = Join-Path $logs 'update.log'
 function Log([string]$text) { ("{0:u} {1}" -f (Get-Date), $text) | Out-File $log -Append -Encoding utf8 }
+function Remove-TreeQuickly([string]$path) {
+  if (-not $path -or -not (Test-Path -LiteralPath $path)) { return }
+  try {
+    [System.IO.Directory]::Delete($path, $true)
+  } catch {
+    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
 
 function Assert-InstallDirectoryAvailable([string]$directory) {
   # The application folder may have a transient handle during shutdown.
@@ -225,18 +233,20 @@ finally {
     # staging paths, so cleanup is safe after the critical lock is free.
     if ($movedOriginal -and $backup -and (Test-Path -LiteralPath $backup)) {
       Log "Cleanup started for previous application backup."
-      Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+      try { [System.IO.Directory]::Delete($backup, $true) }
+      catch { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }
     }
     if ($pkg -and (Test-Path -LiteralPath $pkg)) {
       Remove-Item -LiteralPath $pkg -Force -ErrorAction SilentlyContinue
       $downloadFolder = Split-Path -Path $pkg -Parent
       if ($downloadFolder -like (Join-Path $env:TEMP 'DeskTouchVision-Update*')) {
-        Remove-Item -LiteralPath $downloadFolder -Force -ErrorAction SilentlyContinue
+        Remove-TreeQuickly $downloadFolder
       }
     }
   }
   if ($stage -and (Test-Path -LiteralPath $stage)) {
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    try { [System.IO.Directory]::Delete($stage, $true) }
+    catch { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
   }
   if ($activated) { Log "POST-INSTALL CLEANUP FINISHED PID=$PID." }
 }

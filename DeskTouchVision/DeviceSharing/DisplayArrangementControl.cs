@@ -535,7 +535,7 @@ internal sealed class DisplayArrangementControl : Control
     {
         Name = "DisplayDiagram";
         Dock = DockStyle.Fill;
-        BackColor = Color.FromArgb(30, 31, 36);
+        BackColor = Color.FromArgb(20, 28, 42);
         ForeColor = Color.White;
         DoubleBuffered = true;
         Cursor = Cursors.Default;
@@ -847,6 +847,20 @@ internal sealed class DisplayArrangementControl : Control
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
         g.Clear(BackColor);
 
+        if (ClientSize.Width > 16 && ClientSize.Height > 16)
+        {
+            var canvasFrame = new RectangleF(1f, 1f, ClientSize.Width - 3f, ClientSize.Height - 3f);
+            using var framePath = Rounded(canvasFrame, 12f);
+            using var gridBrush = new SolidBrush(Color.FromArgb(30, 148, 163, 184));
+            for (int gx = 20; gx < ClientSize.Width - 14; gx += 28)
+            {
+                for (int gy = 18; gy < ClientSize.Height - 14; gy += 28)
+                    g.FillEllipse(gridBrush, gx, gy, 2.2f, 2.2f);
+            }
+            using var framePen = new Pen(Color.FromArgb(46, 62, 88), 1.2f);
+            g.DrawPath(framePen, framePath);
+        }
+
         var layout = ComputeLayout(ClientSize);
         if (layout == null || _local == null)
         {
@@ -975,14 +989,45 @@ internal sealed class DisplayArrangementControl : Control
         Size? resolution = null, string? details = null)
     {
         if (rect.Width < 5 || rect.Height < 5) return;
-        using var path = Rounded(rect, 9);
-        using var fill = new SolidBrush(local
-            ? Color.FromArgb(66, 119, 203)
-            : Color.FromArgb(54, 136, 131));
-        using var outline = new Pen(primary ? Color.WhiteSmoke :
-            Color.FromArgb(170, 190, 205), primary ? 2.2f : 1.2f);
+        bool isPhone = platform == "Android";
+        using var path = Rounded(rect, isPhone ? 12f : 9f);
+        var topColor = local
+            ? Color.FromArgb(46, 118, 232)
+            : (isPhone ? Color.FromArgb(17, 138, 132) : Color.FromArgb(24, 132, 148));
+        var bottomColor = local
+            ? Color.FromArgb(26, 78, 182)
+            : (isPhone ? Color.FromArgb(13, 98, 96) : Color.FromArgb(17, 94, 114));
+        using var fill = new LinearGradientBrush(
+            new PointF(rect.Left, rect.Top),
+            new PointF(rect.Left, Math.Max(rect.Top + 1f, rect.Bottom)),
+            topColor,
+            bottomColor);
+        using var outline = new Pen(primary ? Color.FromArgb(186, 230, 253) :
+            Color.FromArgb(148, 182, 208), primary ? 2.2f : 1.3f);
         g.FillPath(fill, path);
         g.DrawPath(outline, path);
+        if (rect.Width >= 24 && rect.Height >= 18)
+        {
+            using var topGlow = new Pen(Color.FromArgb(75, 255, 255, 255), 1f);
+            g.DrawLine(topGlow, rect.Left + 9f, rect.Top + 2f, rect.Right - 9f, rect.Top + 2f);
+            if (isPhone)
+            {
+                float speakerW = Math.Clamp(rect.Width * 0.24f, 10f, 22f);
+                using var speakerPen = new Pen(Color.FromArgb(140, 226, 232, 240), 1.8f);
+                g.DrawLine(speakerPen,
+                    rect.Left + (rect.Width - speakerW) / 2f, rect.Top + 5f,
+                    rect.Left + (rect.Width + speakerW) / 2f, rect.Top + 5f);
+            }
+            else if (rect.Bottom + 7f < g.VisibleClipBounds.Bottom)
+            {
+                float neckW = Math.Clamp(rect.Width * 0.12f, 8f, 18f);
+                float baseW = Math.Clamp(rect.Width * 0.30f, 18f, 44f);
+                float cx = rect.Left + rect.Width / 2f;
+                using var standBrush = new SolidBrush(Color.FromArgb(120, 148, 163, 184));
+                g.FillRectangle(standBrush, cx - neckW / 2f, rect.Bottom + 1f, neckW, 3.5f);
+                g.FillRectangle(standBrush, cx - baseW / 2f, rect.Bottom + 4.5f, baseW, 2.2f);
+            }
+        }
         if (rect.Width < 38 || rect.Height < 28) return;
         float labelHeight = platform=="Android"
             ? Math.Min(48,Math.Max(22,rect.Height*.32f))

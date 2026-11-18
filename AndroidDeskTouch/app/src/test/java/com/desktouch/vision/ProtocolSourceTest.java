@@ -1587,6 +1587,12 @@ public final class ProtocolSourceTest {
         String updaterSource = readProjectSource("src/main/java/com/desktouch/vision/AndroidUpdater.java");
         assertTrue(updaterSource.contains("static void checkInAppOnResume(Activity activity)"));
         assertTrue(updaterSource.contains("promptInAppUpdate("));
+
+        String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
+        assertTrue(sessionSource.contains("void switchTargetAndClaim(int id, int entryDirection){"));
+        assertTrue(sessionSource.contains("TASKBAR_ICON_CACHE"));
+        assertTrue(sessionSource.contains("new Packet(\"taskbar-need-icons\",reqTarget)"));
+        assertTrue(mainSource.contains("active.switchTargetAndClaim(pc.id,0);"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

@@ -8,14 +8,15 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Xml.Linq;
 
 namespace DeskTouch.DeviceShare;
 
 /// <summary>
 /// Captures the local Windows user session's live taskbar (open application
-/// windows + pinned taskbar shortcuts + cached PNG icons) and executes
-/// strictly allowlisted focus/launch actions from paired endpoints.
-/// Never accepts file paths or arbitrary commands from the network.
+/// windows + pinned taskbar shortcuts + clean high-DPI PNG icons without
+/// shortcut arrow overlays) and executes strictly allowlisted focus/launch
+/// actions from paired endpoints.
 /// </summary>
 internal static class WindowsTaskbarHelper
 {
@@ -42,6 +43,7 @@ internal static class WindowsTaskbarHelper
 
     private readonly record struct ActionTarget(IntPtr Hwnd, string? PinnedLnkPath);
     private readonly record struct CachedIcon(string Hash, string Base64, long CachedTicks);
+    private sealed record PinnedShortcutInfo(string Name, string LnkPath, string? TargetExe, string? IconLocation, int IconIndex);
 
     private const int GwlExStyle = -20;
     private const uint GwOwner = 4;
@@ -57,13 +59,13 @@ internal static class WindowsTaskbarHelper
     private const uint ShgfiIcon = 0x000000100;
     private const uint ShgfiLargeIcon = 0x000000000;
     private const int MaxTaskbarItems = 15;
-    private const int MaxIconCacheEntries = 96;
+    private const int MaxIconCacheEntries = 128;
 
     private static readonly ConcurrentDictionary<string, CachedIcon> IconMemo = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object TargetGate = new();
     private static Dictionary<string, ActionTarget> _activeTargets = new(StringComparer.Ordinal);
     private static long _lastPinnedScanTicks;
-    private static IReadOnlyList<(string Name, string LnkPath, string? TargetExe)> _cachedPinned = Array.Empty<(string, string, string?)>();
+    private static IReadOnlyList<PinnedShortcutInfo> _cachedPinned = Array.Empty<PinnedShortcutInfo>();
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int Left, Top, Right, Bottom; }
@@ -83,6 +85,10 @@ internal static class WindowsTaskbarHelper
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -154,6 +160,10 @@ internal static class WindowsTaskbarHelper
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "SHGetFileInfoW")]
     private static extern IntPtr SHGetFileInfo(string path, uint fileAttrs, ref SHFILEINFO shfi, uint sizeFileInfo, uint flags);
 
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, EntryPoint = "ExtractIconExW")]
+    private static extern uint ExtractIconEx(
+        string lpszFile, int nIconIndex, out IntPtr phiconLarge, out IntPtr phiconSmall, uint nIcons);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyIcon(IntPtr hIcon);
@@ -206,7 +216,6 @@ internal static class WindowsTaskbarHelper
         var runningItems = EnumerateRunningWindows();
         var pinned = ReadPinnedShortcuts();
 
-        // Map pinned order cleanly so open windows retain consistent pinned slots.
         var pinnedMatchByIndex = new int[runningItems.Count];
         Array.Fill(pinnedMatchByIndex, int.MaxValue);
         var matchedPinnedIndices = new HashSet<int>();
@@ -237,7 +246,8 @@ internal static class WindowsTaskbarHelper
         {
             var w = entry.Win;
             string key = "w" + w.Hwnd.ToInt64().ToString("X");
-            var (hash, b64) = ResolveWindowIcon(w.Hwnd, w.ExePath, w.ProcessName);
+            PinnedShortcutInfo? matchedPin = entry.PinnedOrder < pinned.Count ? pinned[entry.PinnedOrder] : null;
+            var (hash, b64) = ResolveWindowIcon(w.Hwnd, w.ExePath, w.ProcessName, matchedPin);
             if (!string.IsNullOrEmpty(hash) && !string.IsNullOrEmpty(b64))
                 icons[hash] = b64;
             nextTargets[key] = new ActionTarget(w.Hwnd, null);
@@ -256,7 +266,7 @@ internal static class WindowsTaskbarHelper
             if (matchedPinnedIndices.Contains(p)) continue;
             var pin = pinned[p];
             string key = "p" + p;
-            var (hash, b64) = ResolveFileIcon(pin.LnkPath);
+            var (hash, b64) = ResolvePinnedShortcutIcon(pin);
             if (!string.IsNullOrEmpty(hash) && !string.IsNullOrEmpty(b64))
                 icons[hash] = b64;
             nextTargets[key] = new ActionTarget(IntPtr.Zero, pin.LnkPath);
@@ -321,7 +331,7 @@ internal static class WindowsTaskbarHelper
         if (key == ActionStart)
             return SendWinChord(0);
         if (key == ActionSearch)
-            return SendWinChord(0x53); // 'S' -> Win+S Search
+            return SendWinChord(0x53);
 
         ActionTarget target;
         lock (TargetGate)
@@ -434,11 +444,28 @@ internal static class WindowsTaskbarHelper
                     return true;
             }
 
-            _ = GetWindowThreadProcessId(hwnd, out uint pid);
+            GetWindowThreadProcessId(hwnd, out uint pid);
             string? exePath = QueryProcessPath(pid);
             string procName = !string.IsNullOrEmpty(exePath)
                 ? Path.GetFileNameWithoutExtension(exePath)
                 : "app";
+
+            // Unwrap UWP / Store windows hosted inside ApplicationFrameHost.exe
+            if (string.Equals(procName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase))
+            {
+                uint childPid = FindUwpChildProcessId(hwnd, pid);
+                if (childPid != 0 && childPid != pid)
+                {
+                    string? childExe = QueryProcessPath(childPid);
+                    if (!string.IsNullOrEmpty(childExe))
+                    {
+                        pid = childPid;
+                        exePath = childExe;
+                        procName = Path.GetFileNameWithoutExtension(childExe);
+                    }
+                }
+            }
+
             if (string.Equals(procName, "TextInputHost", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(procName, "SearchHost", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(procName, "StartMenuExperienceHost", StringComparison.OrdinalIgnoreCase) ||
@@ -450,6 +477,22 @@ internal static class WindowsTaskbarHelper
             return true;
         }, IntPtr.Zero);
         return list;
+    }
+
+    private static uint FindUwpChildProcessId(IntPtr parentHwnd, uint hostPid)
+    {
+        uint foundPid = 0;
+        EnumChildWindows(parentHwnd, (childHwnd, _) =>
+        {
+            GetWindowThreadProcessId(childHwnd, out uint cpid);
+            if (cpid != 0 && cpid != hostPid)
+            {
+                foundPid = cpid;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return foundPid;
     }
 
     private static bool IsShellChromeTitle(string title) =>
@@ -473,7 +516,7 @@ internal static class WindowsTaskbarHelper
         }
     }
 
-    private static IReadOnlyList<(string Name, string LnkPath, string? TargetExe)> ReadPinnedShortcuts()
+    private static IReadOnlyList<PinnedShortcutInfo> ReadPinnedShortcuts()
     {
         long now = Environment.TickCount64;
         if (now - Volatile.Read(ref _lastPinnedScanTicks) < 15000 && _cachedPinned.Count > 0)
@@ -486,16 +529,16 @@ internal static class WindowsTaskbarHelper
                 "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar");
             if (!Directory.Exists(dir))
             {
-                _cachedPinned = Array.Empty<(string, string, string?)>();
+                _cachedPinned = Array.Empty<PinnedShortcutInfo>();
                 return _cachedPinned;
             }
-            var links = new List<(string Name, string LnkPath, string? TargetExe)>();
+            var links = new List<PinnedShortcutInfo>();
             foreach (string file in Directory.EnumerateFiles(dir, "*.lnk").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
             {
                 string name = Path.GetFileNameWithoutExtension(file).Trim();
                 if (string.IsNullOrEmpty(name)) continue;
-                string? targetExe = ResolveLnkTarget(file);
-                links.Add((name, file, targetExe));
+                var (targetExe, iconLoc, iconIdx) = ResolveLnkMetadata(file);
+                links.Add(new PinnedShortcutInfo(name, file, targetExe, iconLoc, iconIdx));
                 if (links.Count >= 16) break;
             }
             _cachedPinned = links;
@@ -507,27 +550,44 @@ internal static class WindowsTaskbarHelper
         }
     }
 
-    private static string? ResolveLnkTarget(string lnkPath)
+    private static (string? TargetExe, string? IconLocation, int IconIndex) ResolveLnkMetadata(string lnkPath)
     {
         object? comObj = null;
         try
         {
             comObj = new ShellLinkCom();
             ((IPersistFile)comObj).Load(lnkPath, 0);
-            var sb = new StringBuilder(260);
-            ((IShellLinkW)comObj).GetPath(sb, sb.Capacity, IntPtr.Zero, 0);
-            string p = sb.ToString().Trim();
-            return p.Length > 0 ? p : null;
+            var link = (IShellLinkW)comObj;
+
+            var pathSb = new StringBuilder(520);
+            link.GetPath(pathSb, pathSb.Capacity, IntPtr.Zero, 0);
+            string target = ExpandCleanPath(pathSb.ToString());
+
+            var iconSb = new StringBuilder(520);
+            link.GetIconLocation(iconSb, iconSb.Capacity, out int iconIndex);
+            string iconLoc = ExpandCleanPath(iconSb.ToString());
+
+            return (
+                target.Length > 0 ? target : null,
+                iconLoc.Length > 0 ? iconLoc : null,
+                iconIndex);
         }
         catch
         {
-            return null;
+            return (null, null, 0);
         }
         finally
         {
             if (comObj != null && Marshal.IsComObject(comObj))
                 Marshal.FinalReleaseComObject(comObj);
         }
+    }
+
+    private static string ExpandCleanPath(string raw)
+    {
+        string trimmed = (raw ?? "").Trim().Trim('"');
+        if (string.IsNullOrEmpty(trimmed)) return "";
+        return Environment.ExpandEnvironmentVariables(trimmed);
     }
 
     private static bool IsSameApp(string? runExe, string runProc, string runTitle, string? pinExe, string pinName)
@@ -556,6 +616,9 @@ internal static class WindowsTaskbarHelper
         if (string.Equals(procName, "msedge", StringComparison.OrdinalIgnoreCase)) return "Edge";
         if (string.Equals(procName, "explorer", StringComparison.OrdinalIgnoreCase)) return "Explorer";
         if (string.Equals(procName, "WindowsTerminal", StringComparison.OrdinalIgnoreCase)) return "Terminal";
+        if (string.Equals(procName, "SystemSettings", StringComparison.OrdinalIgnoreCase)) return "Settings";
+        if (string.Equals(procName, "CalculatorApp", StringComparison.OrdinalIgnoreCase)) return "Calculator";
+        if (string.Equals(procName, "WinStore.App", StringComparison.OrdinalIgnoreCase)) return "Store";
         if (string.Equals(procName, "Code", StringComparison.OrdinalIgnoreCase)) return "VS Code";
         if (string.Equals(procName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase))
             return CleanWindowTitle(title, "App");
@@ -575,21 +638,111 @@ internal static class WindowsTaskbarHelper
         return clean.Length <= maxLen ? clean : clean[..(maxLen - 1)] + "…";
     }
 
-    private static (string Hash, string Base64) ResolveWindowIcon(IntPtr hwnd, string? exePath, string procName)
+    private static (string Hash, string Base64) ResolvePinnedShortcutIcon(PinnedShortcutInfo pin)
     {
-        string cacheKey = !string.IsNullOrEmpty(exePath) ? "exe:" + exePath : "hwnd:" + hwnd.ToInt64();
+        string cacheKey = "pin:" + pin.LnkPath;
         if (IconMemo.TryGetValue(cacheKey, out var cached) &&
-            Environment.TickCount64 - cached.CachedTicks < 120_000)
+            Environment.TickCount64 - cached.CachedTicks < 180_000)
         {
             return (cached.Hash, cached.Base64);
         }
 
+        // 1. Custom IconLocation (.ico, .png, or .exe/.dll resource index) — never has a shortcut arrow!
+        if (!string.IsNullOrEmpty(pin.IconLocation) && File.Exists(pin.IconLocation))
+        {
+            var fromIconLoc = TryExtractCleanIconFromSource(pin.IconLocation, pin.IconIndex);
+            if (fromIconLoc != null)
+            {
+                MemoizeIcon(cacheKey, fromIconLoc.Value.Hash, fromIconLoc.Value.Base64);
+                return fromIconLoc.Value;
+            }
+        }
+
+        // 2. Target executable clean resource icon
+        if (!string.IsNullOrEmpty(pin.TargetExe) && File.Exists(pin.TargetExe))
+        {
+            var fromTarget = TryExtractCleanIconFromSource(pin.TargetExe, 0);
+            if (fromTarget != null)
+            {
+                MemoizeIcon(cacheKey, fromTarget.Value.Hash, fromTarget.Value.Base64);
+                return fromTarget.Value;
+            }
+        }
+
+        // 3. Fallback for shell-namespace shortcuts (e.g. File Explorer when IconLocation was empty)
+        if (pin.Name.Contains("Explorer", StringComparison.OrdinalIgnoreCase))
+        {
+            string exp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+            if (File.Exists(exp))
+            {
+                var expIco = TryExtractCleanIconFromSource(exp, 0);
+                if (expIco != null)
+                {
+                    MemoizeIcon(cacheKey, expIco.Value.Hash, expIco.Value.Base64);
+                    return expIco.Value;
+                }
+            }
+        }
+
+        return ResolveFileIcon(pin.LnkPath, cacheKey);
+    }
+
+    private static (string Hash, string Base64) ResolveWindowIcon(
+        IntPtr hwnd, string? exePath, string procName, PinnedShortcutInfo? matchedPin = null)
+    {
+        string cacheKey = !string.IsNullOrEmpty(exePath)
+            ? ("winexe:" + exePath + ":" + (matchedPin?.Name ?? ""))
+            : ("hwnd:" + hwnd.ToInt64());
+        if (IconMemo.TryGetValue(cacheKey, out var cached) &&
+            Environment.TickCount64 - cached.CachedTicks < 180_000)
+        {
+            return (cached.Hash, cached.Base64);
+        }
+
+        // 1. If matched to a pinned shortcut with an explicit .ico file (e.g. Chrome PWA like WhatsApp Web), use that exact .ico
+        if (matchedPin != null && !string.IsNullOrEmpty(matchedPin.IconLocation) &&
+            matchedPin.IconLocation.EndsWith(".ico", StringComparison.OrdinalIgnoreCase) &&
+            File.Exists(matchedPin.IconLocation))
+        {
+            var pinIco = TryExtractCleanIconFromSource(matchedPin.IconLocation, matchedPin.IconIndex);
+            if (pinIco != null)
+            {
+                MemoizeIcon(cacheKey, pinIco.Value.Hash, pinIco.Value.Base64);
+                return pinIco.Value;
+            }
+        }
+
+        // 2. MSIX / WindowsApps / ImmersiveControlPanel package PNG logo (Windows Terminal, Calculator, Store, Settings, WhatsApp, etc.)
+        if (!string.IsNullOrEmpty(exePath))
+        {
+            var appx = TryResolveAppxPackageLogo(exePath);
+            if (appx != null)
+            {
+                MemoizeIcon(cacheKey, appx.Value.Hash, appx.Value.Base64);
+                return appx.Value;
+            }
+        }
+
+        // 3. Clean executable icon via ExtractIconEx / ExtractAssociatedIcon (avoids blurry 16x16 folder WM_GETICON on Explorer or generic WNDCLASS box)
+        if (!string.IsNullOrEmpty(exePath) &&
+            !string.Equals(procName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
+            File.Exists(exePath))
+        {
+            var exeIco = TryExtractCleanIconFromSource(exePath, 0);
+            if (exeIco != null)
+            {
+                MemoizeIcon(cacheKey, exeIco.Value.Hash, exeIco.Value.Base64);
+                return exeIco.Value;
+            }
+        }
+
+        // 4. Window WM_GETICON / class icon fallback
         IntPtr hIcon = IntPtr.Zero;
-        if (SendMessageTimeout(hwnd, WmGetIcon, (IntPtr)1, IntPtr.Zero, SmtoAbortIfHung, 60, out var big) != IntPtr.Zero && big != IntPtr.Zero)
+        if (SendMessageTimeout(hwnd, WmGetIcon, (IntPtr)1, IntPtr.Zero, SmtoAbortIfHung, 45, out var big) != IntPtr.Zero && big != IntPtr.Zero)
             hIcon = big;
-        else if (SendMessageTimeout(hwnd, WmGetIcon, (IntPtr)2, IntPtr.Zero, SmtoAbortIfHung, 60, out var sm2) != IntPtr.Zero && sm2 != IntPtr.Zero)
+        else if (SendMessageTimeout(hwnd, WmGetIcon, (IntPtr)2, IntPtr.Zero, SmtoAbortIfHung, 45, out var sm2) != IntPtr.Zero && sm2 != IntPtr.Zero)
             hIcon = sm2;
-        else if (SendMessageTimeout(hwnd, WmGetIcon, IntPtr.Zero, IntPtr.Zero, SmtoAbortIfHung, 60, out var sm) != IntPtr.Zero && sm != IntPtr.Zero)
+        else if (SendMessageTimeout(hwnd, WmGetIcon, IntPtr.Zero, IntPtr.Zero, SmtoAbortIfHung, 45, out var sm) != IntPtr.Zero && sm != IntPtr.Zero)
             hIcon = sm;
         else
         {
@@ -614,13 +767,137 @@ internal static class WindowsTaskbarHelper
         return ("", "");
     }
 
+    private static (string Hash, string Base64)? TryExtractCleanIconFromSource(string path, int iconIndex)
+    {
+        try
+        {
+            if (path.EndsWith(".ico", StringComparison.OrdinalIgnoreCase))
+            {
+                using var ico = new Icon(path, 32, 32);
+                return EncodeIconToPng(ico);
+            }
+            if (path.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+            {
+                using var srcBmp = new Bitmap(path);
+                return EncodeBitmapToPng(srcBmp);
+            }
+
+            IntPtr hLarge = IntPtr.Zero;
+            IntPtr hSmall = IntPtr.Zero;
+            try
+            {
+                uint extracted = ExtractIconEx(path, iconIndex, out hLarge, out hSmall, 1);
+                IntPtr chosen = hLarge != IntPtr.Zero ? hLarge : hSmall;
+                if (extracted > 0 && chosen != IntPtr.Zero)
+                {
+                    var res = EncodeIconHandleToPng(chosen);
+                    if (res != null) return res;
+                }
+            }
+            finally
+            {
+                if (hLarge != IntPtr.Zero) DestroyIcon(hLarge);
+                if (hSmall != IntPtr.Zero) DestroyIcon(hSmall);
+            }
+
+            using Icon? assoc = Icon.ExtractAssociatedIcon(path);
+            if (assoc != null)
+                return EncodeIconToPng(assoc);
+        }
+        catch { }
+        return null;
+    }
+
+    private static (string Hash, string Base64)? TryResolveAppxPackageLogo(string exePath)
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(exePath);
+            for (int depth = 0; depth < 3 && !string.IsNullOrEmpty(dir); depth++, dir = Path.GetDirectoryName(dir))
+            {
+                string manifestPath = Path.Combine(dir, "AppxManifest.xml");
+                if (!File.Exists(manifestPath)) continue;
+
+                XDocument doc = XDocument.Load(manifestPath);
+                var candidates = new List<string>();
+                foreach (var el in doc.Descendants())
+                {
+                    if (el.Name.LocalName == "VisualElements")
+                    {
+                        string? sq44 = el.Attribute("Square44x44Logo")?.Value;
+                        string? sq150 = el.Attribute("Square150x150Logo")?.Value;
+                        if (!string.IsNullOrEmpty(sq44)) candidates.Add(sq44);
+                        if (!string.IsNullOrEmpty(sq150)) candidates.Add(sq150);
+                    }
+                    else if (el.Name.LocalName == "Logo" && !string.IsNullOrWhiteSpace(el.Value))
+                    {
+                        candidates.Add(el.Value.Trim());
+                    }
+                }
+
+                foreach (string rel in candidates)
+                {
+                    string? resolved = FindBestAppxLogoVariant(dir, rel);
+                    if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
+                    {
+                        using var bmp = new Bitmap(resolved);
+                        var encoded = EncodeBitmapToPng(bmp);
+                        if (encoded != null) return encoded;
+                    }
+                }
+                break;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string? FindBestAppxLogoVariant(string packageRoot, string relativeLogoPath)
+    {
+        string full = Path.Combine(packageRoot, relativeLogoPath.Replace('/', Path.DirectorySeparatorChar));
+        if (File.Exists(full)) return full;
+        string? folder = Path.GetDirectoryName(full);
+        string baseName = Path.GetFileNameWithoutExtension(full);
+        string ext = Path.GetExtension(full);
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return null;
+
+        var files = Directory.GetFiles(folder, baseName + "*" + ext);
+        if (files.Length == 0) return null;
+
+        // Prefer unplated targetsize-48 / targetsize-32 or scale-200 / scale-100 ( avoiding high-contrast white/black variants )
+        string? pick = files
+            .Where(f => !f.Contains("contrast-", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f =>
+            {
+                string n = Path.GetFileName(f);
+                if (n.Contains("targetsize-48", StringComparison.OrdinalIgnoreCase) && n.Contains("unplated", StringComparison.OrdinalIgnoreCase)) return 0;
+                if (n.Contains("targetsize-32", StringComparison.OrdinalIgnoreCase) && n.Contains("unplated", StringComparison.OrdinalIgnoreCase)) return 1;
+                if (n.Contains("scale-200", StringComparison.OrdinalIgnoreCase)) return 2;
+                if (n.Contains("scale-100", StringComparison.OrdinalIgnoreCase)) return 3;
+                if (n.Contains("targetsize-", StringComparison.OrdinalIgnoreCase)) return 4;
+                return 5;
+            })
+            .FirstOrDefault();
+        return pick ?? files[0];
+    }
+
     private static (string Hash, string Base64) ResolveFileIcon(string path, string? overrideKey = null)
     {
         string cacheKey = overrideKey ?? ("file:" + path);
         if (IconMemo.TryGetValue(cacheKey, out var cached) &&
-            Environment.TickCount64 - cached.CachedTicks < 120_000)
+            Environment.TickCount64 - cached.CachedTicks < 180_000)
         {
             return (cached.Hash, cached.Base64);
+        }
+
+        if (!path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
+        {
+            var direct = TryExtractCleanIconFromSource(path, 0);
+            if (direct != null)
+            {
+                MemoizeIcon(cacheKey, direct.Value.Hash, direct.Value.Base64);
+                return direct.Value;
+            }
         }
 
         var shfi = new SHFILEINFO();
@@ -649,7 +926,16 @@ internal static class WindowsTaskbarHelper
         try
         {
             using Icon ico = Icon.FromHandle(hIcon);
-            foreach (int size in new[] { 20, 16 })
+            return EncodeIconToPng(ico);
+        }
+        catch { return null; }
+    }
+
+    private static (string Hash, string Base64)? EncodeIconToPng(Icon ico)
+    {
+        try
+        {
+            foreach (int size in new[] { 28, 22, 18 })
             {
                 using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
                 using (var g = Graphics.FromImage(bmp))
@@ -657,20 +943,51 @@ internal static class WindowsTaskbarHelper
                     g.Clear(Color.Transparent);
                     g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                     g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                     g.DrawIcon(ico, new Rectangle(0, 0, size, size));
                 }
-                using var ms = new MemoryStream();
-                bmp.Save(ms, ImageFormat.Png);
-                byte[] png = ms.ToArray();
-                string b64 = Convert.ToBase64String(png);
-                if (b64.Length <= 4800)
-                {
-                    string hash = Convert.ToHexString(SHA256.HashData(png))[..8];
-                    return (hash, b64);
-                }
+                var res = SerializeBitmapIfUnderLimit(bmp);
+                if (res != null) return res;
             }
         }
         catch { }
+        return null;
+    }
+
+    private static (string Hash, string Base64)? EncodeBitmapToPng(Bitmap source)
+    {
+        try
+        {
+            foreach (int size in new[] { 28, 22, 18 })
+            {
+                using var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Transparent);
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.SmoothingMode = SmoothingMode.HighQuality;
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                    g.DrawImage(source, new Rectangle(0, 0, size, size));
+                }
+                var res = SerializeBitmapIfUnderLimit(bmp);
+                if (res != null) return res;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static (string Hash, string Base64)? SerializeBitmapIfUnderLimit(Bitmap bmp)
+    {
+        using var ms = new MemoryStream();
+        bmp.Save(ms, ImageFormat.Png);
+        byte[] png = ms.ToArray();
+        string b64 = Convert.ToBase64String(png);
+        if (b64.Length <= 4800)
+        {
+            string hash = Convert.ToHexString(SHA256.HashData(png))[..8];
+            return (hash, b64);
+        }
         return null;
     }
 

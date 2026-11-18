@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.81 — Crisp Native Taskbar Icons, Instant Zero-Lag Trackpad System Switching & Modern Windows 11 App Revamp
+
+- **Crisp Native Windows Taskbar Icons on Android (`WindowsTaskbarHelper`, `NetworkSessions`, `DeskTouchSession`, `MainActivity`):** Extracts direct shortcut `.ico`/`.exe` targets without shortcut overlay arrows, unwraps `ApplicationFrameHost` UWP child windows and MSIX `AppxManifest` PNG assets (Terminal, Calculator, Store, WhatsApp, Settings), caches icons persistently across wireless and cable transitions, and self-heals missing icon hashes on demand.
+- **Instant Zero-Lag Trackpad System Switching (`DeskTouchSession`, `MainActivity`, `NetworkSessions`, `DisplaySettingsForm`):** Combines target selection, claim, and initial pointer positioning into a single atomic batch with optimistic instant trackpad activation, decouples background taskbar icon snapshots from the input control read loop, and automatically yields idle computer-to-computer cursor leases when the phone claims control.
+- **Modern Windows 11 Fluent Dark Desktop App (`DisplaySettingsForm`, `DisplayArrangementControl`):** Enables native Windows 11 dark title bars and rounded corners, refreshes the display studio canvas with subtle alignment grid dots, gradient monitor/phone tiles with display stands and speaker details, and upgrades card panels and action buttons with modern hover states.
+
+---
+
 # DeskTouch Vision v0.3.80 — Live Dedicated-PC Windows Taskbar Inside Android Trackpad
 
 - **Live Windows 11 Taskbar inside Android Trackpad (`WindowsTaskbarHelper`, `NetworkSessions`, `DeskTouchSession`, `MainActivity`):** Streams the selected computer's real Windows Taskbar (Start menu button, Search button, open application windows with foreground/running indicators, pinned taskbar shortcuts, and real Windows application icons) directly into the Android `Trackpad` panel so tapping any app icon focuses, restores, or opens it on that dedicated computer immediately.

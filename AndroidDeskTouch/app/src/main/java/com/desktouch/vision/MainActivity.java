@@ -875,6 +875,11 @@ public final class MainActivity extends Activity {
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:
                     if(v.getParent()!=null)v.getParent().requestDisallowInterceptTouchEvent(true);
+                    DeskTouchSession touchSession=DeskTouchRuntime.session(MainActivity.this);
+                    if(touchSession.isConnected() && !touchSession.isActive() && !touchSession.hasClaim()){
+                        touchSession.claimControl();
+                        refreshLiveLinkAndKeyboard();
+                    }
                     prevX=downX=event.getX();prevY=downY=event.getY();
                     touchGlowX=event.getX();touchGlowY=event.getY();touchGlowActive=true;
                     v.invalidate();
@@ -1866,9 +1871,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.80";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.81";
         }catch(Exception ignored){
-            return "0.3.80";
+            return "0.3.81";
         }
     }
 
@@ -2549,11 +2554,12 @@ public final class MainActivity extends Activity {
                     box.setClickable(true);
                     box.setFocusable(true);
                     box.setOnClickListener(v->{
-                        boolean keepControl=active.hasClaim();
-                        active.selectEnvironmentTarget(device.id);
-                        if(keepControl)active.claimControl();
+                        if(active.hasClaim()){
+                            active.switchTargetAndClaim(device.id,0);
+                        }else{
+                            active.selectEnvironmentTarget(device.id);
+                        }
                         refreshEnvironmentMembers();
-                        refreshTrackpadPcTaskbar();
                         refreshLiveLinkAndKeyboard();
                         setFeedback("Selected "+model.fullName+". Use Trackpad to control.",false);
                     });
@@ -2612,11 +2618,8 @@ public final class MainActivity extends Activity {
                 (pc.hub ? "HUB • " : "")+pc.shortName+screenTag+notifTag,
                 sel,
                 v->{
-                    boolean keepControl=active.hasClaim();
-                    active.selectEnvironmentTarget(pc.id);
-                    if(keepControl)active.claimControl();
+                    active.switchTargetAndClaim(pc.id,0);
                     refreshEnvironmentMembers();
-                    refreshTrackpadPcTaskbar();
                     refreshLiveLinkAndKeyboard();
                 });
             LinearLayout.LayoutParams clp=new LinearLayout.LayoutParams(-2,-2);
@@ -2637,10 +2640,8 @@ public final class MainActivity extends Activity {
                     "Display "+mb.displayNumber+" • "+mb.width+"×"+mb.height,
                     m==activeMonIdx,
                     v->{
-                        if(active.selectedEnvironmentTarget()!=screenPc.id){
-                            boolean keepControl=active.hasClaim();
-                            active.selectEnvironmentTarget(screenPc.id);
-                            if(keepControl)active.claimControl();
+                        if(active.selectedEnvironmentTarget()!=screenPc.id || !active.isActive()){
+                            active.switchTargetAndClaim(screenPc.id,0);
                         }
                         active.focusMonitor(monIdx);
                         refreshTrackpadPcTaskbar();
@@ -2877,8 +2878,8 @@ public final class MainActivity extends Activity {
             ImageView img=new ImageView(this);
             img.setImageBitmap(iconBmp);
             img.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            if(!item.running)img.setAlpha(0.78f);
-            LinearLayout.LayoutParams imLp=new LinearLayout.LayoutParams(dp(20),dp(20));
+            if(!item.running)img.setAlpha(0.84f);
+            LinearLayout.LayoutParams imLp=new LinearLayout.LayoutParams(dp(22),dp(22));
             tile.addView(img,imLp);
         }else{
             TextView mono=new TextView(this);
@@ -2890,7 +2891,7 @@ public final class MainActivity extends Activity {
             mono.setGravity(Gravity.CENTER);
             mono.setBackground(PhoneUiKit.roundedBox(
                 item.active ? 0xFF0284C7 : 0xFF475569,Color.TRANSPARENT,dp(5),0));
-            tile.addView(mono,new LinearLayout.LayoutParams(dp(20),dp(20)));
+            tile.addView(mono,new LinearLayout.LayoutParams(dp(22),dp(22)));
         }
 
         TextView lbl=new TextView(this);

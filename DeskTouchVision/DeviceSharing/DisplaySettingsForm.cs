@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading.Channels;
 using System.Windows.Forms;
@@ -58,8 +59,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Width = 172,
         MaxLength = 32,
         BorderStyle = BorderStyle.FixedSingle,
-        BackColor = Color.FromArgb(24, 26, 32),
-        ForeColor = Color.WhiteSmoke,
+        BackColor = Color.FromArgb(12, 18, 28),
+        ForeColor = Color.FromArgb(226, 232, 240),
         Font = new Font("Consolas", 10.5f, FontStyle.Bold),
         PlaceholderText = "Set custom code"
     };
@@ -130,7 +131,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         AutoSize = false,
         Height = 32,
         Dock = DockStyle.Fill,
-        BackColor = Color.FromArgb(31, 32, 36)
+        BackColor = Color.FromArgb(17, 23, 34)
     };
     private readonly Label _sensitivityValue = new()
     {
@@ -182,8 +183,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _notificationCounter.CountChanged += count => PostToUi(() => OnLocalNotificationCountChanged(count));
         Text = "DeskTouch Vision — Displays";
         Font = new Font("Segoe UI", 10);
-        BackColor = Color.FromArgb(31, 32, 36);
-        ForeColor = Color.WhiteSmoke;
+        BackColor = Color.FromArgb(17, 23, 34);
+        ForeColor = Color.FromArgb(241, 245, 249);
         ClientSize = new Size(1000, 690);
         MinimumSize = new Size(780, 600);
         StartPosition = FormStartPosition.CenterScreen;
@@ -222,7 +223,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         var bottom = new Panel { Dock = DockStyle.Bottom, Height = 304,
             Padding = new Padding(24, 8, 24, 7), BackColor = BackColor };
         var pairingBar = new Panel { Dock = DockStyle.Top, Height = 38,
-            Padding = new Padding(10, 4, 10, 4), BackColor = Color.FromArgb(41, 43, 49) };
+            Padding = new Padding(10, 4, 10, 4), BackColor = Color.FromArgb(24, 33, 49) };
+        pairingBar.Paint += (_, pe) =>
+        {
+            using var borderPen = new Pen(Color.FromArgb(46, 62, 88), 1f);
+            pe.Graphics.DrawRectangle(borderPen, 0, 0, Math.Max(1, pairingBar.Width - 1), Math.Max(1, pairingBar.Height - 1));
+        };
         var pairingFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -301,8 +307,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         sensitivityRow.Controls.Add(_sensitivityValue);
         sensitivityRow.Controls.Add(sensitivityLabel);
         var deviceInfo = new Panel { Dock = DockStyle.Fill,
-            BackColor = Color.FromArgb(41, 43, 49),
+            BackColor = Color.FromArgb(24, 33, 49),
             Padding = new Padding(14, 10, 12, 7) };
+        deviceInfo.Paint += (_, pe) =>
+        {
+            using var borderPen = new Pen(Color.FromArgb(46, 62, 88), 1f);
+            pe.Graphics.DrawRectangle(borderPen, 0, 0, Math.Max(1, deviceInfo.Width - 1), Math.Max(1, deviceInfo.Height - 1));
+        };
         _summary.Dock = DockStyle.Top;
         _summary.Height = 39;
         _summary.Font = new Font("Segoe UI Semibold", 11);
@@ -548,6 +559,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        try
+        {
+            int dark = 1;
+            _ = DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
+            int round = 2;
+            _ = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+        }
+        catch { }
         if (_exitRequested && !IsDisposed) PostToUi(ExitDeskTouch);
     }
 
@@ -664,18 +683,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     void IUpdateCloseHost.CloseForVerifiedUpdate() => ExitDeskTouch();
 
+    [DllImport("dwmapi.dll", PreserveSig = true)]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
     private static Button Button(string name, bool primary = false) => new()
     {
         Text = name, Width = name switch {
-            "Windows display settings" => 178, "Copy pairing code" => 155,
+            "Windows display settings" => 178, "Pause phone for payments" => 176,
+            "Copy pairing code" => 155, "Copy full link" => 116,
             "Add devices" => 145, "Get Android app" => 150, _ => 112 },
         FlatStyle = FlatStyle.Flat,
-        FlatAppearance = { BorderColor = Color.FromArgb(85, 89, 100), BorderSize = 1 },
-        ForeColor = Color.White,
-        BackColor = primary ? Color.FromArgb(27, 104, 190)
-                            : Color.FromArgb(56, 58, 65),
+        FlatAppearance =
+        {
+            BorderColor = primary ? Color.FromArgb(96, 165, 250) : Color.FromArgb(51, 68, 94),
+            BorderSize = 1,
+            MouseOverBackColor = primary ? Color.FromArgb(59, 130, 246) : Color.FromArgb(42, 56, 78),
+            MouseDownBackColor = primary ? Color.FromArgb(29, 78, 216) : Color.FromArgb(23, 32, 48)
+        },
+        ForeColor = Color.FromArgb(241, 245, 249),
+        BackColor = primary ? Color.FromArgb(37, 99, 235)
+                            : Color.FromArgb(30, 41, 59),
         Cursor = Cursors.Hand,
-        Font = new Font("Segoe UI", 9)
+        Font = new Font("Segoe UI Semibold", 9f)
     };
 
     internal static void RotateLogIfNeeded(string logPath, long maxBytes = 512 * 1024)
@@ -1454,6 +1483,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.AllowForwardClaim = () =>
                 InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
                     _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
+            _receiver.ReleaseIdleOutboundForPhoneClaim = () => PostToUi(() =>
+            {
+                if (_nativeInput?.Priority.CanApplyRemote == true && _capture?.RemoteActive == true)
+                    ReturnControlLocalFromExternal();
+            });
             _receiver.Start();
             _receiver.SetCustomPairingCode(_customPairingCode);
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);

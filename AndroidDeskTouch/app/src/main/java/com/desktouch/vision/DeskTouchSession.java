@@ -395,9 +395,10 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile int environmentOwnId;
     private volatile int selectedEnvironmentId;
     private volatile int taskbarTargetId = -1;
+    private volatile long lastIconResyncMs;
     private volatile java.util.List<TaskbarItem> taskbarItems =
         java.util.Collections.emptyList();
-    private final java.util.concurrent.ConcurrentHashMap<String,android.graphics.Bitmap> taskbarIcons =
+    private static final java.util.concurrent.ConcurrentHashMap<String,android.graphics.Bitmap> TASKBAR_ICON_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
     private static final SecureRandom RANDOM=new SecureRandom();
 
@@ -527,7 +528,7 @@ final class DeskTouchSession implements AutoCloseable {
         return (running && taskbarTargetId==targetId) ? taskbarItems : java.util.Collections.emptyList();
     }
     android.graphics.Bitmap taskbarIcon(String iconHash){
-        return iconHash!=null && !iconHash.isEmpty() ? taskbarIcons.get(iconHash) : null;
+        return iconHash!=null && !iconHash.isEmpty() ? TASKBAR_ICON_CACHE.get(iconHash) : null;
     }
     void sendTaskbarAction(int targetId,String key){
         if(!running || key==null || key.isEmpty() || controlSender.isShutdown())return;
@@ -606,6 +607,79 @@ final class DeskTouchSession implements AutoCloseable {
         send(new Packet("environment-select",id));
         DeskTouchRuntime.notifyLiveStatusChanged();
         status("Selected "+selected.name+" in the same environment.");
+    }
+
+    void switchTargetAndClaim(int id, int entryDirection){
+        if(!running) {status("Join a shared environment first.");return;}
+        EnvironmentTarget selected=null;
+        for(EnvironmentTarget target:environmentTargets)
+            if(target.id==id){selected=target;break;}
+        if(selected==null || !selected.supportsInput || id==environmentOwnId){
+            status("That environment device is unavailable for remote control.");
+            return;
+        }
+        boolean changedTarget=(selectedEnvironmentId!=id);
+        if(changedTarget){
+            try {
+                synchronized(monitors){
+                    JSONArray layout=new JSONArray(selected.layout);
+                    ArrayList<int[]> parsed=new ArrayList<>();
+                    int minX=Integer.MAX_VALUE,minY=Integer.MAX_VALUE;
+                    int maxX=Integer.MIN_VALUE,maxY=Integer.MIN_VALUE;
+                    for(int i=0;i<layout.length();i++){
+                        JSONObject m=layout.getJSONObject(i);
+                        int x=m.getInt("X"),y=m.getInt("Y");
+                        int width=m.getInt("Width"),height=m.getInt("Height");
+                        if(width<1||height<1||width>32768||height>32768)
+                            throw new IOException("Invalid remote monitor dimensions");
+                        parsed.add(new int[]{x,y,width,height});
+                        minX=Math.min(minX,x);minY=Math.min(minY,y);
+                        maxX=Math.max(maxX,x+width);maxY=Math.max(maxY,y+height);
+                    }
+                    if(parsed.isEmpty())throw new IOException("Missing remote screens");
+                    monitors.clear();monitors.addAll(parsed);
+                    screenX=minX;screenY=minY;screenWidth=maxX-minX;screenHeight=maxY-minY;
+                    if(entryDirection!=0){
+                        cursorX=entryDirection>0 ? screenX : screenX+screenWidth-1;
+                        cursorY=screenY+screenHeight/2;
+                        clampToMonitor();
+                    }else{
+                        cursorX=parsed.get(0)[0]+parsed.get(0)[2]/2;
+                        cursorY=parsed.get(0)[1]+parsed.get(0)[3]/2;
+                    }
+                }
+            }catch(Exception invalid){
+                status("Cannot select device: invalid screen geometry.");return;
+            }
+            selectedEnvironmentId=id;
+            if(taskbarTargetId!=id){
+                taskbarTargetId=-1;
+                taskbarItems=java.util.Collections.emptyList();
+            }
+        }
+        if(reverseLease>0)clearReverseControl(true);
+        forwardActionSeq=0;
+        final int newClaim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
+        claim=newClaim;
+        active=true;
+        final int tx, ty;
+        synchronized(monitors){ tx=cursorX; ty=cursorY; }
+        warmOrProbeUdp();
+        if(!controlSender.isShutdown()){
+            final boolean sendSelect=changedTarget;
+            final int targetId=id;
+            controlSender.execute(()->{
+                if(sendSelect)writeNow(new Packet("environment-select",targetId));
+                writeNow(new Packet("claim",newClaim));
+                writeNow(new Packet("move",tx,ty));
+            });
+        }
+        FastUdpChannel ch=activeForwardUdp(false);
+        if(ch!=null && !udpPacer.isShutdown()){
+            udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,newClaim,(int)SystemClock.uptimeMillis()));
+        }
+        DeskTouchRuntime.notifyLiveStatusChanged();
+        status("Controlling "+selected.name+" with Android keyboard and mouse");
     }
 
     int activeMonitorIndex(){
@@ -947,8 +1021,22 @@ final class DeskTouchSession implements AutoCloseable {
                         selectedEnvironmentId=-1;selectEnvironmentTarget(0);
                     }
                 } else if("taskbar-state".equals(p.type)){
-                    taskbarItems=parseTaskbarItems(p.text);
+                    java.util.List<TaskbarItem> parsedItems=parseTaskbarItems(p.text);
+                    taskbarItems=parsedItems;
                     taskbarTargetId=p.a;
+                    boolean missingIcon=false;
+                    for(TaskbarItem item:parsedItems){
+                        if(!item.iconHash.isEmpty() && !TASKBAR_ICON_CACHE.containsKey(item.iconHash)){
+                            missingIcon=true;
+                            break;
+                        }
+                    }
+                    long nowMs=SystemClock.uptimeMillis();
+                    if(missingIcon && nowMs-lastIconResyncMs>1800L && !controlSender.isShutdown()){
+                        lastIconResyncMs=nowMs;
+                        final int reqTarget=p.a;
+                        controlSender.execute(()->writeNow(new Packet("taskbar-need-icons",reqTarget)));
+                    }
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("taskbar-icon".equals(p.type)){
                     if(p.text!=null){
@@ -960,18 +1048,25 @@ final class DeskTouchSession implements AutoCloseable {
                                 byte[] raw=android.util.Base64.decode(b64,android.util.Base64.DEFAULT);
                                 android.graphics.Bitmap bmp=android.graphics.BitmapFactory.decodeByteArray(raw,0,raw.length);
                                 if(bmp!=null){
-                                    if(taskbarIcons.size()>=64)taskbarIcons.clear();
-                                    taskbarIcons.put(hash,bmp);
+                                    if(TASKBAR_ICON_CACHE.size()>=128)TASKBAR_ICON_CACHE.clear();
+                                    TASKBAR_ICON_CACHE.put(hash,bmp);
                                     DeskTouchRuntime.notifyLiveStatusChanged();
                                 }
                             }catch(Exception ignored){}
                         }
                     }
                 } else if("granted".equals(p.type) && p.a==claim && claim>0){
-                    // The remote Windows endpoint must successfully move its cursor
-                    // and acknowledge "active" before we send any keyboard/buttons.
-                    send(new Packet("move",cursorX,cursorY));
-                    status("Windows granted control; confirming cursor");
+                    active=true;
+                    int tx, ty;
+                    synchronized(monitors){ tx=cursorX; ty=cursorY; }
+                    FastUdpChannel ch=activeForwardUdp(false);
+                    if(ch!=null && !udpPacer.isShutdown()){
+                        final int lease=claim;
+                        udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,lease,(int)SystemClock.uptimeMillis()));
+                    }
+                    send(new Packet("move",tx,ty));
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                    status("Controlling Windows with Android keyboard and mouse");
                 } else if("active".equals(p.type) && p.a==claim && claim>0){
                     active=true;status("Controlling Windows with Android keyboard and mouse");
                 } else if("busy".equals(p.type) && p.a==claim){
@@ -1395,15 +1490,26 @@ final class DeskTouchSession implements AutoCloseable {
 
     void claimControl(){
         if(!running){status("Connect to a Windows PC first");return;}
-        // Never start keyboard events until the target has confirmed that
-        // the first remote cursor movement was actually applied.
         if(reverseLease>0)clearReverseControl(true);
-        active=false;
         forwardActionSeq=0;
-        claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
+        final int newClaim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
+        claim=newClaim;
+        active=true;
+        final int tx, ty;
+        synchronized(monitors){ tx=cursorX; ty=cursorY; }
         warmOrProbeUdp();
-        send(new Packet("claim",claim));
-        status("Requesting Windows mouse and keyboard authority");
+        if(!controlSender.isShutdown()){
+            controlSender.execute(()->{
+                writeNow(new Packet("claim",newClaim));
+                writeNow(new Packet("move",tx,ty));
+            });
+        }
+        FastUdpChannel ch=activeForwardUdp(false);
+        if(ch!=null && !udpPacer.isShutdown()){
+            udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,newClaim,(int)SystemClock.uptimeMillis()));
+        }
+        DeskTouchRuntime.notifyLiveStatusChanged();
+        status("Controlling Windows with Android keyboard and mouse");
     }
     static int resolveLiveRefreshHz(int accessibilityHz, int displayHz){
         if(accessibilityHz>=24 && accessibilityHz<=360) return accessibilityHz;
@@ -1657,15 +1763,8 @@ final class DeskTouchSession implements AutoCloseable {
         int next=index+direction;
         if(index<0||next<0||next>=available.size())return false;
         int before=selectedEnvironmentId;
-        selectEnvironmentTarget(available.get(next).id);
-        if(selectedEnvironmentId==before)return false;
-        synchronized(monitors){
-            cursorX=direction>0?screenX:screenX+screenWidth-1;
-            cursorY=screenY+screenHeight/2;
-            clampToMonitor();
-        }
-        claimControl(); // fresh two-phase ACK from the newly selected device
-        return true;
+        switchTargetAndClaim(available.get(next).id,direction);
+        return selectedEnvironmentId!=before;
     }
     void moveBy(float dx,float dy){
         if(!active)return;
@@ -2572,7 +2671,6 @@ final class DeskTouchSession implements AutoCloseable {
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         taskbarTargetId=-1;taskbarItems=java.util.Collections.emptyList();
-        taskbarIcons.clear();
         if(DeskTouchRuntime.connectedCount()==0) RemoteInputPower.end();
         else RemoteInputPower.begin(application);
         AutoConnectService.onConnectionCountChanged(application);

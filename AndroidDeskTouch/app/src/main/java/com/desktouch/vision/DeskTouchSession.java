@@ -175,10 +175,19 @@ final class DeskTouchSession implements AutoCloseable {
         final double rttMs;
         final double jitterMs;
         final double lossPermille;
+        final double recentPeakLossPermille;
+        final double recentPeakJitterMs;
         final String pcLayout;
         final KeyboardBindingInspector.KeyboardReport keyboardReport;
         LiveStatusSnapshot(boolean connected, String peerName, String fingerprint, boolean cable,
                 String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
+                String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport) {
+            this(connected, peerName, fingerprint, cable, band, speedMbps, rttMs, jitterMs,
+                lossPermille, lossPermille, jitterMs, pcLayout, keyboardReport);
+        }
+        LiveStatusSnapshot(boolean connected, String peerName, String fingerprint, boolean cable,
+                String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
+                double recentPeakLossPermille, double recentPeakJitterMs,
                 String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport) {
             this.connected = connected;
             this.peerName = peerName != null ? peerName : "";
@@ -189,6 +198,8 @@ final class DeskTouchSession implements AutoCloseable {
             this.rttMs = rttMs;
             this.jitterMs = jitterMs;
             this.lossPermille = lossPermille;
+            this.recentPeakLossPermille = recentPeakLossPermille;
+            this.recentPeakJitterMs = recentPeakJitterMs;
             this.pcLayout = pcLayout != null ? pcLayout : "";
             this.keyboardReport = keyboardReport;
         }
@@ -274,16 +285,21 @@ final class DeskTouchSession implements AutoCloseable {
         String band = cableSession ? WifiLinkMonitor.BAND_CABLE : liveLinkBand;
         double jitter = 0.0;
         double loss = 0.0;
+        double peakLoss = 0.0;
+        double peakJitter = 0.0;
         double rtt = cableSession ? 0.0 : liveRttMs;
         if (!cableSession && ch != null) {
+            long nowMs = SystemClock.uptimeMillis();
             if (ch.linkTracker.getSmoothedRttMs() > 0) rtt = ch.linkTracker.getSmoothedRttMs();
             jitter = ch.linkTracker.getEffectiveJitterMs();
             loss = ch.linkTracker.getInboundLossPermille();
+            peakLoss = Math.max(loss, ch.linkTracker.getRecentPeakLossPermille(nowMs));
+            peakJitter = Math.max(jitter, ch.linkTracker.getRecentPeakJitterMs(nowMs));
             String trackerBand = ch.linkTracker.getBand();
             if (trackerBand != null && !trackerBand.isEmpty()) band = trackerBand;
         }
         return new LiveStatusSnapshot(running, peerName, fingerprint, cableSession,
-            band, cableSession ? 0 : liveLinkSpeedMbps, rtt, jitter, loss,
+            band, cableSession ? 0 : liveLinkSpeedMbps, rtt, jitter, loss, peakLoss, peakJitter,
             pcKeyboardLayout, lastKeyboardReport);
     }
     static boolean allowedInputType(String type) {
@@ -1057,6 +1073,13 @@ final class DeskTouchSession implements AutoCloseable {
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
+        if(lease>0 && running && !cableSession && !cellularSession) {
+            LiveStatusSnapshot snap=getLiveSnapshot();
+            if(snap.recentPeakLossPermille>=15.0 || snap.recentPeakJitterMs>=6.0
+                || snap.rttMs>=22.0) {
+                AutoConnectService.onLeaseEndedDegraded(application);
+            }
+        }
     }
     void revokeRemoteFromNative(){
         if(reverseLease>0)clearReverseControl(true);

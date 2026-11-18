@@ -2639,6 +2639,9 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
                               !parsed.IsIPv6LinkLocal &&
                               !System.Net.IPAddress.IsLoopback(parsed)),
             "Collected global IPv6 endpoints must only contain reachable unicast IPv6 addresses");
+        var probeResp = new Packet("probe-echo", 1);
+        Check(probeResp.Type == "probe-echo" && probeResp.A == 1,
+            "Multi-sample cellular probe-echo packet contract must preserve sequence index");
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

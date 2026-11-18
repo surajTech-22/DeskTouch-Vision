@@ -2329,9 +2329,26 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             if (trustedSource != null)
             {
+                string probeIp = UnmapAddress((client.Client.RemoteEndPoint as IPEndPoint)?.Address)?.ToString() ?? "?";
+                _status?.Invoke("Trusted path probe from " + probeIp);
                 await Wire.WriteAsync(ssl,
                     new Packet("probe-ok", Wire.Port, Text: _udpHub?.Port > 0 ? _udpHub.Port.ToString() : ""),
                     token);
+                if (request.A == 2)
+                {
+                    using var echoLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    echoLimit.CancelAfter(TimeSpan.FromMilliseconds(1500));
+                    for (int s = 1; s < 3; s++)
+                    {
+                        try
+                        {
+                            var echoReq = await Wire.ReadAsync(ssl, echoLimit.Token);
+                            if (echoReq.Type != "probe-echo") break;
+                            await Wire.WriteAsync(ssl, new Packet("probe-ok", Wire.Port), echoLimit.Token);
+                        }
+                        catch (Exception) { break; }
+                    }
+                }
             }
             else
             {

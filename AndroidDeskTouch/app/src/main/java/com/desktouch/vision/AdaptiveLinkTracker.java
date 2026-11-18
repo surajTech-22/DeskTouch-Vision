@@ -11,6 +11,7 @@ public final class AdaptiveLinkTracker {
     private static final int REORDER_SLACK = 63;
     private static final long FAST_MIN_RTT_WINDOW_MS = 3_000L;
     private static final long SLOW_BAND_MIN_RTT_WINDOW_MS = 5_000L;
+    private static final long RECENT_PEAK_WINDOW_MS = 45_000L;
     private static final int PING_RING_SIZE = 16;
 
     private final Object recvGate = new Object();
@@ -20,6 +21,10 @@ public final class AdaptiveLinkTracker {
     private long exemptMask;
     private boolean prevWasInteractive;
     private double ewmaLossRatio;
+    private double recentPeakInboundLossPermille;
+    private long recentPeakInboundLossAtMs;
+    private double recentPeakInboundJitterMs;
+    private long recentPeakInboundJitterAtMs;
     private long reorderedPackets;
     private long lostPackets;
     private long latePackets;
@@ -43,6 +48,10 @@ public final class AdaptiveLinkTracker {
 
     private double peerLossPermille;
     private double peerJitterMs;
+    private double recentPeakPeerLossPermille;
+    private long recentPeakPeerLossAtMs;
+    private double recentPeakPeerJitterMs;
+    private long recentPeakPeerJitterAtMs;
     private int peerRefreshHz;
     private int peerFrameTenthsMs;
     private String linkBand = "wireless";
@@ -106,6 +115,10 @@ public final class AdaptiveLinkTracker {
                 windowStartMs = 0L;
                 peerLossPermille = 0.0;
                 peerJitterMs = 0.0;
+                recentPeakPeerLossPermille = 0.0;
+                recentPeakPeerLossAtMs = 0L;
+                recentPeakPeerJitterMs = 0.0;
+                recentPeakPeerJitterAtMs = 0L;
                 consecutiveHighRttCount = 0;
             }
         }
@@ -113,6 +126,10 @@ public final class AdaptiveLinkTracker {
             synchronized (recvGate) {
                 ewmaLossRatio *= 0.20;
                 inboundJitterMs *= 0.25;
+                recentPeakInboundLossPermille = 0.0;
+                recentPeakInboundLossAtMs = 0L;
+                recentPeakInboundJitterMs = 0.0;
+                recentPeakInboundJitterAtMs = 0L;
                 hasLastTransit = false;
             }
         }
@@ -156,6 +173,18 @@ public final class AdaptiveLinkTracker {
             if (packedLossJitter >= 0) {
                 peerLossPermille = unpackLossPermille(packedLossJitter);
                 peerJitterMs = unpackJitterMs(packedLossJitter);
+                if (nowMs > 0L) {
+                    if (recentPeakPeerLossAtMs == 0L || nowMs - recentPeakPeerLossAtMs > RECENT_PEAK_WINDOW_MS
+                        || peerLossPermille >= recentPeakPeerLossPermille) {
+                        recentPeakPeerLossPermille = peerLossPermille;
+                        recentPeakPeerLossAtMs = nowMs;
+                    }
+                    if (recentPeakPeerJitterAtMs == 0L || nowMs - recentPeakPeerJitterAtMs > RECENT_PEAK_WINDOW_MS
+                        || peerJitterMs >= recentPeakPeerJitterMs) {
+                        recentPeakPeerJitterMs = peerJitterMs;
+                        recentPeakPeerJitterAtMs = nowMs;
+                    }
+                }
             }
             if (packedDisplayRate > 0) {
                 int hz = unpackRefreshHz(packedDisplayRate);
@@ -258,6 +287,19 @@ public final class AdaptiveLinkTracker {
                 }
             }
             recordSeqLocked(seq, interactiveOp, true);
+            if (nowMs > 0L) {
+                double currLoss = getInboundLossPermilleLocked();
+                if (recentPeakInboundLossAtMs == 0L || nowMs - recentPeakInboundLossAtMs > RECENT_PEAK_WINDOW_MS
+                    || currLoss >= recentPeakInboundLossPermille) {
+                    recentPeakInboundLossPermille = currLoss;
+                    recentPeakInboundLossAtMs = nowMs;
+                }
+                if (recentPeakInboundJitterAtMs == 0L || nowMs - recentPeakInboundJitterAtMs > RECENT_PEAK_WINDOW_MS
+                    || inboundJitterMs >= recentPeakInboundJitterMs) {
+                    recentPeakInboundJitterMs = inboundJitterMs;
+                    recentPeakInboundJitterAtMs = nowMs;
+                }
+            }
             if (nowMs <= 0L) {
                 return;
             }
@@ -268,6 +310,11 @@ public final class AdaptiveLinkTracker {
                     if (recvDelta >= 0L && recvDelta <= 250L && sendDelta >= 0L && sendDelta <= 45L) {
                         double transitDiff = Math.min(110.0, Math.abs((double) recvDelta - (double) sendDelta));
                         inboundJitterMs += (transitDiff > inboundJitterMs ? 0.22 : 0.36) * (transitDiff - inboundJitterMs);
+                        if (recentPeakInboundJitterAtMs == 0L || nowMs - recentPeakInboundJitterAtMs > RECENT_PEAK_WINDOW_MS
+                            || inboundJitterMs >= recentPeakInboundJitterMs) {
+                            recentPeakInboundJitterMs = inboundJitterMs;
+                            recentPeakInboundJitterAtMs = nowMs;
+                        }
                     } else if (recvDelta > 50L || sendDelta > 45L) {
                         inboundJitterMs *= 0.78;
                     }
@@ -459,6 +506,42 @@ public final class AdaptiveLinkTracker {
         synchronized (rttGate) {
             return peerLossPermille;
         }
+    }
+
+    public double getRecentPeakLossPermille(long nowMs) {
+        double peakIn = 0.0;
+        synchronized (recvGate) {
+            if (recentPeakInboundLossAtMs > 0L && nowMs >= recentPeakInboundLossAtMs
+                && nowMs - recentPeakInboundLossAtMs <= RECENT_PEAK_WINDOW_MS) {
+                peakIn = recentPeakInboundLossPermille;
+            }
+        }
+        double peakPeer = 0.0;
+        synchronized (rttGate) {
+            if (recentPeakPeerLossAtMs > 0L && nowMs >= recentPeakPeerLossAtMs
+                && nowMs - recentPeakPeerLossAtMs <= RECENT_PEAK_WINDOW_MS) {
+                peakPeer = recentPeakPeerLossPermille;
+            }
+        }
+        return Math.max(peakIn, peakPeer);
+    }
+
+    public double getRecentPeakJitterMs(long nowMs) {
+        double peakIn = 0.0;
+        synchronized (recvGate) {
+            if (recentPeakInboundJitterAtMs > 0L && nowMs >= recentPeakInboundJitterAtMs
+                && nowMs - recentPeakInboundJitterAtMs <= RECENT_PEAK_WINDOW_MS) {
+                peakIn = recentPeakInboundJitterMs;
+            }
+        }
+        double peakPeer = 0.0;
+        synchronized (rttGate) {
+            if (recentPeakPeerJitterAtMs > 0L && nowMs >= recentPeakPeerJitterAtMs
+                && nowMs - recentPeakPeerJitterAtMs <= RECENT_PEAK_WINDOW_MS) {
+                peakPeer = recentPeakPeerJitterMs;
+            }
+        }
+        return Math.max(peakIn, peakPeer);
     }
 
     public int getPeerRefreshHz() {

@@ -1246,5 +1246,27 @@ public final class ProtocolSourceTest {
             CellularLinkHelper.shouldPreferCellular(5.0, 3.0, 80.0, 30.0, 4.0, 0.0, 65_000L, 55_000L));
         assertTrue("Healthy low-latency Wi-Fi returning must beat 35ms Mobile network after cooldown",
             CellularLinkHelper.shouldReturnToWifi(35.0, 4.0, 0.0, 4.5, 1.5, 0.0, 90_000L, 50_000L));
+
+        // Verify v0.3.65: recent peak loss memory persists across idle gaps for cellular evaluation & clears on profile change.
+        AdaptiveLinkTracker peakTracker = new AdaptiveLinkTracker("2.4GHz");
+        peakTracker.recordInboundPacket(1L, true, 1000, 1000L);
+        peakTracker.recordInboundPacket(95L, true, 1200, 1200L);
+        double livePeak = peakTracker.getInboundLossPermille();
+        assertTrue("Burst drop must populate peak loss window", livePeak > 50.0);
+        peakTracker.recordInboundPacket(96L, true, 6200, 6200L);
+        assertTrue("Recent peak loss window must retain active burst after idle gap",
+            peakTracker.getRecentPeakLossPermille(8000L) >= livePeak * 0.99);
+        assertEquals("Recent peak loss window must expire cleanly after 45s",
+            0.0, peakTracker.getRecentPeakLossPermille(60_000L), 0.001);
+        peakTracker.onLinkProfileChanged("5GHz", 866, 2);
+        assertEquals("Link profile change must clear prior band peak loss",
+            0.0, peakTracker.getRecentPeakLossPermille(8000L), 0.001);
+
+        DeskTouchSession.LiveStatusSnapshot peakSnap = new DeskTouchSession.LiveStatusSnapshot(
+            true, "DESKTOP", "A".repeat(64), false, "2.4GHz", 144, 5.0, 2.0, 2.0, 85.0, 5.5, "", null);
+        assertTrue("Moderate recent peak Wi-Fi loss (8.5%) must still promote fast 15ms Mobile network",
+            CellularLinkHelper.shouldPreferCellular(
+                peakSnap.rttMs, peakSnap.recentPeakJitterMs, peakSnap.recentPeakLossPermille,
+                15.0, 2.0, 0.0, 70_000L, 0L));
     }
 }

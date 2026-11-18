@@ -54,6 +54,8 @@ public final class AutoConnectService extends Service {
         new java.util.concurrent.atomic.AtomicBoolean();
     private volatile long lastCellularProbeAtMs;
     private volatile long lastTransportSwitchAtMs;
+    private volatile long lastDemotedWifiAtMs;
+    private volatile String lastDemotedWifiBand = "";
     private volatile String lastCellularProbeSummary = "";
     private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
         new java.util.concurrent.atomic.AtomicInteger();
@@ -122,6 +124,17 @@ public final class AutoConnectService extends Service {
         AutoConnectService service=activeInstance;
         if(service!=null) service.evaluateDisconnectAutoPause();
         refreshNotification();
+    }
+
+    static void onLeaseEndedDegraded(Context context) {
+        AutoConnectService service=activeInstance;
+        if(service==null) return;
+        ScheduledExecutorService pool=service.scheduler;
+        if(pool==null || pool.isShutdown()) {
+            service.scheduleCellularEvaluation();
+            return;
+        }
+        pool.schedule(service::scheduleCellularEvaluation,900,TimeUnit.MILLISECONDS);
     }
 
     static void onAccessibilityStateChanged(Context context) {
@@ -688,6 +701,14 @@ public final class AutoConnectService extends Service {
             if(lastTransportSwitchAtMs>0L && now-lastTransportSwitchAtMs<CellularLinkHelper.SWITCH_COOLDOWN_MS) return;
             WifiLinkMonitor.LinkSnapshot wifiSnap=WifiLinkMonitor.inspect(this,false,0);
             if(!("wifi".equals(wifiSnap.transport) || "ethernet".equals(wifiSnap.transport))) return;
+            String wifiBand=AdaptiveLinkTracker.normalizeBand(wifiSnap.band);
+            DeskTouchSession.LiveStatusSnapshot cellSnap=DeskTouchRuntime.liveSnapshotForPeer(activeCellularFp);
+            double cellRtt=cellSnap!=null && cellSnap.rttMs>0 ? cellSnap.rttMs : 35.0;
+            double cellJitter=cellSnap!=null ? cellSnap.jitterMs : 4.0;
+            double cellLoss=cellSnap!=null ? cellSnap.lossPermille : 0.0;
+            boolean sameDemotedBand=wifiBand.equals(lastDemotedWifiBand)
+                && lastDemotedWifiAtMs>0L && (now-lastDemotedWifiAtMs)<75_000L;
+            if(sameDemotedBand && cellRtt<40.0 && cellLoss<25.0) return;
             String lanHost=DeskTouchRuntime.getLastKnownPeerHost(activeCellularFp);
             if(lanHost==null || lanHost.isEmpty() || "127.0.0.1".equals(lanHost)) {
                 try {
@@ -706,12 +727,8 @@ public final class AutoConnectService extends Service {
             CellularLinkHelper.ProbeResult wifiProbe=CellularLinkHelper.probeDirectEndpoints(
                 null,activeCellularFp,trust,java.util.Collections.singletonList(targetWifiHost),1500);
             if(!wifiProbe.reachable) return;
-            DeskTouchSession.LiveStatusSnapshot cellSnap=DeskTouchRuntime.liveSnapshotForPeer(activeCellularFp);
-            double cellRtt=cellSnap!=null && cellSnap.rttMs>0 ? cellSnap.rttMs : 35.0;
-            double cellJitter=cellSnap!=null ? cellSnap.jitterMs : 4.0;
-            double cellLoss=cellSnap!=null ? cellSnap.lossPermille : 0.0;
             if(CellularLinkHelper.shouldReturnToWifi(
-                cellRtt,cellJitter,cellLoss,wifiProbe.rttMs,2.0,0.0,now,lastTransportSwitchAtMs)) {
+                cellRtt,cellJitter,cellLoss,wifiProbe.rttMs,Math.max(1.5,wifiProbe.jitterMs),0.0,now,lastTransportSwitchAtMs)) {
                 DesktopDiscovery.Device wifiDev=new DesktopDiscovery.Device(
                     cellSnap!=null && !cellSnap.peerName.isEmpty() ? cellSnap.peerName : "DeskTouch PC",
                     targetWifiHost,activeCellularFp,true,false);
@@ -736,18 +753,20 @@ public final class AutoConnectService extends Service {
             if(ipv6Endpoints.isEmpty()) return;
             DeskTouchSession.LiveStatusSnapshot wifiSnap=DeskTouchRuntime.liveSnapshotForPeer(nonCableFp);
             if(wifiSnap==null || !wifiSnap.connected) return;
-            boolean wifiDegraded=wifiSnap.lossPermille>=20.0 || wifiSnap.jitterMs>=6.5 || wifiSnap.rttMs>=25.0;
-            long minProbeGap=wifiDegraded ? 12_000L : 45_000L;
+            double wifiLoss=Math.max(wifiSnap.lossPermille,wifiSnap.recentPeakLossPermille);
+            double wifiJitter=Math.max(wifiSnap.jitterMs,wifiSnap.recentPeakJitterMs);
+            boolean wifiDegraded=wifiLoss>=15.0 || wifiJitter>=6.0 || wifiSnap.rttMs>=22.0;
+            long minProbeGap=wifiDegraded ? 10_000L : 45_000L;
             if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<minProbeGap) return;
             lastCellularProbeAtMs=now;
 
-            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(2500L);
+            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(4500L);
             if(cellNet==null) {
                 Log.i("DeskTouch","Mobile network benchmark skipped: cellular data inactive or unavailable");
                 return;
             }
             CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
-                cellNet,nonCableFp,trust,ipv6Endpoints,2200);
+                cellNet,nonCableFp,trust,ipv6Endpoints,2400);
             if(!cellProbe.reachable) {
                 lastCellularProbeSummary="Mobile IPv6 blocked/unreachable: "+cellProbe.errorMessage;
                 Log.i("DeskTouch","Direct mobile network probe unreachable ("+cellProbe.errorMessage+"); keeping Wi-Fi");
@@ -757,18 +776,21 @@ public final class AutoConnectService extends Service {
             double wifiRtt=wifiSnap.rttMs>0 ? wifiSnap.rttMs : 12.0;
             lastCellularProbeSummary=String.format(java.util.Locale.US,
                 "Wi-Fi %.1fms/%.1f%% vs Mobile %.1fms",
-                wifiRtt,wifiSnap.lossPermille/10.0,cellProbe.rttMs);
-            Log.i("DeskTouch","Path benchmark: "+lastCellularProbeSummary+" ("+cellProbe.address+")");
+                wifiRtt,wifiLoss/10.0,cellProbe.rttMs);
+            Log.i("DeskTouch","Path benchmark: "+lastCellularProbeSummary+" (jitter "+String.format(java.util.Locale.US,"%.1f",cellProbe.jitterMs)+"ms, "+cellProbe.address+")");
             if(CellularLinkHelper.shouldPreferCellular(
-                wifiRtt,wifiSnap.jitterMs,wifiSnap.lossPermille,
-                cellProbe.rttMs,4.0,0.0,now,lastTransportSwitchAtMs)) {
+                wifiRtt,wifiJitter,wifiLoss,
+                cellProbe.rttMs,Math.max(1.0,cellProbe.jitterMs),0.0,now,lastTransportSwitchAtMs)) {
                 DesktopDiscovery.Device cellDev=new DesktopDiscovery.Device(
                     wifiSnap.peerName.isEmpty() ? "DeskTouch PC" : wifiSnap.peerName,
                     cellProbe.address,nonCableFp,true,false);
+                final String demotedBand=AdaptiveLinkTracker.normalizeBand(wifiSnap.band);
                 if(!DeskTouchRuntime.switchTransportMakeBeforeBreak(
                     this,cellDev,phone.width,phone.height,cellNet,true,
                     ()->{
                         lastTransportSwitchAtMs=SystemClock.uptimeMillis();
+                        lastDemotedWifiAtMs=lastTransportSwitchAtMs;
+                        lastDemotedWifiBand=demotedBand;
                         Log.i("DeskTouch","Switched active link to Mobile network ("+cellProbe.address+")");
                     },
                     ()->cellularHelper.releaseCellularNetwork())) {
@@ -788,7 +810,7 @@ public final class AutoConnectService extends Service {
             java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(fp);
             if(ipv6Endpoints.isEmpty()) continue;
             lastCellularProbeAtMs=now;
-            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(2500L);
+            android.net.Network cellNet=cellularHelper.acquireCellularNetwork(4500L);
             if(cellNet==null) return;
             CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
                 cellNet,fp,trust,ipv6Endpoints,2400);

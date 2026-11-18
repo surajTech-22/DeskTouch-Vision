@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.65 — Non-Blocking Mobile Network Switcher, Multi-Sample Probe & Burst-Loss Memory
+
+Fixes the Android monitor deadlock that prevented cellular path probing on dual-path networks, adds recent burst-loss retention, and upgrades path benchmarking:
+
+- **Non-blocking `CellularLinkHelper` acquisition & live probe diagnostics:** Removes the `synchronized` monitor lock held across `CountDownLatch.await(...)` inside `acquireCellularNetwork` (which blocked `ConnectivityManager.NetworkCallback.onAvailable` until timeout even when `ccmni` mobile data came up in `<100 ms`), adds explicit `onUnavailable` wakeup and stale-callback guards, and leaves the Android Wi-Fi connection completely untouched while routing only DeskTouch traffic over whichever path is faster.
+- **Multi-sample TLS+echo benchmark (`CellularLinkHelper`, `NetworkSessions`):** Upgrades `"auth-trusted-probe"` (`request.A == 2`) with two fast `"probe-echo"` round trips on the same TLS socket to measure genuine median RTT and cellular jitter rather than relying on a single packet or hardcoded jitter constant, while remaining backward compatible with `v0.3.64` peers and logging trusted probes on Windows.
+- **Recent peak burst-loss memory & anti-ping-pong hold (`AdaptiveLinkTracker`, `DeskTouchSession`, `AutoConnectService`):** Retains 45-second peak packet-loss and jitter windows across idle heartbeat pauses so `AutoConnectService` remembers RF bursts experienced during active mouse control, schedules fast re-evaluation `~900 ms` after returning control from a degraded wireless lease, and avoids bouncing right back onto a recently demoted noisy band while returning smoothly when a clean band returns.
+
+---
+
 # DeskTouch Vision v0.3.64 — Instant Cable Clicks, Smooth Low-RTT Wireless & Direct Mobile Network Auto-Switching
 
 Eliminates USB cable mouse-click stalls, smooths local 2.4 GHz cursor feel without false pace throttling, and adds automatic dual-stack IPv6 + mobile cellular path switching:

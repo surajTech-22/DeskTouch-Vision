@@ -15,6 +15,7 @@ import java.net.Socket;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -34,30 +35,34 @@ final class CellularLinkHelper {
         final String address;
         final double connectMs;
         final double rttMs;
+        final double jitterMs;
         final int udpPort;
         final String errorMessage;
 
         private ProbeResult(boolean reachable, String address, double connectMs,
-                double rttMs, int udpPort, String errorMessage) {
+                double rttMs, double jitterMs, int udpPort, String errorMessage) {
             this.reachable = reachable;
             this.address = address;
             this.connectMs = connectMs;
             this.rttMs = rttMs;
+            this.jitterMs = jitterMs;
             this.udpPort = udpPort;
             this.errorMessage = errorMessage;
         }
 
-        static ProbeResult success(String address, double connectMs, double rttMs, int udpPort) {
-            return new ProbeResult(true, address, connectMs, rttMs, udpPort, "");
+        static ProbeResult success(String address, double connectMs, double rttMs,
+                double jitterMs, int udpPort) {
+            return new ProbeResult(true, address, connectMs, rttMs, jitterMs, udpPort, "");
         }
 
         static ProbeResult failure(String errorMessage) {
-            return new ProbeResult(false, "", 0.0, 0.0, 0,
+            return new ProbeResult(false, "", 0.0, 0.0, 0.0, 0,
                 errorMessage != null ? errorMessage : "unreachable");
         }
     }
 
     private final ConnectivityManager connectivityManager;
+    private final Object lock = new Object();
     private Network cellularNetwork;
     private ConnectivityManager.NetworkCallback activeCallback;
 
@@ -66,73 +71,129 @@ final class CellularLinkHelper {
             context.getApplicationContext().getSystemService(Context.CONNECTIVITY_SERVICE);
     }
 
-    synchronized Network getActiveNetwork() {
-        return cellularNetwork;
+    Network getActiveNetwork() {
+        synchronized (lock) {
+            return cellularNetwork;
+        }
     }
 
-    synchronized Network acquireCellularNetwork(long timeoutMs) {
+    Network acquireCellularNetwork(long timeoutMs) {
         if (connectivityManager == null) return null;
-        if (cellularNetwork != null) {
-            NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(cellularNetwork);
+        Network existing;
+        synchronized (lock) {
+            existing = cellularNetwork;
+        }
+        if (existing != null) {
+            NetworkCapabilities caps = connectivityManager.getNetworkCapabilities(existing);
             if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
                 && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                return cellularNetwork;
+                return existing;
             }
             releaseCellularNetwork();
         }
         final CountDownLatch latch = new CountDownLatch(1);
-        final Network[] found = new Network[1];
+        final AtomicReference<Network> found = new AtomicReference<>();
+        final AtomicReference<ConnectivityManager.NetworkCallback> cbRef = new AtomicReference<>();
         ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
             @Override public void onAvailable(Network network) {
-                synchronized (CellularLinkHelper.this) {
+                synchronized (lock) {
+                    if (activeCallback != cbRef.get()) return;
                     cellularNetwork = network;
-                    found[0] = network;
                 }
+                found.compareAndSet(null, network);
                 latch.countDown();
             }
 
             @Override public void onLost(Network network) {
-                synchronized (CellularLinkHelper.this) {
-                    if (network != null && network.equals(cellularNetwork)) {
+                synchronized (lock) {
+                    if (activeCallback == cbRef.get()
+                        && network != null && network.equals(cellularNetwork)) {
                         cellularNetwork = null;
                     }
                 }
             }
+
+            @Override public void onUnavailable() {
+                synchronized (lock) {
+                    if (activeCallback == cbRef.get()) {
+                        cellularNetwork = null;
+                    }
+                }
+                latch.countDown();
+            }
         };
+        cbRef.set(cb);
         try {
             NetworkRequest req = new NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
                 .build();
-            activeCallback = cb;
+            synchronized (lock) {
+                if (activeCallback != null) {
+                    try {
+                        connectivityManager.unregisterNetworkCallback(activeCallback);
+                    } catch (Throwable ignored) {}
+                }
+                activeCallback = cb;
+                cellularNetwork = null;
+            }
             connectivityManager.requestNetwork(req, cb);
         } catch (Throwable ex) {
-            activeCallback = null;
+            synchronized (lock) {
+                if (activeCallback == cb) {
+                    activeCallback = null;
+                    cellularNetwork = null;
+                }
+            }
             Log.w(TAG, "Cellular requestNetwork unavailable: " + ex.getMessage());
             return null;
         }
 
         boolean acquired = false;
         try {
+            // Never hold lock while awaiting ConnectivityManager callback (avoids self-deadlock).
             acquired = latch.await(Math.max(400L, timeoutMs), TimeUnit.MILLISECONDS);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
         }
-        if (!acquired || found[0] == null) {
-            releaseCellularNetwork();
+        Network result = found.get();
+        if (!acquired || result == null) {
+            Log.w(TAG, "Cellular request timed out or unavailable after "
+                + Math.max(400L, timeoutMs) + " ms");
+            releaseCallbackIfCurrent(cb);
             return null;
         }
-        return found[0];
+        return result;
     }
 
-    synchronized void releaseCellularNetwork() {
-        if (connectivityManager != null && activeCallback != null) {
+    private void releaseCallbackIfCurrent(ConnectivityManager.NetworkCallback expected) {
+        ConnectivityManager.NetworkCallback toUnregister = null;
+        synchronized (lock) {
+            if (activeCallback == expected) {
+                toUnregister = activeCallback;
+                activeCallback = null;
+                cellularNetwork = null;
+            }
+        }
+        if (connectivityManager != null && toUnregister != null) {
             try {
-                connectivityManager.unregisterNetworkCallback(activeCallback);
+                connectivityManager.unregisterNetworkCallback(toUnregister);
             } catch (Throwable ignored) {}
         }
-        activeCallback = null;
-        cellularNetwork = null;
+    }
+
+    void releaseCellularNetwork() {
+        ConnectivityManager.NetworkCallback toUnregister;
+        synchronized (lock) {
+            toUnregister = activeCallback;
+            activeCallback = null;
+            cellularNetwork = null;
+        }
+        if (connectivityManager != null && toUnregister != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(toUnregister);
+            } catch (Throwable ignored) {}
+        }
     }
 
     static ProbeResult probeDirectEndpoints(Network boundNetwork, String fingerprint,
@@ -173,16 +234,45 @@ final class CellularLinkHelper {
                 DataOutputStream out = new DataOutputStream(ssl.getOutputStream());
                 DataInputStream in = new DataInputStream(ssl.getInputStream());
                 long tReq = System.nanoTime();
-                new Packet("auth-trusted-probe", 0, 0, 0, 0, token).write(out);
+                // Request a = 2 tells v0.3.65+ Windows peers to echo up to 2 follow-up probe-echo packets.
+                new Packet("auth-trusted-probe", 2, 0, 0, 0, token).write(out);
                 Packet resp = Packet.read(in);
-                double rttMs = (System.nanoTime() - tReq) / 1_000_000.0;
+                double rtt0 = (System.nanoTime() - tReq) / 1_000_000.0;
                 if ("probe-ok".equals(resp.type)) {
                     int udpPort = 0;
                     if (resp.text != null && !resp.text.isEmpty()) {
                         try { udpPort = Integer.parseInt(resp.text.trim()); }
                         catch (NumberFormatException ignored) {}
                     }
-                    return ProbeResult.success(host.trim(), connectMs, rttMs, udpPort);
+                    double[] samples = new double[] { rtt0, rtt0, rtt0 };
+                    int sampleCount = 1;
+                    try {
+                        ssl.setSoTimeout(Math.min(1200, timeoutMs));
+                        for (int s = 1; s < 3; s++) {
+                            long ts = System.nanoTime();
+                            new Packet("probe-echo", s, 0, 0, 0, "").write(out);
+                            Packet echo = Packet.read(in);
+                            if (echo == null || !"probe-ok".equals(echo.type)) break;
+                            samples[sampleCount++] = (System.nanoTime() - ts) / 1_000_000.0;
+                        }
+                    } catch (Exception ignored) {
+                        // Older v0.3.64 peers close cleanly after the first probe-ok.
+                    }
+                    double medianRtt;
+                    double jitterMs;
+                    if (sampleCount >= 3) {
+                        double a = samples[0], b = samples[1], c = samples[2];
+                        medianRtt = Math.max(Math.min(a, b), Math.min(Math.max(a, b), c));
+                        double mean = (a + b + c) / 3.0;
+                        jitterMs = (Math.abs(a - mean) + Math.abs(b - mean) + Math.abs(c - mean)) / 3.0;
+                    } else if (sampleCount == 2) {
+                        medianRtt = (samples[0] + samples[1]) * 0.5;
+                        jitterMs = Math.abs(samples[0] - samples[1]) * 0.5;
+                    } else {
+                        medianRtt = rtt0;
+                        jitterMs = Math.min(4.0, Math.abs(rtt0 - connectMs) * 0.5);
+                    }
+                    return ProbeResult.success(host.trim(), connectMs, medianRtt, jitterMs, udpPort);
                 }
                 lastErr = "Trusted probe rejected (" + resp.type + ")";
             } catch (Exception ex) {
@@ -211,13 +301,13 @@ final class CellularLinkHelper {
         if (lastSwitchMs > 0L && nowMs - lastSwitchMs < SWITCH_COOLDOWN_MS) {
             return false;
         }
-        boolean wifiDegraded = wifiLossPermille >= 20.0 || wifiJitterMs >= 6.5 || wifiRttMs >= 25.0;
+        boolean wifiDegraded = wifiLossPermille >= 15.0 || wifiJitterMs >= 6.0 || wifiRttMs >= 22.0;
         if (!wifiDegraded) {
             return false;
         }
         double wifiScore = computePathScore(wifiRttMs, wifiJitterMs, wifiLossPermille);
         double cellScore = computePathScore(cellRttMs, cellJitterMs, cellLossPermille);
-        return cellScore + 15.0 < wifiScore;
+        return cellScore + 12.0 < wifiScore;
     }
 
     static boolean shouldReturnToWifi(double cellRttMs, double cellJitterMs, double cellLossPermille,

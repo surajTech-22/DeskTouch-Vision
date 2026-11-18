@@ -167,6 +167,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal FastUdpHub.Peer? MobileUdpPeer;
         internal int PreferMobileMouse;
         internal int PreferMobileKeyboard;
+        internal int DesiredPreferMobileMouse;
+        internal int DesiredPreferMobileKeyboard;
         internal long DualMouseMirrorUntilTicks;
         internal long DualKeyboardMirrorUntilTicks;
         internal FastMovePacer? MovePacer;
@@ -1129,6 +1131,35 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             session.MobileUdpPeer is { Confirmed: true } mob)
             return mob;
         return session.UdpPeer;
+    }
+
+    private void ApplyStreamPreference(Session session, bool desiredMouse, bool desiredKeyboard)
+    {
+        Volatile.Write(ref session.DesiredPreferMobileMouse, desiredMouse ? 1 : 0);
+        Volatile.Write(ref session.DesiredPreferMobileKeyboard, desiredKeyboard ? 1 : 0);
+        bool mobileConfirmed = session.MobileUdpPeer is { Confirmed: true };
+        bool activeMouse = desiredMouse && mobileConfirmed;
+        bool activeKb = desiredKeyboard && mobileConfirmed;
+        int prevMouse = Interlocked.Exchange(ref session.PreferMobileMouse, activeMouse ? 1 : 0);
+        int prevKb = Interlocked.Exchange(ref session.PreferMobileKeyboard, activeKb ? 1 : 0);
+        bool mouseChanged = prevMouse != (activeMouse ? 1 : 0);
+        bool kbChanged = prevKb != (activeKb ? 1 : 0);
+        if (mouseChanged)
+        {
+            Volatile.Write(ref session.DualMouseMirrorUntilTicks,
+                Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
+            UpdateSessionAdaptivePacing(session);
+        }
+        if (kbChanged)
+        {
+            Volatile.Write(ref session.DualKeyboardMirrorUntilTicks,
+                Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
+        }
+        if (mouseChanged || kbChanged)
+        {
+            DiagnosticLog?.Invoke(
+                $"Stream preference updated for {session.Peer.Name}: mouse={(activeMouse ? "Mobile network" : "Wi-Fi")}, keyboard={(activeKb ? "Mobile network" : "Wi-Fi")} (Wi-Fi stays connected)");
+        }
     }
 
     private void UpdateSessionAdaptivePacing(Session session)
@@ -2651,9 +2682,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             var hub = _udpHub;
                             hub.ConfigurePeerEndPoints(mobPeer, candidateEps);
                             DiagnosticLog?.Invoke($"Started two-way mobile receiver punch for {session.Peer.Name} ({candidateEps[0]})");
+                            hub.Send(mobPeer, FastUdpOp.Probe, hub.Port, 0, 0);
                             _ = Task.Run(async () =>
                             {
-                                int[] delaysMs = [50, 80, 140, 220, 350, 550, 800];
+                                int[] delaysMs = [40, 80, 140, 220, 350, 550, 800];
                                 foreach (int ms in delaysMs)
                                 {
                                     if (token.IsCancellationRequested || mobPeer.Confirmed) return;
@@ -2671,6 +2703,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if (p.Type == "mobile-udp-close")
                 {
+                    Volatile.Write(ref session.DesiredPreferMobileMouse, 0);
+                    Volatile.Write(ref session.DesiredPreferMobileKeyboard, 0);
                     Volatile.Write(ref session.PreferMobileMouse, 0);
                     Volatile.Write(ref session.PreferMobileKeyboard, 0);
                     if (session.MobileUdpPeer != null)
@@ -2684,30 +2718,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if (p.Type == "stream-prefer")
                 {
-                    bool mobileConfirmed = session.MobileUdpPeer is { Confirmed: true };
-                    bool wantMobileMouse = (p.A != 0 || string.Equals(p.Text, "cellular", StringComparison.OrdinalIgnoreCase))
-                        && mobileConfirmed;
-                    bool wantMobileKb = (p.B != 0) && mobileConfirmed;
-                    int prevMouse = Interlocked.Exchange(ref session.PreferMobileMouse, wantMobileMouse ? 1 : 0);
-                    int prevKb = Interlocked.Exchange(ref session.PreferMobileKeyboard, wantMobileKb ? 1 : 0);
-                    bool mouseChanged = prevMouse != (wantMobileMouse ? 1 : 0);
-                    bool kbChanged = prevKb != (wantMobileKb ? 1 : 0);
-                    if (mouseChanged)
-                    {
-                        Volatile.Write(ref session.DualMouseMirrorUntilTicks,
-                            Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
-                        UpdateSessionAdaptivePacing(session);
-                    }
-                    if (kbChanged)
-                    {
-                        Volatile.Write(ref session.DualKeyboardMirrorUntilTicks,
-                            Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
-                    }
-                    if (mouseChanged || kbChanged)
-                    {
-                        DiagnosticLog?.Invoke(
-                            $"Stream preference updated for {session.Peer.Name}: mouse={(wantMobileMouse ? "Mobile network" : "Wi-Fi")}, keyboard={(wantMobileKb ? "Mobile network" : "Wi-Fi")} (Wi-Fi stays connected)");
-                    }
+                    bool wantMobileMouse = p.A != 0 || string.Equals(p.Text, "cellular", StringComparison.OrdinalIgnoreCase);
+                    bool wantMobileKb = p.B != 0;
+                    ApplyStreamPreference(session, wantMobileMouse, wantMobileKb);
                     continue;
                 }
                 if(p.Type=="trust-request")
@@ -3441,9 +3454,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (peer.Confirmed && peer.TryMarkConfirmedLogged())
         {
             if (peer.IsAuxiliary)
+            {
                 DiagnosticLog?.Invoke($"Mobile network stream ready for {session.Peer.Name} ({peer.RemoteEndPoint?.Address}). Wi-Fi stays connected.");
+                bool desiredMouse = Volatile.Read(ref session.DesiredPreferMobileMouse) != 0;
+                bool desiredKb = Volatile.Read(ref session.DesiredPreferMobileKeyboard) != 0;
+                if (desiredMouse || desiredKb)
+                    ApplyStreamPreference(session, desiredMouse, desiredKb);
+            }
             else
+            {
                 _status($"Low-latency input confirmed for {session.Peer.Name}.");
+            }
         }
         if (msg.Op == FastUdpOp.LinkPing)
         {
@@ -3640,6 +3661,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double floorMs = isSlow24Ghz ? 7.5 : (isCellular ? 6.5 : (isAndroid ? 4.2 : 1.8));
         if (!isSlow24Ghz && !isCellular && rttMs <= 7.0 && queueDelay <= 2.5 && jitterMs <= 3.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.85);
+        if (isCellular && queueDelay <= 6.0 && jitterMs <= 4.5 && lossPermille < 2.0)
+            return liveRefreshHz is >= 90 ? 6.8 : Math.Min(baseMs, 11.0);
         if (isSlow24Ghz && rttMs <= 12.0 && queueDelay <= 4.0 && jitterMs <= 4.5 && lossPermille < 2.0)
             return Math.Max(floorMs, baseMs * 0.78);
         if (!isCellular && rttMs <= 18.0 && queueDelay <= 6.0 && jitterMs <= 5.5 && lossPermille >= 4.0)
@@ -3648,7 +3671,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return Math.Clamp(baseMs + dropPenalty, Math.Max(floorMs, baseMs), isSlow24Ghz ? 10.5 : Math.Max(baseMs + 2.0, 10.0));
         }
 
-        double rttPressure = Math.Max(0.0, rttMs - 18.0) * 0.08;
+        double rttPressure = isCellular ? 0.0 : Math.Max(0.0, rttMs - 18.0) * 0.08;
         double bloatPressure = Math.Max(0.0, queueDelay - 8.0) * 0.16;
         double jitterPressure = Math.Max(0.0, jitterMs - 8.0) * 0.11;
         double lossPressure = Math.Max(0.0, lossPermille - 8.0) * 0.10;

@@ -343,6 +343,22 @@ final class CellularLinkHelper {
         return candidateLossPermille + 1.0 < activeLossPermille;
     }
 
+    static boolean shouldSwitchKeyboardToFasterZeroLoss(
+            double activeRttMs, double activeLossPermille,
+            double candidateRttMs, double candidateLossPermille,
+            long nowMs, long lastSwitchMs, long minCooldownMs) {
+        if (lastSwitchMs > 0L && nowMs - lastSwitchMs < minCooldownMs) {
+            return false;
+        }
+        if (activeLossPermille >= 2.0 || candidateLossPermille >= 2.0) {
+            return false;
+        }
+        if (activeRttMs <= 0.0 || candidateRttMs <= 0.0) {
+            return false;
+        }
+        return (activeRttMs - candidateRttMs) >= 8.0;
+    }
+
     static boolean shouldPreferCellular(double wifiRttMs, double wifiJitterMs, double wifiLossPermille,
             double cellRttMs, double cellJitterMs, double cellLossPermille,
             long nowMs, long lastSwitchMs) {

@@ -1337,5 +1337,13 @@ public final class ProtocolSourceTest {
             CellularLinkHelper.shouldSwitchStreamOnLoss(25.0, 0.0, 14_000L, 10_000L, 8_000L));
         assertTrue("Active >= 1.0% loss (12 permille) must switch when alternate stream is cleaner",
             CellularLinkHelper.shouldSwitchStreamOnLoss(12.0, 0.0, 50_000L, 10_000L, 8_000L));
+
+        // Verify v0.3.68: Keyboard automatically selects faster 0%-loss path (e.g. 4ms Wi-Fi vs 20ms Mobile) without oscillating back.
+        assertTrue("Keyboard on 20.5ms 0%-loss Mobile must switch to faster 4.2ms 0%-loss Wi-Fi",
+            CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(20.5, 0.0, 4.2, 0.0, 50_000L, 10_000L, 15_000L));
+        assertFalse("Keyboard already on faster 4.2ms 0%-loss Wi-Fi must NEVER bounce back to 20.5ms Mobile",
+            CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(4.2, 0.0, 20.5, 0.0, 50_000L, 10_000L, 15_000L));
+        assertFalse("Keyboard must NEVER switch to a lossy alternate path even if lower RTT",
+            CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(20.5, 0.0, 4.2, 5.0, 50_000L, 10_000L, 15_000L));
     }
 }

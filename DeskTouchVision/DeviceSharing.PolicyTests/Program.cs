@@ -2700,6 +2700,19 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         var splitPref = new Packet("stream-prefer", 1, 0, 0, 0, "cellular");
         Check(splitPref.Type == "stream-prefer" && splitPref.A == 1 && splitPref.B == 0,
             "stream-prefer packet must support independent Mouse (A) and Keyboard (B) path selection");
+
+        // Verify v0.3.68: Wireless debugging mDNS endpoint parser + clean cellular 6.8ms pacing.
+        string sampleMdns =
+            "List of discovered mdns services\n" +
+            "adb-UK9DYX4XF6KZSWGA-a1rxs3\t_adb-tls-connect._tcp\t192.168.1.2:40599\n" +
+            "adb-pair-xyz\t_adb-tls-pairing._tcp\t192.168.1.2:37890\n" +
+            "adb-UK9DYX4XF6KZSWGA-a1rxs3\t_adb-tls-connect._tcp\t192.168.1.2:40599\n";
+        var parsedMdns = AdbCableBridge.ParseMdnsTlsConnectEndpoints(sampleMdns);
+        Check(parsedMdns.Count == 1 && parsedMdns[0] == "192.168.1.2:40599",
+            "ParseMdnsTlsConnectEndpoints must extract unique _adb-tls-connect._tcp endpoints only");
+        double cleanCellLive144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 21.0, 19.0, 1.8, 0.0, "cellular");
+        Check(cleanCellLive144 is >= 6.4 and <= 7.2,
+            "Clean 0%-loss cellular at 144 Hz must unlock crisp ~6.8ms cadence instead of holding at 9.7ms");
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

@@ -52,6 +52,7 @@ public final class AutoConnectService extends Service {
     private ExecutorService cellularExecutor;
     private final java.util.concurrent.atomic.AtomicBoolean cellularProbeInFlight =
         new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile boolean pendingCellularEval;
     private volatile long lastCellularProbeAtMs;
     private final java.util.concurrent.atomic.AtomicInteger networkEpoch=
         new java.util.concurrent.atomic.AtomicInteger();
@@ -120,6 +121,22 @@ public final class AutoConnectService extends Service {
         AutoConnectService service=activeInstance;
         if(service!=null) service.evaluateDisconnectAutoPause();
         refreshNotification();
+    }
+
+    static void onMobileUdpCredentialsReady(Context context) {
+        AutoConnectService service = activeInstance;
+        if (service != null) service.scheduleCellularEvaluation();
+    }
+
+    static void scheduleMobileRetry(Context context, long delayMs) {
+        AutoConnectService service = activeInstance;
+        if (service == null) return;
+        ScheduledExecutorService pool = service.scheduler;
+        if (pool == null || pool.isShutdown()) {
+            service.scheduleCellularEvaluation();
+            return;
+        }
+        pool.schedule(service::scheduleCellularEvaluation, Math.max(250L, delayMs), TimeUnit.MILLISECONDS);
     }
 
     static void onLeaseEndedDegraded(Context context) {
@@ -669,7 +686,11 @@ public final class AutoConnectService extends Service {
             && !DeskTouchRuntime.hasActiveMobileUdpStream();
         if(!needPunchForConnectedWifi && DeskTouchRuntime.anyInputLeaseActive()) return;
         if(!needPunchForConnectedWifi && DeskTouchRuntime.hasActiveMobileUdpStream()) return;
-        if(!cellularProbeInFlight.compareAndSet(false,true)) return;
+        if(!cellularProbeInFlight.compareAndSet(false,true)) {
+            pendingCellularEval=true;
+            return;
+        }
+        pendingCellularEval=false;
         exec.execute(()->{
             try {
                 evaluateCellularFailoverOrReturn();
@@ -677,6 +698,10 @@ public final class AutoConnectService extends Service {
                 Log.w("DeskTouch","Mobile network check skipped",err);
             } finally {
                 cellularProbeInFlight.set(false);
+                if(pendingCellularEval) {
+                    pendingCellularEval=false;
+                    scheduleCellularEvaluation();
+                }
             }
         });
     }

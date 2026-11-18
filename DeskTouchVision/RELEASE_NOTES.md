@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.68 — Auto Wireless Debugging, Instant Mobile Stream Sync, Low-Delay Cellular Pacing & Faster Keyboard Path
+
+Fixes the stream-preference confirmation race after cable/Wi-Fi handoffs, removes artificial mobile pacing delay, auto-connects Wireless Debugging, and puts Keyboard cleanly onto the fastest `0%`-loss path:
+
+- **Zero-race stream preference sync & instant mobile startup (`NetworkSessions`, `DeskTouchSession`, `AutoConnectService`):** Stores desired `Mouse`/`Keyboard` stream preferences on Windows and applies them the instant `MobileUdpPeer.Confirmed` flips true (fixing the race where `stream-prefer` arrived over Wi-Fi before Mobile UDP confirmation completed), queues `AutoConnectService` cellular checks cleanly instead of dropping them during cable unplug transitions, starts Mobile UDP punching immediately upon credential receipt with `1.2–1.5s` fast retries if cellular is still waking, and evaluates initial stream memory/loss immediately on probe confirmation.
+- **Crisp low-delay Mobile network mouse pacing (`NetworkSessions.ComputeAdaptiveUdpIntervalMs`):** Unlocks `6.8 ms` (`144 Hz`) pacing on clean low-jitter `0%`-loss cellular links instead of capping cellular at `9.5–10.0 ms`, and stops penalizing steady baseline cellular propagation latency when queue delay and loss are low.
+- **Keyboard picks faster `0%`-loss path (`DeskTouchSession`, `CellularLinkHelper`):** Anchors post-offload Wi-Fi packet loss once Mouse moves onto Mobile so stale decaying mouse-burst EWMA doesn't pull Keyboard away from clean `~3–6 ms` Wi-Fi, and lets Keyboard automatically pick/remember whichever `0%`-loss channel has lower latency (`>= 8 ms` advantage) while keeping Mouse strictly on `0%`-loss Mobile until active loss reaches `>= 1.0%`.
+- **Automatic paired Wireless Debugging discovery (`AdbCableBridge`):** Queries `adb mdns services` for already-paired `_adb-tls-connect._tcp` endpoints whenever no debugging session is active (with 60s backoff for unpaired devices), launching the Accessibility-free `144 Hz` Virtual Bridge automatically whenever Developer Options + Wireless Debugging are enabled.
+
+---
+
 # DeskTouch Vision v0.3.67 — Independent Mouse & Keyboard Fast Channels + Zero-Loss Stream Memory
 
 Eliminates keyboard lag on Wi-Fi and stops unnecessary repeated switching between Wi-Fi and Mobile network:

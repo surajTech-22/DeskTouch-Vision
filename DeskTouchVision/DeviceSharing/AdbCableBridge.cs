@@ -29,6 +29,9 @@ internal sealed class AdbCableBridge : IDisposable
     private readonly Dictionary<string, long> _bridgedSerials = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (int Port, string Secret, long LastCheckedMs)> _shellBridges =
         new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _wirelessConnectBackoffUntilMs =
+        new(StringComparer.OrdinalIgnoreCase);
+    private long _lastMdnsScanMs;
     private readonly HashSet<string> _loggedMissingAppSerials = new(StringComparer.Ordinal);
     private readonly object _shellGate = new();
     private (int Port, string Secret)? _currentShellBridge;
@@ -160,6 +163,32 @@ internal sealed class AdbCableBridge : IDisposable
         return result;
     }
 
+    internal static IReadOnlyList<string> ParseMdnsTlsConnectEndpoints(string mdnsOutput)
+    {
+        if (string.IsNullOrWhiteSpace(mdnsOutput))
+            return Array.Empty<string>();
+
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using var reader = new StringReader(mdnsOutput);
+        string? line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            string[] parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 3) continue;
+            if (!parts[1].Contains("_adb-tls-connect._tcp", StringComparison.OrdinalIgnoreCase))
+                continue;
+            string endpoint = parts[^1].Trim();
+            int colon = endpoint.LastIndexOf(':');
+            if (colon <= 0 || colon >= endpoint.Length - 1) continue;
+            if (!int.TryParse(endpoint[(colon + 1)..], out int port) || port is <= 0 or > 65535)
+                continue;
+            if (seen.Add(endpoint))
+                result.Add(endpoint);
+        }
+        return result;
+    }
+
     internal static int ParsePortOutput(string output)
     {
         if (string.IsNullOrWhiteSpace(output)) return 0;
@@ -258,6 +287,12 @@ internal sealed class AdbCableBridge : IDisposable
         var (ok, devicesOut) = await RunAdbAsync(adbPath, token, "devices");
         if (!ok) return;
 
+        if (await TryAutoConnectWirelessDebuggingAsync(adbPath, devicesOut, token))
+        {
+            var (reOk, refreshedOut) = await RunAdbAsync(adbPath, token, "devices");
+            if (reOk) devicesOut = refreshedOut;
+        }
+
         IReadOnlyList<string> wiredSerials = ParseWiredAdbSerials(devicesOut);
         if (wiredSerials.Count > 0)
             ElevateAdbProcesses();
@@ -313,6 +348,50 @@ internal sealed class AdbCableBridge : IDisposable
         await SyncShellInputDaemonsAsync(adbPath, devicesOut, nowMs, token);
         if (wiredBecameReady)
             _onCableBridgeReady?.Invoke();
+    }
+
+    private async Task<bool> TryAutoConnectWirelessDebuggingAsync(
+        string adbPath, string devicesOut, CancellationToken token)
+    {
+        IReadOnlyList<string> connectedSerials = ParseConnectedAdbSerials(devicesOut);
+        if (connectedSerials.Count > 0)
+            return false;
+
+        long nowMs = Environment.TickCount64;
+        if (_lastMdnsScanMs > 0 && nowMs - _lastMdnsScanMs < 9000)
+            return false;
+        _lastMdnsScanMs = nowMs;
+
+        var (mdnsOk, mdnsOut) = await RunAdbAsync(adbPath, token, "mdns", "services");
+        if (!mdnsOk) return false;
+
+        IReadOnlyList<string> endpoints = ParseMdnsTlsConnectEndpoints(mdnsOut);
+        bool anyConnected = false;
+        foreach (string endpoint in endpoints)
+        {
+            if (_wirelessConnectBackoffUntilMs.TryGetValue(endpoint, out long retryAfterMs)
+                && nowMs < retryAfterMs)
+            {
+                continue;
+            }
+            var (connOk, connOut) = await RunAdbAsync(adbPath, token, "connect", endpoint);
+            bool succeeded = connOk &&
+                (connOut.Contains("connected to", StringComparison.OrdinalIgnoreCase) ||
+                 connOut.Contains("already connected", StringComparison.OrdinalIgnoreCase)) &&
+                !connOut.Contains("failed to connect", StringComparison.OrdinalIgnoreCase) &&
+                !connOut.Contains("cannot connect", StringComparison.OrdinalIgnoreCase);
+            if (succeeded)
+            {
+                _wirelessConnectBackoffUntilMs.Remove(endpoint);
+                _log?.Invoke($"Wireless debugging auto-connected ({endpoint}); preparing Virtual Bridge.");
+                anyConnected = true;
+            }
+            else
+            {
+                _wirelessConnectBackoffUntilMs[endpoint] = nowMs + 60000;
+            }
+        }
+        return anyConnected;
     }
 
     private async Task SyncShellInputDaemonsAsync(

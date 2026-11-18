@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.71 — Fix Multi-System Windows Keyboard Scan-Code Corruption (Spacebar / Video Controls)
+
+Fixes Windows-to-Windows ("multi-system") remote keyboard input where keys like Spacebar triggered wrong keys or stopped responding:
+
+- **Preserve hardware scan codes on Windows key relay (`NetworkSessions`, `WinNative`):** Fixes `SendFastControlAndAssignSeq` overwriting `packet.A` (the Windows keyboard `scanCode`, e.g., `57` for Spacebar) with the monotonically increasing `actionSeq` counter when relaying keystrokes to another Windows computer. Windows peers now preserve real `A=scanCode`, `B=extended`, `C=down`, and `D=vk` while carrying `actionSeq` cleanly in `Text`, preventing wrong keys (`Esc`/`Q`/`F`/`M`/`K`) on keystrokes 1–255 and input rejection after 255 keystrokes.
+- **Full Windows UDP `FastUdpOp.ReverseKey` support (`HostSession`):** Adds packed `(vk, scanCode, extended)` handling for `FastUdpOp.ReverseKey` plus dedicated `TryAcceptReverseKeyAction` sequence deduplication in `HostSession` for `>= 0.3.71` Windows peers while keeping immediate legacy compatibility.
+
+---
+
 # DeskTouch Vision v0.3.70 — Modern 4-Tab Mobile App Redesign
 
 Introduces the completely redesigned Android app interface while keeping every `v0.3.69` speed, channel, and security capability intact:

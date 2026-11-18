@@ -2738,6 +2738,18 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         var (_, singleFormatted) = DisplaySettingsForm.FormatLiveLinkDisplay(singleSnap, "English (US)");
         Check(!singleFormatted.Contains("Mouse:") && singleFormatted.Contains("5 GHz wireless"),
             "FormatLiveLinkDisplay must stay concise on single-path connections");
+
+        // Verify v0.3.71: multi-system Windows key relay must preserve hardware scanCode in A across 300+ keystrokes.
+        var spaceKey = new Packet("key", 57, 0, 1, 0x20);
+        var winSpace = ReceiverServer.PrepareReverseControlPacket("Windows", 320, spaceKey);
+        Check(winSpace.A == 57 && winSpace.B == 0 && winSpace.C == 1 && winSpace.D == 0x20 && winSpace.Text == "320",
+            "Windows multi-system key relay must preserve hardware Spacebar scanCode=57 and pass actionSeq in Text");
+        var androidSpace = ReceiverServer.PrepareReverseControlPacket("Android", 320, spaceKey);
+        Check(androidSpace.A == 320 && androidSpace.D == 0x20,
+            "Android key relay must retain actionSeq in A and VK in D");
+        Check(ReceiverServer.SupportsWindowsUdpReverseKey("Windows", "0.3.71") &&
+              !ReceiverServer.SupportsWindowsUdpReverseKey("Windows", "0.3.70"),
+            "SupportsWindowsUdpReverseKey must enable packed scan+vk UDP keys starting at v0.3.71");
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

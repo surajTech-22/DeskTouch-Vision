@@ -1682,12 +1682,30 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return true;
     }
 
+    internal static bool SupportsWindowsUdpReverseKey(string? platform, string? appVersion) =>
+        string.Equals(platform, "Windows", StringComparison.Ordinal) &&
+        Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 71);
+
+    internal static Packet PrepareReverseControlPacket(string? platform, int actionSeq, Packet packet)
+    {
+        if (packet.Type == "key")
+        {
+            return string.Equals(platform, "Android", StringComparison.Ordinal)
+                ? packet with { A = actionSeq }
+                : packet with { Text = actionSeq.ToString(System.Globalization.CultureInfo.InvariantCulture) };
+        }
+        return packet with { C = actionSeq };
+    }
+
     private void SendFastControlAndAssignSeq(Session target, int lease, ref Packet packet)
     {
         if (packet.Type is not ("button" or "wheel" or "key")) return;
         int actionSeq = target.NextReverseActionSeq();
         bool isKey = packet.Type == "key";
-        packet = isKey ? packet with { A = actionSeq } : packet with { C = actionSeq };
+        bool targetIsAndroid = string.Equals(target.Peer.Platform, "Android", StringComparison.Ordinal);
+        packet = PrepareReverseControlPacket(target.Peer.Platform, actionSeq, packet);
+        if (isKey && !targetIsAndroid && !SupportsWindowsUdpReverseKey(target.Peer.Platform, target.Peer.AppVersion))
+            return;
         var activeUdp = isKey ? ActiveKeyboardUdpPeer(target) : ActiveMouseUdpPeer(target);
         if (_udpHub == null || activeUdp is not { Confirmed: true } || lease <= 0)
             return;
@@ -1698,7 +1716,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             "wheel" => FastUdpOp.ReverseWheel,
             _ => FastUdpOp.ReverseKey
         };
-        int udpA = isKey ? packet.D : packet.A;
+        int udpA = isKey
+            ? (targetIsAndroid
+                ? packet.D
+                : ((packet.D & 0xFF) | ((packet.A & 0xFF) << 8) | ((packet.B != 0 ? 1 : 0) << 16)))
+            : packet.A;
         int udpB = isKey ? (packet.C != 0 ? 1 : 0) : packet.B;
         _udpHub.Send(activeUdp, op, udpA, udpB, lease, actionSeq);
         bool dualControls = Volatile.Read(ref target.DualPathControls) != 0;
@@ -3935,6 +3957,8 @@ internal sealed class HostSession : IInputSession, IDisposable
     private int _reverseHighestActionSeq;
     private long _reverseSeenActionMask;
     private int _reverseLastButtonSeq;
+    private int _reverseHighestKeySeq;
+    private long _reverseSeenKeyMask;
     MonitorTopology IInputSession.RemoteMonitors => RemoteMonitors;
     bool IInputSession.TrySend(Packet packet) => TrySend(packet);
 
@@ -4042,6 +4066,39 @@ internal sealed class HostSession : IInputSession, IDisposable
             _reverseHighestActionSeq = 0;
             _reverseSeenActionMask = 0;
             _reverseLastButtonSeq = 0;
+            _reverseHighestKeySeq = 0;
+            _reverseSeenKeyMask = 0;
+            return true;
+        }
+    }
+
+    private bool TryAcceptReverseKeyAction(int seq)
+    {
+        if (seq <= 0) return true;
+        lock (_reverseDedupLock)
+        {
+            if (_reverseHighestKeySeq == 0)
+            {
+                _reverseHighestKeySeq = seq;
+                _reverseSeenKeyMask = 1L;
+            }
+            else
+            {
+                int diff = seq - _reverseHighestKeySeq;
+                if (diff > 0)
+                {
+                    _reverseSeenKeyMask = diff >= 64 ? 1L : ((_reverseSeenKeyMask << diff) | 1L);
+                    _reverseHighestKeySeq = seq;
+                }
+                else
+                {
+                    int back = -diff;
+                    if (back >= 64) return false;
+                    long bit = 1L << back;
+                    if ((_reverseSeenKeyMask & bit) != 0L) return false;
+                    _reverseSeenKeyMask |= bit;
+                }
+            }
             return true;
         }
     }
@@ -4112,6 +4169,11 @@ internal sealed class HostSession : IInputSession, IDisposable
             _reversePriority?.CanApplyRemote != true) return;
         if (request.Type is "button" or "wheel" &&
             !TryAcceptReverseControlAction(request.C, request.Type == "button"))
+            return;
+        if (request.Type == "key" &&
+            int.TryParse(request.Text, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int keySeq) &&
+            !TryAcceptReverseKeyAction(keySeq))
             return;
         int active = Volatile.Read(ref _reverseLease);
         bool cursorApplied = false;
@@ -4925,6 +4987,21 @@ internal sealed class HostSession : IInputSession, IDisposable
                     int active = Volatile.Read(ref _reverseLease);
                     if (active > 0 && msg.Lease == active)
                         ProcessReverseInput(new Packet("reverse-wheel", msg.A, msg.B, C: msg.TimestampMs));
+                }
+                else if (msg.Op == FastUdpOp.ReverseKey)
+                {
+                    int active = Volatile.Read(ref _reverseLease);
+                    if (active > 0 && msg.Lease == active)
+                    {
+                        int vk = msg.A & 0xFF;
+                        int scan = (msg.A >> 8) & 0xFF;
+                        int ext = (msg.A >> 16) & 1;
+                        int down = msg.B != 0 ? 1 : 0;
+                        ProcessReverseInput(new Packet("reverse-key", scan, ext, down, vk,
+                            Text: msg.TimestampMs > 0
+                                ? msg.TimestampMs.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                                : null));
+                    }
                 }
             };
             Interlocked.Exchange(ref _highResTimer, Win.EnterHighResolutionTimer())?.Dispose();

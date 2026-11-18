@@ -47,7 +47,12 @@ internal sealed record PeerHello(string Name, string Layout,
 // Id is a connection-scoped route identifier, not a device identity or trust proof.
 internal sealed record EnvironmentMember(int Id, string Name, string Platform,
     string Layout, bool SupportsReverseInput, string? StableIdentity=null,
-    int NotificationCount = -1);
+    int NotificationCount = -1,
+    int ArrangementOrder = -1,
+    double LayoutX = 0,
+    double LayoutY = 0,
+    double LayoutW = 0,
+    double LayoutH = 0);
 internal sealed record EnvironmentPosition(string Key,float X,float Y)
 {
     internal static bool Valid(EnvironmentPosition? p) =>
@@ -477,6 +482,133 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private int _nextVirtualSubId = 10000;
     private int _selectedVirtualSubId;
     private (EnvironmentMember[] Members, int OwnId)? _upstreamRosterOverlay;
+    private readonly object _spatialGate = new();
+    private Dictionary<string, NormalizedSpatialBox> _environmentSpatialLayout = new(StringComparer.OrdinalIgnoreCase);
+    private volatile string _customPairingCode = "";
+    private readonly object _customPairAttemptLock = new();
+    private long _customPairWindowStartTicks;
+    private int _customPairFailedAttempts;
+
+    internal void SetCustomPairingCode(string? code) =>
+        _customPairingCode = PairingCodeHelper.NormalizeCustomCode(code);
+
+    internal bool TryVerifyCustomPairingCode(string? got)
+    {
+        string expected = _customPairingCode;
+        string actual = PairingCodeHelper.NormalizeCustomCode(got);
+        if (expected.Length == 0 || actual.Length == 0)
+            return false;
+        long now = Environment.TickCount64;
+        lock (_customPairAttemptLock)
+        {
+            if (now - _customPairWindowStartTicks > 30000)
+            {
+                _customPairWindowStartTicks = now;
+                _customPairFailedAttempts = 0;
+            }
+            if (_customPairFailedAttempts >= 6)
+                return false;
+            bool match = CryptographicOperations.FixedTimeEquals(
+                System.Text.Encoding.UTF8.GetBytes(actual),
+                System.Text.Encoding.UTF8.GetBytes(expected));
+            if (!match)
+            {
+                _customPairFailedAttempts++;
+                return false;
+            }
+            _customPairFailedAttempts = 0;
+            return true;
+        }
+    }
+
+    internal void SetEnvironmentSpatialLayout(
+        IReadOnlyDictionary<string, NormalizedSpatialBox> spatialByIdentity)
+    {
+        bool changed = false;
+        lock (_spatialGate)
+        {
+            if (spatialByIdentity.Count != _environmentSpatialLayout.Count)
+            {
+                changed = true;
+            }
+            else
+            {
+                foreach (var kv in spatialByIdentity)
+                {
+                    if (!_environmentSpatialLayout.TryGetValue(kv.Key, out var existing) ||
+                        existing != kv.Value)
+                    {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (changed)
+                _environmentSpatialLayout = new Dictionary<string, NormalizedSpatialBox>(
+                    spatialByIdentity, StringComparer.OrdinalIgnoreCase);
+        }
+        if (changed && _sessions.Count > 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await PublishEnvironmentAsync(_cancel.Token); }
+                catch (Exception) { }
+            });
+        }
+    }
+
+    private List<EnvironmentMember> ApplyAndOrderSpatialMembers(List<EnvironmentMember> members)
+    {
+        Dictionary<string, NormalizedSpatialBox> snapshot;
+        lock (_spatialGate)
+            snapshot = _environmentSpatialLayout;
+        if (snapshot.Count == 0)
+            return members;
+
+        var decorated = new List<(EnvironmentMember Member, int Index, int Order)>(members.Count);
+        for (int i = 0; i < members.Count; i++)
+        {
+            var m = members[i];
+            NormalizedSpatialBox box = default;
+            bool matched = false;
+            if (!string.IsNullOrWhiteSpace(m.StableIdentity) &&
+                snapshot.TryGetValue(m.StableIdentity, out box))
+            {
+                matched = true;
+            }
+            else if (m.Id == 0 && snapshot.TryGetValue("LOCAL", out box))
+            {
+                matched = true;
+            }
+            else if (snapshot.TryGetValue(m.Platform + "|" + m.Name, out box))
+            {
+                matched = true;
+            }
+
+            if (matched)
+            {
+                m = m with
+                {
+                    ArrangementOrder = box.Order,
+                    LayoutX = box.X,
+                    LayoutY = box.Y,
+                    LayoutW = box.W,
+                    LayoutH = box.H
+                };
+                decorated.Add((m, i, box.Order));
+            }
+            else
+            {
+                decorated.Add((m, i, int.MaxValue - 1000 + i));
+            }
+        }
+
+        return decorated
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.Index)
+            .Select(x => x.Member)
+            .ToList();
+    }
 
     internal event Action<string, int>? HubYieldRequested;
     internal IReadOnlyList<(int VirtualId, ConnectedPeer Peer, int BridgeSessionId)> BridgedPeers
@@ -1932,6 +2064,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _environmentPositions.Remove(legacy);
             }
         }
+        members = ApplyAndOrderSpatialMembers(members);
         string payload = JsonSerializer.Serialize(members);
         if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
         {
@@ -1967,6 +2100,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         continue;
                     combined.Add(up with { Id = ++extraId, SupportsReverseInput = false });
                 }
+                combined = ApplyAndOrderSpatialMembers(combined);
                 string candidate = JsonSerializer.Serialize(combined);
                 if (System.Text.Encoding.UTF8.GetByteCount(candidate) <= 7800)
                     sendPayload = candidate;
@@ -2629,7 +2763,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return;
         }
         bool approved=trustedSource!=null ||
-            (request.Type=="auth" && ConstantTimeSecret(request.Text,Secret));
+            (request.Type=="auth" && (
+                ConstantTimeSecret(request.Text,Secret) ||
+                TryVerifyCustomPairingCode(request.Text)));
         if (!approved && request.Type=="auth-request" && _requestApproval!=null)
         {
             using var approvalLimit = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -4622,8 +4758,9 @@ internal sealed class HostSession : IInputSession, IDisposable
         secret = secret.Trim().ToUpperInvariant();
         if (pinnedFingerprint.Length != 64 || !pinnedFingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("Enter the receiver's complete 64-digit SHA-256 fingerprint.");
-        if (!askReceiver && (secret.Length != (trustedConnection ? 64 : 32) ||
-            !secret.All(Uri.IsHexDigit)))
+        bool validFixedSecret = secret.Length == (trustedConnection ? 64 : 32) && secret.All(Uri.IsHexDigit);
+        bool validCustomCode = !trustedConnection && !string.IsNullOrEmpty(PairingCodeHelper.NormalizeCustomCode(secret));
+        if (!askReceiver && !validFixedSecret && !validCustomCode)
             throw new ArgumentException("Invalid authenticated pairing credential.");
         if (!IPAddress.TryParse(ip.Trim(), out var address) ||
             address.AddressFamily != AddressFamily.InterNetwork)

@@ -142,13 +142,22 @@ final class DeskTouchSession implements AutoCloseable {
         final String name,platform,layout;
         final boolean supportsInput;
         final int notificationCount;
+        final int arrangementOrder;
+        final double layoutX,layoutY,layoutW,layoutH;
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled){
-            this(id,name,platform,layout,enabled,-1);
+            this(id,name,platform,layout,enabled,-1,-1,0,0,0,0);
         }
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,int notificationCount){
+            this(id,name,platform,layout,enabled,notificationCount,-1,0,0,0,0);
+        }
+        EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,
+                int notificationCount,int arrangementOrder,
+                double layoutX,double layoutY,double layoutW,double layoutH){
             this.id=id;this.name=name;this.platform=platform;
             this.layout=layout;this.supportsInput=enabled;
             this.notificationCount=notificationCount;
+            this.arrangementOrder=arrangementOrder;
+            this.layoutX=layoutX;this.layoutY=layoutY;this.layoutW=layoutW;this.layoutH=layoutH;
         }
         @Override public String toString(){
             String base=platform+" • "+name+(supportsInput?"":" (view only)");
@@ -535,7 +544,44 @@ final class DeskTouchSession implements AutoCloseable {
         }
         selectedEnvironmentId=id;
         send(new Packet("environment-select",id));
+        DeskTouchRuntime.notifyLiveStatusChanged();
         status("Selected "+selected.name+" in the same environment.");
+    }
+
+    int activeMonitorIndex(){
+        synchronized(monitors){
+            if(monitors.isEmpty()) return -1;
+            for(int i=0;i<monitors.size();i++){
+                int[] m=monitors.get(i);
+                if(cursorX>=m[0] && cursorX<m[0]+m[2] && cursorY>=m[1] && cursorY<m[1]+m[3])
+                    return i;
+            }
+            return 0;
+        }
+    }
+
+    void focusMonitor(int monitorIndex){
+        int tx, ty;
+        boolean sendMove;
+        int lease;
+        synchronized(monitors){
+            if(monitorIndex<0 || monitorIndex>=monitors.size()) return;
+            int[] m=monitors.get(monitorIndex);
+            cursorX=m[0]+m[2]/2;
+            cursorY=m[1]+m[3]/2;
+            tx=cursorX; ty=cursorY;
+            sendMove=active;
+            lease=claim;
+        }
+        if(sendMove){
+            FastUdpChannel ch=activeForwardUdp(false);
+            if(ch!=null && lease>0 && !udpPacer.isShutdown()){
+                udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,lease,(int)SystemClock.uptimeMillis()));
+            }else{
+                send(new Packet("move",tx,ty));
+            }
+        }
+        DeskTouchRuntime.notifyLiveStatusChanged();
     }
 
     private void acceptEnvironmentRoster(Packet packet){
@@ -556,7 +602,12 @@ final class DeskTouchSession implements AutoCloseable {
                 if(new JSONArray(layout).length()==0)return;
                 members.add(new EnvironmentTarget(id,name,platform,layout,
                     m.optBoolean("SupportsReverseInput",false),
-                    m.optInt("NotificationCount",-1)));
+                    m.optInt("NotificationCount",-1),
+                    m.optInt("ArrangementOrder",-1),
+                    m.optDouble("LayoutX",0.0),
+                    m.optDouble("LayoutY",0.0),
+                    m.optDouble("LayoutW",0.0),
+                    m.optDouble("LayoutH",0.0)));
             }
             if(!ids.contains(0))return;
             environmentOwnId=packet.a;
@@ -591,6 +642,15 @@ final class DeskTouchSession implements AutoCloseable {
     void connect(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
             boolean interactiveUser,android.net.Network networkOverride,boolean cellular,
             Runnable onConnected,Runnable onFailure) {
+        connectInternal(device,androidWidth,androidHeight,interactiveUser,networkOverride,cellular,null,onConnected,onFailure);
+    }
+    void connectWithPairingCode(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
+            String pairingSecret,Runnable onFailure) {
+        connectInternal(device,androidWidth,androidHeight,true,null,false,pairingSecret,null,onFailure);
+    }
+    private void connectInternal(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
+            boolean interactiveUser,android.net.Network networkOverride,boolean cellular,
+            String pairingSecret,Runnable onConnected,Runnable onFailure) {
         sender.execute(()->{
             if(running || connecting) {status("Already connected or connecting");return;}
             connecting=true;
@@ -627,8 +687,15 @@ final class DeskTouchSession implements AutoCloseable {
                     ssl.startHandshake();
                     in=new DataInputStream(new BufferedInputStream(ssl.getInputStream()));
                     out=new DataOutputStream(ssl.getOutputStream());
-                    new Packet(tryTrusted?"auth-trusted":"auth-request",0,0,0,0,
-                        tryTrusted?saved:PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL)).write(out);
+                    String cleanPairingCode=LinkedDisplayHelper.normalizeCustomPairingCode(pairingSecret);
+                    boolean useCustomCode=!tryTrusted && !cleanPairingCode.isEmpty();
+                    String packetType=tryTrusted ? "auth-trusted" : (useCustomCode ? "auth" : "auth-request");
+                    String packetPayload=tryTrusted
+                        ? saved
+                        : (useCustomCode
+                            ? cleanPairingCode
+                            : PhoneScreenGeometry.cleanDeviceName(Build.MANUFACTURER,Build.MODEL));
+                    new Packet(packetType,0,0,0,0,packetPayload).write(out);
                     ready=Packet.read(in);
                     if(ready!=null && "ready".equals(ready.type)) break;
                     try { ssl.close(); } catch (Exception ignored) {}
@@ -811,6 +878,9 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                 } else if("environment-roster".equals(p.type)){
                     acceptEnvironmentRoster(p);
+                } else if("environment-selected".equals(p.type)){
+                    selectedEnvironmentId=p.a;
+                    DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("environment-unavailable".equals(p.type)){
                     status("Environment member went offline. Select another device.");
                     if(selectedEnvironmentId==p.a){

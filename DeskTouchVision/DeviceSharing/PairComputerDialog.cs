@@ -21,8 +21,8 @@ internal sealed class PairComputerDialog : Form
         Font = new Font("Segoe UI", 11), BackColor = Color.White };
     private readonly TextBox _manual = new() { Dock = DockStyle.Fill,
         Multiline = true, ScrollBars = ScrollBars.Vertical,
-        Font = new Font("Consolas", 9), BorderStyle = BorderStyle.FixedSingle,
-        PlaceholderText = "Paste a pairing code when this PC is not discovered" };
+        Font = new Font("Consolas", 9.5f), BorderStyle = BorderStyle.FixedSingle,
+        PlaceholderText = "Enter custom pairing code or paste full DT1 link" };
     private readonly Label _discoveryStatus = new() { Dock = DockStyle.Fill,
         ForeColor = Color.FromArgb(85, 89, 94), AutoEllipsis = true };
     private readonly Label _error = new() { Dock = DockStyle.Bottom, Height = 32,
@@ -146,25 +146,92 @@ internal sealed class PairComputerDialog : Form
         }
     }
 
+    internal static NearbyComputer? FindPeerByCode(
+        IEnumerable<NearbyComputer> peers,
+        string rawCode,
+        out bool matchedCustomTag)
+    {
+        matchedCustomTag = false;
+        string normalized = PairingCodeHelper.NormalizeCustomCode(rawCode);
+        if (normalized.Length == 0)
+            return null;
+
+        var candidates = peers.Where(p => !p.IsAndroid).ToArray();
+        foreach (var peer in candidates)
+        {
+            string expectedTag = PairingCodeHelper.ComputeDiscoveryTag(peer.Fingerprint, normalized);
+            if (!string.IsNullOrEmpty(expectedTag) &&
+                string.Equals(peer.PairingTag, expectedTag, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedCustomTag = true;
+                return peer;
+            }
+        }
+
+        if (normalized.Length >= 6 && normalized.All(Uri.IsHexDigit))
+        {
+            var hexMatches = candidates
+                .Where(p => p.Fingerprint.StartsWith(normalized, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (hexMatches.Length == 1)
+                return hexMatches[0];
+        }
+        return null;
+    }
+
     private void AcceptSelection()
     {
-        if (!string.IsNullOrWhiteSpace(_manual.Text))
+        string manual = _manual.Text.Trim();
+        if (!string.IsNullOrWhiteSpace(manual))
         {
-            var parts = _manual.Text.Trim().Split('|');
-            if (parts.Length != 4 || parts[0].Trim() != "DT1" ||
-                !IPAddress.TryParse(parts[1].Trim(), out var address) ||
-                address.AddressFamily != AddressFamily.InterNetwork ||
-                parts[2].Trim().Length != 64 || !parts[2].Trim().All(Uri.IsHexDigit) ||
-                parts[3].Trim().Length != 32 || !parts[3].Trim().All(Uri.IsHexDigit))
+            if (manual.Contains('|'))
             {
-                _error.Text = "Invalid pairing code. Copy the complete code from the other PC.";
-                return;
+                var parts = manual.Split('|');
+                if (parts.Length != 4 || parts[0].Trim() != "DT1" ||
+                    !IPAddress.TryParse(parts[1].Trim(), out var address) ||
+                    address.AddressFamily != AddressFamily.InterNetwork ||
+                    parts[2].Trim().Length != 64 || !parts[2].Trim().All(Uri.IsHexDigit) ||
+                    parts[3].Trim().Length != 32 || !parts[3].Trim().All(Uri.IsHexDigit))
+                {
+                    _error.Text = "Invalid pairing link. Copy the full link or enter a pairing code.";
+                    return;
+                }
+                Address = address.ToString();
+                Fingerprint = parts[2].Trim().ToUpperInvariant();
+                Secret = parts[3].Trim().ToUpperInvariant();
+                ComputerName = Address;
+                UseRemoteApproval = false;
             }
-            Address = address.ToString();
-            Fingerprint = parts[2].Trim().ToUpperInvariant();
-            Secret = parts[3].Trim().ToUpperInvariant();
-            ComputerName = Address;
-            UseRemoteApproval = false;
+            else
+            {
+                var codeMatched = FindPeerByCode(
+                    _nearby.Items.Cast<NearbyItem>().Select(x => x.Peer),
+                    manual,
+                    out bool matchedCustomTag);
+                if (codeMatched == null)
+                {
+                    _error.Text = "No discovered computer matched that pairing code. Click Scan devices first, or paste the full DT1 link.";
+                    return;
+                }
+                if (!codeMatched.CanReceive)
+                {
+                    _error.Text = "That Windows endpoint is at capacity. The existing environment stays connected.";
+                    return;
+                }
+                Address = codeMatched.Address;
+                Fingerprint = codeMatched.Fingerprint;
+                ComputerName = codeMatched.Name;
+                if (matchedCustomTag)
+                {
+                    Secret = PairingCodeHelper.NormalizeCustomCode(manual);
+                    UseRemoteApproval = false;
+                }
+                else
+                {
+                    Secret = "";
+                    UseRemoteApproval = true;
+                }
+            }
         }
         else if (_nearby.SelectedItem is NearbyItem selected)
         {

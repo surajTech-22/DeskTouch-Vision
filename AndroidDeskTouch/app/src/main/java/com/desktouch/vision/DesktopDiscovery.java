@@ -13,6 +13,7 @@ final class DesktopDiscovery {
         String groupId;
         boolean isHub;
         int hubMemberCount = 1;
+        String pairingTag;
         Device(String n,String a,String f,boolean ready,boolean android) {
             this(n,a,f,ready,android,false);
         }
@@ -123,6 +124,13 @@ final class DesktopDiscovery {
         return id.matches("[A-Fa-f0-9]{64}") ? id.toUpperCase(Locale.ROOT) : null;
     }
 
+    static String[] parsePairTagHint(String message) {
+        if(message==null || !message.startsWith("DT1-PAIR|")) return null;
+        String[] parts=message.trim().split("\\|",-1);
+        if(parts.length!=3 || !parts[1].matches("[A-Fa-f0-9]{64}") || !parts[2].matches("[A-Fa-f0-9]{24}")) return null;
+        return new String[]{parts[1].toUpperCase(Locale.ROOT), parts[2].toUpperCase(Locale.ROOT)};
+    }
+
     static String[] parseHubCountHint(String message) {
         if(message==null || !message.startsWith("DT1-HUBCOUNT|")) return null;
         String[] parts=message.trim().split("\\|",-1);
@@ -214,6 +222,8 @@ final class DesktopDiscovery {
         Device primary=null;
         String hubFingerprint=null;
         int hubCountVal=1;
+        String pairFp=null;
+        String pairTagVal=null;
         for(String raw:lines) {
             if(raw==null) continue;
             String message=raw.trim();
@@ -230,6 +240,12 @@ final class DesktopDiscovery {
                 hubCountVal=Math.max(1,Integer.parseInt(hc[1]));
                 continue;
             }
+            String[] pt=parsePairTagHint(message);
+            if(pt!=null) {
+                pairFp=pt[0];
+                pairTagVal=pt[1];
+                continue;
+            }
             if(primary==null) {
                 Device parsed=parse(message,"127.0.0.1");
                 if(parsed!=null && !parsed.android)
@@ -240,6 +256,9 @@ final class DesktopDiscovery {
         if(primary!=null && primary.fingerprint.equals(hubFingerprint)) {
             primary.isHub=hubCountVal>=2;
             primary.hubMemberCount=hubCountVal;
+        }
+        if(primary!=null && primary.fingerprint.equals(pairFp)) {
+            primary.pairingTag=pairTagVal;
         }
         return primary;
     }
@@ -261,6 +280,7 @@ final class DesktopDiscovery {
         Map<String,String> sourceIpByFingerprint=new HashMap<>();
         List<String[]> pendingLinks=new ArrayList<>();
         List<String[]> hubHints=new ArrayList<>();
+        List<String[]> pairHints=new ArrayList<>();
         // The local phone's beacon is for Windows, not a remote Android peer.
         String ownAndroidIdentity=null;
         try {ownAndroidIdentity=MobileDiscoveryResponder.mobileFingerprint();}
@@ -325,6 +345,11 @@ final class DesktopDiscovery {
                     hubHints.add(new String[]{hubCount[0],ip,hubCount[1]});
                     continue;
                 }
+                String[] pairTag=parsePairTagHint(message);
+                if(pairTag!=null){
+                    pairHints.add(new String[]{pairTag[0],ip,pairTag[1]});
+                    continue;
+                }
                 if(message.startsWith("DT1-LINK|")){
                     String[] link=message.split("\\|",-1);
                     if(link.length==3&&link[1].matches("[A-Fa-f0-9]{64}")&&
@@ -362,7 +387,7 @@ final class DesktopDiscovery {
         applyConnectedGroups(found,verifiedLinks);
         // A plain UDP claim cannot grant trust. Only associate the hub role
         // with a device which also announced its fingerprint from this IP.
-        for(Device device:found)if(!device.android)
+        for(Device device:found)if(!device.android){
             for(String[] hint:hubHints)
                 if(hint[0].equals(device.fingerprint)&&
                     hint[1].equals(sourceIpByFingerprint.get(device.fingerprint))) {
@@ -370,6 +395,12 @@ final class DesktopDiscovery {
                     if(cnt>=2) device.isHub=true;
                     device.hubMemberCount=Math.max(device.hubMemberCount,cnt);
                 }
+            for(String[] ph:pairHints)
+                if(ph[0].equals(device.fingerprint)&&
+                    ph[1].equals(sourceIpByFingerprint.get(device.fingerprint))) {
+                    device.pairingTag=ph[2];
+                }
+        }
         found.sort(Comparator.comparing((Device d)->d.android)
             .thenComparing(d->d.groupId,String.CASE_INSENSITIVE_ORDER)
             .thenComparing(d->d.name,String.CASE_INSENSITIVE_ORDER));

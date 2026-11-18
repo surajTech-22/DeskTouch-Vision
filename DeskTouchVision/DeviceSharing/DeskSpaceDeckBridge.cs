@@ -5,6 +5,13 @@ using System.Text.Json;
 
 namespace DeskTouch.DeviceShare;
 
+internal readonly record struct NormalizedSpatialBox(
+    int Order,
+    double X,
+    double Y,
+    double W,
+    double H);
+
 internal sealed record BridgeDeviceItemDto(
     int Id,
     string Name,
@@ -141,26 +148,27 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())));
     }
 
-    internal static IReadOnlyList<BridgeDeviceItemDto> NormalizeAndOrderDevices(
-        IReadOnlyList<BridgeDeviceItemDto> raw,
-        IReadOnlyDictionary<int, System.Drawing.RectangleF> arrangedBounds)
+    internal static Dictionary<TKey, NormalizedSpatialBox> ComputeNormalizedLayout<TItem, TKey>(
+        IReadOnlyList<TItem> items,
+        Func<TItem, TKey> keySelector,
+        Func<TItem, System.Drawing.RectangleF?> boundsSelector)
+        where TKey : notnull
     {
-        if (raw.Count == 0) return raw;
-        if (arrangedBounds.Count == 0)
-        {
-            return raw.Select((d, idx) => d with { ArrangementOrder = idx }).ToArray();
-        }
-        var ordered = DisplayArrangementControl.SortBySpatialArrangement(
-            raw, d => arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0 ? r : null);
+        var result = new Dictionary<TKey, NormalizedSpatialBox>();
+        if (items.Count == 0) return result;
 
+        var ordered = DisplayArrangementControl.SortBySpatialArrangement(items, boundsSelector);
         var matchedRects = ordered
-            .Select(d => arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0 ? (System.Drawing.RectangleF?)r : null)
-            .Where(r => r.HasValue)
+            .Select(boundsSelector)
+            .Where(r => r.HasValue && r.Value.Width > 0 && r.Value.Height > 0)
             .Select(r => r!.Value)
             .ToArray();
+
         if (matchedRects.Length == 0)
         {
-            return ordered.Select((d, idx) => d with { ArrangementOrder = idx }).ToArray();
+            for (int i = 0; i < ordered.Count; i++)
+                result[keySelector(ordered[i])] = new NormalizedSpatialBox(i, 0, 0, 0, 0);
+            return result;
         }
 
         float minX = matchedRects.Min(r => r.Left);
@@ -170,27 +178,55 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
         double spanW = Math.Max(1.0, maxX - minX);
         double spanH = Math.Max(1.0, maxY - minY);
 
-        var result = new BridgeDeviceItemDto[ordered.Count];
         for (int i = 0; i < ordered.Count; i++)
         {
-            var d = ordered[i];
-            if (arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0)
+            var r = boundsSelector(ordered[i]);
+            if (r is { Width: > 0, Height: > 0 } rect)
             {
-                result[i] = d with
-                {
-                    LayoutX = Math.Round((r.Left - minX) / spanW, 4),
-                    LayoutY = Math.Round((r.Top - minY) / spanH, 4),
-                    LayoutW = Math.Round(r.Width / spanW, 4),
-                    LayoutH = Math.Round(r.Height / spanH, 4),
-                    ArrangementOrder = i
-                };
+                result[keySelector(ordered[i])] = new NormalizedSpatialBox(
+                    i,
+                    Math.Round((rect.Left - minX) / spanW, 4),
+                    Math.Round((rect.Top - minY) / spanH, 4),
+                    Math.Round(rect.Width / spanW, 4),
+                    Math.Round(rect.Height / spanH, 4));
             }
             else
             {
-                result[i] = d with { ArrangementOrder = i };
+                result[keySelector(ordered[i])] = new NormalizedSpatialBox(i, 0, 0, 0, 0);
             }
         }
         return result;
+    }
+
+    internal static IReadOnlyList<BridgeDeviceItemDto> NormalizeAndOrderDevices(
+        IReadOnlyList<BridgeDeviceItemDto> raw,
+        IReadOnlyDictionary<int, System.Drawing.RectangleF> arrangedBounds)
+    {
+        if (raw.Count == 0) return raw;
+        if (arrangedBounds.Count == 0)
+        {
+            return raw.Select((d, idx) => d with { ArrangementOrder = idx }).ToArray();
+        }
+        var layout = ComputeNormalizedLayout(
+            raw,
+            d => d.Id,
+            d => arrangedBounds.TryGetValue(d.Id, out var r) && r.Width > 0 && r.Height > 0 ? r : null);
+        return raw
+            .Select(d =>
+            {
+                if (!layout.TryGetValue(d.Id, out var b))
+                    return d;
+                return d with
+                {
+                    ArrangementOrder = b.Order,
+                    LayoutX = b.X,
+                    LayoutY = b.Y,
+                    LayoutW = b.W,
+                    LayoutH = b.H
+                };
+            })
+            .OrderBy(d => d.ArrangementOrder)
+            .ToArray();
     }
 
     internal BridgeDeviceSnapshotDto CurrentSnapshot

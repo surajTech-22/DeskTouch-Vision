@@ -1511,5 +1511,53 @@ public final class ProtocolSourceTest {
             found, matched, java.util.Collections.emptySet(), java.util.Collections.emptySet());
         assertNotNull(gateway);
         assertEquals(fpHub, gateway.fingerprint);
+
+        // Verify v0.3.76 spatial Linked Displays sorting, Trackpad PC taskbar filtering, and custom pairing tags.
+        DeskTouchSession.EnvironmentTarget hubTarget = new DeskTouchSession.EnvironmentTarget(
+            0, "DESKTOP-IQ1KSJ9", "Windows", hubLayout, true, 3, 1, 0.32, 0.10, 0.45, 0.40);
+        DeskTouchSession.EnvironmentTarget leftTarget = new DeskTouchSession.EnvironmentTarget(
+            2, "SURAJ", "Windows", multiLayout, true, 3, 0, 0.0, 0.10, 0.30, 0.40);
+        DeskTouchSession.EnvironmentTarget phoneTarget = new DeskTouchSession.EnvironmentTarget(
+            3, "Xiaomi 22041216I", "Android", phoneLayout, true, -1, 2, 0.80, 0.0, 0.18, 0.85);
+        java.util.List<DeskTouchSession.EnvironmentTarget> unsorted =
+            java.util.Arrays.asList(hubTarget, leftTarget, phoneTarget);
+        java.util.List<DeskTouchSession.EnvironmentTarget> sorted =
+            LinkedDisplayHelper.sortTargetsSpatially(unsorted);
+        assertEquals(2, sorted.get(0).id);
+        assertEquals(0, sorted.get(1).id);
+        assertEquals(3, sorted.get(2).id);
+
+        java.util.List<java.util.List<DeskTouchSession.EnvironmentTarget>> rows =
+            LinkedDisplayHelper.groupTargetsIntoRows(sorted);
+        assertEquals(1, rows.size());
+        assertEquals(3, rows.get(0).size());
+
+        DeskTouchSession.EnvironmentTarget topPc = new DeskTouchSession.EnvironmentTarget(
+            2, "SURAJ", "Windows", multiLayout, true, 1, 0, 0.0, 0.0, 0.45, 0.35);
+        DeskTouchSession.EnvironmentTarget bottomHub = new DeskTouchSession.EnvironmentTarget(
+            0, "DESKTOP-IQ1KSJ9", "Windows", hubLayout, true, 2, 1, 0.0, 0.55, 0.45, 0.35);
+        java.util.List<java.util.List<DeskTouchSession.EnvironmentTarget>> stackedRows =
+            LinkedDisplayHelper.groupTargetsIntoRows(
+                LinkedDisplayHelper.sortTargetsSpatially(java.util.Arrays.asList(bottomHub, topPc)));
+        assertEquals(2, stackedRows.size());
+        assertEquals(2, stackedRows.get(0).get(0).id);
+        assertEquals(0, stackedRows.get(1).get(0).id);
+
+        java.util.List<LinkedDisplayHelper.DisplayTileModel> trackpadPcs =
+            LinkedDisplayHelper.buildTrackpadPcTiles(sorted, 0, 3);
+        assertEquals(2, trackpadPcs.size());
+        assertEquals(2, trackpadPcs.get(0).id);
+        assertEquals(0, trackpadPcs.get(1).id);
+
+        assertEquals("SURAJ-99", LinkedDisplayHelper.normalizeCustomPairingCode(" suraj-99 "));
+        assertEquals("", LinkedDisplayHelper.normalizeCustomPairingCode("bad|code"));
+        String expectedTag = LinkedDisplayHelper.computePairingTag(fpMember, "SURAJ-99");
+        assertEquals(24, expectedTag.length());
+        String[] parsedHint = DesktopDiscovery.parsePairTagHint("DT1-PAIR|" + fpMember + "|" + expectedTag);
+        assertNotNull(parsedHint);
+        dMember.pairingTag = parsedHint[1];
+        DesktopDiscovery.Device customMatched = LinkedDisplayHelper.findDeviceByPairingCode(found, "suraj-99");
+        assertNotNull(customMatched);
+        assertEquals(fpMember, customMatched.fingerprint);
     }
 }

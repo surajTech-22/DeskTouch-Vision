@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.76 — Ordered Mobile Linked Displays, Dedicated Trackpad PC & Screen Taskbar, and Editable Windows Pairing Code
+
+- **Ordered `Linked Displays` on Android (`NetworkSessions`, `DisplaySettingsForm`, `DeskTouchSession`, `LinkedDisplayHelper`, `MainActivity`):** Synchronizes arranged device order and normalized 2D layout coordinates over the environment roster so Android Home `Linked Displays` matches the exact Left/Center/Right and stacked Windows display arrangement, with 1-tap switching synced across tabs.
+- **Dedicated PC & Screen Selection Taskbar in Android `Trackpad` (`MainActivity`, `DeskTouchSession`, `LinkedDisplayHelper`):** Adds a scrollable `PC & Screen Taskbar` directly inside the `Trackpad` control card so users can switch between connected computers or jump between individual monitors (`Display 1`, `Display 2`, etc.) directly from the Trackpad panel.
+- **Visible & editable Pairing Code on Windows (`PairingCodeHelper`, `DisplaySettingsForm`, `PairComputerDialog`, `NearbyComputerDiscovery`, `NetworkSessions`, `DesktopDiscovery`):** Displays the active pairing code in an editable field right on the Windows Displays window (`Set code`, `Copy code`, `Copy full link`), broadcasts only a one-way salted SHA-256 discovery tag (`DT1-PAIR`) over LAN/cable, and supports direct custom-code lookup and rate-limited pinned TLS pairing from both Android and Windows.
+
+---
+
 # DeskTouch Vision v0.3.75 — Exact App Display Arrangement Order, Fast Background Update Cleanup & Live Bridge Coords
 
 - **Spatial display placement & order published to Deck and Tray (`DisplayArrangementControl`, `DeskSpaceDeckBridge`, `DisplaySettingsForm`):** Orders all connected devices by their real arranged spatial position in the DeskTouch Displays diagram (left-to-right within rows, top-to-bottom across rows), includes normalized 2D display layout bounds on every bridge snapshot, and republishes immediately whenever display placement changes.

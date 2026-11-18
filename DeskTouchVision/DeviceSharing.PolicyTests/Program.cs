@@ -2871,6 +2871,50 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               "DeskSpaceDeckBridge must order stacked rows top-to-bottom and left-to-right within rows");
     }
 
+    // Custom editable pairing code validation, salted DT1-PAIR discovery, and spatial EnvironmentMember fields.
+    Check(PairingCodeHelper.NormalizeCustomCode(" suraj-99 ") == "SURAJ-99" &&
+          PairingCodeHelper.NormalizeCustomCode("ab") == "" &&
+          PairingCodeHelper.NormalizeCustomCode("bad|code") == "",
+          "PairingCodeHelper must normalize 4-32 alphanumeric codes and reject pipes or short codes");
+    string pairTag = PairingCodeHelper.ComputeDiscoveryTag(fpOne, "suraj-99");
+    Check(pairTag.Length == 24 && pairTag.All(Uri.IsHexDigit),
+          "ComputeDiscoveryTag must produce a salted 24-hex discovery tag without exposing raw code");
+
+    using (var pairDisc = new NearbyComputerDiscovery(fpOne, () => true, () => Array.Empty<string>(), () => true, () => 2, "suraj-99"))
+    {
+        var msgs = pairDisc.BuildPresenceMessages();
+        Check(msgs[0].StartsWith("DT1-READY|", StringComparison.Ordinal) &&
+              msgs[1] == "DT1-HUB|" + fpOne &&
+              msgs.Any(m => m == $"DT1-PAIR|{fpOne}|{pairTag}"),
+              "NearbyComputerDiscovery must preserve primary discovery messages and append salted DT1-PAIR tag");
+    }
+
+    var discoveredCustom = new[]
+    {
+        new NearbyComputer("SURAJ", "192.168.1.22", fpOne, false, true, false, 1, pairTag),
+        new NearbyComputer("OTHER", "192.168.1.23", fpTwo, false, true, false, 1, null)
+    };
+    var customFound = PairComputerDialog.FindPeerByCode(discoveredCustom, "suraj-99", out bool matchedCustomTag);
+    Check(customFound != null && matchedCustomTag && customFound.Fingerprint == fpOne,
+          "PairComputerDialog.FindPeerByCode must locate Windows PC matching custom pairing tag");
+
+    using (var pairReceiver = new ReceiverServer(_ => { }, new LocalInputPriority(), (_, _) => Task.FromResult(false)))
+    {
+        pairReceiver.SetCustomPairingCode("TEAM2026");
+        Check(pairReceiver.TryVerifyCustomPairingCode("team2026"),
+              "ReceiverServer must accept matching custom pairing code case-insensitively");
+        for (int fail = 0; fail < 6; fail++)
+            Check(!pairReceiver.TryVerifyCustomPairingCode("WRONG1"), "Wrong custom pairing code must be rejected");
+        Check(!pairReceiver.TryVerifyCustomPairingCode("TEAM2026"),
+              "ReceiverServer must temporarily rate-limit custom pairing code attempts after repeated failures");
+    }
+
+    var orderedMemberDto = new EnvironmentMember(2, "SURAJ", "Windows", testDisplay.ToWire(), true, fpOne, 4, 0, 0.0, 0.1, 0.3, 0.4);
+    var orderedRoundtrip = System.Text.Json.JsonSerializer.Deserialize<EnvironmentMember>(
+        System.Text.Json.JsonSerializer.Serialize(orderedMemberDto));
+    Check(orderedRoundtrip != null && orderedRoundtrip.ArrangementOrder == 0 && Math.Abs(orderedRoundtrip.LayoutW - 0.3) < 0.001,
+          "EnvironmentMember must preserve optional spatial arrangement order and bounds");
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

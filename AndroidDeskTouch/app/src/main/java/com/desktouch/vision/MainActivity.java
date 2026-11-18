@@ -44,7 +44,8 @@ public final class MainActivity extends Activity {
     private TextView liveBadgeText,mouseTag,mouseMetric,kbTag,kbMetric;
     private Button scanBtn,findScanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
     private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn,notifAccessBtn;
-    private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout;
+    private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout,trackpadTaskbarLbl;
+    private LinearLayout trackpadTaskbarCard,trackpadPcBar,trackpadScreenBar;
     private TextView findStatus,findCountTag;
     private EditText pairingCodeInput;
     private volatile List<DesktopDiscovery.Device> lastScannedDevices=new ArrayList<>();
@@ -131,10 +132,15 @@ public final class MainActivity extends Activity {
         selectTab(0);
 
         DeskTouchRuntime.setLiveStatusListener(()->runOnUiThread(()->{
-            if(!isFinishing()&&!isDestroyed())refreshLiveLinkAndKeyboard();
+            if(!isFinishing()&&!isDestroyed()){
+                refreshEnvironmentMembers();
+                refreshTrackpadPcTaskbar();
+                refreshLiveLinkAndKeyboard();
+            }
         }));
         registerKeyboardDeviceListener();
         refreshEnvironmentMembers();
+        refreshTrackpadPcTaskbar();
         refreshPermissionState();
         refreshTrustSummary();
         refreshStreamOptionControls();
@@ -462,8 +468,8 @@ public final class MainActivity extends Activity {
         arrangementScroll.setHorizontalScrollBarEnabled(false);
         arrangementScroll.setFillViewport(true);
         environmentList=new LinearLayout(this);
-        environmentList.setOrientation(LinearLayout.HORIZONTAL);
-        environmentList.setGravity(Gravity.CENTER);
+        environmentList.setOrientation(LinearLayout.VERTICAL);
+        environmentList.setGravity(Gravity.CENTER_HORIZONTAL);
         arrangementScroll.addView(environmentList,new HorizontalScrollView.LayoutParams(-2,-2));
         arrangementViewport.addView(arrangementScroll,new LinearLayout.LayoutParams(-1,-2));
         envCard.addView(arrangementViewport,new LinearLayout.LayoutParams(-1,-2));
@@ -620,7 +626,7 @@ public final class MainActivity extends Activity {
         pairCard.addView(pairTitle);
 
         TextView pairSub=new TextView(this);
-        pairSub.setText("Paste the identity code copied from DeskTouch on Windows to locate and join that hub directly.");
+        pairSub.setText("Enter the custom pairing code shown on DeskTouch Windows (or paste hex/identity code) to connect.");
         pairSub.setTextSize(11.5f);
         pairSub.setPadding(0,dp(3),0,dp(10));
         pairCard.addView(pairSub);
@@ -631,7 +637,7 @@ public final class MainActivity extends Activity {
         pairCard.addView(pairRow,new LinearLayout.LayoutParams(-1,-2));
 
         pairingCodeInput=new EditText(this);
-        pairingCodeInput.setHint("Paste Windows pairing code");
+        pairingCodeInput.setHint("Enter Windows pairing code");
         pairingCodeInput.setSingleLine(true);
         pairingCodeInput.setTextSize(12.5f);
         pairingCodeInput.setPadding(dp(12),dp(10),dp(12),dp(10));
@@ -721,6 +727,40 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(0,-2,1f);
         rcLp.leftMargin=dp(4);
         ctrlActions.addView(returnControlBtn,rcLp);
+
+        trackpadTaskbarCard=new LinearLayout(this);
+        trackpadTaskbarCard.setOrientation(LinearLayout.VERTICAL);
+        trackpadTaskbarCard.setPadding(dp(10),dp(8),dp(10),dp(8));
+        PhoneUiKit.styleSubcard(trackpadTaskbarCard,palette,this);
+        LinearLayout.LayoutParams tbWrapLp=new LinearLayout.LayoutParams(-1,-2);
+        tbWrapLp.topMargin=dp(10);
+        controlCard.addView(trackpadTaskbarCard,tbWrapLp);
+
+        trackpadTaskbarLbl=new TextView(this);
+        trackpadTaskbarLbl.setText("PC & Screen Taskbar (Tap to select)");
+        trackpadTaskbarLbl.setTextSize(10.5f);
+        trackpadTaskbarLbl.setTypeface(null,Typeface.BOLD);
+        trackpadTaskbarCard.addView(trackpadTaskbarLbl);
+
+        HorizontalScrollView pcTaskbarScroll=new HorizontalScrollView(this);
+        pcTaskbarScroll.setHorizontalScrollBarEnabled(false);
+        trackpadPcBar=new LinearLayout(this);
+        trackpadPcBar.setOrientation(LinearLayout.HORIZONTAL);
+        trackpadPcBar.setGravity(Gravity.CENTER_VERTICAL);
+        pcTaskbarScroll.addView(trackpadPcBar,new HorizontalScrollView.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams pcScrollLp=new LinearLayout.LayoutParams(-1,-2);
+        pcScrollLp.topMargin=dp(6);
+        trackpadTaskbarCard.addView(pcTaskbarScroll,pcScrollLp);
+
+        HorizontalScrollView scrTaskbarScroll=new HorizontalScrollView(this);
+        scrTaskbarScroll.setHorizontalScrollBarEnabled(false);
+        trackpadScreenBar=new LinearLayout(this);
+        trackpadScreenBar.setOrientation(LinearLayout.HORIZONTAL);
+        trackpadScreenBar.setGravity(Gravity.CENTER_VERTICAL);
+        scrTaskbarScroll.addView(trackpadScreenBar,new HorizontalScrollView.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams scrScrollLp=new LinearLayout.LayoutParams(-1,-2);
+        scrScrollLp.topMargin=dp(6);
+        trackpadTaskbarCard.addView(scrTaskbarScroll,scrScrollLp);
 
         LinearLayout padCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(padCard,cardParams(10));
@@ -1049,6 +1089,8 @@ public final class MainActivity extends Activity {
 
         onTheme(p->{
             PhoneUiKit.styleCard(controlCard,p,this);
+            PhoneUiKit.styleSubcard(trackpadTaskbarCard,p,this);
+            trackpadTaskbarLbl.setTextColor(p.textSecondary);
             PhoneUiKit.styleCard(padCard,p,this);
             trackpadTargetTitle.setTextColor(p.textPrimary);
             padSurfaceTitle.setTextColor(p.textPrimary);
@@ -1727,6 +1769,7 @@ public final class MainActivity extends Activity {
             updater.accept(palette);
         }
         refreshEnvironmentMembers();
+        refreshTrackpadPcTaskbar();
         refreshPermissionState();
         refreshLiveLinkAndKeyboard();
     }
@@ -1785,9 +1828,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.75";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.76";
         }catch(Exception ignored){
-            return "0.3.75";
+            return "0.3.76";
         }
     }
 
@@ -2362,117 +2405,222 @@ public final class MainActivity extends Activity {
         if(connectionSummary!=null){
             connectionSummary.setText("Linked Displays • "+targets.size()+" online");
         }
+        List<DeskTouchSession.EnvironmentTarget> sortedTargets=LinkedDisplayHelper.sortTargetsSpatially(targets);
+        List<List<DeskTouchSession.EnvironmentTarget>> rows=LinkedDisplayHelper.groupTargetsIntoRows(sortedTargets);
         int ownId=active.ownEnvironmentId();
         int selectedId=active.selectedEnvironmentTarget();
-        for(int i=0;i<targets.size();i++){
-            DeskTouchSession.EnvironmentTarget device=targets.get(i);
-            LinkedDisplayHelper.DisplayTileModel model=LinkedDisplayHelper.parseTileModel(
-                device,selectedId,ownId);
-            int notifCount=model.self
-                ? DeskTouchNotificationListener.readActiveCount(this)
-                : model.notificationCount;
+        for(int r=0;r<rows.size();r++){
+            List<DeskTouchSession.EnvironmentTarget> rowTargets=rows.get(r);
+            LinearLayout rowLayout=new LinearLayout(this);
+            rowLayout.setOrientation(LinearLayout.HORIZONTAL);
+            rowLayout.setGravity(Gravity.CENTER);
+            for(int i=0;i<rowTargets.size();i++){
+                DeskTouchSession.EnvironmentTarget device=rowTargets.get(i);
+                LinkedDisplayHelper.DisplayTileModel model=LinkedDisplayHelper.parseTileModel(
+                    device,selectedId,ownId);
+                int notifCount=model.self
+                    ? DeskTouchNotificationListener.readActiveCount(this)
+                    : model.notificationCount;
 
-            LinearLayout col=new LinearLayout(this);
-            col.setOrientation(LinearLayout.VERTICAL);
-            col.setGravity(Gravity.CENTER_HORIZONTAL);
+                LinearLayout col=new LinearLayout(this);
+                col.setOrientation(LinearLayout.VERTICAL);
+                col.setGravity(Gravity.CENTER_HORIZONTAL);
 
-            TextView notifPill=new TextView(this);
-            notifPill.setText(LinkedDisplayHelper.formatNotificationCount(notifCount));
-            notifPill.setTextSize(10.5f);
-            notifPill.setTypeface(null,Typeface.BOLD);
-            notifPill.setPadding(dp(8),dp(2),dp(8),dp(2));
-            notifPill.setGravity(Gravity.CENTER);
-            boolean hasCount=notifCount>=0;
-            PhoneUiKit.stylePill(notifPill,
-                hasCount ? 0xFF132B45 : 0xFF262B36,
-                hasCount ? 0xFF38BDF8 : 0xFF3F4756,
-                hasCount ? 0xFF7DD3FC : 0xFF94A3B8,this);
-            if(model.self && !hasCount){
-                notifPill.setClickable(true);
-                notifPill.setOnClickListener(v->{
-                    setFeedback("Enable Notification Count Badge in Setup to display this phone's count.",true);
-                    selectTab(PhoneUiKit.TAB_SETUP);
-                });
+                TextView notifPill=new TextView(this);
+                notifPill.setText(LinkedDisplayHelper.formatNotificationCount(notifCount));
+                notifPill.setTextSize(10.5f);
+                notifPill.setTypeface(null,Typeface.BOLD);
+                notifPill.setPadding(dp(8),dp(2),dp(8),dp(2));
+                notifPill.setGravity(Gravity.CENTER);
+                boolean hasCount=notifCount>=0;
+                PhoneUiKit.stylePill(notifPill,
+                    hasCount ? 0xFF132B45 : 0xFF262B36,
+                    hasCount ? 0xFF38BDF8 : 0xFF3F4756,
+                    hasCount ? 0xFF7DD3FC : 0xFF94A3B8,this);
+                if(model.self && !hasCount){
+                    notifPill.setClickable(true);
+                    notifPill.setOnClickListener(v->{
+                        setFeedback("Enable Notification Count Badge in Setup to display this phone's count.",true);
+                        selectTab(PhoneUiKit.TAB_SETUP);
+                    });
+                }
+                col.addView(notifPill,new LinearLayout.LayoutParams(-2,-2));
+
+                int boxW=model.portrait ? dp(68) : dp(model.monitorCount>1 ? 132 : 118);
+                int boxH=model.portrait ? dp(90) : dp(72);
+                int fill=model.hub ? 0xFF4277CB : 0xFF368883;
+                int pressed=model.hub ? 0xFF4E86DF : 0xFF419D98;
+                boolean highlight=model.selected && model.selectable;
+                int strokeColor=highlight ? 0xFFE0F2FE : 0xFFAABECD;
+                int strokePx=highlight ? Math.max(2,dp(2)) : Math.max(1,dp(1));
+
+                LinearLayout box=new LinearLayout(this);
+                box.setOrientation(LinearLayout.VERTICAL);
+                box.setGravity(Gravity.CENTER);
+                box.setPadding(dp(6),dp(5),dp(6),dp(5));
+                box.setBackground(model.selectable
+                    ? PhoneUiKit.interactiveBg(fill,pressed,strokeColor,dp(5),strokePx,0x33FFFFFF)
+                    : PhoneUiKit.roundedBox(fill,strokeColor,dp(5),strokePx));
+
+                TextView roleChip=new TextView(this);
+                roleChip.setText(model.hub ? "HUB" : (model.self ? "PHONE" : (highlight ? "ACTIVE" : "PC")));
+                roleChip.setTextSize(8f);
+                roleChip.setTypeface(null,Typeface.BOLD);
+                roleChip.setTextColor(0xFFF8FAFC);
+                roleChip.setPadding(dp(5),dp(1),dp(5),dp(1));
+                roleChip.setBackground(PhoneUiKit.roundedBox(0x38000000,Color.TRANSPARENT,dp(4),0));
+                LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(-2,-2);
+                rcLp.bottomMargin=dp(2);
+                box.addView(roleChip,rcLp);
+
+                TextView labelView=new TextView(this);
+                labelView.setText(model.displayLabel);
+                labelView.setTextSize(10.5f);
+                labelView.setTypeface(null,Typeface.BOLD);
+                labelView.setTextColor(Color.WHITE);
+                labelView.setGravity(Gravity.CENTER);
+                labelView.setSingleLine(true);
+                labelView.setEllipsize(TextUtils.TruncateAt.END);
+                box.addView(labelView);
+
+                TextView nameView=new TextView(this);
+                nameView.setText(model.shortName);
+                nameView.setTextSize(9.5f);
+                nameView.setTypeface(null,Typeface.BOLD);
+                nameView.setTextColor(0xFFE8F3FF);
+                nameView.setGravity(Gravity.CENTER);
+                nameView.setSingleLine(true);
+                nameView.setEllipsize(TextUtils.TruncateAt.END);
+                box.addView(nameView);
+
+                TextView resView=new TextView(this);
+                resView.setText((!model.self && !model.supportsInput) ? "Perm. req" : model.resolutionSummary);
+                resView.setTextSize(8.5f);
+                resView.setTextColor((!model.self && !model.supportsInput) ? 0xFFFDE68A : 0xFFD6E7F5);
+                resView.setGravity(Gravity.CENTER);
+                resView.setSingleLine(true);
+                resView.setEllipsize(TextUtils.TruncateAt.END);
+                box.addView(resView);
+
+                if(model.selectable){
+                    box.setClickable(true);
+                    box.setFocusable(true);
+                    box.setOnClickListener(v->{
+                        boolean keepControl=active.hasClaim();
+                        active.selectEnvironmentTarget(device.id);
+                        if(keepControl)active.claimControl();
+                        refreshEnvironmentMembers();
+                        refreshTrackpadPcTaskbar();
+                        refreshLiveLinkAndKeyboard();
+                        setFeedback("Selected "+model.fullName+". Use Trackpad to control.",false);
+                    });
+                }
+
+                LinearLayout.LayoutParams boxLp=new LinearLayout.LayoutParams(boxW,boxH);
+                boxLp.topMargin=dp(5);
+                col.addView(box,boxLp);
+
+                LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(-2,-2);
+                colLp.gravity=Gravity.CENTER_VERTICAL;
+                if(i>0)colLp.leftMargin=dp(8);
+                rowLayout.addView(col,colLp);
             }
-            col.addView(notifPill,new LinearLayout.LayoutParams(-2,-2));
-
-            int boxW=model.portrait ? dp(68) : dp(model.monitorCount>1 ? 132 : 118);
-            int boxH=model.portrait ? dp(90) : dp(72);
-            int fill=model.hub ? 0xFF4277CB : 0xFF368883;
-            int pressed=model.hub ? 0xFF4E86DF : 0xFF419D98;
-            boolean highlight=model.selected && model.selectable;
-            int strokeColor=highlight ? 0xFFE0F2FE : 0xFFAABECD;
-            int strokePx=highlight ? Math.max(2,dp(2)) : Math.max(1,dp(1));
-
-            LinearLayout box=new LinearLayout(this);
-            box.setOrientation(LinearLayout.VERTICAL);
-            box.setGravity(Gravity.CENTER);
-            box.setPadding(dp(6),dp(5),dp(6),dp(5));
-            box.setBackground(model.selectable
-                ? PhoneUiKit.interactiveBg(fill,pressed,strokeColor,dp(5),strokePx,0x33FFFFFF)
-                : PhoneUiKit.roundedBox(fill,strokeColor,dp(5),strokePx));
-
-            TextView roleChip=new TextView(this);
-            roleChip.setText(model.hub ? "HUB" : (model.self ? "PHONE" : (highlight ? "ACTIVE" : "PC")));
-            roleChip.setTextSize(8f);
-            roleChip.setTypeface(null,Typeface.BOLD);
-            roleChip.setTextColor(0xFFF8FAFC);
-            roleChip.setPadding(dp(5),dp(1),dp(5),dp(1));
-            roleChip.setBackground(PhoneUiKit.roundedBox(0x38000000,Color.TRANSPARENT,dp(4),0));
-            LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(-2,-2);
-            rcLp.bottomMargin=dp(2);
-            box.addView(roleChip,rcLp);
-
-            TextView labelView=new TextView(this);
-            labelView.setText(model.displayLabel);
-            labelView.setTextSize(10.5f);
-            labelView.setTypeface(null,Typeface.BOLD);
-            labelView.setTextColor(Color.WHITE);
-            labelView.setGravity(Gravity.CENTER);
-            labelView.setSingleLine(true);
-            labelView.setEllipsize(TextUtils.TruncateAt.END);
-            box.addView(labelView);
-
-            TextView nameView=new TextView(this);
-            nameView.setText(model.shortName);
-            nameView.setTextSize(9.5f);
-            nameView.setTypeface(null,Typeface.BOLD);
-            nameView.setTextColor(0xFFE8F3FF);
-            nameView.setGravity(Gravity.CENTER);
-            nameView.setSingleLine(true);
-            nameView.setEllipsize(TextUtils.TruncateAt.END);
-            box.addView(nameView);
-
-            TextView resView=new TextView(this);
-            resView.setText((!model.self && !model.supportsInput) ? "Perm. req" : model.resolutionSummary);
-            resView.setTextSize(8.5f);
-            resView.setTextColor((!model.self && !model.supportsInput) ? 0xFFFDE68A : 0xFFD6E7F5);
-            resView.setGravity(Gravity.CENTER);
-            resView.setSingleLine(true);
-            resView.setEllipsize(TextUtils.TruncateAt.END);
-            box.addView(resView);
-
-            if(model.selectable){
-                box.setClickable(true);
-                box.setFocusable(true);
-                box.setOnClickListener(v->{
-                    active.selectEnvironmentTarget(device.id);
-                    refreshEnvironmentMembers();
-                    refreshLiveLinkAndKeyboard();
-                    setFeedback("Target switched to "+model.fullName+". Use Trackpad to control.",false);
-                });
-            }
-
-            LinearLayout.LayoutParams boxLp=new LinearLayout.LayoutParams(boxW,boxH);
-            boxLp.topMargin=dp(5);
-            col.addView(box,boxLp);
-
-            LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(-2,-2);
-            colLp.gravity=Gravity.CENTER_VERTICAL;
-            if(i>0)colLp.leftMargin=dp(8);
-            environmentList.addView(col,colLp);
+            LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-2,-2);
+            rowLp.gravity=Gravity.CENTER_HORIZONTAL;
+            if(r>0)rowLp.topMargin=dp(8);
+            environmentList.addView(rowLayout,rowLp);
         }
+        refreshTrackpadPcTaskbar();
         renderConnectedHubOnFindIfIdle();
+    }
+
+    private void refreshTrackpadPcTaskbar(){
+        if(trackpadPcBar==null || trackpadScreenBar==null)return;
+        trackpadPcBar.removeAllViews();
+        trackpadScreenBar.removeAllViews();
+
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
+        int ownId=active.ownEnvironmentId();
+        int selectedId=active.selectedEnvironmentTarget();
+        List<LinkedDisplayHelper.DisplayTileModel> pcs=LinkedDisplayHelper.buildTrackpadPcTiles(targets,selectedId,ownId);
+
+        if(pcs.isEmpty()){
+            trackpadScreenBar.setVisibility(View.GONE);
+            TextView empty=new TextView(this);
+            empty.setText(active.isConnected() ? "Waiting for PC list..." : "Not connected yet • Open Find to link a PC");
+            empty.setTextSize(11f);
+            empty.setTextColor(palette.textSecondary);
+            trackpadPcBar.addView(empty);
+            return;
+        }
+
+        LinkedDisplayHelper.DisplayTileModel activePc=null;
+        for(int i=0;i<pcs.size();i++){
+            LinkedDisplayHelper.DisplayTileModel pc=pcs.get(i);
+            boolean sel=pc.selected;
+            if(sel)activePc=pc;
+
+            String notifTag=pc.notificationCount>=0 ? " ["+pc.notificationCount+"]" : "";
+            String screenTag=pc.monitorCount>1 ? " ("+pc.monitorCount+")" : "";
+            TextView chip=createTaskbarChip(
+                (pc.hub ? "HUB • " : "")+pc.shortName+screenTag+notifTag,
+                sel,
+                v->{
+                    boolean keepControl=active.hasClaim();
+                    active.selectEnvironmentTarget(pc.id);
+                    if(keepControl)active.claimControl();
+                    refreshEnvironmentMembers();
+                    refreshTrackpadPcTaskbar();
+                    refreshLiveLinkAndKeyboard();
+                });
+            LinearLayout.LayoutParams clp=new LinearLayout.LayoutParams(-2,-2);
+            if(i>0)clp.leftMargin=dp(7);
+            trackpadPcBar.addView(chip,clp);
+        }
+
+        if(activePc!=null && activePc.monitors!=null && activePc.monitors.size()>1){
+            trackpadScreenBar.setVisibility(View.VISIBLE);
+            int activeMonIdx=active.activeMonitorIndex();
+            for(int m=0;m<activePc.monitors.size();m++){
+                final int monIdx=m;
+                LinkedDisplayHelper.MonitorBox mb=activePc.monitors.get(m);
+                TextView screenChip=createTaskbarChip(
+                    "Display "+mb.displayNumber+" • "+mb.width+"×"+mb.height,
+                    m==activeMonIdx,
+                    v->{
+                        active.focusMonitor(monIdx);
+                        refreshTrackpadPcTaskbar();
+                        setFeedback("Moved cursor to Display "+mb.displayNumber+".",false);
+                    });
+                LinearLayout.LayoutParams slp=new LinearLayout.LayoutParams(-2,-2);
+                if(m>0)slp.leftMargin=dp(6);
+                trackpadScreenBar.addView(screenChip,slp);
+            }
+        }else{
+            trackpadScreenBar.setVisibility(View.GONE);
+        }
+    }
+
+    private TextView createTaskbarChip(String label,boolean selected,View.OnClickListener onClick){
+        PhoneUiKit.Palette p=palette;
+        TextView chip=new TextView(this);
+        chip.setText(label);
+        chip.setTextSize(11f);
+        chip.setTypeface(null,Typeface.BOLD);
+        chip.setSingleLine(true);
+        chip.setPadding(dp(11),dp(6),dp(11),dp(6));
+        int bg=selected ? 0xFF1D4ED8 : p.subtleBtnBg;
+        int stroke=selected ? 0xFF7DD3FC : p.border;
+        int fg=selected ? Color.WHITE : p.textPrimary;
+        chip.setTextColor(fg);
+        chip.setBackground(PhoneUiKit.interactiveBg(
+            bg, selected ? 0xFF2563EB : p.cardBg, stroke, dp(9),
+            Math.max(1,dp(selected ? 2 : 1)), p.rippleColor));
+        chip.setClickable(true);
+        chip.setFocusable(true);
+        chip.setOnClickListener(onClick);
+        return chip;
     }
 
     private void setDiscoveryStatus(String text){
@@ -2710,6 +2858,10 @@ public final class MainActivity extends Activity {
     }
 
     private void onHubGatewaySelected(DesktopDiscovery.Device gateway){
+        onHubGatewaySelected(gateway,null);
+    }
+
+    private void onHubGatewaySelected(DesktopDiscovery.Device gateway,String pairingSecret){
         if(gateway==null)return;
         if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
             session=DeskTouchRuntime.select(this,gateway.fingerprint);
@@ -2723,6 +2875,16 @@ public final class MainActivity extends Activity {
         }
         if(!gateway.ready){
             setDiscoveryStatus("Environment gateway is at capacity or unavailable.");
+            return;
+        }
+        String customCode=LinkedDisplayHelper.normalizeCustomPairingCode(pairingSecret);
+        if(!customCode.isEmpty()){
+            android.graphics.Point size=PhoneScreenGeometry.read(this);
+            AutoConnectService.setReconnect(this,true);
+            AutoConnectService.resumePeer(this,gateway.fingerprint);
+            session=DeskTouchRuntime.select(this,gateway.fingerprint);
+            session.connectWithPairingCode(gateway,size.x,size.y,customCode,null);
+            setDiscoveryStatus("Connecting to "+gateway.name+" using pairing code...");
             return;
         }
         new AlertDialog.Builder(this)
@@ -2756,21 +2918,35 @@ public final class MainActivity extends Activity {
         return LinkedDisplayHelper.resolveGatewayForDevice(list,matched,connected,approved);
     }
 
+    private void pairWithMatchedDevice(List<DesktopDiscovery.Device> list,
+            DesktopDiscovery.Device matched,String customCode){
+        DesktopDiscovery.Device gateway=resolveGatewayForScan(list,matched);
+        boolean directCustomMatch=matched!=null && gateway!=null
+            && !customCode.isEmpty()
+            && gateway.fingerprint.equalsIgnoreCase(matched.fingerprint)
+            && matched.pairingTag!=null
+            && matched.pairingTag.equalsIgnoreCase(
+                LinkedDisplayHelper.computePairingTag(matched.fingerprint,customCode));
+        onHubGatewaySelected(gateway,directCustomMatch ? customCode : null);
+    }
+
     private void pairByEnteredCode(){
         if(pairingCodeInput==null)return;
-        String normalized=LinkedDisplayHelper.normalizePairingCode(
-            pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString());
-        if(normalized.isEmpty()){
-            setFeedback("Enter at least 6 hex characters from the Windows Copy Pairing Code button.",true);
+        String rawInput=pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString();
+        String customCode=LinkedDisplayHelper.normalizeCustomPairingCode(rawInput);
+        String hexCode=LinkedDisplayHelper.normalizePairingCode(rawInput);
+        String lookupCode=!customCode.isEmpty() ? customCode : hexCode;
+        if(lookupCode.isEmpty()){
+            setFeedback("Enter the 4–32 character pairing code shown on DeskTouch Windows.",true);
             return;
         }
         List<DesktopDiscovery.Device> snapshot=lastScannedDevices;
-        DesktopDiscovery.Device cached=LinkedDisplayHelper.findDeviceByPairingCode(snapshot,normalized);
+        DesktopDiscovery.Device cached=LinkedDisplayHelper.findDeviceByPairingCode(snapshot,lookupCode);
         if(cached!=null){
-            onHubGatewaySelected(resolveGatewayForScan(snapshot,cached));
+            pairWithMatchedDevice(snapshot,cached,customCode);
             return;
         }
-        setDiscoveryStatus("Searching Wi-Fi and cable for pairing code "+normalized+"...");
+        setDiscoveryStatus("Searching Wi-Fi and cable for pairing code...");
         if(scanning)return;
         scanning=true;
         new Thread(()->{
@@ -2780,12 +2956,12 @@ public final class MainActivity extends Activity {
                 runOnUiThread(()->{
                     if(isFinishing()||isDestroyed())return;
                     renderScannedHubs(list);
-                    DesktopDiscovery.Device matched=LinkedDisplayHelper.findDeviceByPairingCode(list,normalized);
+                    DesktopDiscovery.Device matched=LinkedDisplayHelper.findDeviceByPairingCode(list,lookupCode);
                     if(matched==null){
                         setDiscoveryStatus("No reachable hub or PC matched that pairing code on your network.");
                         return;
                     }
-                    onHubGatewaySelected(resolveGatewayForScan(list,matched));
+                    pairWithMatchedDevice(list,matched,customCode);
                 });
             }catch(Exception e){
                 runOnUiThread(()->{

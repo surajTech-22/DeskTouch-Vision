@@ -52,7 +52,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Text = "Live link: Waiting for connected phone or computer"
     };
     private readonly Button _add = Button("Add devices", true);
-    private readonly Button _copyCode = Button("Copy pairing code");
+    private readonly TextBox _pairingCodeInput = new()
+    {
+        Name = "PairingCodeEditor",
+        Width = 172,
+        MaxLength = 32,
+        BorderStyle = BorderStyle.FixedSingle,
+        BackColor = Color.FromArgb(24, 26, 32),
+        ForeColor = Color.WhiteSmoke,
+        Font = new Font("Consolas", 10.5f, FontStyle.Bold),
+        PlaceholderText = "Set custom code"
+    };
+    private readonly Button _savePairingCode = Button("Set code");
+    private readonly Button _copyCode = Button("Copy code");
+    private readonly Button _copyFullLink = Button("Copy full link");
+    private string _customPairingCode = PairingCodeHelper.LoadOrCreateCode();
     private readonly Button _disconnect = Button("Disconnect");
     private readonly Button _pausePhonePayments = Button("Pause phone for payments");
     private readonly ToolStripMenuItem _pausePhonePaymentsTray = new("Pause phone for payments");
@@ -205,9 +219,51 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 266,
-            Padding = new Padding(24, 10, 24, 7), BackColor = BackColor };
-        var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52,
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 304,
+            Padding = new Padding(24, 8, 24, 7), BackColor = BackColor };
+        var pairingBar = new Panel { Dock = DockStyle.Top, Height = 38,
+            Padding = new Padding(10, 4, 10, 4), BackColor = Color.FromArgb(41, 43, 49) };
+        var pairingFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Margin = Padding.Empty
+        };
+        var pairingLabel = new Label
+        {
+            Text = "Pairing code:",
+            AutoSize = true,
+            ForeColor = Color.FromArgb(186, 216, 241),
+            Font = new Font("Segoe UI Semibold", 9.5f),
+            Margin = new Padding(0, 5, 8, 0)
+        };
+        _pairingCodeInput.Text = _customPairingCode;
+        _pairingCodeInput.Height = 27;
+        _pairingCodeInput.Margin = new Padding(0, 1, 8, 0);
+        _savePairingCode.Height = 28;
+        _savePairingCode.Margin = new Padding(0, 0, 8, 0);
+        _copyCode.Height = 28;
+        _copyCode.Margin = new Padding(0, 0, 8, 0);
+        _copyFullLink.Height = 28;
+        _copyFullLink.Margin = new Padding(0, 0, 10, 0);
+        var pairingHint = new Label
+        {
+            Text = "Editable (4-32 letters/digits). Enter on phone or another PC.",
+            AutoSize = true,
+            ForeColor = Color.FromArgb(165, 173, 188),
+            Font = new Font("Segoe UI", 8.5f),
+            Margin = new Padding(0, 6, 0, 0)
+        };
+        pairingFlow.Controls.Add(pairingLabel);
+        pairingFlow.Controls.Add(_pairingCodeInput);
+        pairingFlow.Controls.Add(_savePairingCode);
+        pairingFlow.Controls.Add(_copyCode);
+        pairingFlow.Controls.Add(_copyFullLink);
+        pairingFlow.Controls.Add(pairingHint);
+        pairingBar.Controls.Add(pairingFlow);
+
+        var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48,
             Name = "ConnectionActions",
             FlowDirection = FlowDirection.LeftToRight, AutoSize = false,
             // Wrapping creates a hidden second row beneath the fixed-height
@@ -216,7 +272,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _pausePhonePayments.Click += (_, _) => PausePhoneForPayments();
         _pausePhonePaymentsTray.Click += (_, _) => PausePhoneForPayments();
         _shortcuts.Click += (_, _) => ShowConnectedShortcuts();
-        foreach (var b in new[] { _add, _trustDevice, _copyCode, _shortcuts, _pausePhonePayments, _disconnect, _nativeDisplaySettings, _androidDownload })
+        foreach (var b in new[] { _add, _trustDevice, _shortcuts, _pausePhonePayments, _disconnect, _nativeDisplaySettings, _androidDownload })
         {
             b.Height = 35;
             b.Margin = new Padding(0, 2, 10, 5);
@@ -270,6 +326,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
         bottom.Controls.Add(deviceInfo);
         bottom.Controls.Add(sensitivityRow);
+        bottom.Controls.Add(pairingBar);
         bottom.Controls.Add(actions);
         bottom.Controls.Add(_status);
 
@@ -291,7 +348,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Controls.Add(header);
 
         _add.Click += async (_, _) => await AddComputerAsync();
-        _copyCode.Click += (_, _) => CopyPairingCode();
+        _savePairingCode.Click += (_, _) => SaveCustomPairingCode();
+        _pairingCodeInput.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                e.SuppressKeyPress = true;
+                SaveCustomPairingCode();
+            }
+        };
+        _copyCode.Click += (_, _) => CopyShortPairingCode();
+        _copyFullLink.Click += (_, _) => CopyPairingCode();
         _disconnect.Click += (_, _) => DisconnectByUser();
         _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
@@ -304,6 +371,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _display.EnvironmentArrangementChanged += () =>
         {
             SavePreferredEdge();
+            PublishEnvironmentSpatialLayout();
             PublishDeckBridgeSnapshot();
             RefreshTrayFlyoutIfVisible();
         };
@@ -708,8 +776,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trustDevice.Visible = canTrust;
         _manageTrusted.Enabled = _trusted != null;
         _add.Enabled = !_connecting && !_closing.IsCancellationRequested;
-        _copyCode.Enabled = _receiver?.CanAcceptNewPeer == true &&
+        _copyCode.Enabled = !string.IsNullOrWhiteSpace(_customPairingCode);
+        _copyFullLink.Enabled = _receiver?.CanAcceptNewPeer == true &&
             !_connecting && _host == null;
+        _savePairingCode.Enabled = !_closing.IsCancellationRequested;
         bool canPausePhone = _receiver?.HasReadyAndroidPeer ?? false;
         _pausePhonePayments.Enabled = canPausePhone;
         _pausePhonePaymentsTray.Enabled = canPausePhone;
@@ -956,6 +1026,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
             _display.EnvironmentDevices =
                 DisplayArrangementControl.ProjectEnvironment(tiles,baseTargetId);
+            PublishEnvironmentSpatialLayout(baseTargetId);
             UpdateTargetChoice();
             UpdateButtons();
         }
@@ -1384,6 +1455,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
                     _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
             _receiver.Start();
+            _receiver.SetCustomPairingCode(_customPairingCode);
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
             if (_adbBridge?.CurrentShellBridge is { } existingBridge)
                 _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret);
@@ -1404,7 +1476,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                             return neighbours;
                         },
                         () => _host == null,
-                        () => _host != null ? 0 : (Volatile.Read(ref _receiver)?.ActiveEnvironmentDeviceCount ?? 1));
+                        () => _host != null ? 0 : (Volatile.Read(ref _receiver)?.ActiveEnvironmentDeviceCount ?? 1),
+                        _customPairingCode);
                     _discovery.Start();
                     _adbBridge ??= new AdbCableBridge(
                         LogDiagnostic,
@@ -1637,6 +1710,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.RemoteEdge = _preferredEdge;
             SavePreferredEdge();
             _capture?.SetEdge(_preferredEdge);
+            PublishEnvironmentSpatialLayout();
             PublishDeckBridgeSnapshot();
             RefreshTrayFlyoutIfVisible();
             Status("Both computers' outside-edge handoff positions synchronized.");
@@ -1700,6 +1774,42 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         return await completion.Task;
     }
 
+    private void SaveCustomPairingCode()
+    {
+        try
+        {
+            string saved = PairingCodeHelper.SaveCode(_pairingCodeInput.Text);
+            _customPairingCode = saved;
+            _pairingCodeInput.Text = saved;
+            _receiver?.SetCustomPairingCode(saved);
+            _discovery?.SetCustomPairingCode(saved);
+            BroadcastOnlinePresence();
+            Status($"Pairing code updated for {Environment.MachineName}: {saved}");
+        }
+        catch (ArgumentException ex)
+        {
+            Status(ex.Message);
+        }
+    }
+
+    private void CopyShortPairingCode()
+    {
+        try
+        {
+            string code = PairingCodeHelper.NormalizeCustomCode(_pairingCodeInput.Text);
+            if (code.Length == 0)
+                code = _customPairingCode;
+            if (string.IsNullOrEmpty(code))
+            {
+                Status("Enter a 4–32 character pairing code first.");
+                return;
+            }
+            Clipboard.SetText(code);
+            Status($"Pairing code {code} copied. Enter it on your phone or another computer.");
+        }
+        catch (Exception ex) { Status("Unable to copy pairing code: " + ex.Message); }
+    }
+
     private void CopyPairingCode()
     {
         if (_receiver == null) { Status("This computer is currently controlling another PC."); return; }
@@ -1716,9 +1826,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             // Pairing secret is available only by a deliberate Copy action.
             var code = $"DT1|{address}|{_receiver.Fingerprint}|{_receiver.Secret}";
             Clipboard.SetText(code);
-            Status($"Pairing code copied for {Environment.MachineName}. Paste it into Add devices on the other PC. Keep it private.");
+            Status($"Full pairing link copied for {Environment.MachineName}. Keep it private.");
         }
-        catch (Exception ex) { Status("Unable to copy pairing code: " + ex.Message); }
+        catch (Exception ex) { Status("Unable to copy full pairing link: " + ex.Message); }
     }
 
     internal enum HubAutoConnectDecision
@@ -2423,6 +2533,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (!_captureUsesInbound) _host?.PublishSourcePlacement(edge);
         if (_captureUsesInbound || _host == null)
             _receiver?.PublishPlacement(Opposite(edge));
+        PublishEnvironmentSpatialLayout();
         PublishDeckBridgeSnapshot();
         RefreshTrayFlyoutIfVisible();
         Status($"Connected computer placed {_preferredEdge.ToString().ToLowerInvariant()}. " +
@@ -2842,6 +2953,60 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Status("Sent payment-safe pause request to your phone so payment apps work normally.");
         PublishDeckBridgeSnapshot();
         RefreshTrayFlyoutIfVisible();
+    }
+
+    private void PublishEnvironmentSpatialLayout(int? explicitBaseTargetId = null)
+    {
+        if (_receiver == null || _closing.IsCancellationRequested || IsDisposed)
+            return;
+        try
+        {
+            int baseId = explicitBaseTargetId ?? CurrentBaseTargetId();
+            var boundsByTarget = _display.GetArrangedDeviceBounds(baseId)
+                .ToDictionary(x => x.TargetId, x => x.Bounds);
+            if (boundsByTarget.Count == 0)
+                return;
+
+            var entries = new List<(string Key, RectangleF Bounds)>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            void AddEntry(string key, int targetId)
+            {
+                if (string.IsNullOrWhiteSpace(key) || !seen.Add(key)) return;
+                if (boundsByTarget.TryGetValue(targetId, out var rect) && rect.Width > 0 && rect.Height > 0)
+                    entries.Add((key, rect));
+            }
+
+            AddEntry(_receiver.Fingerprint, EnvironmentRouteOrder.Local);
+            if (_host != null)
+            {
+                foreach (var member in _host.EnvironmentMembers)
+                {
+                    if (member.Id == _host.OwnEnvironmentMemberId) continue;
+                    var localDirect = FindLocalReceiverPeerByIdentity(member.StableIdentity);
+                    int targetId = localDirect?.Id ?? -member.Id;
+                    string key = !string.IsNullOrWhiteSpace(member.StableIdentity)
+                        ? member.StableIdentity
+                        : member.Platform + "|" + member.Name;
+                    AddEntry(key, targetId);
+                }
+                foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
+                    AddEntry(ReceiverServer.LayoutIdentity(peer), id);
+            }
+            else
+            {
+                foreach (var (id, peer) in _receiver.ConnectedPeers)
+                    AddEntry(ReceiverServer.LayoutIdentity(peer), id);
+                foreach (var (vid, peer, _) in _receiver.BridgedPeers)
+                    AddEntry(ReceiverServer.LayoutIdentity(peer), vid);
+            }
+
+            var normalized = DeskSpaceDeckBridge.ComputeNormalizedLayout(
+                entries,
+                e => e.Key,
+                e => e.Bounds);
+            _receiver.SetEnvironmentSpatialLayout(normalized);
+        }
+        catch { }
     }
 
     private void RefreshTrayFlyoutIfVisible()

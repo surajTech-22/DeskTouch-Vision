@@ -9,7 +9,8 @@ namespace DeskTouch.DeviceShare;
 /// <summary>Discovery-only information. The advertised fingerprint is never
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
-    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false, int MemberCount = 1);
+    bool IsAndroid = false, bool CanReceive = true, bool IsHub = false, int MemberCount = 1,
+    string? PairingTag = null);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and
@@ -30,16 +31,21 @@ internal sealed class NearbyComputerDiscovery : IDisposable
     private readonly Func<IEnumerable<string>> _connectedFingerprints;
     private readonly Func<bool> _isEnvironmentHub;
     private readonly Func<int>? _getEnvironmentMemberCount;
+    private volatile string _customPairingCode = "";
     private UdpClient? _listener;
     private Task? _loop;
     private TcpListener? _loopbackListener;
     private Task? _loopbackLoop;
     internal int LoopbackPort { get; private set; }
 
+    internal void SetCustomPairingCode(string? code) =>
+        _customPairingCode = PairingCodeHelper.NormalizeCustomCode(code);
+
     internal NearbyComputerDiscovery(string fingerprint, Func<bool>? canAcceptConnections = null,
         Func<IEnumerable<string>>? connectedFingerprints = null,
         Func<bool>? isEnvironmentHub = null,
-        Func<int>? getEnvironmentMemberCount = null)
+        Func<int>? getEnvironmentMemberCount = null,
+        string? customPairingCode = null)
     {
         if (fingerprint.Length != 64 || !fingerprint.All(Uri.IsHexDigit))
             throw new ArgumentException("A stable TLS fingerprint is required.");
@@ -48,6 +54,7 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         _connectedFingerprints = connectedFingerprints ?? (() => Array.Empty<string>());
         _isEnvironmentHub = isEnvironmentHub ?? (() => true);
         _getEnvironmentMemberCount = getEnvironmentMemberCount;
+        SetCustomPairingCode(customPairingCode);
     }
 
     private static bool IsPrivateLan(IPAddress address)
@@ -130,6 +137,9 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                 continue;
             messages.Add("DT1-LINK|" + _fingerprint + "|" + other.ToUpperInvariant());
         }
+        string pairTag = PairingCodeHelper.ComputeDiscoveryTag(_fingerprint, _customPairingCode);
+        if (pairTag.Length > 0)
+            messages.Add("DT1-PAIR|" + _fingerprint.ToUpperInvariant() + "|" + pairTag);
         return messages;
     }
 
@@ -284,6 +294,8 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         var found = new ConcurrentDictionary<string, NearbyComputer>(StringComparer.OrdinalIgnoreCase);
         var advertisedHubs = new ConcurrentDictionary<string, (string Address, int Count)>(
             StringComparer.OrdinalIgnoreCase);
+        var advertisedPairTags = new ConcurrentDictionary<string, (string Address, string Tag)>(
+            StringComparer.OrdinalIgnoreCase);
         using var udp = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
         udp.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
         var destinations = GetBroadcastDestinations();
@@ -340,6 +352,17 @@ internal sealed class NearbyComputerDiscovery : IDisposable
                     }
                     continue;
                 }
+                if (response.StartsWith("DT1-PAIR|", StringComparison.Ordinal))
+                {
+                    string[] pt = response.Split('|');
+                    if (pt.Length == 3 && pt[1].Length == 64 && pt[1].All(Uri.IsHexDigit) &&
+                        pt[2].Length == 24 && pt[2].All(Uri.IsHexDigit))
+                    {
+                        advertisedPairTags[pt[1].ToUpperInvariant()] =
+                            (packet.RemoteEndPoint.Address.ToString(), pt[2].ToUpperInvariant());
+                    }
+                    continue;
+                }
                 var peer = ParseReply(response, packet.RemoteEndPoint.Address);
                 if (peer is not null)
                 {
@@ -358,13 +381,20 @@ internal sealed class NearbyComputerDiscovery : IDisposable
         }
         return DistinctDevices(found.Values.Select(p =>
         {
-            if (!p.IsAndroid &&
-                advertisedHubs.TryGetValue(p.Fingerprint, out var claimed) &&
-                string.Equals(claimed.Address, p.Address, StringComparison.OrdinalIgnoreCase))
+            var next = p;
+            if (!next.IsAndroid &&
+                advertisedHubs.TryGetValue(next.Fingerprint, out var claimed) &&
+                string.Equals(claimed.Address, next.Address, StringComparison.OrdinalIgnoreCase))
             {
-                return p with { IsHub = claimed.Count >= 2, MemberCount = claimed.Count };
+                next = next with { IsHub = claimed.Count >= 2, MemberCount = claimed.Count };
             }
-            return p;
+            if (!next.IsAndroid &&
+                advertisedPairTags.TryGetValue(next.Fingerprint, out var tagInfo) &&
+                string.Equals(tagInfo.Address, next.Address, StringComparison.OrdinalIgnoreCase))
+            {
+                next = next with { PairingTag = tagInfo.Tag };
+            }
+            return next;
         }));
     }
 

@@ -2,8 +2,11 @@ package com.desktouch.vision;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -177,6 +180,104 @@ final class LinkedDisplayHelper {
             target.notificationCount, monitors);
     }
 
+    static List<DeskTouchSession.EnvironmentTarget> sortTargetsSpatially(
+            List<DeskTouchSession.EnvironmentTarget> targets) {
+        if (targets == null || targets.isEmpty()) return Collections.emptyList();
+        ArrayList<DeskTouchSession.EnvironmentTarget> copy = new ArrayList<>(targets);
+        copy.sort((a, b) -> {
+            boolean hasOrdA = a.arrangementOrder >= 0;
+            boolean hasOrdB = b.arrangementOrder >= 0;
+            if (hasOrdA && hasOrdB && a.arrangementOrder != b.arrangementOrder) {
+                return Integer.compare(a.arrangementOrder, b.arrangementOrder);
+            }
+            if (hasOrdA != hasOrdB) return hasOrdA ? -1 : 1;
+
+            boolean hasGeoA = a.layoutW > 0.001 && a.layoutH > 0.001;
+            boolean hasGeoB = b.layoutW > 0.001 && b.layoutH > 0.001;
+            if (hasGeoA && hasGeoB) {
+                double ay = a.layoutY + (a.layoutH * 0.5);
+                double by = b.layoutY + (b.layoutH * 0.5);
+                if (Math.abs(ay - by) > 0.22) return Double.compare(ay, by);
+                int xc = Double.compare(a.layoutX, b.layoutX);
+                if (xc != 0) return xc;
+            }
+            return Integer.compare(a.id, b.id);
+        });
+        return copy;
+    }
+
+    static List<List<DeskTouchSession.EnvironmentTarget>> groupTargetsIntoRows(
+            List<DeskTouchSession.EnvironmentTarget> sorted) {
+        if (sorted == null || sorted.isEmpty()) return Collections.emptyList();
+        boolean allHaveBounds = true;
+        for (DeskTouchSession.EnvironmentTarget t : sorted) {
+            if (t.layoutW <= 0.001 || t.layoutH <= 0.001) {
+                allHaveBounds = false;
+                break;
+            }
+        }
+        if (!allHaveBounds || sorted.size() <= 1) {
+            return Collections.singletonList(sorted);
+        }
+
+        ArrayList<DeskTouchSession.EnvironmentTarget> byRow = new ArrayList<>(sorted);
+        byRow.sort(Comparator.comparingDouble((DeskTouchSession.EnvironmentTarget t) -> t.layoutY + t.layoutH * 0.5)
+            .thenComparingDouble(t -> t.layoutX));
+
+        ArrayList<List<DeskTouchSession.EnvironmentTarget>> rows = new ArrayList<>();
+        ArrayList<DeskTouchSession.EnvironmentTarget> currentRow = new ArrayList<>();
+        double rowMinY = 0;
+        double rowMaxY = 0;
+        for (DeskTouchSession.EnvironmentTarget t : byRow) {
+            double top = t.layoutY;
+            double bottom = t.layoutY + t.layoutH;
+            if (currentRow.isEmpty()) {
+                currentRow.add(t);
+                rowMinY = top;
+                rowMaxY = bottom;
+            } else {
+                double overlap = Math.min(rowMaxY, bottom) - Math.max(rowMinY, top);
+                double minH = Math.max(0.01, Math.min(rowMaxY - rowMinY, t.layoutH));
+                if (overlap > minH * 0.30) {
+                    currentRow.add(t);
+                    rowMinY = Math.min(rowMinY, top);
+                    rowMaxY = Math.max(rowMaxY, bottom);
+                } else {
+                    currentRow.sort(Comparator.comparingDouble(x -> x.layoutX));
+                    rows.add(currentRow);
+                    currentRow = new ArrayList<>();
+                    currentRow.add(t);
+                    rowMinY = top;
+                    rowMaxY = bottom;
+                }
+            }
+        }
+        if (!currentRow.isEmpty()) {
+            currentRow.sort(Comparator.comparingDouble(x -> x.layoutX));
+            rows.add(currentRow);
+        }
+        return rows;
+    }
+
+    static List<DisplayTileModel> buildTrackpadPcTiles(
+            List<DeskTouchSession.EnvironmentTarget> targets, int selectedId, int ownId) {
+        List<DeskTouchSession.EnvironmentTarget> ordered = sortTargetsSpatially(targets);
+        ArrayList<DisplayTileModel> pcs = new ArrayList<>();
+        for (DeskTouchSession.EnvironmentTarget t : ordered) {
+            DisplayTileModel model = parseTileModel(t, selectedId, ownId);
+            if (!model.self && model.selectable && !"Android".equalsIgnoreCase(model.platform)) {
+                pcs.add(model);
+            }
+        }
+        if (pcs.isEmpty()) {
+            for (DeskTouchSession.EnvironmentTarget t : ordered) {
+                DisplayTileModel model = parseTileModel(t, selectedId, ownId);
+                if (!model.self && model.selectable) pcs.add(model);
+            }
+        }
+        return pcs;
+    }
+
     static String normalizePairingCode(String raw) {
         if (raw == null) return "";
         String cleaned = raw.replaceAll("[\\s:\\-.]+", "").trim().toUpperCase(Locale.ROOT);
@@ -189,10 +290,52 @@ final class LinkedDisplayHelper {
         return cleaned;
     }
 
+    static String normalizeCustomPairingCode(String raw) {
+        if (raw == null) return "";
+        String clean = raw.trim();
+        if (clean.length() < 4 || clean.length() > 32) return "";
+        for (int i = 0; i < clean.length(); i++) {
+            char c = clean.charAt(i);
+            boolean ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+                || (c >= 'a' && c <= 'z') || c == '-' || c == '_';
+            if (!ok) return "";
+        }
+        return clean.toUpperCase(Locale.ROOT);
+    }
+
+    static String computePairingTag(String fingerprint, String rawCode) {
+        if (fingerprint == null) return "";
+        String fp = fingerprint.trim().toUpperCase(Locale.ROOT);
+        String code = normalizeCustomPairingCode(rawCode);
+        if (fp.length() != 64 || code.isEmpty()) return "";
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(("DT1-PAIRTAG-V1|" + fp + "|" + code).getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(24);
+            for (int i = 0; i < 12; i++) {
+                hex.append(String.format(Locale.ROOT, "%02X", digest[i] & 0xFF));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
     static DesktopDiscovery.Device findDeviceByPairingCode(
             List<DesktopDiscovery.Device> devices, String rawCode) {
+        if (devices == null || devices.isEmpty()) return null;
+        String customCode = normalizeCustomPairingCode(rawCode);
+        if (!customCode.isEmpty()) {
+            for (DesktopDiscovery.Device d : devices) {
+                if (d == null || d.android || d.fingerprint == null || d.pairingTag == null) continue;
+                String expectedTag = computePairingTag(d.fingerprint, customCode);
+                if (!expectedTag.isEmpty() && expectedTag.equalsIgnoreCase(d.pairingTag)) {
+                    return d;
+                }
+            }
+        }
         String code = normalizePairingCode(rawCode);
-        if (code.isEmpty() || devices == null || devices.isEmpty()) return null;
+        if (code.isEmpty()) return null;
         DesktopDiscovery.Device uniquePrefixMatch = null;
         int prefixCount = 0;
         for (DesktopDiscovery.Device d : devices) {

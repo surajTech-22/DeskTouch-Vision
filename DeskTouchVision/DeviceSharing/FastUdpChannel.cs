@@ -208,7 +208,13 @@ internal sealed class FastUdpCodec : IDisposable
 
 internal sealed class AdaptiveLinkTracker
 {
-    private const int ReorderSlack = 8;
+    // 2.4 GHz power-save/buffer stalls routinely deliver a whole burst
+    // 100-500 ms after it was sent. The old 8-frame window (132 ms at the
+    // 16.5 ms 2.4 GHz cap) wrote those frames off as lost and never
+    // reconciled them, so 7-40% "loss" appeared next to a 5 ms RTT. Settle
+    // only after 63 frames (~470 ms at 7.5 ms, ~1.0 s at 16.5 ms), and
+    // reclassify anything that still arrives afterwards as late, not lost.
+    private const int ReorderSlack = 63;
     private const long FastMinRttWindowMs = 3_000;
     private const long SlowBandMinRttWindowMs = 5_000;
     private const int PingRingSize = 16;
@@ -220,6 +226,7 @@ internal sealed class AdaptiveLinkTracker
     private double _ewmaLossRatio;
     private long _reorderedPackets;
     private long _lostPackets;
+    private long _latePackets;
     private long _lastArriveMs;
     private double _inboundJitterMs;
     private bool _hasLastTransit;
@@ -555,6 +562,17 @@ internal sealed class AdaptiveLinkTracker
                 {
                     _seenMask |= bit;
                     if (back >= 1) _reorderedPackets++;
+                    if (seq <= _settledSeq)
+                    {
+                        // This slot was already counted as lost when the
+                        // settle window advanced, but it has now arrived
+                        // after a Wi-Fi power-save/buffer stall. Reclassify
+                        // it as late so the reported loss reflects frames
+                        // that never arrive at all.
+                        if (_lostPackets > 0) _lostPackets--;
+                        _latePackets++;
+                        _ewmaLossRatio *= 0.94;
+                    }
                 }
             }
         }
@@ -571,7 +589,13 @@ internal sealed class AdaptiveLinkTracker
         {
             ulong s = start + i;
             ulong back = _maxSeq - s;
-            bool seen = back < 64 && ((_seenMask & (1UL << (int)back)) != 0);
+            // A slot older than the 64-bit sliding window is no longer
+            // representable (this happens whenever one or more frames arrive
+            // back-to-back and the settle target jumps). Treat it as unknown
+            // rather than lost: the old code counted these boundary slots as
+            // loss, which is what produced 39-61% "loss" from a single
+            // reordered burst.
+            bool seen = back >= 64 || ((_seenMask & (1UL << (int)back)) != 0);
             if (seen)
             {
                 _ewmaLossRatio *= 0.94;
@@ -603,6 +627,7 @@ internal sealed class AdaptiveLinkTracker
 
     internal long ReorderedPackets { get { lock (_recvGate) return _reorderedPackets; } }
     internal long LostPackets { get { lock (_recvGate) return _lostPackets; } }
+    internal long LatePackets { get { lock (_recvGate) return _latePackets; } }
 
     internal double SmoothedRttMs { get { lock (_rttGate) return _smoothedRttMs; } }
 
@@ -1153,7 +1178,19 @@ internal sealed class FastMovePacer : IDisposable
             if (_disposed || order <= _lastSentUdpOrder)
                 return false;
             _lastSentUdpOrder = order;
-            return _sendUdp(StampSeq(move));
+            Packet stamped = StampSeq(move);
+            bool sent = _sendUdp(stamped);
+            if (sent && Volatile.Read(ref _duplicateMoves))
+            {
+                // 2.4 GHz workaround: a second authenticated frame carries the
+                // same move sequence, so independent air loss cannot remove
+                // both copies. Android's move dedup discards the copy when
+                // the first one already landed; 48 bytes is ~0.03% of the
+                // 144 Mbps link at the 2.4 GHz move rate.
+                if (_sendUdp(stamped))
+                    Interlocked.Increment(ref _duplicateSentCount);
+            }
+            return sent;
         }
     }
 
@@ -1216,6 +1253,8 @@ internal sealed class FastMovePacer : IDisposable
     private double _effectiveMinIntervalMs = -1;
     private int _effectiveWarmIntervalMs = WarmKeepaliveIntervalMs;
     private long _udpDirectCount, _udpFlushedCount, _trailingTcpSyncCount;
+    private bool _duplicateMoves;
+    private long _duplicateSentCount;
 
     internal double EffectiveMinIntervalMs
     {
@@ -1230,7 +1269,7 @@ internal sealed class FastMovePacer : IDisposable
 
     internal void SetWarmIntervalMs(int ms)
     {
-        int clamped = Math.Clamp(ms, 18, 120);
+        int clamped = Math.Clamp(ms, 8, 120);
         lock (_gate)
         {
             if (_effectiveWarmIntervalMs == clamped) return;
@@ -1242,6 +1281,17 @@ internal sealed class FastMovePacer : IDisposable
             }
         }
     }
+
+    internal void SetDuplicateMoves(bool enabled)
+    {
+        lock (_gate)
+        {
+            if (_duplicateMoves == enabled) return;
+            Volatile.Write(ref _duplicateMoves, enabled);
+        }
+    }
+
+    internal long TakeDuplicateCount() => Interlocked.Exchange(ref _duplicateSentCount, 0);
 
     internal (long UdpDirect, long UdpPacedFlush, long TrailingTcpSync) TakeStats() => (
         Interlocked.Exchange(ref _udpDirectCount, 0),

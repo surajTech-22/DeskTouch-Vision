@@ -1,3 +1,15 @@
+# DeskTouch Vision v0.3.62 - 2.4 GHz Wireless Low-Latency Workarounds & Honest Loss Accounting
+
+Makes phone control over 2.4 GHz faster and steadier without forcing the phone onto another band, and stops late-but-delivered frames from being reported as packet loss:
+
+- **Late-vs-lost accounting (`FastUdpChannel`):** Widens the reorder settle window from 8 to 63 frames (~470 ms at 7.5 ms pacing, ~1.0 s at the 16.5 ms 2.4 GHz cap), reclassifies frames that still arrive after settlement as late instead of lost, and stops counting slots outside the 64-bit sliding window as loss. The old boundary logic turned a single 3-8 frame reorder burst into 19-39% displayed loss even with a 5 ms RTT; the live line now reports only frames that never arrive.
+- **~100 Hz 2.4 GHz keepalive (`NetworkSessions`, `FastUdpChannel`, `DeskTouchSession`):** Drives the Warm/CAM pulse at 10-20 ms on 2.4 GHz (was 55-95 ms) and at 12 ms from the phone during an active lease (was 22 ms), keeping the radio out of Wi-Fi power-save between mouse frames. Measured basis: 100 Hz ping = 1% loss / 6.5 ms average / 8 ms p90, versus 1 Hz = 2.5% loss / 115 ms average and 10 Hz = 6% loss / 441 ms maximum.
+- **Duplicate 2.4 GHz move frames (`NetworkSessions`, `FastUdpChannel`):** Sends each movement twice with the same move sequence; the Android receiver's move dedup drops the copy when the first already landed. Independent air loss can no longer remove both copies, at a cost of at most ~50 kbps payload on a 144 Mbps link.
+- **Power-lock verification (`DeskTouchSession`, `RemoteInputPower`):** Confirms the CPU and dual Wi-Fi low-latency/high-performance locks are reacquired on every granted Windows-to-Android input lease, not only at TCP connect.
+- **Diagnostics (`NetworkSessions`):** Telemetry now includes `late_total`, `reordered_total` and `duplicated` so a 2.4 GHz stall can be separated from real air loss without a packet capture.
+
+---
+
 # DeskTouch Vision v0.3.61 — Wireless Accessibility Dual-Position Recovery & System-to-System Edge/Status Fixes
 
 Resolves recent update regressions across computer-to-computer and mobile wireless connections:

@@ -1106,6 +1106,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             session.Peer.Platform, effectiveHz, rtt, minRtt, jitter, loss, session.LinkBand);
         pacer.SetMinIntervalMs(paceMs);
         pacer.SetWarmIntervalMs(ComputeWarmIntervalMs(session.LinkBand, queueDelay, loss));
+        pacer.SetDuplicateMoves(
+            string.Equals(session.Peer.Platform, "Android", StringComparison.Ordinal) &&
+            string.Equals(AdaptiveLinkTracker.NormalizeBand(session.LinkBand), "2.4GHz", StringComparison.Ordinal));
     }
 
     internal string? ConnectedPeerName =>
@@ -1313,9 +1316,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             sinceMoveMs = lastSentTicks > 0
                                 ? (nowTicks - lastSentTicks) * 1000.0 / Stopwatch.Frequency
                                 : double.MaxValue;
-                            // Maintain keepalive pulse when mouse pauses or between bursts (>= 18ms)
-                            // so the remote phone radio stays awake in Continuous Active Mode (CAM).
-                            if (isAndroidPeer && sinceMoveMs >= 18.0 && nowMs - peer.LastCamPulseMs >= 18)
+                            // Backup CAM pulse. The move pacer owns the tight
+                            // ~100 Hz 2.4 GHz cadence (10-20 ms); this only
+                            // fills the gap if the pacer timer is idle.
+                            if (isAndroidPeer && sinceMoveMs >= 60.0 && nowMs - peer.LastCamPulseMs >= 60)
                             {
                                 peer.LastCamPulseMs = nowMs;
                                 _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
@@ -1377,8 +1381,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
                     double jitter = peer?.LinkTracker.EffectiveJitterMs ?? 0;
                     double loss = peer?.LinkTracker.CombinedLossPermille ?? 0;
+                    long lateTotal = peer?.LinkTracker.LatePackets ?? 0;
+                    long reorderedTotal = peer?.LinkTracker.ReorderedPackets ?? 0;
+                    long duplicated = pacer.TakeDuplicateCount();
                     DiagnosticLog?.Invoke(
-                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} fast_confirmed={peer?.Confirmed == true} live_hz={effectiveHz} pace_ms={pacer.EffectiveMinIntervalMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback}");
+                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} fast_confirmed={peer?.Confirmed == true} live_hz={effectiveHz} pace_ms={pacer.EffectiveMinIntervalMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback} late_total={lateTotal} reordered_total={reorderedTotal} duplicated={duplicated}");
                 }
                 tick++;
             }
@@ -3354,9 +3361,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal static int ComputeWarmIntervalMs(string? linkBand, double queueDelayMs, double lossPermille)
     {
         bool isSlow24 = string.Equals(AdaptiveLinkTracker.NormalizeBand(linkBand), "2.4GHz", StringComparison.Ordinal);
-        int minMs = isSlow24 ? 55 : 24;
-        int maxMs = isSlow24 ? 95 : 52;
-        double baseMs = isSlow24 ? 55.0 : 24.0;
+        // 2.4 GHz power-save needs a Warm pulse at ~100 Hz to stay in CAM.
+        // Measured PC->phone ping: 100 Hz = 1% loss / 6.5 ms avg / 8 ms p90,
+        // while 1 Hz = 2.5% loss / 115 ms avg and 10 Hz = 6% loss / 441 ms max.
+        if (isSlow24)
+        {
+            return Math.Clamp((int)Math.Round(12.0 + queueDelayMs * 0.65 + lossPermille * 0.25), 10, 20);
+        }
+        int minMs = 24;
+        int maxMs = 52;
+        double baseMs = 24.0;
         return Math.Clamp((int)Math.Round(baseMs + queueDelayMs * 0.65 + lossPermille * 0.25), minMs, maxMs);
     }
 
@@ -4361,8 +4375,10 @@ internal sealed class HostSession : IInputSession, IDisposable
         if (liveHz < 24)
             liveHz = Volatile.Read(ref _remoteMonitors).Monitors.FirstOrDefault()?.RefreshHz ?? 0;
         double paceMs = pacer?.EffectiveMinIntervalMs ?? 2.5;
+        long lateTotal = client?.LinkTracker.LatePackets ?? 0;
+        long reorderedTotal = client?.LinkTracker.ReorderedPackets ?? 0;
         DiagnosticLog?.Invoke(
-            $"Telemetry [out->{_remoteSystemName ?? "hub"}]: fast_confirmed={udpConfirmed} live_hz={liveHz} pace_ms={paceMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={tcpFallback}");
+            $"Telemetry [out->{_remoteSystemName ?? "hub"}]: fast_confirmed={udpConfirmed} live_hz={liveHz} pace_ms={paceMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={tcpFallback} late_total={lateTotal} reordered_total={reorderedTotal}");
     }
 
     private async Task HeartbeatAsync()

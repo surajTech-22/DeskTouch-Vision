@@ -285,18 +285,51 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         Check(transitTracker.InboundJitterMs > 8.0,
             "Transit jitter must detect real network buffering and catch-up bursts");
 
-        // Verify fast EWMA packet-loss recovery (~0.94 decay) recovers within ~50 clean frames
-        // once missing slots pass the 8-packet reorder slack window.
-        var lossRecovery = new AdaptiveLinkTracker();
-        lossRecovery.RecordInboundPacket(1, hasSenderTimestamp: true, 1000, 1000);
-        for (ulong s = 6; s <= 15; s++)
-            lossRecovery.RecordInboundPacket(s, hasSenderTimestamp: true, 1000 + (int)(s * 7), 1000 + (long)(s * 7));
-        double spikeLoss = lossRecovery.InboundLossPermille;
-        for (ulong s = 16; s <= 65; s++)
-            lossRecovery.RecordInboundPacket(s, hasSenderTimestamp: true, 1000 + (int)(s * 7), 1000 + (long)(s * 7));
-        double recoveredLoss = lossRecovery.InboundLossPermille;
-        Check(spikeLoss > 40.0 && recoveredLoss < spikeLoss * 0.25 && recoveredLoss < 15.0,
-            "AdaptiveLinkTracker EWMA loss must decay briskly after brief wireless burst drops");
+        // Verify the 63-frame 2.4 GHz reorder window: buffered power-save
+        // bursts are reordered, and a frame that still arrives after
+        // settlement is reclassified from lost to late.
+        var burstTracker = new AdaptiveLinkTracker("2.4GHz");
+        long burstMs = 1000;
+        for (ulong s = 1; s <= 30; s++)
+        {
+            burstMs += 16;
+            burstTracker.RecordInboundPacket(s, true, burstMs);
+        }
+        for (ulong s = 40; s >= 31; s--)
+        {
+            burstMs += 1;
+            burstTracker.RecordInboundPacket(s, true, burstMs);
+        }
+        Check(burstTracker.LostPackets == 0 && burstTracker.ReorderedPackets >= 9 &&
+              burstTracker.InboundLossPermille < 1.0,
+            "Buffered 2.4 GHz power-save bursts must count as reordered, not packet loss");
+
+        var lateTracker = new AdaptiveLinkTracker("2.4GHz");
+        long lateMs = 1000;
+        for (ulong s = 1; s <= 69; s++)
+        {
+            lateMs += 8;
+            lateTracker.RecordInboundPacket(s, true, lateMs);
+        }
+        for (ulong s = 71; s <= 133; s++)
+        {
+            lateMs += 8;
+            lateTracker.RecordInboundPacket(s, true, lateMs);
+        }
+        Check(lateTracker.LostPackets == 1 && lateTracker.LatePackets == 0,
+            "Frame missing past the 63-frame slack must settle as lost");
+        lateMs += 8;
+        lateTracker.RecordInboundPacket(70, true, lateMs);
+        Check(lateTracker.LostPackets == 0 && lateTracker.LatePackets == 1,
+            "Frame arriving after settlement must be reclassified as late, not lost");
+        double lateLoss = lateTracker.InboundLossPermille;
+        for (ulong s = 134; s <= 200; s++)
+        {
+            lateMs += 8;
+            lateTracker.RecordInboundPacket(s, true, lateMs);
+        }
+        Check(lateLoss > 0 && lateTracker.InboundLossPermille < lateLoss * 0.25 && lateLoss < 100.0,
+            "EWMA loss must decay briskly after a brief 2.4 GHz burst drop");
     }
 
     // Verify AdbCableBridge wired-device parsing & reverse-rule verification.
@@ -390,7 +423,7 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         }
         Check(tracker.ReorderedPackets >= 1 && tracker.LostPackets == 0,
             "Brief wireless reordering must not inflate real packet-loss counts");
-        for (ulong s = 16; s <= 35; s++)
+        for (ulong s = 16; s <= 100; s++)
         {
             if (s == 18) continue;
             tickMs += 7;
@@ -407,6 +440,20 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         dynPacer.SetWarmIntervalMs(36);
         Check(Math.Abs(dynPacer.EffectiveMinIntervalMs - 14.5) < 0.01,
             "FastMovePacer must expose live adaptive pacing interval");
+
+        var duplicatePackets = new List<Packet>();
+        using var duplicatePacer = new FastMovePacer(
+            canSendUdp: () => true,
+            sendUdp: packet => { duplicatePackets.Add(packet); return true; },
+            queueReliableTcp: _ => { },
+            nextSeq: () => 42);
+        duplicatePacer.SetMinIntervalMs(7.5);
+        duplicatePacer.SetDuplicateMoves(true);
+        duplicatePacer.TryHandleMove(new Packet("move", 10, 20));
+        Check(duplicatePackets.Count == 2 &&
+              duplicatePackets[0].C == 42 && duplicatePackets[1].C == 42 &&
+              duplicatePacer.TakeDuplicateCount() == 1,
+            "2.4 GHz duplicate move must carry the same move sequence so Android dedup drops the copy");
     }
 
     byte[] extSrvKey = Enumerable.Range(21, 32).Select(x => (byte)x).ToArray();
@@ -2285,11 +2332,12 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
           wifiText.Contains("loss 3.0%", StringComparison.Ordinal),
         "Wireless status display must report ping, jitter, and percent loss accurately");
 
-    Check(ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 0, 0) >= 55 &&
+    Check(ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 0, 0) is >= 10 and <= 20 &&
+          ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 40, 400) <= 20 &&
           ReceiverServer.ComputeWarmIntervalMs("5GHz", 0, 0) == 24 &&
           ReceiverServer.SupportsUdpEdgePush("0.3.50") &&
           !ReceiverServer.SupportsUdpEdgePush("0.3.49"),
-        "2.4 GHz keepalive interval and v0.3.50 edge-push version gate must behave safely");
+        "2.4 GHz keepalive must hold ~100 Hz CAM pacing while 5 GHz stays low-rate");
 
     var cableProbeTracker = new AdaptiveLinkTracker("cable");
     cableProbeTracker.OnLinkProfileChanged("cable", 480, 0);
@@ -2358,10 +2406,10 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         "MouseHook fallback must require sustained >30ms RawInput absence across multiple hook moves");
     var wifiLossGap = new AdaptiveLinkTracker("2.4GHz");
     wifiLossGap.RecordInboundPacket(1, true, 1000, 1000);
-    wifiLossGap.RecordInboundPacket(10, true, 1070, 1070);
-    wifiLossGap.RecordInboundPacket(19, true, 1140, 1140);
+    wifiLossGap.RecordInboundPacket(100, true, 1100, 1100);   // real 98-frame outage
+    wifiLossGap.RecordInboundPacket(200, true, 1200, 1200);   // real 99-frame outage
     double preGapLoss = wifiLossGap.InboundLossPermille;
-    wifiLossGap.RecordInboundPacket(20, true, 4140, 4140);
+    wifiLossGap.RecordInboundPacket(201, true, 4200, 4200);   // 3 s quiet radio gap
     Check(preGapLoss > 50.0 && wifiLossGap.InboundLossPermille < preGapLoss * 0.6,
         "Wireless loss tracker must decay stale outage spikes after quiet recovery gaps");
 

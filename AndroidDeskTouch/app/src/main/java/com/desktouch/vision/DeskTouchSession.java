@@ -146,6 +146,11 @@ final class DeskTouchSession implements AutoCloseable {
     private static int phoneCameraFrameSeq;
     private static int phoneMicSeq;
     static void setMediaRequestListener(MediaRequestListener listener){ mediaRequestListener = listener; }
+    interface WirelessPairResultListener {
+        void onResult(boolean ok, String message);
+    }
+    private static volatile WirelessPairResultListener wirelessPairResultListener;
+    static void setWirelessPairResultListener(WirelessPairResultListener listener){ wirelessPairResultListener = listener; }
     static final class EnvironmentTarget {
         final int id;
         final String name,platform,layout;
@@ -986,6 +991,7 @@ final class DeskTouchSession implements AutoCloseable {
                     publishLinkProfile(snap);
                 }
                 ShellInputClient.warmConnectIfConfigured(application);
+                VirtualBridgeHelper.probeAndSync(application,this,true);
                 publishKeyboardBindings();
                 publishCurrentBatteryAndNotifications();
                 registerPhoneMediaSink();
@@ -1235,6 +1241,16 @@ final class DeskTouchSession implements AutoCloseable {
                 } else if("shell-input-bridge".equals(p.type)){
                     ShellInputClient.configure(application,p.a,p.text);
                     publishKeyboardBindings();
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("bridge-status".equals(p.type)){
+                    VirtualBridgeHelper.updateRemoteStatus(p.a,p.b,p.text);
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("adb-pair-result".equals(p.type)){
+                    boolean ok=p.a==1;
+                    String msg=p.text!=null ? p.text : "";
+                    WirelessPairResultListener pl=wirelessPairResultListener;
+                    if(pl!=null) pl.onResult(ok,msg);
+                    if(ok) VirtualBridgeHelper.probeAndSync(application,this,true);
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("cable-bridge-ready".equals(p.type)){
                     AutoConnectService.onCableBridgeReadyHint(application,fingerprint);
@@ -2149,6 +2165,25 @@ final class DeskTouchSession implements AutoCloseable {
         // asking the user to disconnect or pair the phone again.
         if(running)send(new Packet("android-capability",
             canAcceptRemoteInput()?1:0));
+    }
+
+    void sendAdbBridgeHint(String json){
+        if(running && json!=null && !json.isEmpty()){
+            send(new Packet("adb-bridge-hint",0,0,0,0,json));
+        }
+    }
+
+    void requestShellBridgeSync(){
+        if(running){
+            send(new Packet("request-shell-bridge"));
+        }
+    }
+
+    void sendWirelessPairRequest(int pairPort, int connectPort, String code){
+        if(running){
+            send(new Packet("adb-pair-request",Math.max(0,pairPort),Math.max(0,connectPort),0,0,
+                code!=null ? code : ""));
+        }
     }
 
     private void handlePauseAccessibilityFromWindows(){
@@ -3150,6 +3185,7 @@ final class DeskTouchSession implements AutoCloseable {
             inboundFiles.clear();
         }
         if(DeskTouchRuntime.connectedCount()==0){
+            VirtualBridgeHelper.clearRemoteStatus();
             RemoteInputPower.end();
             PhoneMediaService.stopAll(application);
         } else RemoteInputPower.begin(application);

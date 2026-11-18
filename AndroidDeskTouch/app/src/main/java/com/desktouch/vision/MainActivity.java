@@ -54,6 +54,10 @@ public final class MainActivity extends Activity {
     private TextView liveBadgeText,mouseTag,mouseMetric,kbTag,kbMetric;
     private Button scanBtn,findScanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
     private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn,notifAccessBtn;
+    private Button checkBridgeBtn,pairBridgeBtn;
+    private LinearLayout bridgeActionRow;
+    private long lastBridgeAutoProbeMs;
+    private volatile java.util.function.BiConsumer<Boolean,String> activePairResultHandler;
     private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout,trackpadTaskbarLbl;
     private LinearLayout trackpadTaskbarCard,trackpadPcBar,trackpadScreenBar;
     private HorizontalScrollView trackpadScreenScroll;
@@ -87,6 +91,15 @@ public final class MainActivity extends Activity {
         @Override public void run(){
             if(!liveUiRunning)return;
             refreshLiveLinkAndKeyboard();
+            if(DeskTouchRuntime.connectedCount()>0 &&
+                ShellInputClient.allowed(MainActivity.this) &&
+                !ShellInputClient.ready(MainActivity.this)){
+                long nowUp=android.os.SystemClock.uptimeMillis();
+                if(nowUp-lastBridgeAutoProbeMs>=12000L){
+                    lastBridgeAutoProbeMs=nowUp;
+                    DeskTouchRuntime.requestShellBridgeSync(MainActivity.this,false);
+                }
+            }
             liveUiHandler.postDelayed(this,750L);
         }
     };
@@ -168,8 +181,17 @@ public final class MainActivity extends Activity {
             if(!isFinishing()&&!isDestroyed()){
                 refreshEnvironmentMembers();
                 refreshTrackpadPcTaskbar();
+                refreshPermissionState();
                 refreshLiveLinkAndKeyboard();
+                updateVisibleScreenAwake();
             }
+        }));
+        DeskTouchSession.setWirelessPairResultListener((ok,msg)->runOnUiThread(()->{
+            if(isFinishing()||isDestroyed())return;
+            java.util.function.BiConsumer<Boolean,String> handler=activePairResultHandler;
+            if(handler!=null) handler.accept(ok,msg);
+            refreshPermissionState();
+            setFeedback(msg,true);
         }));
         setupEcosystemHooks();
         registerKeyboardDeviceListener();
@@ -1796,6 +1818,24 @@ public final class MainActivity extends Activity {
         permissionState.setLineSpacing(dp(2),1f);
         permBox.addView(permissionState);
 
+        bridgeActionRow=new LinearLayout(this);
+        bridgeActionRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams brLp=new LinearLayout.LayoutParams(-1,-2);
+        brLp.topMargin=dp(8);
+        safetyCard.addView(bridgeActionRow,brLp);
+
+        checkBridgeBtn=PhoneUiKit.createButton(this,"Check Bridge",palette,PhoneUiKit.BTN_SUBTLE);
+        checkBridgeBtn.setOnClickListener(v->checkVirtualBridgeFromUi());
+        LinearLayout.LayoutParams cbLp=new LinearLayout.LayoutParams(0,-2,1f);
+        cbLp.rightMargin=dp(4);
+        bridgeActionRow.addView(checkBridgeBtn,cbLp);
+
+        pairBridgeBtn=PhoneUiKit.createButton(this,"Pair Wireless Bridge",palette,PhoneUiKit.BTN_TINT_AMBER);
+        pairBridgeBtn.setOnClickListener(v->showPairWirelessBridgeDialog());
+        LinearLayout.LayoutParams pbLp=new LinearLayout.LayoutParams(0,-2,1.25f);
+        pbLp.leftMargin=dp(4);
+        bridgeActionRow.addView(pairBridgeBtn,pbLp);
+
         LinearLayout safetyBtns1=new LinearLayout(this);
         safetyBtns1.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams sb1Lp=new LinearLayout.LayoutParams(-1,-2);
@@ -2088,6 +2128,14 @@ public final class MainActivity extends Activity {
             otpHelperSwitch.applyPalette(p);
             PhoneUiKit.styleSubcard(permBox,p,this);
             permissionState.setTextColor(p.amberText);
+            if(checkBridgeBtn!=null) PhoneUiKit.styleButton(checkBridgeBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            if(pairBridgeBtn!=null){
+                VirtualBridgeHelper.RemoteStatus rs=VirtualBridgeHelper.latestStatus();
+                boolean needsPair="needs_wireless_pair".equals(rs.state)
+                    || VirtualBridgeHelper.inspectSystemDebugState(this).wifiDebugEnabled;
+                PhoneUiKit.styleButton(pairBridgeBtn,p,
+                    needsPair ? PhoneUiKit.BTN_TINT_AMBER : PhoneUiKit.BTN_SUBTLE,this);
+            }
             PhoneUiKit.styleButton(accBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(pinWidgetBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(stopCtrlBtn,p,PhoneUiKit.BTN_DANGER,this);
@@ -2298,9 +2346,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.85";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.86";
         }catch(Exception ignored){
-            return "0.3.85";
+            return "0.3.86";
         }
     }
 
@@ -2344,6 +2392,11 @@ public final class MainActivity extends Activity {
         startLiveUiTicker();
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+        if(DeskTouchRuntime.connectedCount()>0 && ShellInputClient.allowed(this) && !ShellInputClient.ready(this)){
+            lastBridgeAutoProbeMs=android.os.SystemClock.uptimeMillis();
+            ShellInputClient.warmConnectIfConfigured(this);
+            DeskTouchRuntime.requestShellBridgeSync(this,true);
+        }
         AndroidUpdater.checkInAppOnResume(this);
     }
 
@@ -2794,24 +2847,159 @@ public final class MainActivity extends Activity {
                     ? "Accessibility Paused for Payment Apps"
                     : "Accessibility Off • Tap Pay Safe or Setup to enable");
             }else{
-                protectionDesc.setText(ShellInputClient.allowed(this)
-                    ? "Accessibility Active • Virtual Bridge Ready"
-                    : "Accessibility Active");
+                protectionDesc.setText("Accessibility Active");
             }
         }
 
+        VirtualBridgeHelper.DebugState dbgState=VirtualBridgeHelper.inspectSystemDebugState(this);
+        VirtualBridgeHelper.RemoteStatus remoteBridge=VirtualBridgeHelper.latestStatus();
+        boolean shellAllowed=ShellInputClient.allowed(this);
+        if(bridgeActionRow!=null){
+            bridgeActionRow.setVisibility((!shellReady && shellAllowed) ? View.VISIBLE : View.GONE);
+        }
+        if(pairBridgeBtn!=null && palette!=null){
+            boolean highlightPair="needs_wireless_pair".equals(remoteBridge.state) || dbgState.wifiDebugEnabled;
+            PhoneUiKit.styleButton(pairBridgeBtn,palette,
+                highlightPair ? PhoneUiKit.BTN_TINT_AMBER : PhoneUiKit.BTN_SUBTLE,this);
+        }
+
         if(permissionState==null)return;
-        String bridgeLine=shellReady
-            ? "active (works with Accessibility OFF)"
-            : (ShellInputClient.allowed(this)
-                ? "standby (starts automatically when cable or Wireless Debugging is connected to Windows)"
-                : "disabled in DeskTouch");
+        String bridgeLine;
+        if(shellReady){
+            bridgeLine="active (works with Accessibility OFF — mouse & keyboard ready)";
+        }else if(!shellAllowed){
+            bridgeLine="disabled in DeskTouch";
+        }else if(DeskTouchRuntime.connectedCount()<=0){
+            bridgeLine="standby (connect to your Windows PC over Wi-Fi or USB cable first)";
+        }else if("adb_missing".equals(remoteBridge.state)){
+            bridgeLine="waiting — update/reinstall DeskTouch Vision on Windows (ADB tool missing on PC)";
+        }else if("usb_unauthorized".equals(remoteBridge.state)){
+            bridgeLine="waiting — tap 'Allow USB debugging' popup on this phone (tick Always allow)";
+        }else if("daemon_error".equals(remoteBridge.state) && !remoteBridge.detail.isEmpty()){
+            bridgeLine=remoteBridge.detail;
+        }else if("needs_wireless_pair".equals(remoteBridge.state) || dbgState.wifiDebugEnabled){
+            bridgeLine="Wireless Debugging detected — tap 'Pair Wireless Bridge' below for 1-time 6-digit pairing";
+        }else if(dbgState.usbDebugEnabled){
+            bridgeLine="USB Debugging ON — plug in your data cable to Windows (or turn ON Wireless debugging)";
+        }else{
+            bridgeLine="standby — turn ON Wireless debugging or USB debugging in Developer options (or enable Accessibility)";
+        }
         permissionState.setText(PermissionContinuity.state(this) +
             "\nVirtual Bridge: " + bridgeLine +
             "\nDeskTouch keyboard: " +
             (DeskTouchInputMethod.isSelected(this)
                 ? "selected for focused-field typing."
                 : "not selected (optional when Accessibility is used)."));
+    }
+
+    private void checkVirtualBridgeFromUi(){
+        if(!ShellInputClient.allowed(this)){
+            ShellInputClient.setAllowed(this,true);
+        }
+        ShellInputClient.warmConnectIfConfigured(this);
+        DeskTouchRuntime.requestShellBridgeSync(this,true);
+        refreshPermissionState();
+        scan();
+        setFeedback(DeskTouchRuntime.connectedCount()>0
+            ? "Checking USB cable & Wireless Debugging bridge with Windows..."
+            : "Scanning for Windows PCs to check Virtual Bridge...",true);
+    }
+
+    private void showPairWirelessBridgeDialog(){
+        if(DeskTouchRuntime.connectedCount()<=0){
+            new AlertDialog.Builder(this)
+                .setTitle("Pair Wireless Bridge")
+                .setMessage("Connect your phone to your Windows PC in DeskTouch first, then tap Pair Wireless Bridge.")
+                .setPositiveButton("OK",null)
+                .show();
+            return;
+        }
+        DeskTouchRuntime.requestShellBridgeSync(this,true);
+
+        LinearLayout box=new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20),dp(12),dp(20),dp(6));
+
+        TextView guide=new TextView(this);
+        guide.setText("One-time Wireless Debugging pairing starts Accessibility-free Virtual Bridge over Wi-Fi:\n\n"
+            +"1. Tap 'Open Developer Options' -> turn ON 'Wireless debugging' -> tap 'Pair device with pairing code'.\n"
+            +"2. Tip: Keep that pairing popup open (use Split Screen here OR enter the 6-digit code on Windows via Tray menu -> Pair Wireless Android Bridge...).");
+        guide.setTextSize(12.5f);
+        guide.setLineSpacing(dp(2),1f);
+        box.addView(guide);
+
+        Button devBtn=PhoneUiKit.createButton(this,"Open Developer Options",palette,PhoneUiKit.BTN_SUBTLE);
+        devBtn.setOnClickListener(v->{
+            try{
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+            }catch(RuntimeException ignored){
+                try{startActivity(new Intent(Settings.ACTION_SETTINGS));}catch(RuntimeException ignored2){}
+            }
+        });
+        LinearLayout.LayoutParams devLp=new LinearLayout.LayoutParams(-1,-2);
+        devLp.topMargin=dp(10);
+        box.addView(devBtn,devLp);
+
+        EditText portEdit=new EditText(this);
+        portEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        portEdit.setHint("Pairing Port (optional if auto-detected)");
+        int detectedPairPort=VirtualBridgeHelper.bestPairPortHint();
+        if(detectedPairPort>0) portEdit.setText(String.valueOf(detectedPairPort));
+        LinearLayout.LayoutParams pLp=new LinearLayout.LayoutParams(-1,-2);
+        pLp.topMargin=dp(10);
+        box.addView(portEdit,pLp);
+
+        EditText codeEdit=new EditText(this);
+        codeEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        codeEdit.setHint("6-digit Wi-Fi pairing code");
+        LinearLayout.LayoutParams cLp=new LinearLayout.LayoutParams(-1,-2);
+        cLp.topMargin=dp(6);
+        box.addView(codeEdit,cLp);
+
+        TextView dialogStatus=new TextView(this);
+        dialogStatus.setTextSize(12f);
+        dialogStatus.setPadding(0,dp(8),0,0);
+        VirtualBridgeHelper.RemoteStatus cur=VirtualBridgeHelper.latestStatus();
+        dialogStatus.setText(cur.detail.isEmpty()
+            ? "Ready for 6-digit code from Developer options -> Pair device with pairing code."
+            : cur.detail);
+        box.addView(dialogStatus);
+
+        AlertDialog dlg=new AlertDialog.Builder(this)
+            .setTitle("Pair Wireless Bridge")
+            .setView(box)
+            .setPositiveButton("Pair & Activate",null)
+            .setNegativeButton("Close",null)
+            .create();
+        activePairResultHandler=(ok,msg)->{
+            dialogStatus.setText(msg);
+            if(ok && dlg.isShowing()){
+                liveUiHandler.postDelayed(()->{
+                    if(!isFinishing() && !isDestroyed() && dlg.isShowing()) dlg.dismiss();
+                },900L);
+            }
+        };
+        dlg.setOnDismissListener(d->{ activePairResultHandler=null; });
+        dlg.setOnShowListener(d->{
+            Button okBtn=dlg.getButton(DialogInterface.BUTTON_POSITIVE);
+            if(okBtn!=null){
+                okBtn.setOnClickListener(v->{
+                    String rawCode=codeEdit.getText()!=null ? codeEdit.getText().toString().trim() : "";
+                    String rawPort=portEdit.getText()!=null ? portEdit.getText().toString().trim() : "";
+                    int pairPort=0;
+                    if(!rawPort.isEmpty()){
+                        try{ pairPort=Integer.parseInt(rawPort); }catch(NumberFormatException ignored){}
+                    }
+                    dialogStatus.setText("Pairing Wireless Debugging with Windows...");
+                    boolean sent=DeskTouchRuntime.pairWirelessBridge(
+                        MainActivity.this,pairPort,VirtualBridgeHelper.bestConnectPortHint(),rawCode);
+                    if(!sent){
+                        dialogStatus.setText("Not connected to Windows right now. Reconnect and try again.");
+                    }
+                });
+            }
+        });
+        dlg.show();
     }
 
     private void onNotificationAccessClicked(){
@@ -3886,6 +4074,8 @@ public final class MainActivity extends Activity {
             catch(RuntimeException ignored){}
             inputDeviceListener=null;
         }
+        DeskTouchSession.setWirelessPairResultListener(null);
+        activePairResultHandler=null;
         DeskTouchRuntime.setLiveStatusListener(null);
         DeskTouchRuntime.setListener(null);
         // The foreground reconnect service owns the authenticated TLS sessions.
@@ -4806,8 +4996,11 @@ public final class MainActivity extends Activity {
         PhoneMediaService.stopAll(this);
         DeskTouchRuntime.resetRememberedStreams(this);
         lastWindowsTaskbarSig="";
+        ShellInputClient.warmConnectIfConfigured(this);
+        DeskTouchRuntime.requestShellBridgeSync(this,true);
         refreshLiveShareButtons();
         refreshStreamOptionControls();
+        refreshPermissionState();
         refreshLiveLinkAndKeyboard();
         scan();
         new AlertDialog.Builder(this)

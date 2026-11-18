@@ -87,11 +87,28 @@ jobs:
           if (!(Test-Path 'DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe')) {
             throw "Windows device-sharing module missing from installable app"
           }
+          # Bundle official Google Android Platform Tools (adb.exe + USB DLLs) so
+          # Virtual Bridge auto-recognizes tester phones even on PCs without Android Studio.
+          $ptTmp = Join-Path $env:RUNNER_TEMP 'android-platform-tools'
+          $ptZip = Join-Path $ptTmp 'platform-tools.zip'
+          $ptDest = 'DeskTouchVision/dist/app/DeviceSharing/platform-tools'
+          New-Item -ItemType Directory -Force $ptTmp,$ptDest | Out-Null
+          Invoke-WebRequest -Uri 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip' -OutFile $ptZip -UseBasicParsing
+          Expand-Archive -LiteralPath $ptZip -DestinationPath $ptTmp -Force
+          foreach ($bin in @('adb.exe','AdbWinApi.dll','AdbWinUsbApi.dll','NOTICE.txt')) {
+            $src = Join-Path $ptTmp "platform-tools\$bin"
+            if (!(Test-Path -LiteralPath $src -PathType Leaf)) {
+              throw "Official Android Platform Tools missing expected file: $bin"
+            }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $ptDest $bin) -Force
+          }
+          Remove-Item -LiteralPath $ptTmp -Recurse -Force -ErrorAction SilentlyContinue
           # Explicit file integrity records are inside the official ZIP,
           # which itself is SHA-256 verified before install/update.
           $app = 'DeskTouchVision/dist/app'
           $required = @('DeskTouchVision.exe','DeviceSharing/DeskTouch.DeviceShare.exe',
             'DeviceSharing/DeskTouch.DeviceShare.deps.json','DeviceSharing/DeskTouch.DeviceShare.runtimeconfig.json',
+            'DeviceSharing/platform-tools/adb.exe','DeviceSharing/platform-tools/AdbWinApi.dll','DeviceSharing/platform-tools/AdbWinUsbApi.dll',
             'Update-DeskTouch.ps1','VERIFY_DESKTOUCH_PAYLOAD.ps1','CHECK_SECURITY_STATUS.ps1')
           foreach ($relative in $required) {
             $item = Join-Path $app ($relative -replace '/', '\')

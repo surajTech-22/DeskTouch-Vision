@@ -1675,6 +1675,41 @@ public final class ProtocolSourceTest {
         assertTrue(sessionSource.contains("phone-mic-audio"));
     }
 
+    @Test
+    public void virtualBridgeAutoRecognitionAndPairingWorkSafely() throws Exception {
+        String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
+        String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
+        String shellClientSource = readProjectSource("src/main/java/com/desktouch/vision/ShellInputClient.java");
+
+        String hintJson = VirtualBridgeHelper.encodeHintJson(true, true, 41234, 37890, true, false);
+        org.json.JSONObject bridgeHintObj = new org.json.JSONObject(hintJson);
+        assertTrue(bridgeHintObj.getBoolean("usb"));
+        assertTrue(bridgeHintObj.getBoolean("wifi"));
+        assertEquals(41234, bridgeHintObj.getInt("connectPort"));
+        assertEquals(37890, bridgeHintObj.getInt("pairPort"));
+        assertTrue(bridgeHintObj.getBoolean("allowed"));
+        assertFalse(bridgeHintObj.getBoolean("ready"));
+
+        VirtualBridgeHelper.clearRemoteStatus();
+        VirtualBridgeHelper.updateRemoteStatus(37891, 41235, "needs_wireless_pair|Pair once");
+        assertEquals("needs_wireless_pair", VirtualBridgeHelper.latestStatus().state);
+        assertEquals("Pair once", VirtualBridgeHelper.latestStatus().detail);
+        assertEquals(37891, VirtualBridgeHelper.bestPairPortHint());
+        assertEquals(41235, VirtualBridgeHelper.bestConnectPortHint());
+        VirtualBridgeHelper.clearRemoteStatus();
+        assertEquals("debug_off", VirtualBridgeHelper.latestStatus().state);
+
+        assertTrue(shellClientSource.contains("scheduleRetryIfValid("));
+        assertTrue(shellClientSource.contains("DeskTouchRuntime.requestShellBridgeSync(app)"));
+        assertTrue(shellClientSource.contains("if (\"ERR\".equals(ack))"));
+        assertTrue(sessionSource.contains("bridge-status"));
+        assertTrue(sessionSource.contains("adb-pair-result"));
+        assertTrue(sessionSource.contains("sendAdbBridgeHint("));
+        assertTrue(mainSource.contains("checkVirtualBridgeFromUi("));
+        assertTrue(mainSource.contains("showPairWirelessBridgeDialog("));
+        assertTrue(mainSource.contains("setLiveStatusListener") && mainSource.contains("refreshPermissionState()"));
+    }
+
     private static String readProjectSource(String relFromAppModule) {
         try {
             String[] prefixes = {"", "app/", "AndroidDeskTouch/app/"};

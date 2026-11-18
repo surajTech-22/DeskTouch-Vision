@@ -500,6 +500,39 @@ final class DeskTouchRuntime {
         notifyLiveStatusChanged();
     }
 
+    static void requestShellBridgeSync(Context context){
+        requestShellBridgeSync(context,true);
+    }
+
+    static void requestShellBridgeSync(Context context, boolean force){
+        if(context!=null) appContext=context.getApplicationContext();
+        Context ctx=appContext;
+        if(ctx==null) return;
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()){
+                VirtualBridgeHelper.probeAndSync(ctx,s,force);
+            }
+        }
+    }
+
+    static boolean pairWirelessBridge(Context context, int pairPort, int connectPort, String code){
+        if(context!=null) appContext=context.getApplicationContext();
+        DeskTouchSession chosen=null;
+        String sel=selectedFingerprint;
+        if(sel!=null){
+            DeskTouchSession s=sessions.get(sel);
+            if(s!=null && s.isConnected()) chosen=s;
+        }
+        if(chosen==null){
+            for(DeskTouchSession s:sessions.values()){
+                if(s!=null && s.isConnected()){ chosen=s; break; }
+            }
+        }
+        if(chosen==null) return false;
+        chosen.sendWirelessPairRequest(pairPort,connectPort,code);
+        return true;
+    }
+
     static synchronized void clear(){
         PEER_ENDPOINTS.clear();
         for(DeskTouchSession s:pendingMakeBeforeBreak.values())s.close();

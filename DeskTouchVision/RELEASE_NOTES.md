@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.86 — Automatic Virtual Bridge Recognition, Built-In Windows ADB Tools & One-Time Wireless Pairing
+
+- **Built-In Android Platform Tools on Every Windows PC (`desktouch-vision.yml`, `AdbCableBridge`, `Update-DeskTouch.ps1`):** Bundles official Google `adb.exe`, `AdbWinApi.dll`, and `AdbWinUsbApi.dll` inside `DeskTouchVision-Install.exe` and `DeskTouchVision-win-x64.zip` and stages them into `%LOCALAPPDATA%\DeskTouchVision\platform-tools` so tester PCs without Android Studio auto-start Virtual Bridge cleanly without locking app updates.
+- **Automatic Wireless & USB Debugging Recognition (`VirtualBridgeHelper`, `AdbCableBridge`, `NetworkSessions`):** Android automatically reads system USB/Wireless Debugging state, resolves its own local `_adb-tls-connect._tcp` / `_adb-tls-pairing._tcp` ports via `NsdManager`, pushes live hints over the encrypted connection, enables OpenScreen mDNS (`ADB_MDNS_OPENSCREEN=1`), clears stale `offline` wireless endpoints, and automatically retries `ShellInputClient` loopback auth without dropping credentials on a single timeout.
+- **Live Virtual Bridge Diagnostics & 1-Time Wireless Pairing UI (`MainActivity`, `WirelessBridgePairDialog`, `DeskTouchSession`):** Fixes Setup tab state refresh (`setLiveStatusListener`) and replaces generic "standby" text with exact real-time guidance (pending `"Allow USB debugging"` prompt, `"Pair Wireless Bridge"` one-time 6-digit pairing from Android or Windows Tray menu, or instant **`Check Bridge`** sync).
+
+---
+
 # DeskTouch Vision v0.3.85 — Phone Screen Window, Wireless Camera & Mic, Recent Shared Shelf, QR Quick-Pair, One-Click Repair & Reliable Auto-Update Exit
 
 - **Clean Automatic Update Exit & Instant Window Wakeup (`Update-DeskTouch.ps1`, `SingleInstanceActivation`, `DisplaySettingsForm`):** Automatically clears stale/stuck background updater helpers and cleanly exits ALL running `DeskTouchVision.exe` / `DeskTouch.DeviceShare.exe` processes before installing an update so automatic updates never stall, closes owned dialogs immediately on update signal, and uses `AttachThreadInput` foreground activation so re-opening DeskTouch reliably brings the window straight to front.

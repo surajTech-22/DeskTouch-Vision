@@ -620,6 +620,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ShowFromTray();
             await RunOneClickRepairAsync();
         });
+        _trayMenu.Items.Add("Pair Wireless Android Bridge...", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenWirelessBridgePairDialog();
+        });
         _trayMenu.Items.Add("Profiles & Automation Rules...", null, (_, _) =>
         {
             ShowFromTray();
@@ -1733,7 +1738,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.SetCustomPairingCode(_customPairingCode);
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
             if (_adbBridge?.CurrentShellBridge is { } existingBridge)
-                _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret);
+                _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret, forceBroadcast: true);
+            if (_adbBridge?.CurrentStatus is { } existingBridgeStatus)
+                _receiver.SetBridgeStatus(existingBridgeStatus.State, existingBridgeStatus.Detail,
+                    existingBridgeStatus.PairPortHint, existingBridgeStatus.ConnectPortHint);
+            _receiver.AndroidBridgeHintReceived += (peerIp, usb, wifi, cPort, pPort, allowed, ready) =>
+                _adbBridge?.UpdateAndroidDebugHint(peerIp, usb, wifi, cPort, pPort, allowed, ready);
+            _receiver.ShellBridgeRefreshRequested += () =>
+                _adbBridge?.TriggerRefresh();
+            _receiver.WirelessAdbPairRequested += (peerIp, pPort, code, cPort) =>
+                _adbBridge != null
+                    ? _adbBridge.PairWirelessDebuggingAsync(peerIp, pPort, code, cPort)
+                    : Task.FromResult((false, "Virtual Bridge service is not started yet on Windows."));
             try
             {
                 // Preserve UDP discovery even when the PC becomes an outgoing
@@ -1757,14 +1773,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _adbBridge ??= new AdbCableBridge(
                         LogDiagnostic,
                         onShellBridgeReady: (port, secret) =>
-                            Volatile.Read(ref _receiver)?.SetShellBridgeAuth(port, secret),
+                            Volatile.Read(ref _receiver)?.SetShellBridgeAuth(port, secret, forceBroadcast: true),
                         onBridgeDetached: () =>
                         {
                             Volatile.Read(ref _receiver)?.NotifyCableDetached();
                             BroadcastOnlinePresence();
                         },
                         onCableBridgeReady: () =>
-                            Volatile.Read(ref _receiver)?.NotifyCableBridgeReady());
+                            Volatile.Read(ref _receiver)?.NotifyCableBridgeReady(),
+                        onBridgeStatusChanged: status =>
+                            Volatile.Read(ref _receiver)?.SetBridgeStatus(
+                                status.State, status.Detail, status.PairPortHint, status.ConnectPortHint));
                     BroadcastOnlinePresence();
                 }
                 Status("Ready for trusted device discovery. No global input hooks while unpaired.");
@@ -3814,11 +3833,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
             catch { }
 
+            _adbBridge?.TriggerRefresh();
+            var bridgeSnap = _adbBridge?.CurrentStatus;
+            string bridgeSummary = bridgeSnap != null
+                ? $"\nVirtual Bridge: {bridgeSnap.Detail}"
+                : "";
             string summary =
                 $"Stopped stuck updater helpers: {report.StoppedStaleUpdaters}\n" +
                 $"Cleared duplicate background processes: {report.StoppedDuplicateProcesses}\n" +
                 $"Cleaned old temporary folders: {report.CleanedDebrisFolders}\n" +
-                $"{report.FirewallNote}";
+                $"{report.FirewallNote}{bridgeSummary}";
             Status("Background & network check finished.");
             if (!IsDisposed)
             {
@@ -3830,6 +3854,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             if (!IsDisposed) _repairButton.Enabled = true;
         }
+    }
+
+    private void OpenWirelessBridgePairDialog()
+    {
+        if (_adbBridge == null)
+        {
+            MessageBox.Show(this, "DeskTouch device sharing is still starting up. Try again in a moment.",
+                "DeskTouch Vision", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        using var dlg = new WirelessBridgePairDialog(
+            _adbBridge.CurrentStatus,
+            (ip, pPort, code, cPort) => _adbBridge.PairWirelessDebuggingAsync(ip, pPort, code, cPort));
+        dlg.ShowDialog(this);
     }
 
     private void ExecutePowerActionFromUi(int targetId, string action)

@@ -21,6 +21,19 @@ foreach ($r in $rules) {
     -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
   Write-Host ("Allowed DeskTouch on Private LocalSubnet: {0} {1}" -f $r.Protocol,$r.Port) -ForegroundColor Green
 }
+$stagedAdb = Join-Path $env:LOCALAPPDATA 'DeskTouchVision\platform-tools\adb.exe'
+$bundledAdb = Join-Path $env:LOCALAPPDATA 'Programs\DeskTouchVision\DeviceSharing\platform-tools\adb.exe'
+$adbExe = if (Test-Path -LiteralPath $stagedAdb -PathType Leaf) { $stagedAdb } elseif (Test-Path -LiteralPath $bundledAdb -PathType Leaf) { $bundledAdb } else { $null }
+if ($adbExe) {
+  $adbRuleName = 'DeskTouchVision.Private.UDP.5353.mDNS'
+  $existingAdbRule = Get-NetFirewallRule -Name $adbRuleName -ErrorAction SilentlyContinue
+  if ($existingAdbRule) { Remove-NetFirewallRule -Name $adbRuleName -ErrorAction Stop }
+  New-NetFirewallRule -Name $adbRuleName -DisplayName 'DeskTouch Vision Wireless Debugging mDNS' `
+    -Group 'DeskTouch Vision' -Enabled True -Direction Inbound -Action Allow `
+    -Program $adbExe -Profile Private -Protocol UDP -LocalPort 5353 `
+    -RemoteAddress LocalSubnet -ErrorAction Stop | Out-Null
+  Write-Host 'Allowed Wireless Debugging mDNS (UDP 5353) on Private LocalSubnet.' -ForegroundColor Green
+}
 $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
 if (-not ($profiles | Where-Object NetworkCategory -eq 'Private')) {
   Write-Warning 'Your active network is not Private. Set your trusted Wi-Fi/Ethernet profile to Private in Windows Settings; these rules intentionally do not open Public networks.'

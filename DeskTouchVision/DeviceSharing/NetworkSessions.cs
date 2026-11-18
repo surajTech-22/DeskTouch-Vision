@@ -192,6 +192,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal FastMovePacer? MovePacer;
         internal long TcpFallbackMoves;
         internal bool IsCableSession;
+        internal IPAddress? RemoteAddress;
         internal long CableMoves;
         internal long LastTcpPingMs;
         internal double TcpRttMs;
@@ -468,6 +469,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly object _layoutGate=new();
     private readonly object _shellAuthGate = new();
     private (int Port, string Secret)? _shellBridgeAuth;
+    private (string State, string Detail, int PairPort, int ConnectPort) _bridgeStatus =
+        ("debug_off", "", 0, 0);
     private readonly Dictionary<string,EnvironmentPosition> _environmentPositions=
         new(StringComparer.Ordinal);
     internal event Action<IReadOnlyDictionary<string,System.Drawing.PointF>>?
@@ -536,6 +539,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<int, byte[]>? PhoneCameraFrameReceived;
     internal event Action<int, int, string?>? PhoneCameraStatusReceived;
     internal event Action<int, byte[], int>? PhoneMicAudioReceived;
+    internal event Action<string?, bool, bool, int, int, bool, bool>? AndroidBridgeHintReceived;
+    internal event Action? ShellBridgeRefreshRequested;
+    internal event Func<string?, int, string, int, Task<(bool Ok, string Message)>>? WirelessAdbPairRequested;
 
     internal void SendPhoneScreenWatch(int targetPeerId, bool enable)
     {
@@ -1180,12 +1186,13 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             FormatSplitPathsSummary(session));
     }
 
-    internal void SetShellBridgeAuth(int port, string secret)
+    internal void SetShellBridgeAuth(int port, string secret, bool forceBroadcast = false)
     {
         if (port <= 0 || port > 65535 || string.IsNullOrWhiteSpace(secret)) return;
         lock (_shellAuthGate)
         {
-            if (_shellBridgeAuth is { } cur && cur.Port == port &&
+            if (!forceBroadcast &&
+                _shellBridgeAuth is { } cur && cur.Port == port &&
                 string.Equals(cur.Secret, secret, StringComparison.Ordinal))
                 return;
             _shellBridgeAuth = (port, secret);
@@ -1202,6 +1209,38 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         _cancel.Token);
                 }
                 catch (Exception) { /* peer may disconnect concurrently */ }
+            }
+        });
+    }
+
+    internal void SetBridgeStatus(string state, string detail, int pairPort, int connectPort)
+    {
+        string cleanState = string.IsNullOrWhiteSpace(state) ? "debug_off" : state.Trim();
+        string cleanDetail = detail ?? "";
+        lock (_shellAuthGate)
+        {
+            if (_bridgeStatus.State == cleanState &&
+                _bridgeStatus.Detail == cleanDetail &&
+                _bridgeStatus.PairPort == pairPort &&
+                _bridgeStatus.ConnectPort == connectPort)
+            {
+                return;
+            }
+            _bridgeStatus = (cleanState, cleanDetail, pairPort, connectPort);
+        }
+        string wireText = $"{cleanState}|{cleanDetail}";
+        _ = Task.Run(async () =>
+        {
+            foreach (var session in _sessions.Values)
+            {
+                if (session.Peer.Platform != "Android") continue;
+                try
+                {
+                    await SendToAsync(session,
+                        new Packet("bridge-status", pairPort, connectPort, Text: wireText),
+                        _cancel.Token);
+                }
+                catch (Exception) { }
             }
         });
     }
@@ -3290,6 +3329,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         int initialSpeed = isCable ? 0 : localSpeed;
         var session=new Session{
             Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable,
+            RemoteAddress=remoteAddress,
             LinkBand=initialBand,
             LinkSpeedMbps=initialSpeed,
             LastPongTicks=Stopwatch.GetTimestamp(),
@@ -3395,11 +3435,23 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (peer.Platform == "Android")
             {
                 (int Port, string Secret)? shellAuth;
-                lock (_shellAuthGate) shellAuth = _shellBridgeAuth;
+                (string State, string Detail, int PairPort, int ConnectPort) bridgeSnapshot;
+                lock (_shellAuthGate)
+                {
+                    shellAuth = _shellBridgeAuth;
+                    bridgeSnapshot = _bridgeStatus;
+                }
                 if (shellAuth is { } auth)
                 {
                     await SendToAsync(session,
                         new Packet("shell-input-bridge", auth.Port, Text: auth.Secret),
+                        token);
+                }
+                if (!string.IsNullOrWhiteSpace(bridgeSnapshot.State))
+                {
+                    await SendToAsync(session,
+                        new Packet("bridge-status", bridgeSnapshot.PairPort, bridgeSnapshot.ConnectPort,
+                            Text: $"{bridgeSnapshot.State}|{bridgeSnapshot.Detail}"),
                         token);
                 }
                 await SendToAsync(session,
@@ -4175,6 +4227,88 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         try { await SendToAsync(targetWin, new Packet("taskbar-action", Text: actionKey), token); }
                         catch (Exception) { }
                     }
+                    continue;
+                }
+                if (p.Type == "adb-bridge-hint" && session.Peer.Platform == "Android" &&
+                    p.Text is { Length: > 1 and <= 2048 })
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(p.Text);
+                        var root = doc.RootElement;
+                        bool usb = root.TryGetProperty("usb", out var u) && u.ValueKind == JsonValueKind.True;
+                        bool wifi = root.TryGetProperty("wifi", out var w) && w.ValueKind == JsonValueKind.True;
+                        int cPort = root.TryGetProperty("connectPort", out var cp) && cp.TryGetInt32(out int cpVal) ? cpVal : 0;
+                        int pPort = root.TryGetProperty("pairPort", out var pp) && pp.TryGetInt32(out int ppVal) ? ppVal : 0;
+                        bool allowed = !root.TryGetProperty("allowed", out var al) || al.ValueKind != JsonValueKind.False;
+                        bool ready = root.TryGetProperty("ready", out var rd) && rd.ValueKind == JsonValueKind.True;
+                        string? remoteIp = AdbCableBridge.NormalizeIpv4Host(session.RemoteAddress);
+                        AndroidBridgeHintReceived?.Invoke(remoteIp, usb, wifi, cPort, pPort, allowed, ready);
+                        if (allowed && !ready)
+                        {
+                            (int Port, string Secret)? auth;
+                            lock (_shellAuthGate) auth = _shellBridgeAuth;
+                            if (auth is { } existingAuth)
+                            {
+                                await SendToAsync(session,
+                                    new Packet("shell-input-bridge", existingAuth.Port, Text: existingAuth.Secret),
+                                    token);
+                            }
+                        }
+                    }
+                    catch (JsonException) { }
+                    continue;
+                }
+                if (p.Type == "request-shell-bridge" && session.Peer.Platform == "Android")
+                {
+                    ShellBridgeRefreshRequested?.Invoke();
+                    (int Port, string Secret)? auth;
+                    (string State, string Detail, int PairPort, int ConnectPort) bStat;
+                    lock (_shellAuthGate)
+                    {
+                        auth = _shellBridgeAuth;
+                        bStat = _bridgeStatus;
+                    }
+                    if (auth is { } existingAuth)
+                    {
+                        await SendToAsync(session,
+                            new Packet("shell-input-bridge", existingAuth.Port, Text: existingAuth.Secret),
+                            token);
+                    }
+                    if (!string.IsNullOrWhiteSpace(bStat.State))
+                    {
+                        await SendToAsync(session,
+                            new Packet("bridge-status", bStat.PairPort, bStat.ConnectPort,
+                                Text: $"{bStat.State}|{bStat.Detail}"),
+                            token);
+                    }
+                    continue;
+                }
+                if (p.Type == "adb-pair-request" && session.Peer.Platform == "Android")
+                {
+                    string? remoteIp = AdbCableBridge.NormalizeIpv4Host(session.RemoteAddress);
+                    int pairPortArg = p.A;
+                    int connectPortArg = p.B;
+                    string codeArg = p.Text ?? "";
+                    var pairHandler = WirelessAdbPairRequested;
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            (bool ok, string msg) = pairHandler != null
+                                ? await pairHandler(remoteIp, pairPortArg, codeArg, connectPortArg)
+                                : (false, "Wireless ADB bridge helper is not initialized yet on Windows.");
+                            await SendToAsync(session, new Packet("adb-pair-result", ok ? 1 : 0, Text: msg), token);
+                        }
+                        catch (Exception ex)
+                        {
+                            try
+                            {
+                                await SendToAsync(session, new Packet("adb-pair-result", 0, Text: ex.Message), token);
+                            }
+                            catch { }
+                        }
+                    }, token);
                     continue;
                 }
                 if (p.Type == "device-battery")

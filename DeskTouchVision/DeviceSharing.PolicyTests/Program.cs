@@ -3063,6 +3063,73 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
           updaterText.Contains("Stop-Process -Id $proc.Id -Force", StringComparison.Ordinal),
           "Automatic updater must clear stale updaters and exit any lingering DeskTouch process before install");
 
+    // Verify v0.3.86: Bundled ADB staging/resolution, Wireless Debugging pairing & state parsers,
+    // and Android-to-Windows Virtual Bridge auto-recognition helpers.
+    {
+        string adbStatesSample =
+            "List of devices attached\n" +
+            "USB999\tunauthorized\n" +
+            "192.168.1.44:41201\toffline\n" +
+            "OFFUSB\toffline\n" +
+            "adb-ABC-123._adb-tls-connect._tcp\toffline\n" +
+            "OKDEV\tdevice\n";
+        var unauth = AdbCableBridge.ParseAdbUnauthorizedSerials(adbStatesSample);
+        var offlineWireless = AdbCableBridge.ParseOfflineWirelessSerials(adbStatesSample);
+        Check(unauth.Count == 1 && unauth[0] == "USB999",
+              "ParseAdbUnauthorizedSerials must identify pending 'Allow USB debugging' prompts");
+        Check(offlineWireless.Count == 2 &&
+              offlineWireless.Contains("192.168.1.44:41201") &&
+              offlineWireless.Contains("adb-ABC-123._adb-tls-connect._tcp") &&
+              !offlineWireless.Contains("OFFUSB"),
+              "ParseOfflineWirelessSerials must identify only stale wireless endpoints");
+
+        string mdnsPairSample =
+            "List of discovered mdns services\n" +
+            "adb-XYZ-pair\t_adb-tls-pairing._tcp\t192.168.1.50:37421\n" +
+            "adb-XYZ-conn\t_adb-tls-connect._tcp\t192.168.1.50:40111\n";
+        var pairingEps = AdbCableBridge.ParseMdnsTlsPairingEndpoints(mdnsPairSample);
+        Check(pairingEps.Count == 1 && pairingEps[0] == "192.168.1.50:37421" &&
+              AdbCableBridge.ExtractPortFromEndpoint(pairingEps[0]) == 37421,
+              "ParseMdnsTlsPairingEndpoints must parse _adb-tls-pairing._tcp port cleanly");
+
+        Check(AdbCableBridge.ExtractShellFailureReason("NO_PORT:Permission denied\n") == "Permission denied" &&
+              AdbCableBridge.ExtractShellFailureReason("NO_PORT\n") == null,
+              "ExtractShellFailureReason must parse NO_PORT error summary cleanly");
+        Check(AdbCableBridge.NormalizeIpv4Host(System.Net.IPAddress.Parse("::ffff:192.168.1.88")) == "192.168.1.88" &&
+              AdbCableBridge.NormalizeIpv4Host(System.Net.IPAddress.Loopback) == null,
+              "NormalizeIpv4Host must unmap IPv4-mapped IPv6 peer addresses and reject loopback");
+
+        string fakeLocalDir = Path.Combine(Path.GetTempPath(), $"dt-adb-resolve-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(fakeLocalDir, "DeskTouchVision", "platform-tools"));
+        try
+        {
+            string fakeStagedAdb = Path.Combine(fakeLocalDir, "DeskTouchVision", "platform-tools", "adb.exe");
+            File.WriteAllText(fakeStagedAdb, "stub");
+            string? resolved = AdbCableBridge.ResolveAdbPath(
+                explicitOverride: null,
+                localAppData: fakeLocalDir,
+                androidHome: null,
+                androidSdkRoot: null,
+                pathEnv: "");
+            Check(!string.IsNullOrWhiteSpace(resolved) && File.Exists(resolved),
+                  "ResolveAdbPath must discover staged DeskTouchVision platform-tools adb.exe");
+        }
+        finally
+        {
+            try { Directory.Delete(fakeLocalDir, true); } catch { }
+        }
+
+        string repoRootDir = Directory.GetParent(Directory.GetParent(issPath!)!.FullName)!.FullName;
+        string workflowPath = Path.Combine(repoRootDir, ".github", "workflows", "desktouch-vision.yml");
+        if (File.Exists(workflowPath))
+        {
+            string wfText = File.ReadAllText(workflowPath);
+            Check(wfText.Contains("platform-tools-latest-windows.zip", StringComparison.Ordinal) &&
+                  wfText.Contains("DeviceSharing/platform-tools/adb.exe", StringComparison.Ordinal),
+                  "Windows release workflow must bundle Android platform-tools adb.exe for tester PCs");
+        }
+    }
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

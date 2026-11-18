@@ -360,3 +360,112 @@ internal sealed class PairingQrDialog : Form
         Margin = new Padding(0, 0, 10, 0)
     };
 }
+
+internal sealed class WirelessBridgePairDialog : Form
+{
+    private readonly TextBox _endpointBox = new() { Dock = DockStyle.Top, Height = 28 };
+    private readonly TextBox _codeBox = new() { Dock = DockStyle.Top, Height = 28 };
+    private readonly Label _statusLabel = new() { Dock = DockStyle.Top, Height = 44 };
+    private readonly Button _pairBtn = new()
+    {
+        Text = "Pair & Activate",
+        AutoSize = true,
+        Height = 32,
+        FlatStyle = FlatStyle.Flat,
+        BackColor = Color.FromArgb(37, 99, 235),
+        ForeColor = Color.White,
+        Cursor = Cursors.Hand
+    };
+    private readonly Func<string?, int, string, int, Task<(bool Ok, string Message)>> _pairAction;
+    private readonly int _connectPortHint;
+
+    internal WirelessBridgePairDialog(
+        AdbCableBridge.BridgeStatusReport status,
+        Func<string?, int, string, int, Task<(bool Ok, string Message)>> pairAction)
+    {
+        _pairAction = pairAction;
+        _connectPortHint = status.ConnectPortHint;
+
+        Text = "DeskTouch Vision — Pair Wireless Android Bridge";
+        ClientSize = new Size(440, 310);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        BackColor = Color.FromArgb(17, 23, 34);
+        ForeColor = Color.FromArgb(241, 245, 249);
+        Font = new Font("Segoe UI", 9.5f);
+        Padding = new Padding(18);
+
+        var title = new Label
+        {
+            Text = "One-Time Wireless Debugging Pairing",
+            Font = new Font("Segoe UI Semibold", 14),
+            Dock = DockStyle.Top,
+            Height = 32
+        };
+        var guide = new Label
+        {
+            Text = "On Android: Developer options -> Wireless debugging -> Pair device with pairing code.\nLeave IP:Port blank to auto-detect, or type the Port/IP:Port shown on phone.",
+            ForeColor = Color.FromArgb(186, 200, 220),
+            Dock = DockStyle.Top,
+            Height = 46
+        };
+        var epLbl = new Label { Text = "Pairing IP:Port (optional — auto-detected if blank):", Dock = DockStyle.Top, Height = 22 };
+        if (status.PairPortHint > 0) _endpointBox.Text = status.PairPortHint.ToString();
+        var codeLbl = new Label { Text = "6-digit Wi-Fi pairing code:", Dock = DockStyle.Top, Height = 24, Padding = new Padding(0, 6, 0, 0) };
+
+        _statusLabel.ForeColor = Color.FromArgb(148, 163, 184);
+        _statusLabel.Text = status.Detail;
+        _statusLabel.Padding = new Padding(0, 8, 0, 0);
+
+        _pairBtn.FlatAppearance.BorderColor = Color.FromArgb(56, 189, 248);
+        _pairBtn.FlatAppearance.BorderSize = 1;
+        _pairBtn.Click += async (_, _) => await ExecutePairAsync();
+
+        var btnRow = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, FlowDirection = FlowDirection.RightToLeft };
+        btnRow.Controls.Add(_pairBtn);
+
+        Controls.Add(btnRow);
+        Controls.Add(_statusLabel);
+        Controls.Add(_codeBox);
+        Controls.Add(codeLbl);
+        Controls.Add(_endpointBox);
+        Controls.Add(epLbl);
+        Controls.Add(guide);
+        Controls.Add(title);
+    }
+
+    private async Task ExecutePairAsync()
+    {
+        _pairBtn.Enabled = false;
+        _statusLabel.ForeColor = Color.FromArgb(148, 163, 184);
+        _statusLabel.Text = "Pairing Wireless Debugging and starting Virtual Bridge...";
+        try
+        {
+            string rawEp = _endpointBox.Text.Trim();
+            string? ip = null;
+            int port = 0;
+            if (!string.IsNullOrEmpty(rawEp))
+            {
+                int colon = rawEp.LastIndexOf(':');
+                if (colon > 0)
+                {
+                    ip = rawEp[..colon].Trim();
+                    _ = int.TryParse(rawEp[(colon + 1)..].Trim(), out port);
+                }
+                else
+                {
+                    _ = int.TryParse(rawEp, out port);
+                }
+            }
+            var (ok, msg) = await _pairAction(ip, port, _codeBox.Text.Trim(), _connectPortHint);
+            _statusLabel.ForeColor = ok ? Color.FromArgb(74, 222, 128) : Color.FromArgb(248, 113, 113);
+            _statusLabel.Text = msg;
+        }
+        finally
+        {
+            if (!IsDisposed) _pairBtn.Enabled = true;
+        }
+    }
+}

@@ -100,6 +100,15 @@ function Stop-InstalledApplications([string]$installDir) {
       $null = $proc.WaitForExit(3000)
     } catch { }
   }
+  # Also release any adb.exe spawned specifically from inside $installDir (never touch IDE SDK adb.exe).
+  if ($installDir) {
+    foreach ($adbInfo in @(Get-CimInstance Win32_Process -Filter "Name='adb.exe'" -ErrorAction SilentlyContinue)) {
+      if ($adbInfo.ExecutablePath -and $adbInfo.ExecutablePath.StartsWith($installDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        Log "Stopping install-scoped adb.exe PID=$($adbInfo.ProcessId) before moving install directory."
+        Stop-Process -Id $adbInfo.ProcessId -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
 }
 
 $stage = $null

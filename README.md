@@ -1,6 +1,6 @@
 # DeskTouch Vision — Windows & Android keyboard and mouse sharing
 
-> ## Download Latest Release (v0.3.85+)
+> ## Download Latest Release
 >
 > - **Windows (Single Installer):** [Download DeskTouchVision-Install.exe](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest/download/DeskTouchVision-Install.exe) — double-click to install directly
 > - **Android Phone App:** [Download DeskTouchVision-android-preview.apk](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest/download/DeskTouchVision-android-preview.apk)

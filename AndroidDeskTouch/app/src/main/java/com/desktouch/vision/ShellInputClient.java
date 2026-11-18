@@ -61,6 +61,15 @@ final class ShellInputClient {
     private static int pendingPushY;
     private static Runnable pendingMoveAck;
 
+    private static final java.util.concurrent.ScheduledExecutorService RETRY_SCHEDULER =
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "DeskTouch bridge-retry");
+            t.setDaemon(true);
+            return t;
+        });
+    private static final java.util.concurrent.atomic.AtomicInteger RETRY_ATTEMPT =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
     private ShellInputClient() {}
 
     static boolean allowed(Context context) {
@@ -71,10 +80,16 @@ final class ShellInputClient {
 
     static void setAllowed(Context context, boolean allow) {
         if (context == null) return;
+        Context app = context.getApplicationContext();
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putBoolean(ALLOW_SHELL_BRIDGE, allow).apply();
         if (!allow) {
+            RETRY_ATTEMPT.set(0);
             endRemote();
+        } else {
+            RETRY_ATTEMPT.set(0);
+            warmConnectIfConfigured(app);
+            DeskTouchRuntime.requestShellBridgeSync(app);
         }
         DeskTouchRuntime.accessibilityPermissionChanged(context);
     }
@@ -155,18 +170,45 @@ final class ShellInputClient {
         configuredPort = port;
         configuredSecret = secret;
         persistBridgeConfig(app, port, secret);
+        RETRY_ATTEMPT.set(0);
         if (sameEndpoint && ready(app)) {
             return;
         }
         WORKER.execute(() -> {
+            boolean ok;
             synchronized (CLIENT_LOCK) {
-                connectAndAuthLocked(app, port, secret);
-                if (connectedReady && remoteSessionActive) {
+                ok = connectAndAuthLocked(app, port, secret);
+                if (ok && remoteSessionActive) {
+                    ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
+                }
+            }
+            if (!ok) {
+                scheduleRetryIfValid(app, port, secret);
+            }
+            DeskTouchRuntime.accessibilityPermissionChanged(app);
+        });
+    }
+
+    private static void scheduleRetryIfValid(Context app, int port, String secret) {
+        if (app == null || !allowed(app) || ready(app)) return;
+        if (port != configuredPort || !secret.equals(configuredSecret)) return;
+        int attempt = RETRY_ATTEMPT.incrementAndGet();
+        if (attempt > 3) return;
+        RETRY_SCHEDULER.schedule(() -> {
+            if (!allowed(app) || ready(app)) return;
+            if (port != configuredPort || !secret.equals(configuredSecret)) return;
+            boolean ok;
+            synchronized (CLIENT_LOCK) {
+                ok = !ready(app) && connectAndAuthLocked(app, port, secret);
+                if (ok && remoteSessionActive) {
                     ensureBeginLocked(app, lastPointerSpeed, lastRefreshHz);
                 }
             }
             DeskTouchRuntime.accessibilityPermissionChanged(app);
-        });
+            if (!ok) {
+                scheduleRetryIfValid(app, port, secret);
+            }
+        }, 1100L * attempt, TimeUnit.MILLISECONDS);
     }
 
     private static boolean connectAndAuthLocked(Context app, int port, String secret) {
@@ -177,9 +219,9 @@ final class ShellInputClient {
         }
         try {
             Socket s = new Socket();
-            s.connect(new InetSocketAddress("127.0.0.1", port), 650);
+            s.connect(new InetSocketAddress("127.0.0.1", port), 1200);
             s.setTcpNoDelay(true);
-            s.setSoTimeout(1200);
+            s.setSoTimeout(1400);
             BufferedWriter w = new BufferedWriter(
                 new OutputStreamWriter(s.getOutputStream(), StandardCharsets.US_ASCII));
             BufferedReader r = new BufferedReader(
@@ -190,7 +232,9 @@ final class ShellInputClient {
             if (!"OK".equals(ack)) {
                 try { s.close(); } catch (IOException ignored) {}
                 connectedReady = false;
-                clearDeadBridgeConfigLocked(app);
+                if ("ERR".equals(ack)) {
+                    clearDeadBridgeConfigLocked(app);
+                }
                 return false;
             }
             s.setSoTimeout(1100);
@@ -198,11 +242,13 @@ final class ShellInputClient {
             writer = w;
             reader = r;
             connectedReady = true;
+            RETRY_ATTEMPT.set(0);
             Log.i("DeskTouch", "Accessibility-free Shell Bridge virtual input ready on loopback:" + port);
             return true;
         } catch (IOException ex) {
             connectedReady = false;
-            clearDeadBridgeConfigLocked(app);
+            // Do not erase valid bridge credentials on a single transient loopback hiccup;
+            // allow scheduled/warm reconnects to attach once the daemon settles.
             Log.w("DeskTouch", "Shell Bridge loopback connect deferred: " + ex.getMessage());
             return false;
         }

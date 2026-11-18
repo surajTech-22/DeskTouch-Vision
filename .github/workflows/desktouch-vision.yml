@@ -192,12 +192,27 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
+            $rawNotes = Get-Content -LiteralPath "DeskTouchVision/RELEASE_NOTES.md" -Raw
+            $latestSection = ($rawNotes -split "\r?\n---\r?\n", 2)[0].Trim()
+            $releaseBody = @"
+## Direct Downloads (One-Click Install)
+
+- **Windows Single Installer (Recommended):** [Download DeskTouchVision-Install.exe](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-Install.exe)
+- **Android Phone App:** [Download DeskTouchVision-android-preview.apk](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-android-preview.apk)
+
+---
+
+$latestSection
+"@
+            $notesOut = Join-Path $env:RUNNER_TEMP "release-notes-$tag.md"
+            [IO.File]::WriteAllText($notesOut, $releaseBody, [Text.Encoding]::UTF8)
+
             gh release create $tag `
               DeskTouchVision/published/DeskTouchVision-Install.exe `
               DeskTouchVision/published/DeskTouchVision-Install.exe.sha256 `
               DeskTouchVision/published/DeskTouchVision-win-x64.zip `
               DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 `
-              --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes-file "DeskTouchVision/RELEASE_NOTES.md"
+              --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes-file $notesOut
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             $assets = @(gh release view $tag --json assets --jq '.assets[].name' --repo "${{ github.repository }}")
             if ($LASTEXITCODE -ne 0) { throw "Cannot verify Windows-only release assets" }

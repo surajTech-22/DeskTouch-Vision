@@ -1,5 +1,11 @@
 # DeskTouch Vision — Windows & Android keyboard and mouse sharing
 
+> ## Download Latest Release (v0.3.85+)
+>
+> - **Windows (Single Installer):** [Download DeskTouchVision-Install.exe](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest/download/DeskTouchVision-Install.exe) — double-click to install directly
+> - **Android Phone App:** [Download DeskTouchVision-android-preview.apk](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest/download/DeskTouchVision-android-preview.apk)
+> - **All Release Files:** [Open Latest Release Page](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest)
+
 DeskTouch Vision shares your **keyboard and mouse across Windows PCs and Android phones** on a trusted private Wi-Fi network — with no Developer Options, USB cables, or Bluetooth dongles required.
 
 ## How it works
@@ -13,9 +19,9 @@ Each Windows PC keeps its existing monitors and local input priority, while conn
 
 ## Install and pair
 
-1. Download `DeskTouchVision-win-x64.zip` from https://github.com/surajTech-22/DeskTouch-Vision/releases/latest on Windows, extract, and run `INSTALL_DESKTOUCH.cmd`.
-2. Click **Get Android app** on Windows and scan the QR code with your phone's camera to install `DeskTouchVision-android-preview.apk`.
-3. On Android, open DeskTouch Vision, follow the short Accessibility / Restricted Settings setup (Battery: No restrictions for Xiaomi/Redmi), tap **Find devices**, join your PC, and approve on Windows.
+1. Download **`DeskTouchVision-Install.exe`** using the link at the top of this page (or from [Latest Release](https://github.com/surajTech-22/DeskTouch-Vision/releases/latest)) and double-click to install. *(If Windows SmartScreen prompts for a preview build, click **More info** -> **Run anyway**.)*
+2. Click **Get Android app** on Windows and scan the QR code with your phone's camera to install `DeskTouchVision-android-preview.apk` (or tap the Android download link above).
+3. On Android, open DeskTouch Vision, follow the short setup, tap **Find** or **Scan QR** (matching the **Scan QR** code in DeskTouch Windows), and join your computer.
 4. Click **Trust connected PC** on Android so both devices reconnect automatically over Wi-Fi.
 
 ## Diagnostics

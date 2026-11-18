@@ -260,7 +260,8 @@ public final class AdaptiveLinkTracker {
             || op == FastUdpChannel.OP_REVERSE_GRANTED
             || op == FastUdpChannel.OP_REVERSE_ACTIVE
             || op == FastUdpChannel.OP_REVERSE_BUTTON
-            || op == FastUdpChannel.OP_REVERSE_WHEEL;
+            || op == FastUdpChannel.OP_REVERSE_WHEEL
+            || op == FastUdpChannel.OP_REVERSE_KEY;
     }
 
     public void recordAuthenticatedSeqOnly(long seq) {

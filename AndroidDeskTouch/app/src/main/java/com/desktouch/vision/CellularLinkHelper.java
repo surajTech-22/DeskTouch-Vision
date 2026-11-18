@@ -332,6 +332,17 @@ final class CellularLinkHelper {
         return safeRtt + safeJitter * 2.5 + safeLoss * 1.4;
     }
 
+    static boolean shouldSwitchStreamOnLoss(double activeLossPermille, double candidateLossPermille,
+            long nowMs, long lastSwitchMs, long minCooldownMs) {
+        if (activeLossPermille < 10.0) { // Keep running until active path shows >= 1.0% loss.
+            return false;
+        }
+        if (lastSwitchMs > 0L && nowMs - lastSwitchMs < minCooldownMs) {
+            return false;
+        }
+        return candidateLossPermille + 1.0 < activeLossPermille;
+    }
+
     static boolean shouldPreferCellular(double wifiRttMs, double wifiJitterMs, double wifiLossPermille,
             double cellRttMs, double cellJitterMs, double cellLossPermille,
             long nowMs, long lastSwitchMs) {

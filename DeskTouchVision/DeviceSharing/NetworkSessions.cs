@@ -165,8 +165,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ReverseMoveSignaled;
         internal FastUdpHub.Peer? UdpPeer;
         internal FastUdpHub.Peer? MobileUdpPeer;
-        internal int PreferMobileStream;
-        internal long DualStreamMirrorUntilTicks;
+        internal int PreferMobileMouse;
+        internal int PreferMobileKeyboard;
+        internal long DualMouseMirrorUntilTicks;
+        internal long DualKeyboardMirrorUntilTicks;
         internal FastMovePacer? MovePacer;
         internal long TcpFallbackMoves;
         internal bool IsCableSession;
@@ -989,7 +991,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             QueueTcpReverseMove(target, inner, countAsFallback: !target.IsCableSession);
             return;
         }
-        if (inner.Type is "button" or "wheel")
+        if (inner.Type is "button" or "wheel" or "key")
             SendFastControlAndAssignSeq(target, Volatile.Read(ref target.BridgedClaimLease), ref inner);
         if (inner.Type is ("button" or "wheel" or "key" or "text"))
             target.ReverseQueue.Writer.TryWrite(inner);
@@ -1113,9 +1115,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         }
     }
 
-    private static FastUdpHub.Peer? ActiveOutboundUdpPeer(Session session)
+    private static FastUdpHub.Peer? ActiveMouseUdpPeer(Session session)
     {
-        if (Volatile.Read(ref session.PreferMobileStream) != 0 &&
+        if (Volatile.Read(ref session.PreferMobileMouse) != 0 &&
+            session.MobileUdpPeer is { Confirmed: true } mob)
+            return mob;
+        return session.UdpPeer;
+    }
+
+    private static FastUdpHub.Peer? ActiveKeyboardUdpPeer(Session session)
+    {
+        if (Volatile.Read(ref session.PreferMobileKeyboard) != 0 &&
             session.MobileUdpPeer is { Confirmed: true } mob)
             return mob;
         return session.UdpPeer;
@@ -1133,7 +1143,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 ComputeAdaptiveCableIntervalMs(effectiveHz, Volatile.Read(ref session.TcpRttMs)));
             return;
         }
-        var peer = ActiveOutboundUdpPeer(session);
+        var peer = ActiveMouseUdpPeer(session);
         string activeBand = ReferenceEquals(peer, session.MobileUdpPeer) ? "cellular" : session.LinkBand;
         double rtt = peer?.LinkTracker.SmoothedRttMs ?? 0;
         double minRtt = peer?.LinkTracker.MinRttMs ?? 0;
@@ -1366,8 +1376,10 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     long fallback = Interlocked.Exchange(ref session.TcpFallbackMoves, 0);
                     if (s.UdpDirect == 0 && s.UdpPacedFlush == 0 && fallback == 0)
                         continue;
-                    var activePeer = ActiveOutboundUdpPeer(session);
-                    string streamPath = ReferenceEquals(activePeer, session.MobileUdpPeer) ? "mobile" : "wifi";
+                    var activePeer = ActiveMouseUdpPeer(session);
+                    var activeKbPeer = ActiveKeyboardUdpPeer(session);
+                    string mousePath = ReferenceEquals(activePeer, session.MobileUdpPeer) ? "mobile" : "wifi";
+                    string kbPath = ReferenceEquals(activeKbPeer, session.MobileUdpPeer) ? "mobile" : "wifi";
                     double rtt = activePeer?.LinkTracker.SmoothedRttMs ?? 0;
                     double jitter = activePeer?.LinkTracker.EffectiveJitterMs ?? 0;
                     double loss = activePeer?.LinkTracker.CombinedLossPermille ?? 0;
@@ -1379,7 +1391,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             ? $" wifi_rtt={peer.LinkTracker.SmoothedRttMs:F1} wifi_loss={peer.LinkTracker.CombinedLossPermille / 10.0:F2}"
                             : "");
                     DiagnosticLog?.Invoke(
-                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} path={streamPath} fast_confirmed={activePeer?.Confirmed == true} live_hz={effectiveHz} pace_ms={pacer.EffectiveMinIntervalMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2}{mobSuffix} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback} late_total={lateTotal} reordered_total={reorderedTotal}");
+                        $"Telemetry [hub->{session.Peer.Name}]: app={session.Peer.AppVersion ?? "?"} mouse={mousePath} kb={kbPath} fast_confirmed={activePeer?.Confirmed == true} live_hz={effectiveHz} pace_ms={pacer.EffectiveMinIntervalMs:F1} rtt_ms={rtt:F1} jitter_ms={jitter:F1} loss_pct={loss / 10.0:F2}{mobSuffix} fast_direct={s.UdpDirect} fast_paced={s.UdpPacedFlush} trailing_sync={s.TrailingTcpSync} tcp_fallback={fallback} late_total={lateTotal} reordered_total={reorderedTotal}");
                 }
                 tick++;
             }
@@ -1613,20 +1625,29 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private void SendFastControlAndAssignSeq(Session target, int lease, ref Packet packet)
     {
-        if (packet.Type is not ("button" or "wheel")) return;
+        if (packet.Type is not ("button" or "wheel" or "key")) return;
         int actionSeq = target.NextReverseActionSeq();
-        packet = packet with { C = actionSeq };
-        var activeUdp = ActiveOutboundUdpPeer(target);
+        bool isKey = packet.Type == "key";
+        packet = isKey ? packet with { A = actionSeq } : packet with { C = actionSeq };
+        var activeUdp = isKey ? ActiveKeyboardUdpPeer(target) : ActiveMouseUdpPeer(target);
         if (_udpHub == null || activeUdp is not { Confirmed: true } || lease <= 0)
             return;
-        target.MovePacer?.FlushThrottledUdpMoveNow();
-        var op = packet.Type == "button" ? FastUdpOp.ReverseButton : FastUdpOp.ReverseWheel;
-        _udpHub.Send(activeUdp, op, packet.A, packet.B, lease, actionSeq);
-        if (Volatile.Read(ref target.DualStreamMirrorUntilTicks) > Stopwatch.GetTimestamp())
+        if (!isKey) target.MovePacer?.FlushThrottledUdpMoveNow();
+        FastUdpOp op = packet.Type switch
+        {
+            "button" => FastUdpOp.ReverseButton,
+            "wheel" => FastUdpOp.ReverseWheel,
+            _ => FastUdpOp.ReverseKey
+        };
+        int udpA = isKey ? packet.D : packet.A;
+        int udpB = isKey ? (packet.C != 0 ? 1 : 0) : packet.B;
+        _udpHub.Send(activeUdp, op, udpA, udpB, lease, actionSeq);
+        long mirrorUntil = Volatile.Read(ref isKey ? ref target.DualKeyboardMirrorUntilTicks : ref target.DualMouseMirrorUntilTicks);
+        if (mirrorUntil > Stopwatch.GetTimestamp())
         {
             var backup = ReferenceEquals(activeUdp, target.MobileUdpPeer) ? target.UdpPeer : target.MobileUdpPeer;
             if (backup is { Confirmed: true })
-                _udpHub.Send(backup, op, packet.A, packet.B, lease, actionSeq);
+                _udpHub.Send(backup, op, udpA, udpB, lease, actionSeq);
         }
     }
 
@@ -1642,7 +1663,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
             return QueueTcpRelayMove(relay, packet, countAsFallback: !relay.Target.IsCableSession);
         }
-        if(packet.Type is "button" or "wheel")
+        if(packet.Type is "button" or "wheel" or "key")
             SendFastControlAndAssignSeq(relay.Target, relay.Claim, ref packet);
         return relay.InputQueue.Writer.TryWrite(packet);
     }
@@ -2122,7 +2143,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
             return QueueTcpReverseMove(selected, packet, countAsFallback: !selected.IsCableSession);
         }
-        if (packet.Type is "button" or "wheel")
+        if (packet.Type is "button" or "wheel" or "key")
             SendFastControlAndAssignSeq(selected, fastClaimLease, ref packet);
         if (selected.ReverseQueue.Writer.TryWrite(packet)) return true;
         _status("Peer input queue stalled. Disconnecting that peer safely.");
@@ -2173,15 +2194,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     await SendToAsync(session, ReverseInputProtocol.Encode(p), token);
                     continue;
                 }
-                bool isImmediateControl = p.Type is "button" or "wheel";
+                bool isImmediateControl = p.Type is "button" or "wheel" or "key" or "text";
                 var udpSync = session.MovePacer?.TakePendingReliableSync(
                     skipIfUdpDelivered: isImmediateControl);
                 var tcpPrior = Interlocked.Exchange(ref session.LatestReverseMove, null);
-                var prior = udpSync ?? (isImmediateControl && session.UdpPeer is { Confirmed: true }
+                var prior = udpSync ?? (isImmediateControl && ActiveMouseUdpPeer(session) is { Confirmed: true }
                     ? null : tcpPrior);
                 if (prior != null && !(isImmediateControl && session.MatchesLastWireMove(prior)))
                     await SendUrgentAsync(session, EncodeMoveForWire(session, prior), token);
-                if (isImmediateControl || p.Type is "key" or "text")
+                if (isImmediateControl)
                     await SendUrgentAsync(session, ReverseInputProtocol.Encode(p), token);
                 else
                     await SendMoveToAsync(session, ReverseInputProtocol.Encode(p), token);
@@ -2486,24 +2507,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 nextSeq: session.NextReverseMoveSeq,
                 enableTrailingSync: false)
             : new FastMovePacer(
-                canSendUdp: () => _udpHub != null && ActiveOutboundUdpPeer(session) is { Confirmed: true } &&
+                canSendUdp: () => _udpHub != null && ActiveMouseUdpPeer(session) is { Confirmed: true } &&
                     Volatile.Read(ref session.ActiveReverseLease) > 0,
                 sendUdp: move =>
                 {
-                    var peerUdp = ActiveOutboundUdpPeer(session);
+                    var peerUdp = ActiveMouseUdpPeer(session);
                     int lease = Volatile.Read(ref session.ActiveReverseLease);
                     return SendReverseMoveUdp(session, peerUdp, lease, move);
                 },
                 queueReliableTcp: move => QueueReliableReverseMoveForSession(session, move, countAsFallback: true),
                 sendWarm: () =>
                 {
-                    var peerUdp = ActiveOutboundUdpPeer(session);
+                    var peerUdp = ActiveMouseUdpPeer(session);
                     if (_udpHub != null && peerUdp is { Confirmed: true } && _sessions.ContainsKey(id))
                         _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
                 },
                 queueTrailingSync: move =>
                 {
-                    var peerUdp = ActiveOutboundUdpPeer(session);
+                    var peerUdp = ActiveMouseUdpPeer(session);
                     int lease = Volatile.Read(ref session.ActiveReverseLease);
                     bool udpDelivered = SendReverseMoveUdp(session, peerUdp, lease, move);
                     if (!udpDelivered || Volatile.Read(ref session.PendingFirstCursorAck) != 0)
@@ -2650,7 +2671,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if (p.Type == "mobile-udp-close")
                 {
-                    Volatile.Write(ref session.PreferMobileStream, 0);
+                    Volatile.Write(ref session.PreferMobileMouse, 0);
+                    Volatile.Write(ref session.PreferMobileKeyboard, 0);
                     if (session.MobileUdpPeer != null)
                     {
                         session.MobileUdpPeer.Confirmed = false;
@@ -2662,17 +2684,29 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if (p.Type == "stream-prefer")
                 {
-                    bool wantMobile = (p.A != 0 || string.Equals(p.Text, "cellular", StringComparison.OrdinalIgnoreCase))
-                        && session.MobileUdpPeer is { Confirmed: true };
-                    int prevPref = Interlocked.Exchange(ref session.PreferMobileStream, wantMobile ? 1 : 0);
-                    if (prevPref != (wantMobile ? 1 : 0))
+                    bool mobileConfirmed = session.MobileUdpPeer is { Confirmed: true };
+                    bool wantMobileMouse = (p.A != 0 || string.Equals(p.Text, "cellular", StringComparison.OrdinalIgnoreCase))
+                        && mobileConfirmed;
+                    bool wantMobileKb = (p.B != 0) && mobileConfirmed;
+                    int prevMouse = Interlocked.Exchange(ref session.PreferMobileMouse, wantMobileMouse ? 1 : 0);
+                    int prevKb = Interlocked.Exchange(ref session.PreferMobileKeyboard, wantMobileKb ? 1 : 0);
+                    bool mouseChanged = prevMouse != (wantMobileMouse ? 1 : 0);
+                    bool kbChanged = prevKb != (wantMobileKb ? 1 : 0);
+                    if (mouseChanged)
                     {
-                        Volatile.Write(ref session.DualStreamMirrorUntilTicks,
+                        Volatile.Write(ref session.DualMouseMirrorUntilTicks,
                             Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
                         UpdateSessionAdaptivePacing(session);
-                        DiagnosticLog?.Invoke(wantMobile
-                            ? $"Cursor receive stream switched to Mobile network for {session.Peer.Name} (Wi-Fi stays connected)"
-                            : $"Cursor receive stream switched back to Wi-Fi for {session.Peer.Name}");
+                    }
+                    if (kbChanged)
+                    {
+                        Volatile.Write(ref session.DualKeyboardMirrorUntilTicks,
+                            Stopwatch.GetTimestamp() + Stopwatch.Frequency / 4);
+                    }
+                    if (mouseChanged || kbChanged)
+                    {
+                        DiagnosticLog?.Invoke(
+                            $"Stream preference updated for {session.Peer.Name}: mouse={(wantMobileMouse ? "Mobile network" : "Wi-Fi")}, keyboard={(wantMobileKb ? "Mobile network" : "Wi-Fi")} (Wi-Fi stays connected)");
                     }
                     continue;
                 }
@@ -3415,7 +3449,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             _udpHub?.Send(peer, FastUdpOp.LinkFeedback, msg.A,
                 peer.LinkTracker.GetInboundPackedLossJitter(), 0, payloadTag: 0);
-            if (!peer.IsAuxiliary || Volatile.Read(ref session.PreferMobileStream) != 0)
+            if (!peer.IsAuxiliary || Volatile.Read(ref session.PreferMobileMouse) != 0)
                 UpdateSessionAdaptivePacing(session);
             return;
         }
@@ -3427,7 +3461,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 Volatile.Write(ref session.LiveRefreshHz, reportedHz);
                 Volatile.Write(ref session.LiveFrameTenthsMs, peer.LinkTracker.PeerFrameTenthsMs);
             }
-            if (!peer.IsAuxiliary || Volatile.Read(ref session.PreferMobileStream) != 0)
+            if (!peer.IsAuxiliary || Volatile.Read(ref session.PreferMobileMouse) != 0)
                 UpdateSessionAdaptivePacing(session);
             return;
         }
@@ -3700,7 +3734,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         int? tag = move.C > 0 ? move.C : null;
         var (wirePrevX, wirePrevY) = session.TakeWirePrevious(move.A, move.B, preferWaypoint: false);
         FastUdpHub.Peer? mirrorPeer = null;
-        if (Volatile.Read(ref session.DualStreamMirrorUntilTicks) > Stopwatch.GetTimestamp())
+        if (Volatile.Read(ref session.DualMouseMirrorUntilTicks) > Stopwatch.GetTimestamp())
         {
             var candidate = ReferenceEquals(peerUdp, session.MobileUdpPeer) ? session.UdpPeer : session.MobileUdpPeer;
             if (candidate is { Confirmed: true }) mirrorPeer = candidate;

@@ -47,6 +47,7 @@ final class DeskTouchSession implements AutoCloseable {
         private int highestControlActionSeq;
         private long seenControlActionMask;
         private int lastExecutedButtonSeq;
+        private int lastExecutedKeySeq;
         private int highestReverseMoveSeq;
 
         synchronized void reset(){
@@ -54,6 +55,7 @@ final class DeskTouchSession implements AutoCloseable {
             highestControlActionSeq=0;
             seenControlActionMask=0L;
             lastExecutedButtonSeq=0;
+            lastExecutedKeySeq=0;
             highestReverseMoveSeq=0;
         }
 
@@ -75,6 +77,7 @@ final class DeskTouchSession implements AutoCloseable {
             highestControlActionSeq=0;
             seenControlActionMask=0L;
             lastExecutedButtonSeq=0;
+            lastExecutedKeySeq=0;
             return true;
         }
 
@@ -100,12 +103,38 @@ final class DeskTouchSession implements AutoCloseable {
             if(isButton) lastExecutedButtonSeq=seq;
             return true;
         }
+
+        synchronized boolean tryAcceptKeyAction(int seq){
+            if(seq<=0) return true;
+            if(seq<=lastExecutedKeySeq) return false;
+            if(highestControlActionSeq==0){
+                highestControlActionSeq=seq;
+                seenControlActionMask=1L;
+            }else{
+                int diff=seq-highestControlActionSeq;
+                if(diff>0){
+                    seenControlActionMask=diff>=64 ? 1L : ((seenControlActionMask<<diff)|1L);
+                    highestControlActionSeq=seq;
+                }else{
+                    int back=-diff;
+                    if(back>=64) return false;
+                    long bit=1L<<back;
+                    if((seenControlActionMask & bit)!=0L) return false;
+                    seenControlActionMask|=bit;
+                }
+            }
+            lastExecutedKeySeq=seq;
+            return true;
+        }
     }
 
     private final ReverseControlDeduplicator reverseDedup = new ReverseControlDeduplicator();
 
     boolean tryAcceptControlAction(int seq, boolean isButton){
         return reverseDedup.tryAcceptControlAction(seq,isButton);
+    }
+    boolean tryAcceptKeyAction(int seq){
+        return reverseDedup.tryAcceptKeyAction(seq);
     }
     interface Events { void status(String message); }
     static final class EnvironmentTarget {
@@ -204,15 +233,23 @@ final class DeskTouchSession implements AutoCloseable {
             this.keyboardReport = keyboardReport;
         }
     }
+    private static final String STREAM_MEMORY_PREFS = "desktouch_stream_memory";
+    private static final long STREAM_SWITCH_COOLDOWN_MS = 8_000L;
+    private static final long STREAM_SAVE_CLEAN_DELAY_MS = 3_000L;
     private volatile FastUdpChannel udpChannel;
     private volatile FastUdpChannel mobileUdpChannel;
+    private volatile CellularLinkHelper lastCellularHelper;
+    private final Object streamPrefLock = new Object();
     private volatile int mobileUdpPort;
     private volatile int mobileUdpPeerId;
     private volatile byte[] mobileUdpKey;
-    private volatile boolean preferMobileStream;
-    private volatile long lastStreamSwitchAtMs;
-    private volatile long lastDemotedWifiAtMs;
-    private volatile String lastDemotedWifiBand = "";
+    private volatile boolean preferMobileMouse;
+    private volatile boolean preferMobileKeyboard;
+    private volatile long lastMouseSwitchAtMs;
+    private volatile long lastKeyboardSwitchAtMs;
+    private volatile long connectedStreamSinceMs;
+    private volatile String lastSavedMouseStream = "";
+    private volatile String lastSavedKeyboardStream = "";
     private volatile long mobilePunchBackoffUntilMs;
     private volatile boolean mobilePunchAttemptedOnce;
     private volatile long lastMobileUdpLinkPingMs;
@@ -303,7 +340,7 @@ final class DeskTouchSession implements AutoCloseable {
         double peakLoss = 0.0;
         double peakJitter = 0.0;
         double rtt = cableSession ? 0.0 : liveRttMs;
-        if (!cableSession && preferMobileStream && mobCh != null && mobCh.confirmed) {
+        if (!cableSession && preferMobileMouse && mobCh != null && mobCh.confirmed) {
             long nowMs = SystemClock.uptimeMillis();
             if (mobCh.linkTracker.getSmoothedRttMs() > 0) rtt = mobCh.linkTracker.getSmoothedRttMs();
             jitter = mobCh.linkTracker.getEffectiveJitterMs();
@@ -322,7 +359,7 @@ final class DeskTouchSession implements AutoCloseable {
             if (trackerBand != null && !trackerBand.isEmpty()) band = trackerBand;
         }
         return new LiveStatusSnapshot(running, peerName, fingerprint, cableSession,
-            band, (!cableSession && preferMobileStream) ? 0 : (cableSession ? 0 : liveLinkSpeedMbps),
+            band, (!cableSession && preferMobileMouse && mobCh != null && mobCh.confirmed) ? 0 : (cableSession ? 0 : liveLinkSpeedMbps),
             rtt, jitter, loss, peakLoss, peakJitter,
             pcKeyboardLayout, lastKeyboardReport);
     }
@@ -1018,11 +1055,7 @@ final class DeskTouchSession implements AutoCloseable {
         }else if("reverse-wheel".equals(p.type)){
             dispatchReverseWheel(p.a,p.b!=0,p.c,false);
         }else if("reverse-key".equals(p.type)){
-            final int activeLease=reverseLease;
-            Runnable accepted=onReverseInputAccepted(activeLease);
-            Runnable rejected=onReverseInputRejected(activeLease);
-            if(reverseUsingShell) ShellInputClient.key(p.d,p.c!=0,accepted,rejected);
-            else DeskTouchAccessibilityService.key(p.d,p.c!=0,accepted,rejected);
+            dispatchReverseKey(p.d,p.c!=0,p.a>0 ? p.a : 0,false);
         }else if("reverse-text".equals(p.type) && p.text!=null &&
             p.text.length()>0 && p.text.length()<=512){
             final int activeLease=reverseLease;
@@ -1054,6 +1087,15 @@ final class DeskTouchSession implements AutoCloseable {
         if(!tryAcceptControlAction(actionSeq,false)) return;
         if(reverseUsingShell) ShellInputClient.wheel(amount,horizontal);
         else DeskTouchAccessibilityService.wheel(amount,horizontal);
+    }
+    private void dispatchReverseKey(int vk,boolean down,int actionSeq,boolean fromUdp){
+        if(fromUdp) lastUdpReverseMoveAtMs=SystemClock.uptimeMillis();
+        if(!tryAcceptKeyAction(actionSeq)) return;
+        final int activeLease=reverseLease;
+        Runnable accepted=onReverseInputAccepted(activeLease);
+        Runnable rejected=onReverseInputRejected(activeLease);
+        if(reverseUsingShell) ShellInputClient.key(vk,down,accepted,rejected);
+        else DeskTouchAccessibilityService.key(vk,down,accepted,rejected);
     }
     private Runnable onReverseInputAccepted(int activeLease){
         return ()->{ if(reverseLease==activeLease)reportedMissingKeyboard=0; };
@@ -1100,10 +1142,9 @@ final class DeskTouchSession implements AutoCloseable {
         DeskTouchAccessibilityService.endRemote();
         if(notifyWindows && lease>0 && running)
             send(new Packet("reverse-local-active",lease));
-        if(lease>0 && running && !cableSession && !cellularSession) {
+        if(lease>0 && running && !cableSession && !cellularSession && mobileUdpChannel==null) {
             LiveStatusSnapshot snap=getLiveSnapshot();
-            if(snap.recentPeakLossPermille>=15.0 || snap.recentPeakJitterMs>=6.0
-                || snap.rttMs>=22.0) {
+            if(snap.recentPeakLossPermille>=10.0) {
                 AutoConnectService.onLeaseEndedDegraded(application);
             }
         }
@@ -1433,7 +1474,36 @@ final class DeskTouchSession implements AutoCloseable {
                     if (retry != null) retry.cancel(false);
                     ScheduledFuture<?> to = mobileUdpTimeoutFuture;
                     if (to != null) to.cancel(false);
-                    android.util.Log.i("DeskTouch", "Mobile UDP receiver stream confirmed alongside Wi-Fi");
+                    long now = SystemClock.uptimeMillis();
+                    boolean changed = false;
+                    synchronized (streamPrefLock) {
+                        String savedMouse = readRememberedStream("mouse");
+                        String savedKb = readRememberedStream("keyboard");
+                        if ("cellular".equals(savedMouse) && !preferMobileMouse) {
+                            preferMobileMouse = true;
+                            lastMouseSwitchAtMs = now;
+                            lastSavedMouseStream = "cellular";
+                            changed = true;
+                        } else if ("wifi".equals(savedMouse)) {
+                            lastSavedMouseStream = "wifi";
+                        }
+                        if ("cellular".equals(savedKb) && !preferMobileKeyboard) {
+                            preferMobileKeyboard = true;
+                            lastKeyboardSwitchAtMs = now;
+                            lastSavedKeyboardStream = "cellular";
+                            changed = true;
+                        } else if ("wifi".equals(savedKb)) {
+                            lastSavedKeyboardStream = "wifi";
+                        }
+                        if (connectedStreamSinceMs <= 0L) connectedStreamSinceMs = now;
+                    }
+                    if (changed) {
+                        sendStreamPreference();
+                    }
+                    android.util.Log.i("DeskTouch", String.format(java.util.Locale.US,
+                        "Mobile UDP receiver confirmed alongside Wi-Fi (Mouse:%s, Keyboard:%s)",
+                        preferMobileMouse ? "Mobile" : "Wi-Fi",
+                        preferMobileKeyboard ? "Mobile" : "Wi-Fi"));
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 } else {
                     ScheduledFuture<?> retry = udpProbeRetryFuture;
@@ -1464,6 +1534,11 @@ final class DeskTouchSession implements AutoCloseable {
                     || !isActiveBackendReady()) return;
                 dispatchReverseWheel(amount, horizontal != 0, actionSeq, true);
             }
+            @Override public void onReverseKey(int vk, boolean down, int lease, int actionSeq) {
+                if (!running || lease <= 0 || lease != reverseLease
+                    || !isActiveBackendReady()) return;
+                dispatchReverseKey(vk, down, actionSeq, true);
+            }
             @Override public void onLinkPing(int pingToken, int senderPaceTenths, int lease, int ts) {
                 if (!running) return;
                 FastUdpChannel activeCh = isMobile ? mobileUdpChannel : udpChannel;
@@ -1473,22 +1548,156 @@ final class DeskTouchSession implements AutoCloseable {
                     activeCh.linkTracker.getInboundPackedLossJitter(),
                     packCurrentDisplayRate(),
                     reverseLease);
-                if (!isMobile || preferMobileStream) {
+                if (!isMobile || preferMobileMouse) {
                     syncAdaptiveMetrics(activeCh);
                 }
+                evaluateLossTriggeredStreams();
                 DeskTouchRuntime.notifyLiveStatusChanged();
             }
             @Override public void onLinkFeedback(int echoToken, int packedLossJitter, int packedDisplayRate, int lease) {
                 if (!running) return;
                 FastUdpChannel activeCh = isMobile ? mobileUdpChannel : udpChannel;
                 if (activeCh != null) {
-                    if (!isMobile || preferMobileStream) {
+                    if (!isMobile || preferMobileMouse) {
                         syncAdaptiveMetrics(activeCh);
                     }
+                    evaluateLossTriggeredStreams();
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 }
             }
         };
+    }
+
+    private String streamMemoryKey(String role) {
+        String fp = fingerprint;
+        if (fp == null || fp.isEmpty()) return null;
+        String band = AdaptiveLinkTracker.normalizeBand(liveLinkBand);
+        if (band.isEmpty()) band = WifiLinkMonitor.BAND_WIRELESS;
+        return fp + "|" + role + "|" + band;
+    }
+
+    private String readRememberedStream(String role) {
+        String key = streamMemoryKey(role);
+        if (key == null) return "";
+        try {
+            return application.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+                .getString(key, "");
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void rememberCleanStreamIfNeeded(String role, String stream) {
+        String key = streamMemoryKey(role);
+        if (key == null || stream == null || stream.isEmpty()) return;
+        if ("mouse".equals(role)) {
+            if (stream.equals(lastSavedMouseStream)) return;
+            lastSavedMouseStream = stream;
+        } else {
+            if (stream.equals(lastSavedKeyboardStream)) return;
+            lastSavedKeyboardStream = stream;
+        }
+        try {
+            application.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+                .edit().putString(key, stream).apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void sendStreamPreference() {
+        if (!running) return;
+        boolean mobMouse = preferMobileMouse;
+        boolean mobKb = preferMobileKeyboard;
+        String label = (mobMouse || mobKb) ? "cellular" : "wifi";
+        send(new Packet("stream-prefer", mobMouse ? 1 : 0, mobKb ? 1 : 0, 0, 0, label));
+    }
+
+    private void evaluateLossTriggeredStreams() {
+        if (!running || cableSession || cellularSession) return;
+        long now = SystemClock.uptimeMillis();
+        synchronized (streamPrefLock) {
+            if (!running || cableSession || cellularSession) return;
+            FastUdpChannel wifiCh = udpChannel;
+            FastUdpChannel mobCh = mobileUdpChannel;
+            if (wifiCh == null) return;
+            double wifiLoss = Math.max(wifiCh.linkTracker.getInboundLossPermille(),
+                wifiCh.linkTracker.getPeerLossPermille());
+            if (mobCh == null || !mobCh.confirmed) {
+                if (connectedStreamSinceMs > 0L
+                    && now - connectedStreamSinceMs >= STREAM_SAVE_CLEAN_DELAY_MS
+                    && wifiLoss == 0.0) {
+                    if (!preferMobileMouse) rememberCleanStreamIfNeeded("mouse", "wifi");
+                    if (!preferMobileKeyboard) rememberCleanStreamIfNeeded("keyboard", "wifi");
+                }
+                return;
+            }
+            long lastMobArrive = mobCh.linkTracker.getLastArriveMs();
+            long latestSwitch = Math.max(lastMouseSwitchAtMs, lastKeyboardSwitchAtMs);
+            boolean silentMobileDrop = (preferMobileMouse || preferMobileKeyboard)
+                && lastMobArrive > 0 && now - lastMobArrive > 3500L && now - latestSwitch > 4000L;
+            if (silentMobileDrop) {
+                preferMobileMouse = false;
+                preferMobileKeyboard = false;
+                lastMouseSwitchAtMs = now;
+                lastKeyboardSwitchAtMs = now;
+                lastSavedMouseStream = "";
+                lastSavedKeyboardStream = "";
+                sendStreamPreference();
+                DeskTouchRuntime.notifyLiveStatusChanged();
+                closeMobileUdpChannel(true, lastCellularHelper);
+                mobilePunchBackoffUntilMs = now + 20_000L;
+                return;
+            }
+
+            double mobLoss = Math.max(mobCh.linkTracker.getInboundLossPermille(),
+                mobCh.linkTracker.getPeerLossPermille());
+            boolean changed = false;
+
+            double activeMouseLoss = preferMobileMouse ? mobLoss : wifiLoss;
+            double candMouseLoss = preferMobileMouse ? wifiLoss : mobLoss;
+            if (CellularLinkHelper.shouldSwitchStreamOnLoss(
+                activeMouseLoss, candMouseLoss, now, lastMouseSwitchAtMs, STREAM_SWITCH_COOLDOWN_MS)) {
+                preferMobileMouse = !preferMobileMouse;
+                lastMouseSwitchAtMs = now;
+                lastSavedMouseStream = "";
+                changed = true;
+            } else {
+                long mouseStableSince = lastMouseSwitchAtMs > 0L ? lastMouseSwitchAtMs : connectedStreamSinceMs;
+                if (mouseStableSince > 0L && now - mouseStableSince >= STREAM_SAVE_CLEAN_DELAY_MS
+                    && activeMouseLoss == 0.0) {
+                    rememberCleanStreamIfNeeded("mouse", preferMobileMouse ? "cellular" : "wifi");
+                }
+            }
+
+            // If Mouse just switched to Mobile, let Wi-Fi unload for 3s before blaming Wi-Fi for Keyboard.
+            boolean kbHoldForMouseUnload = !preferMobileKeyboard && preferMobileMouse
+                && lastMouseSwitchAtMs > 0L && now - lastMouseSwitchAtMs < STREAM_SAVE_CLEAN_DELAY_MS;
+            double activeKbLoss = preferMobileKeyboard ? mobLoss : wifiLoss;
+            double candKbLoss = preferMobileKeyboard ? wifiLoss : mobLoss;
+            if (!kbHoldForMouseUnload && CellularLinkHelper.shouldSwitchStreamOnLoss(
+                activeKbLoss, candKbLoss, now, lastKeyboardSwitchAtMs, STREAM_SWITCH_COOLDOWN_MS)) {
+                preferMobileKeyboard = !preferMobileKeyboard;
+                lastKeyboardSwitchAtMs = now;
+                lastSavedKeyboardStream = "";
+                changed = true;
+            } else {
+                long kbStableSince = lastKeyboardSwitchAtMs > 0L ? lastKeyboardSwitchAtMs : connectedStreamSinceMs;
+                if (kbStableSince > 0L && now - kbStableSince >= STREAM_SAVE_CLEAN_DELAY_MS
+                    && activeKbLoss == 0.0) {
+                    rememberCleanStreamIfNeeded("keyboard", preferMobileKeyboard ? "cellular" : "wifi");
+                }
+            }
+
+            if (changed) {
+                sendStreamPreference();
+                DeskTouchRuntime.notifyLiveStatusChanged();
+                android.util.Log.i("DeskTouch", String.format(java.util.Locale.US,
+                    "Updated receive streams -> Mouse:%s Keyboard:%s (Wi-Fi loss %.1f%%, Mobile loss %.1f%%)",
+                    preferMobileMouse ? "Mobile" : "Wi-Fi",
+                    preferMobileKeyboard ? "Mobile" : "Wi-Fi",
+                    wifiLoss / 10.0, mobLoss / 10.0));
+            }
+        }
     }
 
     private void acceptMobileUdpCredentials(Packet p) {
@@ -1505,144 +1714,97 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     void evaluateLocalMobileReceiver(Context context, CellularLinkHelper helper) {
-        if (!running || cableSession || cellularSession || helper == null || isBusyInLease()) return;
+        if (!running || cableSession || cellularSession || helper == null) return;
+        this.lastCellularHelper = helper;
         long now = SystemClock.uptimeMillis();
         FastUdpChannel mobCh = mobileUdpChannel;
         if (mobCh != null && !mobCh.confirmed) {
             return; // Punch still in progress
         }
-        if (mobCh == null) {
-            if (mobileUdpPort <= 0 || mobileUdpKey == null) return;
-            java.util.List<String> pcEndpoints = DeskTouchRuntime.peerEndpoints(fingerprint);
-            if (pcEndpoints.isEmpty()) return;
-            FastUdpChannel wifiCh = udpChannel;
-            double wifiLoss = 0.0, wifiJitter = 0.0, wifiRtt = liveRttMs;
-            if (wifiCh != null) {
-                wifiLoss = Math.max(wifiCh.linkTracker.getInboundLossPermille(),
-                    wifiCh.linkTracker.getRecentPeakLossPermille(now));
-                wifiJitter = Math.max(wifiCh.linkTracker.getEffectiveJitterMs(),
-                    wifiCh.linkTracker.getRecentPeakJitterMs(now));
-                if (wifiCh.linkTracker.getSmoothedRttMs() > 0) wifiRtt = wifiCh.linkTracker.getSmoothedRttMs();
-            }
-            boolean wifiDegraded = wifiLoss >= 15.0 || wifiJitter >= 6.0 || wifiRtt >= 22.0;
-            if (mobilePunchAttemptedOnce && !wifiDegraded) return;
-            if (now < mobilePunchBackoffUntilMs) return;
-            mobilePunchAttemptedOnce = true;
-
-            android.net.Network cellNet = helper.acquireCellularNetwork(4500L);
-            if (cellNet == null) return;
-            java.util.List<String> myCellV6 = CellularLinkHelper.getGlobalCellularIpv6Addresses(
-                helper.connectivityManager(), cellNet);
-            if (myCellV6.isEmpty()) {
-                android.util.Log.i("DeskTouch", "Mobile UDP receiver skipped: no global IPv6 address on cellular link");
-                helper.releaseCellularNetwork();
-                mobilePunchBackoffUntilMs = now + 30_000L;
-                return;
-            }
-            try {
-                java.util.ArrayList<InetAddress> targets = new java.util.ArrayList<>();
-                for (String s : pcEndpoints) {
-                    try { targets.add(InetAddress.getByName(s)); }
-                    catch (Exception ignored) {}
-                }
-                if (targets.isEmpty()) {
-                    helper.releaseCellularNetwork();
-                    return;
-                }
-                FastUdpChannel ch = new FastUdpChannel(
-                    targets.get(0), mobileUdpPort, mobileUdpPeerId, mobileUdpKey,
-                    createUdpListener(true), cellNet, targets);
-                ch.linkTracker.onLinkProfileChanged(WifiLinkMonitor.BAND_CELLULAR, 0, 0);
-                mobileUdpChannel = ch;
-                JSONArray cellArr = new JSONArray(myCellV6);
-                send(new Packet("mobile-udp-punch", ch.localPort(), 0, 0, 0, cellArr.toString()));
-                ch.sendProbe();
-                android.util.Log.i("DeskTouch", "Started two-way local mobile UDP punch from "
-                    + myCellV6.get(0) + ":" + ch.localPort() + " while keeping Wi-Fi");
-                final int[] attempts = {0};
-                if (!udpPacer.isShutdown()) {
-                    mobileUdpProbeRetryFuture = udpPacer.scheduleWithFixedDelay(() -> {
-                        if (!running || mobileUdpChannel != ch || ch.confirmed || ++attempts[0] > 14) {
-                            ScheduledFuture<?> f = mobileUdpProbeRetryFuture;
-                            if (f != null) f.cancel(false);
-                            return;
-                        }
-                        ch.sendProbe();
-                    }, 120, 180, TimeUnit.MILLISECONDS);
-                    mobileUdpTimeoutFuture = udpPacer.schedule(() -> {
-                        if (running && mobileUdpChannel == ch && !ch.confirmed) {
-                            android.util.Log.i("DeskTouch",
-                                "Mobile UDP receiver punch timed out (router or carrier blocked two-way UDP); keeping Wi-Fi");
-                            mobilePunchBackoffUntilMs = SystemClock.uptimeMillis() + 60_000L;
-                            closeMobileUdpChannel(true, helper);
-                        }
-                    }, 3800, TimeUnit.MILLISECONDS);
-                    mobileUdpKeepAliveFuture = udpPacer.scheduleWithFixedDelay(() -> {
-                        if (!running || mobileUdpChannel != ch || !ch.confirmed) return;
-                        long t = SystemClock.uptimeMillis();
-                        long gap = ch.linkTracker.computeProbeIntervalMs(preferMobileStream && isBusyInLease());
-                        if (t - lastMobileUdpLinkPingMs >= gap) {
-                            lastMobileUdpLinkPingMs = t;
-                            int pace = (int) Math.round(lastAdaptiveMoveIntervalMs * 10.0);
-                            ch.sendLinkPing(ch.linkTracker.nextPingToken(t), pace, reverseLease);
-                        }
-                    }, 350, 350, TimeUnit.MILLISECONDS);
-                }
-            } catch (Exception ex) {
-                android.util.Log.w("DeskTouch", "Mobile UDP setup skipped: " + ex.getMessage());
-                closeMobileUdpChannel(true, helper);
-                mobilePunchBackoffUntilMs = now + 45_000L;
-            }
+        if (mobCh != null) {
+            // Both streams are active; switching runs event-driven on loss feedback, not periodic polling.
             return;
         }
-
-        // Both Wi-Fi UDP and Mobile UDP are active -> compare strength and receive on the stronger path
+        if (mobileUdpPort <= 0 || mobileUdpKey == null) return;
+        java.util.List<String> pcEndpoints = DeskTouchRuntime.peerEndpoints(fingerprint);
+        if (pcEndpoints.isEmpty()) return;
         FastUdpChannel wifiCh = udpChannel;
-        if (wifiCh == null) return;
-        double wifiLoss = Math.max(wifiCh.linkTracker.getInboundLossPermille(),
-            wifiCh.linkTracker.getRecentPeakLossPermille(now));
-        double wifiJitter = Math.max(wifiCh.linkTracker.getEffectiveJitterMs(),
-            wifiCh.linkTracker.getRecentPeakJitterMs(now));
-        double wifiRtt = wifiCh.linkTracker.getSmoothedRttMs() > 0
-            ? wifiCh.linkTracker.getSmoothedRttMs() : (liveRttMs > 0 ? liveRttMs : 12.0);
-        double mobRtt = mobCh.linkTracker.getSmoothedRttMs() > 0 ? mobCh.linkTracker.getSmoothedRttMs() : 35.0;
-        double mobJitter = mobCh.linkTracker.getEffectiveJitterMs();
-        double mobLoss = Math.max(mobCh.linkTracker.getInboundLossPermille(),
-            mobCh.linkTracker.getPeerLossPermille());
+        double wifiLoss = 0.0;
+        if (wifiCh != null) {
+            wifiLoss = Math.max(wifiCh.linkTracker.getInboundLossPermille(),
+                wifiCh.linkTracker.getPeerLossPermille());
+        }
+        boolean rememberCell = "cellular".equals(readRememberedStream("mouse"))
+            || "cellular".equals(readRememberedStream("keyboard"));
+        boolean wifiLossTriggered = wifiLoss >= 10.0;
+        if (mobilePunchAttemptedOnce && !wifiLossTriggered && !rememberCell) return;
+        if (now < mobilePunchBackoffUntilMs) return;
+        mobilePunchAttemptedOnce = true;
 
-        if (!preferMobileStream) {
-            if (CellularLinkHelper.shouldPreferCellular(
-                wifiRtt, wifiJitter, wifiLoss, mobRtt, mobJitter, mobLoss, now, lastStreamSwitchAtMs)) {
-                preferMobileStream = true;
-                lastStreamSwitchAtMs = now;
-                lastDemotedWifiAtMs = now;
-                lastDemotedWifiBand = AdaptiveLinkTracker.normalizeBand(liveLinkBand);
-                send(new Packet("stream-prefer", 1, 0, 0, 0, "cellular"));
-                android.util.Log.i("DeskTouch", String.format(java.util.Locale.US,
-                    "Receiving movements via Mobile network (%.1fms/%.1f%%) instead of noisy Wi-Fi (%.1fms/%.1f%%); Wi-Fi stays connected",
-                    mobRtt, mobLoss / 10.0, wifiRtt, wifiLoss / 10.0));
-                DeskTouchRuntime.notifyLiveStatusChanged();
+        android.net.Network cellNet = helper.acquireCellularNetwork(4500L);
+        if (cellNet == null) return;
+        java.util.List<String> myCellV6 = CellularLinkHelper.getGlobalCellularIpv6Addresses(
+            helper.connectivityManager(), cellNet);
+        if (myCellV6.isEmpty()) {
+            android.util.Log.i("DeskTouch", "Mobile UDP receiver skipped: no global IPv6 address on cellular link");
+            helper.releaseCellularNetwork();
+            mobilePunchBackoffUntilMs = now + 30_000L;
+            return;
+        }
+        try {
+            java.util.ArrayList<InetAddress> targets = new java.util.ArrayList<>();
+            for (String s : pcEndpoints) {
+                try { targets.add(InetAddress.getByName(s)); }
+                catch (Exception ignored) {}
             }
-        } else {
-            long lastMobArrive = mobCh.linkTracker.getLastArriveMs();
-            boolean silentMobileDrop = lastMobArrive > 0 && now - lastMobArrive > 3500L && now - lastStreamSwitchAtMs > 4000L;
-            String curWifiBand = AdaptiveLinkTracker.normalizeBand(liveLinkBand);
-            boolean sameDemotedBand = curWifiBand.equals(lastDemotedWifiBand)
-                && lastDemotedWifiAtMs > 0 && now - lastDemotedWifiAtMs < 75_000L;
-            boolean returnToWifi = silentMobileDrop || mobLoss >= 80.0
-                || (!sameDemotedBand && CellularLinkHelper.shouldReturnToWifi(
-                    mobRtt, mobJitter, mobLoss, wifiRtt, wifiJitter, wifiLoss, now, lastStreamSwitchAtMs));
-            if (returnToWifi) {
-                preferMobileStream = false;
-                lastStreamSwitchAtMs = now;
-                send(new Packet("stream-prefer", 0, 0, 0, 0, "wifi"));
-                android.util.Log.i("DeskTouch", "Switched movement receive stream back to Wi-Fi");
-                DeskTouchRuntime.notifyLiveStatusChanged();
-                if (silentMobileDrop) {
-                    closeMobileUdpChannel(true, helper);
-                    mobilePunchBackoffUntilMs = now + 20_000L;
-                }
+            if (targets.isEmpty()) {
+                helper.releaseCellularNetwork();
+                return;
             }
+            FastUdpChannel ch = new FastUdpChannel(
+                targets.get(0), mobileUdpPort, mobileUdpPeerId, mobileUdpKey,
+                createUdpListener(true), cellNet, targets);
+            ch.linkTracker.onLinkProfileChanged(WifiLinkMonitor.BAND_CELLULAR, 0, 0);
+            mobileUdpChannel = ch;
+            JSONArray cellArr = new JSONArray(myCellV6);
+            send(new Packet("mobile-udp-punch", ch.localPort(), 0, 0, 0, cellArr.toString()));
+            ch.sendProbe();
+            android.util.Log.i("DeskTouch", "Started two-way local mobile UDP punch from "
+                + myCellV6.get(0) + ":" + ch.localPort() + " while keeping Wi-Fi");
+            final int[] attempts = {0};
+            if (!udpPacer.isShutdown()) {
+                mobileUdpProbeRetryFuture = udpPacer.scheduleWithFixedDelay(() -> {
+                    if (!running || mobileUdpChannel != ch || ch.confirmed || ++attempts[0] > 14) {
+                        ScheduledFuture<?> f = mobileUdpProbeRetryFuture;
+                        if (f != null) f.cancel(false);
+                        return;
+                    }
+                    ch.sendProbe();
+                }, 120, 180, TimeUnit.MILLISECONDS);
+                mobileUdpTimeoutFuture = udpPacer.schedule(() -> {
+                    if (running && mobileUdpChannel == ch && !ch.confirmed) {
+                        android.util.Log.i("DeskTouch",
+                            "Mobile UDP receiver punch timed out (router or carrier blocked two-way UDP); keeping Wi-Fi");
+                        mobilePunchBackoffUntilMs = SystemClock.uptimeMillis() + 60_000L;
+                        closeMobileUdpChannel(true, helper);
+                    }
+                }, 3800, TimeUnit.MILLISECONDS);
+                mobileUdpKeepAliveFuture = udpPacer.scheduleWithFixedDelay(() -> {
+                    if (!running || mobileUdpChannel != ch || !ch.confirmed) return;
+                    long t = SystemClock.uptimeMillis();
+                    long gap = ch.linkTracker.computeProbeIntervalMs(
+                        (preferMobileMouse || preferMobileKeyboard) && isBusyInLease());
+                    if (t - lastMobileUdpLinkPingMs >= gap) {
+                        lastMobileUdpLinkPingMs = t;
+                        int pace = (int) Math.round(lastAdaptiveMoveIntervalMs * 10.0);
+                        ch.sendLinkPing(ch.linkTracker.nextPingToken(t), pace, reverseLease);
+                    }
+                }, 350, 350, TimeUnit.MILLISECONDS);
+            }
+        } catch (Exception ex) {
+            android.util.Log.w("DeskTouch", "Mobile UDP setup skipped: " + ex.getMessage());
+            closeMobileUdpChannel(true, helper);
+            mobilePunchBackoffUntilMs = now + 45_000L;
         }
     }
 
@@ -1656,6 +1818,9 @@ final class DeskTouchSession implements AutoCloseable {
             FastUdpChannel ch=new FastUdpChannel(addr,p.a,p.b,key,createUdpListener(false), boundNetwork);
             ch.linkTracker.onLinkProfileChanged(liveLinkBand,liveLinkSpeedMbps,0);
             udpChannel=ch;
+            connectedStreamSinceMs=SystemClock.uptimeMillis();
+            lastSavedMouseStream="";
+            lastSavedKeyboardStream="";
             send(new Packet("udp-ready",ch.localPort()));
             ch.sendProbe();
             final int[] attempts={0};
@@ -1730,8 +1895,13 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     private void closeMobileUdpChannel(boolean notifyWindows, CellularLinkHelper helper) {
-        boolean wasPreferring = preferMobileStream;
-        preferMobileStream = false;
+        boolean wasPreferring = preferMobileMouse || preferMobileKeyboard;
+        synchronized (streamPrefLock) {
+            preferMobileMouse = false;
+            preferMobileKeyboard = false;
+            lastSavedMouseStream = "";
+            lastSavedKeyboardStream = "";
+        }
         ScheduledFuture<?> keepAlive = mobileUdpKeepAliveFuture;
         mobileUdpKeepAliveFuture = null;
         if (keepAlive != null) keepAlive.cancel(false);

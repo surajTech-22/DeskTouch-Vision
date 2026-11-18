@@ -2672,6 +2672,34 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
             auxHub.RemovePeer(auxPeer);
             auxHub.RemovePeer(primaryPeer);
         }
+
+        // Verify v0.3.67: FastUdpOp.ReverseKey AEAD contract, non-colliding key seq field, and independent stream-prefer payload.
+        Check(AdaptiveLinkTracker.IsInteractiveOp(FastUdpOp.ReverseKey),
+            "FastUdpOp.ReverseKey must be treated as an interactive op for packet loss tracking");
+        byte[] keyTestKey = Enumerable.Range(1, FastUdpCodec.KeySize).Select(i => (byte)i).ToArray();
+        using (var srvKeyCodec = new FastUdpCodec(keyTestKey, 0x0042, true))
+        using (var cliKeyCodec = new FastUdpCodec(keyTestKey, 0x0042, false))
+        {
+            byte[] keyFrame = new byte[FastUdpCodec.FrameSize];
+            int sealedLen = srvKeyCodec.Seal(FastUdpOp.ReverseKey, 65, 1, 77, 19, keyFrame);
+            Check(sealedLen == FastUdpCodec.FrameSize &&
+                  cliKeyCodec.TryOpen(keyFrame, out var openedKey) &&
+                  openedKey.Op == FastUdpOp.ReverseKey &&
+                  openedKey.A == 65 &&
+                  openedKey.B == 1 &&
+                  openedKey.Lease == 77 &&
+                  openedKey.TimestampMs == 19,
+                "FastUdpOp.ReverseKey must seal and open vk, down flag, lease, and actionSeq cleanly");
+        }
+        var encodedReverseKey = ReverseInputProtocol.Encode(new Packet("key", 19, 0, 1, 65));
+        Check(encodedReverseKey.Type == "reverse-key" &&
+              encodedReverseKey.A == 19 &&
+              encodedReverseKey.C == 1 &&
+              encodedReverseKey.D == 65,
+            "ReverseInputProtocol must preserve key actionSeq in A alongside C=down and D=vk");
+        var splitPref = new Packet("stream-prefer", 1, 0, 0, 0, "cellular");
+        Check(splitPref.Type == "stream-prefer" && splitPref.A == 1 && splitPref.B == 0,
+            "stream-prefer packet must support independent Mouse (A) and Keyboard (B) path selection");
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

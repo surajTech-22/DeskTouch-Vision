@@ -21,7 +21,8 @@ internal enum FastUdpOp : byte
     ReverseWheel = 10,
     LinkPing = 11,
     LinkFeedback = 12,
-    ReverseEdgePush = 13
+    ReverseEdgePush = 13,
+    ReverseKey = 14
 }
 
 internal readonly record struct FastUdpMessage(
@@ -338,7 +339,7 @@ internal sealed class AdaptiveLinkTracker
     internal static bool IsInteractiveOp(FastUdpOp op) => op is
         FastUdpOp.ReverseMove or FastUdpOp.Move or FastUdpOp.ReverseEdgePush or
         FastUdpOp.ReverseClaim or FastUdpOp.ReverseGranted or FastUdpOp.ReverseActive or
-        FastUdpOp.ReverseButton or FastUdpOp.ReverseWheel;
+        FastUdpOp.ReverseButton or FastUdpOp.ReverseWheel or FastUdpOp.ReverseKey;
 
     internal int NextPingToken(long nowMs)
     {

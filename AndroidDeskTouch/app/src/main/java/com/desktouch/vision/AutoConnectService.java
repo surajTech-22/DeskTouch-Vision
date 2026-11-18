@@ -664,7 +664,11 @@ public final class AutoConnectService extends Service {
     private void scheduleCellularEvaluation() {
         ExecutorService exec=cellularExecutor;
         if(exec==null || exec.isShutdown() || !enabled(this) || !reconnectEnabled(this)) return;
-        if(DeskTouchRuntime.anyCableConnected() || DeskTouchRuntime.anyInputLeaseActive()) return;
+        if(DeskTouchRuntime.anyCableConnected()) return;
+        boolean needPunchForConnectedWifi=DeskTouchRuntime.connectedNonCableFingerprint()!=null
+            && !DeskTouchRuntime.hasActiveMobileUdpStream();
+        if(!needPunchForConnectedWifi && DeskTouchRuntime.anyInputLeaseActive()) return;
+        if(!needPunchForConnectedWifi && DeskTouchRuntime.hasActiveMobileUdpStream()) return;
         if(!cellularProbeInFlight.compareAndSet(false,true)) return;
         exec.execute(()->{
             try {
@@ -684,7 +688,7 @@ public final class AutoConnectService extends Service {
             cellularHelper.releaseCellularNetwork();
         }
         if(trust==null || !enabled(this) || !reconnectEnabled(this)) return;
-        if(DeskTouchRuntime.anyCableConnected() || DeskTouchRuntime.anyInputLeaseActive()) return;
+        if(DeskTouchRuntime.anyCableConnected()) return;
         Set<String> allowed=trust.fingerprints();
         if(allowed.isEmpty()) return;
         Set<String> paused=getSharedPreferences(PREFS,MODE_PRIVATE)
@@ -692,7 +696,7 @@ public final class AutoConnectService extends Service {
         long now=SystemClock.uptimeMillis();
 
         // Keep Wi-Fi <-> Wi-Fi session intact and run the local auxiliary Mobile UDP receiver
-        // alongside it so whichever path (Wi-Fi vs Mobile network) is stronger receives movements.
+        // alongside it; switching runs event-driven on loss feedback, not periodic timers.
         String nonCableFp=DeskTouchRuntime.connectedNonCableFingerprint();
         if(nonCableFp!=null) {
             if(paused.contains(nonCableFp)) return;
@@ -701,7 +705,7 @@ public final class AutoConnectService extends Service {
         }
 
         // Fallback only when Wi-Fi is completely disconnected/unavailable (Case 3).
-        if(DeskTouchRuntime.connectedCount()>0) return;
+        if(DeskTouchRuntime.anyInputLeaseActive() || DeskTouchRuntime.connectedCount()>0) return;
         if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<60_000L) return;
         PhoneScreenGeometry.Info phone=PhoneScreenGeometry.readInfo(this);
         for(String fp:DeskTouchRuntime.endpointFingerprints()) {

@@ -37,6 +37,7 @@ final class FastUdpChannel implements Closeable {
     static final byte OP_LINK_PING = 11;
     static final byte OP_LINK_FEEDBACK = 12;
     static final byte OP_REVERSE_EDGE_PUSH = 13;
+    static final byte OP_REVERSE_KEY = 14;
 
     static int unpackCurr(int packed) {
         int hi = (packed >>> 16) & 0xFFFF;
@@ -151,7 +152,7 @@ final class FastUdpChannel implements Closeable {
             int id = ((frame[6] & 0xFF) << 8) | (frame[7] & 0xFF);
             if (id != peerId) return null;
             byte op = frame[5];
-            if (op < OP_REVERSE_MOVE || op > OP_REVERSE_EDGE_PUSH) return null;
+            if (op < OP_REVERSE_MOVE || op > OP_REVERSE_KEY) return null;
             long seq = readLongBE(frame, 8);
             if (seq == 0) return null;
 
@@ -222,6 +223,7 @@ final class FastUdpChannel implements Closeable {
         default void onReverseClaim(int claim, int dispatchSeq) {}
         default void onReverseButton(int button, int down, int lease, int actionSeq) {}
         default void onReverseWheel(int amount, int horizontal, int lease, int actionSeq) {}
+        default void onReverseKey(int vk, boolean down, int lease, int actionSeq) {}
         default void onLinkPing(int pingToken, int senderPaceTenths, int lease, int ts) {}
         default void onLinkFeedback(int echoToken, int packedLossJitter, int packedDisplayRate, int lease) {}
     }
@@ -461,6 +463,9 @@ final class FastUdpChannel implements Closeable {
                 } else if (msg.op == OP_REVERSE_WHEEL) {
                     markConfirmed();
                     if (msg.lease > 0) listener.onReverseWheel(msg.a, msg.b, msg.lease, msg.timestampMs);
+                } else if (msg.op == OP_REVERSE_KEY) {
+                    markConfirmed();
+                    if (msg.lease > 0) listener.onReverseKey(msg.a, msg.b != 0, msg.lease, msg.timestampMs);
                 }
             } catch (Exception e) {
                 if (closed) break;

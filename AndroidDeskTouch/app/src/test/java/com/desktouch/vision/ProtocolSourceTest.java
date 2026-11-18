@@ -1305,5 +1305,37 @@ public final class ProtocolSourceTest {
             clientCodec.close();
             serverCodec.close();
         }
+
+        // Verify v0.3.67: Independent FastUdpChannel.OP_REVERSE_KEY, AdaptiveLinkTracker interactive classification,
+        // and loss-triggered stream switching without flip-flopping on 0% streams.
+        assertTrue("OP_REVERSE_KEY must be classified as interactive",
+            AdaptiveLinkTracker.isInteractiveOp(FastUdpChannel.OP_REVERSE_KEY));
+        byte[] kbKey = new byte[FastUdpChannel.KEY_SIZE];
+        for (int i = 0; i < kbKey.length; i++) kbKey[i] = (byte) (i + 7);
+        FastUdpChannel.Codec srvKb = new FastUdpChannel.Codec(kbKey, 42, true);
+        FastUdpChannel.Codec cliKb = new FastUdpChannel.Codec(kbKey, 42, false);
+        byte[] kbFrame = new byte[FastUdpChannel.FRAME_SIZE];
+        int kbLen = srvKb.seal(FastUdpChannel.OP_REVERSE_KEY, 65, 1, 77, 19, kbFrame);
+        assertEquals(FastUdpChannel.FRAME_SIZE, kbLen);
+        FastUdpChannel.Message openedKb = cliKb.tryOpen(kbFrame, kbLen, null);
+        assertNotNull(openedKb);
+        assertEquals(FastUdpChannel.OP_REVERSE_KEY, openedKb.op);
+        assertEquals(65, openedKb.a);
+        assertEquals(1, openedKb.b);
+        assertEquals(77, openedKb.lease);
+        assertEquals(19, openedKb.timestampMs);
+        srvKb.close();
+        cliKb.close();
+
+        assertFalse("Clean 0% active stream must NEVER switch even if alternate is 0%",
+            CellularLinkHelper.shouldSwitchStreamOnLoss(0.0, 0.0, 50_000L, 10_000L, 8_000L));
+        assertFalse("Sub-1% loss (0.8% = 8 permille) must stay on current remembered stream",
+            CellularLinkHelper.shouldSwitchStreamOnLoss(8.0, 0.0, 50_000L, 10_000L, 8_000L));
+        assertFalse("High active loss (2.0%) must continue on current path if alternate is no cleaner",
+            CellularLinkHelper.shouldSwitchStreamOnLoss(20.0, 20.0, 50_000L, 10_000L, 8_000L));
+        assertFalse("Cooldown window must prevent rapid repeated stream switching",
+            CellularLinkHelper.shouldSwitchStreamOnLoss(25.0, 0.0, 14_000L, 10_000L, 8_000L));
+        assertTrue("Active >= 1.0% loss (12 permille) must switch when alternate stream is cleaner",
+            CellularLinkHelper.shouldSwitchStreamOnLoss(12.0, 0.0, 50_000L, 10_000L, 8_000L));
     }
 }

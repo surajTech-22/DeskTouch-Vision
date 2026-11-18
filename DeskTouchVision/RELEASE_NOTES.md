@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.67 — Independent Mouse & Keyboard Fast Channels + Zero-Loss Stream Memory
+
+Eliminates keyboard lag on Wi-Fi and stops unnecessary repeated switching between Wi-Fi and Mobile network:
+
+- **Independent fast UDP channels for Keyboard & Mouse (`FastUdpChannel`, `FastUdpHub`, `NetworkSessions`, `DeskTouchSession`):** Adds dedicated `FastUdpOp.ReverseKey` (`14`) with reliable ordered TCP backup (`p.a` sequence preservation, non-blocking `isImmediateControl` flush), separate `preferMobileMouse` and `preferMobileKeyboard` stream selection (`stream-prefer` `A`/`B`), and isolated mouse-button vs keystroke deduplication (`lastExecutedKeySeq`), allowing e.g. `4 ms` Wi-Fi keyboard strokes simultaneously alongside `0%`-loss Mobile `144 Hz` mouse streaming.
+- **Persistent 0%-loss stream memory & instantaneous loss-triggered switching (`DeskTouchSession`, `CellularLinkHelper`, `AutoConnectService`):** Saves cleanly working (`0%` loss) stream choices per band and device role in local app preferences (`desktouch_stream_memory`, strictly without saving IPs or network names), restores remembered channels immediately upon auxiliary Mobile UDP confirmation, eliminates periodic 1-second/75-second bounce-backs onto congested Wi-Fi, and only evaluates switching when the active stream itself crosses `>= 1.0%` packet loss and the alternate stream shows strictly lower loss.
+
+---
+
 # DeskTouch Vision v0.3.66 — Always-On Wi-Fi Link + Simultaneous Local Mobile Receiver & Stronger-Path Switching
 
 Replaces cellular-over-Wi-Fi session replacement with a purely local dual-stream architecture that keeps the PC and phone connected Wi-Fi-to-Wi-Fi continuously:

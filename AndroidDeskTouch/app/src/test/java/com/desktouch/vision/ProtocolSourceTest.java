@@ -1653,6 +1653,26 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("openFullscreenScreenPreview("));
         assertTrue(mainSource.contains("SCREEN_ORIENTATION_SENSOR_LANDSCAPE"));
         assertTrue(sessionSource.contains("void setScreenPreviewWatch(int targetId, int monitorIndex, boolean highRes)"));
+
+        // Verify v0.3.85: QR direct payload parsing, Phone Screen/Camera streaming, Shelf, & Repair controls.
+        String sampleFp = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        String sampleSecret = "A1B2C3D4E5F60718293A4B5C6D7E8F90";
+        QrScannerDialog.DirectQrTarget qr = QrScannerDialog.parseDirectQrPayload(
+            "DT1|192.168.1.42|" + sampleFp.toLowerCase(java.util.Locale.ROOT) + "|" + sampleSecret);
+        assertNotNull(qr);
+        assertEquals("192.168.1.42", qr.address);
+        assertEquals(sampleFp, qr.fingerprint);
+        assertEquals(sampleSecret, qr.secret);
+        assertNull(QrScannerDialog.parseDirectQrPayload("DT1|not-an-ip|" + sampleFp + "|" + sampleSecret));
+        assertNull(QrScannerDialog.parseDirectQrPayload("DT1|192.168.1.42|short|" + sampleSecret));
+        assertNull(QrScannerDialog.parseDirectQrPayload("RANDOM"));
+        assertTrue(mainSource.contains("launchQrScanner("));
+        assertTrue(mainSource.contains("showSharedShelfDialog("));
+        assertTrue(mainSource.contains("runFixConnectionAndBackground("));
+        assertTrue(sessionSource.contains("connectWithDirectSecret("));
+        assertTrue(sessionSource.contains("phone-screen-watch"));
+        assertTrue(sessionSource.contains("phone-camera-watch"));
+        assertTrue(sessionSource.contains("phone-mic-audio"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

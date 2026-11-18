@@ -3027,6 +3027,42 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
           issText.Contains("Local\\DeskTouchVision.WindowsDisplays.ExitEvent.2026", StringComparison.Ordinal),
           "Single-EXE Inno Setup installer must output DeskTouchVision-Install.exe and clean up running processes pre-install");
 
+    // Verify v0.3.85: Phone screen aspect-ratio touch mapping, Recent Shared Shelf, QR payload, & auto-update cleanup.
+    var centerTouch = PhoneCanvasMath.MapCanvasTouchToNormalized(500, 500, 1000, 1000, 540, 1200);
+    Check(centerTouch.NormX == 5000 && centerTouch.NormY == 5000,
+          "PhoneCanvasMath must map center of portrait frame cleanly to (5000, 5000)");
+    var pillarLeft = PhoneCanvasMath.MapCanvasTouchToNormalized(50, 500, 1000, 1000, 500, 1000);
+    Check(pillarLeft.NormX == 0 && pillarLeft.NormY == 5000,
+          "PhoneCanvasMath must clamp pillarbox margin clicks to edge X=0");
+
+    string qrSample = PairingQrDialog.BuildDirectQrPayload("192.168.1.42", fpOne, "00112233445566778899aabbccddeeff");
+    Check(qrSample == $"DT1|192.168.1.42|{fpOne}|00112233445566778899AABBCCDDEEFF",
+          "BuildDirectQrPayload must emit canonical uppercase DT1 link");
+
+    string shelfTemp = Path.Combine(Path.GetTempPath(), $"desktouch-shelf-test-{Guid.NewGuid():N}.json");
+    try
+    {
+        var shelf = new SharedShelfStore(shelfTemp);
+        shelf.AddClipboardText("Hello Shelf", "Xiaomi");
+        shelf.AddOtp("WhatsApp", "482910", "Code", "Xiaomi");
+        Check(shelf.ListEntries().Count == 2 &&
+              shelf.ListEntries("otp").Count == 1 &&
+              shelf.ListEntries("otp")[0].PayloadText == "482910",
+              "SharedShelfStore must store, filter, and persist clips & codes");
+        shelf.Clear();
+        Check(shelf.ListEntries().Count == 0, "SharedShelfStore.Clear must empty persisted shelf items");
+    }
+    finally
+    {
+        try { if (File.Exists(shelfTemp)) File.Delete(shelfTemp); } catch { }
+    }
+
+    string updaterScriptPath = Path.Combine(Directory.GetParent(issPath!)!.FullName, "Update-DeskTouch.ps1");
+    string updaterText = File.ReadAllText(updaterScriptPath);
+    Check(updaterText.Contains("Stop-StaleUpdaters", StringComparison.Ordinal) &&
+          updaterText.Contains("Stop-Process -Id $proc.Id -Force", StringComparison.Ordinal),
+          "Automatic updater must clear stale updaters and exit any lingering DeskTouch process before install");
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

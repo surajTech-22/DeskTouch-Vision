@@ -137,6 +137,15 @@ final class DeskTouchSession implements AutoCloseable {
         return reverseDedup.tryAcceptKeyAction(seq);
     }
     interface Events { void status(String message); }
+    interface MediaRequestListener {
+        void onScreenShareRequested();
+        void onCameraShareRequested(int lens, boolean torch, boolean mic);
+    }
+    private static volatile MediaRequestListener mediaRequestListener;
+    private static int phoneScreenFrameSeq;
+    private static int phoneCameraFrameSeq;
+    private static int phoneMicSeq;
+    static void setMediaRequestListener(MediaRequestListener listener){ mediaRequestListener = listener; }
     static final class EnvironmentTarget {
         final int id;
         final String name,platform,layout;
@@ -813,6 +822,10 @@ final class DeskTouchSession implements AutoCloseable {
             String pairingSecret,Runnable onFailure) {
         connectInternal(device,androidWidth,androidHeight,true,null,false,pairingSecret,null,onFailure);
     }
+    void connectWithDirectSecret(String address,String fingerprint,String secret,int androidWidth,int androidHeight) {
+        DesktopDiscovery.Device dev = new DesktopDiscovery.Device(address, address, fingerprint, true, false, false);
+        connectInternal(dev, androidWidth, androidHeight, true, null, false, secret, null, null);
+    }
     private void connectInternal(DesktopDiscovery.Device device,int androidWidth,int androidHeight,
             boolean interactiveUser,android.net.Network networkOverride,boolean cellular,
             String pairingSecret,Runnable onConnected,Runnable onFailure) {
@@ -975,6 +988,7 @@ final class DeskTouchSession implements AutoCloseable {
                 ShellInputClient.warmConnectIfConfigured(application);
                 publishKeyboardBindings();
                 publishCurrentBatteryAndNotifications();
+                registerPhoneMediaSink();
                 if(onConnected!=null) onConnected.run();
                 DeskTouchRuntime.notifyLiveStatusChanged();
                 Thread heartbeat=new Thread(()->{
@@ -1236,6 +1250,7 @@ final class DeskTouchSession implements AutoCloseable {
                             String t=o.optString("t","");
                             if(!t.isEmpty() && !h.equals(lastAppliedClipboardHash)){
                                 lastAppliedClipboardHash=h;
+                                EcosystemFeatures.recordShelfClip(application,t,peerName);
                                 java.util.function.Consumer<String> applier=remoteClipboardTextApplier;
                                 if(applier!=null) applier.accept(t);
                             }
@@ -1292,6 +1307,16 @@ final class DeskTouchSession implements AutoCloseable {
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("pause-accessibility".equals(p.type)){
                     handlePauseAccessibilityFromWindows();
+                } else if("phone-screen-watch".equals(p.type)){
+                    handlePhoneScreenWatch(p.a!=0);
+                } else if("phone-touch".equals(p.type)){
+                    handlePhoneMirrorTouch(p.a,p.b,p.c);
+                } else if("phone-nav".equals(p.type)){
+                    handlePhoneMirrorNav(p.a);
+                } else if("phone-text".equals(p.type) && p.text!=null){
+                    handlePhoneMirrorText(p.text);
+                } else if("phone-camera-watch".equals(p.type)){
+                    handlePhoneCameraWatch(p.a!=0,p.b,p.c!=0,p.d!=0);
                 } else if("goodbye".equals(p.type)) break;
             }
         } catch(Exception e){
@@ -1589,6 +1614,7 @@ final class DeskTouchSession implements AutoCloseable {
 
     void publishOtpOffer(String app, String code, String title){
         if(!running || code==null || code.isEmpty()) return;
+        EcosystemFeatures.recordShelfOtp(application,app,code,"Phone");
         try {
             String json=new JSONObject().put("App",app==null?"Phone":app)
                 .put("Code",code).put("Title",title==null?"":title).toString();
@@ -1633,6 +1659,7 @@ final class DeskTouchSession implements AutoCloseable {
         if(hash!=null && hash.equals(lastAppliedClipboardHash)) return;
         String clipped=text.length()>2800 ? text.substring(0,2800) : text;
         lastAppliedClipboardHash=hash;
+        EcosystemFeatures.recordShelfClip(application,clipped,"This phone");
         try {
             String json=new JSONObject().put("h",hash==null?"":hash).put("t",clipped).toString();
             send(new Packet("clipboard-text",0,0,0,0,json));
@@ -1751,6 +1778,7 @@ final class DeskTouchSession implements AutoCloseable {
                     writeNow(new Packet("file-chunk",txId,seq++,targetId,0,b64));
                 }
                 writeNow(new Packet("file-done",txId,seq,targetId,0,""));
+                EcosystemFeatures.recordShelfFile(application,fileName,"Sent to Windows",uri.toString(),"This phone");
                 if(onDone!=null) onDone.accept("Sent '"+fileName+"' cleanly.");
             } catch(Exception ex){
                 if(onDone!=null) onDone.accept("File transfer failed: "+ex.getMessage());
@@ -1807,6 +1835,7 @@ final class DeskTouchSession implements AutoCloseable {
         try { w.out.flush(); w.out.close(); } catch(Exception ignored){}
         String saved=EcosystemFeatures.saveCompletedDownload(application,w.fileName,w.tempFile);
         if(saved!=null){
+            EcosystemFeatures.recordShelfFile(application,w.fileName,"Received in "+saved,saved,peerName);
             status("Saved received file: "+saved);
         } else {
             w.tempFile.delete();
@@ -1819,6 +1848,112 @@ final class DeskTouchSession implements AutoCloseable {
         if(w==null) return;
         try { w.out.close(); } catch(Exception ignored){}
         if(deleteTemp) w.tempFile.delete();
+    }
+
+    private void registerPhoneMediaSink(){
+        PhoneMediaService.setSink(new PhoneMediaService.MediaSink(){
+            @Override public void onScreenFrame(byte[] jpeg){
+                if(!running) return;
+                sendMediaChunks("phone-screen-chunk",++phoneScreenFrameSeq,jpeg);
+            }
+            @Override public void onScreenStatus(int stateCode, String msg){
+                if(running) send(new Packet("phone-screen-status",stateCode,0,0,0,msg==null?"":msg));
+            }
+            @Override public void onCameraFrame(byte[] jpeg){
+                if(!running) return;
+                sendMediaChunks("phone-camera-chunk",++phoneCameraFrameSeq,jpeg);
+            }
+            @Override public void onCameraStatus(int stateCode, String msg){
+                if(running) send(new Packet("phone-camera-status",stateCode,0,0,0,msg==null?"":msg));
+            }
+            @Override public void onMicAudio(byte[] pcm16Mono, int sampleRate){
+                if(!running || pcm16Mono==null || pcm16Mono.length==0) return;
+                String b64=android.util.Base64.encodeToString(pcm16Mono,android.util.Base64.NO_WRAP);
+                if(b64.length()<=7200)
+                    send(new Packet("phone-mic-audio",++phoneMicSeq,sampleRate,1,0,b64));
+            }
+        });
+    }
+
+    private void sendMediaChunks(String packetType, int frameId, byte[] jpeg){
+        if(!running || jpeg==null || jpeg.length==0 || jpeg.length>160*1024) return;
+        final int chunkSize=3600;
+        int total=(jpeg.length+chunkSize-1)/chunkSize;
+        for(int i=0;i<total;i++){
+            if(!running) return;
+            int off=i*chunkSize;
+            int len=Math.min(chunkSize,jpeg.length-off);
+            String b64=android.util.Base64.encodeToString(jpeg,off,len,android.util.Base64.NO_WRAP);
+            send(new Packet(packetType,frameId,i,total,0,b64));
+        }
+    }
+
+    private void handlePhoneScreenWatch(boolean enable){
+        if(!enable){
+            PhoneMediaService.stopScreenShare(application);
+            return;
+        }
+        registerPhoneMediaSink();
+        if(PhoneMediaService.isScreenSharingActive()){
+            send(new Packet("phone-screen-status",1,0,0,0,"Live"));
+        }else{
+            send(new Packet("phone-screen-status",2,0,0,0,"Tap Share Phone Screen on phone"));
+            MediaRequestListener l=mediaRequestListener;
+            if(l!=null) l.onScreenShareRequested();
+        }
+    }
+
+    private void handlePhoneCameraWatch(boolean enable, int lens, boolean torch, boolean mic){
+        if(!enable){
+            PhoneMediaService.stopCameraShare(application);
+            return;
+        }
+        registerPhoneMediaSink();
+        boolean hasCam=application.checkSelfPermission(android.Manifest.permission.CAMERA)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(hasCam){
+            PhoneMediaService.startCameraShare(application,lens,torch,mic);
+        }else{
+            send(new Packet("phone-camera-status",2,lens,0,0,"Tap Share Camera on phone"));
+            MediaRequestListener l=mediaRequestListener;
+            if(l!=null) l.onCameraShareRequested(lens,torch,mic);
+        }
+    }
+
+    private void handlePhoneMirrorTouch(int action, int normX, int normY){
+        android.graphics.Point size=PhoneScreenGeometry.read(application);
+        int w=Math.max(1,size.x);
+        int h=Math.max(1,size.y);
+        int px=Math.max(0,Math.min(w-1,Math.round(Math.max(0,Math.min(10000,normX))*(w-1)/10000f)));
+        int py=Math.max(0,Math.min(h-1,Math.round(Math.max(0,Math.min(10000,normY))*(h-1)/10000f)));
+        if(ShellInputClient.ready(application)){
+            ShellInputClient.movePointer(-1,-1,px,py,0,0,null);
+            if(action==0) ShellInputClient.mouseButton(1,true);
+            else if(action==2) ShellInputClient.mouseButton(1,false);
+            return;
+        }
+        DeskTouchAccessibilityService.injectMirrorTouch(action,px,py);
+    }
+
+    private void handlePhoneMirrorNav(int navCode){
+        if(ShellInputClient.ready(application)){
+            int vk = navCode==1 ? 27 : (navCode==2 ? 0x24 : (navCode==3 ? 0x2E : 0));
+            if(vk!=0){
+                ShellInputClient.key(vk,true,null,null);
+                ShellInputClient.key(vk,false,null,null);
+                return;
+            }
+        }
+        DeskTouchAccessibilityService.injectMirrorNav(navCode);
+    }
+
+    private void handlePhoneMirrorText(String text){
+        if(text==null || text.isEmpty()) return;
+        if(ShellInputClient.ready(application)){
+            ShellInputClient.text(text,null,null);
+            return;
+        }
+        DeskTouchAccessibilityService.injectMirrorText(text);
     }
 
     void claimControl(){
@@ -3014,8 +3149,10 @@ final class DeskTouchSession implements AutoCloseable {
             }
             inboundFiles.clear();
         }
-        if(DeskTouchRuntime.connectedCount()==0) RemoteInputPower.end();
-        else RemoteInputPower.begin(application);
+        if(DeskTouchRuntime.connectedCount()==0){
+            RemoteInputPower.end();
+            PhoneMediaService.stopAll(application);
+        } else RemoteInputPower.begin(application);
         AutoConnectService.onConnectionCountChanged(application);
         DeskTouchRuntime.notifyLiveStatusChanged();
         SSLSocket sock=socket;socket=null;

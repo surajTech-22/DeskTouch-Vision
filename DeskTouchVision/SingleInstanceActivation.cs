@@ -178,7 +178,16 @@ internal static class SingleInstanceActivation
                     WindowMatch? surfaced = matches.FirstOrDefault(m =>
                         m.Visible && !m.Minimized && m.Responsive);
                     if (surfaced is { Handle: var hwnd } && hwnd != IntPtr.Zero)
+                    {
                         ReinforceForeground(hwnd);
+                        // Wait briefly for the target UI thread to process ShowDisplaysMessage
+                        // before the foreground launcher process releases focus permission.
+                        for (int w = 0; w < 6 && NativeMethods.GetForegroundWindow() != hwnd; w++)
+                        {
+                            Thread.Sleep(35);
+                            ReinforceForeground(hwnd);
+                        }
+                    }
                     return true;
                 }
 
@@ -382,9 +391,32 @@ internal static class SingleInstanceActivation
     {
         try
         {
-            _ = NativeMethods.ShowWindow(hwnd, NativeMethods.SW_SHOW);
-            _ = NativeMethods.BringWindowToTop(hwnd);
-            _ = NativeMethods.SetForegroundWindow(hwnd);
+            if (NativeMethods.IsIconic(hwnd))
+                _ = NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
+            else
+                _ = NativeMethods.ShowWindow(hwnd, NativeMethods.SW_SHOW);
+
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            uint fgThread = fg != IntPtr.Zero ? NativeMethods.GetWindowThreadProcessId(fg, out _) : 0;
+            uint targetThread = NativeMethods.GetWindowThreadProcessId(hwnd, out _);
+            uint curThread = NativeMethods.GetCurrentThreadId();
+            bool attachedFg = false, attachedTarget = false;
+            try
+            {
+                if (fgThread != 0 && fgThread != curThread)
+                    attachedFg = NativeMethods.AttachThreadInput(curThread, fgThread, true);
+                if (targetThread != 0 && targetThread != curThread && targetThread != fgThread)
+                    attachedTarget = NativeMethods.AttachThreadInput(curThread, targetThread, true);
+                _ = NativeMethods.BringWindowToTop(hwnd);
+                _ = NativeMethods.SetForegroundWindow(hwnd);
+            }
+            finally
+            {
+                if (attachedTarget)
+                    try { _ = NativeMethods.AttachThreadInput(curThread, targetThread, false); } catch { }
+                if (attachedFg)
+                    try { _ = NativeMethods.AttachThreadInput(curThread, fgThread, false); } catch { }
+            }
         }
         catch { }
     }
@@ -498,6 +530,7 @@ internal static class SingleInstanceActivation
         internal const uint WM_NULL = 0x0000;
         internal const uint SMTO_ABORTIFHUNG = 0x0002;
         internal const int SW_SHOW = 5;
+        internal const int SW_RESTORE = 9;
 
         internal delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -557,5 +590,15 @@ internal static class SingleInstanceActivation
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool ShowWindow(IntPtr hwnd, int command);
+
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+
+        [DllImport("kernel32.dll")]
+        internal static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, [MarshalAs(UnmanagedType.Bool)] bool fAttach);
     }
 }

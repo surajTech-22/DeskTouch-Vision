@@ -486,6 +486,143 @@ final class EcosystemFeatures {
         return new float[]{nx, ny};
     }
 
+    static final class ShelfEntry {
+        final String id;
+        final String kind;
+        final String title;
+        final String preview;
+        final String payload;
+        final String source;
+        final long timestampMs;
+
+        ShelfEntry(String id, String kind, String title, String preview,
+                String payload, String source, long timestampMs) {
+            this.id = id;
+            this.kind = kind;
+            this.title = title;
+            this.preview = preview;
+            this.payload = payload;
+            this.source = source;
+            this.timestampMs = timestampMs;
+        }
+    }
+
+    private static final String PREF_SHELF = "desktouch_shelf_v1";
+    private static final String KEY_SHELF_ITEMS = "items";
+    private static final Object SHELF_LOCK = new Object();
+
+    static void recordShelfClip(Context ctx, String text, String source) {
+        if (ctx == null || text == null || text.trim().isEmpty()) return;
+        String clean = text.trim();
+        addShelfEntry(ctx, new ShelfEntry(
+            Long.toHexString(System.nanoTime()), "clip", "Shared Clipboard",
+            truncate(clean.replace('\n', ' '), 100),
+            clean.length() > 2800 ? clean.substring(0, 2800) : clean,
+            source == null ? "DeskTouch" : source, System.currentTimeMillis()),
+            "clip|" + clean);
+    }
+
+    static void recordShelfOtp(Context ctx, String app, String code, String source) {
+        if (ctx == null || code == null || code.trim().isEmpty()) return;
+        String c = code.trim();
+        String a = (app == null || app.trim().isEmpty()) ? "Verification" : app.trim();
+        addShelfEntry(ctx, new ShelfEntry(
+            Long.toHexString(System.nanoTime()), "otp", "Code " + c + " (" + a + ")",
+            "Tap to copy verification code",
+            c, source == null ? "Phone" : source, System.currentTimeMillis()),
+            "otp|" + c);
+    }
+
+    static void recordShelfFile(Context ctx, String name, String detail, String pathOrUri, String source) {
+        if (ctx == null || name == null || name.trim().isEmpty()) return;
+        String n = name.trim();
+        addShelfEntry(ctx, new ShelfEntry(
+            Long.toHexString(System.nanoTime()), "file", n,
+            detail == null ? "Shared file" : detail,
+            pathOrUri == null ? "" : pathOrUri,
+            source == null ? "DeskTouch" : source, System.currentTimeMillis()),
+            "file|" + n + "|" + detail);
+    }
+
+    static List<ShelfEntry> listShelfEntries(Context ctx, String kindFilter) {
+        if (ctx == null) return Collections.emptyList();
+        synchronized (SHELF_LOCK) {
+            List<ShelfEntry> all = loadShelfLocked(ctx);
+            if (kindFilter == null || kindFilter.isEmpty() || "all".equalsIgnoreCase(kindFilter))
+                return all;
+            List<ShelfEntry> filtered = new ArrayList<>();
+            for (ShelfEntry e : all) {
+                if (kindFilter.equalsIgnoreCase(e.kind)) filtered.add(e);
+            }
+            return filtered;
+        }
+    }
+
+    static void clearShelfEntries(Context ctx) {
+        if (ctx == null) return;
+        synchronized (SHELF_LOCK) {
+            ctx.getApplicationContext().getSharedPreferences(PREF_SHELF, Context.MODE_PRIVATE)
+                .edit().putString(KEY_SHELF_ITEMS, "[]").apply();
+        }
+    }
+
+    private static void addShelfEntry(Context ctx, ShelfEntry item, String dedupKey) {
+        synchronized (SHELF_LOCK) {
+            List<ShelfEntry> items = loadShelfLocked(ctx);
+            for (int i = items.size() - 1; i >= 0; i--) {
+                ShelfEntry existing = items.get(i);
+                String existingKey = existing.kind + "|" + ("file".equals(existing.kind)
+                    ? (existing.title + "|" + existing.preview) : existing.payload);
+                if (dedupKey.equals(existingKey)) items.remove(i);
+            }
+            items.add(0, item);
+            while (items.size() > 25) items.remove(items.size() - 1);
+            saveShelfLocked(ctx, items);
+        }
+    }
+
+    private static List<ShelfEntry> loadShelfLocked(Context ctx) {
+        List<ShelfEntry> out = new ArrayList<>();
+        try {
+            String raw = ctx.getApplicationContext()
+                .getSharedPreferences(PREF_SHELF, Context.MODE_PRIVATE)
+                .getString(KEY_SHELF_ITEMS, "[]");
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                out.add(new ShelfEntry(
+                    o.optString("id", ""),
+                    o.optString("kind", "clip"),
+                    o.optString("title", ""),
+                    o.optString("preview", ""),
+                    o.optString("payload", ""),
+                    o.optString("source", ""),
+                    o.optLong("ts", 0L)));
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
+    private static void saveShelfLocked(Context ctx, List<ShelfEntry> items) {
+        try {
+            JSONArray arr = new JSONArray();
+            for (ShelfEntry e : items) {
+                arr.put(new JSONObject()
+                    .put("id", e.id)
+                    .put("kind", e.kind)
+                    .put("title", e.title)
+                    .put("preview", e.preview)
+                    .put("payload", e.payload)
+                    .put("source", e.source)
+                    .put("ts", e.timestampMs));
+            }
+            ctx.getApplicationContext()
+                .getSharedPreferences(PREF_SHELF, Context.MODE_PRIVATE)
+                .edit().putString(KEY_SHELF_ITEMS, arr.toString()).apply();
+        } catch (Exception ignored) {}
+    }
+
     private static String truncate(String s, int maxLen) {
         if (s == null) return "";
         String t = s.trim();

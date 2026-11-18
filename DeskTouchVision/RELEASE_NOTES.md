@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.85 — Phone Screen Window, Wireless Camera & Mic, Recent Shared Shelf, QR Quick-Pair, One-Click Repair & Reliable Auto-Update Exit
+
+- **Clean Automatic Update Exit & Instant Window Wakeup (`Update-DeskTouch.ps1`, `SingleInstanceActivation`, `DisplaySettingsForm`):** Automatically clears stale/stuck background updater helpers and cleanly exits ALL running `DeskTouchVision.exe` / `DeskTouch.DeviceShare.exe` processes before installing an update so automatic updates never stall, closes owned dialogs immediately on update signal, and uses `AttachThreadInput` foreground activation so re-opening DeskTouch reliably brings the window straight to front.
+- **Phone Screen Window on Windows (`PhoneScreenForm`, `PhoneMediaService`, `DeskTouchAccessibilityService`, `DeskTouchSession`):** Mirror and tap/swipe your phone screen inside a resizable Fluent window on Windows with Back/Home/Recents/Wake navigation, quick text typing, and automatic pause for banking/payment privacy.
+- **Phone Camera & Microphone Wireless Webcam (`PhoneWebcamForm`, `LocalMjpegServer`, `WaveOutAudioPlayer`, `PhoneMediaService`):** Stream your phone's camera (back/front switch, flashlight, 90-degree rotation, Clean View for call window capture, plus loopback MJPEG URL) and microphone audio wirelessly to Windows on explicit consent.
+- **Recent Shared Shelf (`SharedShelfStore`, `SharedShelfDialog`, `EcosystemFeatures`, `MainActivity`):** Persistent recent history on both Windows and Android for shared clipboard text/images, detected verification codes, and sent/received files with category filters and 1-click Copy / Open / Clear actions.
+- **Quick-Scan QR Pairing & One-Click Background/Network Fix (`PairingQrDialog`, `QrScannerDialog`, `BackgroundAndNetworkRepairHelper`, `MainActivity`):** Show a scannable pairing QR on Windows, scan directly in Android with Camera2 + ZXing (`DT1` encrypted quick-pair or code), and run **"Fix Background & Network"** on Windows or **"Fix Connection & Bg"** on Android anytime to clear stuck processes and refresh network access.
+
+---
+
 # DeskTouch Vision v0.3.84 — Single Click-to-Run Windows Installer (`DeskTouchVision-Install.exe`) & Cross-Path Process Conflict Recovery
 
 - **Direct Single-File Windows Installer (`DeskTouchVision.iss`, `.github/workflows/desktouch-vision.yml`):** Publishes `DeskTouchVision-Install.exe` (with matching `.sha256`) alongside the ZIP and Android APK so testers can install directly by running a single `.exe` installer without extracting archives or encountering script execution policy blocks.

@@ -26,6 +26,23 @@ function Remove-TreeQuickly([string]$path) {
   }
 }
 
+function Stop-StaleUpdaters([int]$minAgeSeconds = 180) {
+  try {
+    $cutoff = (Get-Date).AddSeconds(-$minAgeSeconds)
+    $stale = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.ProcessId -ne $PID -and
+        $_.CommandLine -match '(?i)Update-DeskTouch[.]ps1' -and
+        $_.CreationDate -and
+        $_.CreationDate -lt $cutoff
+      })
+    foreach ($old in $stale) {
+      Log ("Stopping stale updater PID={0} started={1} so automatic update is not blocked." -f $old.ProcessId, $old.CreationDate)
+      Stop-Process -Id $old.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+  } catch { }
+}
+
 function Assert-InstallDirectoryAvailable([string]$directory) {
   # The application folder may have a transient handle during shutdown.
   # Retry the RENAME several times; do not force-kill input-sharing apps.
@@ -55,30 +72,33 @@ function Assert-InstallDirectoryAvailable([string]$directory) {
 }
 
 function Stop-InstalledApplications([string]$installDir) {
+  # Signal all running DeskTouch processes gracefully first so hooks/TLS tear down cleanly.
+  $exitHandle = $null
+  if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
+    try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
+  }
   foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
-    $processes = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop)
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction SilentlyContinue)
     foreach ($info in $processes) {
       $p = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
       if (-not $p -or $p.Id -eq $PID) { continue }
       Log "Requesting graceful close: $exeName PID=$($p.Id) ($($info.ExecutablePath))"
-      if ($exeName -eq 'DeskTouch.DeviceShare.exe') {
-        $exitHandle = $null
-        if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
-          try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
-        }
-      }
       [void]$p.CloseMainWindow()
-      if (-not $p.WaitForExit(8000)) {
-        $isInstalledPath = $info.ExecutablePath -and
-          $info.ExecutablePath.StartsWith($installDir + '\', [StringComparison]::OrdinalIgnoreCase)
-        if ($isInstalledPath) {
-          throw "Active $exeName did not close safely; update deferred to avoid leaving input hooks/held keys behind."
-        }
-        Log "Stopping leftover external $exeName PID=$($p.Id) so updated instance owns the lock cleanly."
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        $null = $p.WaitForExit(3000)
-      }
     }
+  }
+  $deadline = (Get-Date).AddMilliseconds(4500)
+  while ((Get-Date) -lt $deadline) {
+    $remaining = @(Get-Process -Name 'DeskTouchVision','DeskTouch.DeviceShare' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID })
+    if ($remaining.Count -eq 0) { return }
+    Start-Sleep -Milliseconds 150
+  }
+  # Ensure NO DeskTouch process (installed, tray, hung, or external) blocks automatic update installation.
+  foreach ($proc in @(Get-Process -Name 'DeskTouchVision','DeskTouch.DeviceShare' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID })) {
+    try {
+      Log "Stopping remaining $(([string]$proc.ProcessName)) PID=$($proc.Id) so automatic update installs cleanly."
+      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+      $null = $proc.WaitForExit(3000)
+    } catch { }
   }
 }
 
@@ -87,6 +107,7 @@ $backup = $null
 $movedOriginal = $false
 $activated = $false
 try {
+  Stop-StaleUpdaters -minAgeSeconds 180
   # Wait briefly for another authorized updater to finish the critical
   # install phase. Old versions used to keep this lock through slow backup
   # deletion, leaving an "already running" loop for many minutes.
@@ -139,8 +160,10 @@ try {
   & (Join-Path $payload 'VERIFY_DESKTOUCH_PAYLOAD.ps1') -Root $payload
 
   $parent = Get-Process -Id $CurrentPid -ErrorAction SilentlyContinue
-  if ($parent -and -not $parent.WaitForExit(15000)) {
-    throw 'DeskTouch shell did not close. Update deferred rather than forcibly terminating.'
+  if ($parent -and -not $parent.WaitForExit(5000)) {
+    Log "DeskTouch shell PID=$CurrentPid did not exit gracefully within 5s; forcing exit for automatic update."
+    Stop-Process -Id $CurrentPid -Force -ErrorAction SilentlyContinue
+    $null = $parent.WaitForExit(3000)
   }
   Stop-InstalledApplications $targetFull
 

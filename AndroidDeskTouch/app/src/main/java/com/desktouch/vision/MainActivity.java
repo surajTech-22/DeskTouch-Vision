@@ -30,6 +30,14 @@ public final class MainActivity extends Activity {
     private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
     private static final int TAB_COUNT=5;
     private static final int REQ_SEND_FILE=38201;
+    private static final int REQ_QR_CAMERA=38202;
+    private static final int REQ_MEDIA_CAMERA=38203;
+    private static final int REQ_MEDIA_PROJECTION=38204;
+
+    private int pendingCamLens;
+    private boolean pendingCamTorch;
+    private boolean pendingCamMic=true;
+    private Button shareScreenBtn,shareCameraBtn;
 
     private PhoneUiKit.Palette palette;
     private final List<Consumer<PhoneUiKit.Palette>> themeUpdaters=new ArrayList<>();
@@ -174,6 +182,18 @@ public final class MainActivity extends Activity {
             DeskTouchNotificationListener.readActiveCount(this));
         refreshLiveLinkAndKeyboard();
         handleShareIntent(getIntent());
+        DeskTouchSession.setMediaRequestListener(new DeskTouchSession.MediaRequestListener(){
+            @Override public void onScreenShareRequested(){
+                runOnUiThread(()->{
+                    if(!isFinishing() && !isDestroyed()) requestPhoneScreenProjection();
+                });
+            }
+            @Override public void onCameraShareRequested(int lens, boolean torch, boolean mic){
+                runOnUiThread(()->{
+                    if(!isFinishing() && !isDestroyed()) requestPhoneCameraPermissionsAndStart(lens,torch,mic);
+                });
+            }
+        });
 
         // Only checks official GitHub metadata; never downloads or silently
         // installs an executable without explicit user action.
@@ -186,10 +206,36 @@ public final class MainActivity extends Activity {
         handleShareIntent(intent);
     }
 
+    @Override public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] grantResults){
+        super.onRequestPermissionsResult(requestCode,permissions,grantResults);
+        if(requestCode==REQ_QR_CAMERA){
+            if(grantResults.length>0 && grantResults[0]==android.content.pm.PackageManager.PERMISSION_GRANTED){
+                openQrScannerDialog();
+            }else{
+                setFeedback("Camera permission is needed to scan a Windows pairing QR code.",true);
+            }
+        }else if(requestCode==REQ_MEDIA_CAMERA){
+            if(checkSelfPermission(android.Manifest.permission.CAMERA)==android.content.pm.PackageManager.PERMISSION_GRANTED){
+                PhoneMediaService.startCameraShare(this,pendingCamLens,pendingCamTorch,pendingCamMic);
+                refreshLiveShareButtons();
+            }else{
+                setFeedback("Camera permission denied; cannot stream phone camera.",true);
+            }
+        }
+    }
+
     @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
         super.onActivityResult(requestCode,resultCode,data);
         if(requestCode==REQ_SEND_FILE && resultCode==RESULT_OK && data!=null && data.getData()!=null){
             sendSelectedUriToActiveComputer(data.getData());
+        }else if(requestCode==REQ_MEDIA_PROJECTION){
+            if(resultCode==RESULT_OK && data!=null){
+                PhoneMediaService.startScreenShare(this,resultCode,data);
+                setFeedback("Mirroring phone screen to Windows cleanly.",true);
+            }else{
+                setFeedback("Screen share permission cancelled.",true);
+            }
+            refreshLiveShareButtons();
         }
     }
 
@@ -500,6 +546,15 @@ public final class MainActivity extends Activity {
         pwLp.leftMargin=dp(2);
         ecoActions.addView(homePowerBtn,pwLp);
 
+        Button homeShelfBtn=PhoneUiKit.createButton(this,"Shelf",palette,PhoneUiKit.BTN_SUBTLE);
+        homeShelfBtn.setTextSize(11f);
+        homeShelfBtn.setPadding(dp(10),dp(6),dp(10),dp(6));
+        homeShelfBtn.setOnClickListener(v->showSharedShelfDialog());
+        LinearLayout.LayoutParams shfLp=new LinearLayout.LayoutParams(-2,-2);
+        shfLp.leftMargin=dp(4);
+        ecoActions.addView(homeShelfBtn,shfLp);
+        onTheme(p->PhoneUiKit.styleButton(homeShelfBtn,p,PhoneUiKit.BTN_SUBTLE,this));
+
         LinearLayout envCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(envCard,cardParams(10));
 
@@ -735,9 +790,17 @@ public final class MainActivity extends Activity {
 
         Button pairCodeBtn=PhoneUiKit.createButton(this,"Find & Pair",palette,PhoneUiKit.BTN_TINT_ACCENT);
         pairCodeBtn.setTextSize(12f);
-        pairCodeBtn.setPadding(dp(14),dp(10),dp(14),dp(10));
+        pairCodeBtn.setPadding(dp(12),dp(10),dp(12),dp(10));
         pairCodeBtn.setOnClickListener(v->pairByEnteredCode());
-        pairRow.addView(pairCodeBtn,new LinearLayout.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams pcBtnLp=new LinearLayout.LayoutParams(-2,-2);
+        pcBtnLp.rightMargin=dp(6);
+        pairRow.addView(pairCodeBtn,pcBtnLp);
+
+        Button scanQrBtn=PhoneUiKit.createButton(this,"Scan QR",palette,PhoneUiKit.BTN_PRIMARY);
+        scanQrBtn.setTextSize(12f);
+        scanQrBtn.setPadding(dp(12),dp(10),dp(12),dp(10));
+        scanQrBtn.setOnClickListener(v->launchQrScanner());
+        pairRow.addView(scanQrBtn,new LinearLayout.LayoutParams(-2,-2));
 
         onTheme(p->{
             PhoneUiKit.styleCard(findHero,p,this);
@@ -757,6 +820,7 @@ public final class MainActivity extends Activity {
             pairingCodeInput.setTextColor(p.textPrimary);
             pairingCodeInput.setHintTextColor(p.textMuted);
             PhoneUiKit.styleButton(pairCodeBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
+            PhoneUiKit.styleButton(scanQrBtn,p,PhoneUiKit.BTN_PRIMARY,this);
         });
     }
 
@@ -1929,6 +1993,62 @@ public final class MainActivity extends Activity {
         fgLp.leftMargin=dp(4);
         tuRow2.addView(forgetBtn,fgLp);
 
+        LinearLayout liveShareCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(liveShareCard,cardParams(10));
+
+        TextView liveShareTitle=PhoneUiKit.createSectionLabel(this,"LIVE SHARE, SHELF & REPAIR",palette);
+        liveShareCard.addView(liveShareTitle);
+
+        TextView liveShareSub=new TextView(this);
+        liveShareSub.setText("Stream your phone screen or camera/mic directly to Windows, open recent clips/codes/files, or fix background/network locks.");
+        liveShareSub.setTextSize(11.5f);
+        liveShareSub.setPadding(0,dp(4),0,dp(8));
+        liveShareCard.addView(liveShareSub);
+
+        LinearLayout shareRow1=new LinearLayout(this);
+        shareRow1.setOrientation(LinearLayout.HORIZONTAL);
+        liveShareCard.addView(shareRow1,new LinearLayout.LayoutParams(-1,-2));
+
+        shareScreenBtn=PhoneUiKit.createButton(this,"Share Phone Screen",palette,PhoneUiKit.BTN_TINT_ACCENT);
+        shareScreenBtn.setOnClickListener(v->toggleShareScreenFromUi());
+        LinearLayout.LayoutParams ssLp=new LinearLayout.LayoutParams(0,-2,1f);
+        ssLp.rightMargin=dp(4);
+        shareRow1.addView(shareScreenBtn,ssLp);
+
+        shareCameraBtn=PhoneUiKit.createButton(this,"Share Camera & Mic",palette,PhoneUiKit.BTN_SUBTLE);
+        shareCameraBtn.setOnClickListener(v->toggleShareCameraFromUi());
+        LinearLayout.LayoutParams scLp=new LinearLayout.LayoutParams(0,-2,1f);
+        scLp.leftMargin=dp(4);
+        shareRow1.addView(shareCameraBtn,scLp);
+
+        LinearLayout shareRow2=new LinearLayout(this);
+        shareRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams sr2Lp=new LinearLayout.LayoutParams(-1,-2);
+        sr2Lp.topMargin=dp(8);
+        liveShareCard.addView(shareRow2,sr2Lp);
+
+        Button setupShelfBtn=PhoneUiKit.createButton(this,"Recent Shared Shelf",palette,PhoneUiKit.BTN_SUBTLE);
+        setupShelfBtn.setOnClickListener(v->showSharedShelfDialog());
+        LinearLayout.LayoutParams sShLp=new LinearLayout.LayoutParams(0,-2,1f);
+        sShLp.rightMargin=dp(4);
+        shareRow2.addView(setupShelfBtn,sShLp);
+
+        Button fixConnBtn=PhoneUiKit.createButton(this,"Fix Connection & Bg",palette,PhoneUiKit.BTN_TINT_EMERALD);
+        fixConnBtn.setOnClickListener(v->runFixConnectionAndBackground());
+        LinearLayout.LayoutParams fcLp=new LinearLayout.LayoutParams(0,-2,1f);
+        fcLp.leftMargin=dp(4);
+        shareRow2.addView(fixConnBtn,fcLp);
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(liveShareCard,p,this);
+            liveShareTitle.setTextColor(p.textSecondary);
+            liveShareSub.setTextColor(p.textSecondary);
+            PhoneUiKit.styleButton(shareScreenBtn,p,PhoneMediaService.isScreenSharingActive() ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_TINT_ACCENT,this);
+            PhoneUiKit.styleButton(shareCameraBtn,p,PhoneMediaService.isCameraSharingActive() ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(setupShelfBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(fixConnBtn,p,PhoneUiKit.BTN_TINT_EMERALD,this);
+        });
+
         LinearLayout appearCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(appearCard,cardParams(10));
 
@@ -2178,9 +2298,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.84";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.85";
         }catch(Exception ignored){
-            return "0.3.84";
+            return "0.3.85";
         }
     }
 
@@ -4274,6 +4394,7 @@ public final class MainActivity extends Activity {
             setFeedback("Sent Lock command.",true);
         },true);
         addEcoMediaPill("📁Send",this::launchFilePicker,true);
+        addEcoMediaPill("📋Shelf",this::showSharedShelfDialog,true);
     }
 
     private void addEcoMediaPill(String label,Runnable action,boolean addLeftMargin){
@@ -4583,6 +4704,209 @@ public final class MainActivity extends Activity {
                 setFeedback("Reply sent.",true);
             })
             .setNegativeButton("Cancel",null)
+            .show();
+    }
+
+    private void launchQrScanner(){
+        if(checkSelfPermission(android.Manifest.permission.CAMERA)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED){
+            openQrScannerDialog();
+        }else{
+            requestPermissions(new String[]{android.Manifest.permission.CAMERA},REQ_QR_CAMERA);
+        }
+    }
+
+    private void openQrScannerDialog(){
+        QrScannerDialog.show(this,scanned->{
+            QrScannerDialog.DirectQrTarget qr=QrScannerDialog.parseDirectQrPayload(scanned);
+            if(qr!=null){
+                if(DeskTouchRuntime.connectedCount()>0 && !DeskTouchRuntime.isConnected(qr.fingerprint)){
+                    setFeedback("Disconnect existing hub before pairing a different QR target.",true);
+                    return;
+                }
+                android.graphics.Point size=PhoneScreenGeometry.read(this);
+                AutoConnectService.setReconnect(this,true);
+                AutoConnectService.resumePeer(this,qr.fingerprint);
+                session=DeskTouchRuntime.select(this,qr.fingerprint);
+                session.connectWithDirectSecret(qr.address,qr.fingerprint,qr.secret,size.x,size.y);
+                selectTab(PhoneUiKit.TAB_HOME);
+                setFeedback("Scanned QR! Connecting securely to "+qr.address+"...",true);
+                return;
+            }
+            if(pairingCodeInput!=null){
+                pairingCodeInput.setText(scanned);
+                pairByEnteredCode();
+            }
+        });
+    }
+
+    private void toggleShareScreenFromUi(){
+        if(PhoneMediaService.isScreenSharingActive()){
+            PhoneMediaService.stopScreenShare(this);
+            setFeedback("Stopped phone screen mirror.",true);
+            refreshLiveShareButtons();
+        }else{
+            requestPhoneScreenProjection();
+        }
+    }
+
+    private void requestPhoneScreenProjection(){
+        android.media.projection.MediaProjectionManager mpm=(android.media.projection.MediaProjectionManager)
+            getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+        if(mpm!=null){
+            startActivityForResult(mpm.createScreenCaptureIntent(),REQ_MEDIA_PROJECTION);
+        }else{
+            setFeedback("Screen sharing is unavailable on this Android build.",true);
+        }
+    }
+
+    private void toggleShareCameraFromUi(){
+        if(PhoneMediaService.isCameraSharingActive()){
+            PhoneMediaService.stopCameraShare(this);
+            setFeedback("Stopped phone camera & mic stream.",true);
+            refreshLiveShareButtons();
+        }else{
+            requestPhoneCameraPermissionsAndStart(0,false,true);
+        }
+    }
+
+    private void requestPhoneCameraPermissionsAndStart(int lens,boolean torch,boolean mic){
+        pendingCamLens=lens;
+        pendingCamTorch=torch;
+        pendingCamMic=mic;
+        boolean hasCam=checkSelfPermission(android.Manifest.permission.CAMERA)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(hasCam && (!mic || hasMic)){
+            PhoneMediaService.startCameraShare(this,lens,torch,mic);
+            refreshLiveShareButtons();
+        }else{
+            ArrayList<String> reqs=new ArrayList<>();
+            if(!hasCam) reqs.add(android.Manifest.permission.CAMERA);
+            if(mic && !hasMic) reqs.add(android.Manifest.permission.RECORD_AUDIO);
+            requestPermissions(reqs.toArray(new String[0]),REQ_MEDIA_CAMERA);
+        }
+    }
+
+    private void refreshLiveShareButtons(){
+        if(shareScreenBtn!=null){
+            boolean scr=PhoneMediaService.isScreenSharingActive();
+            shareScreenBtn.setText(scr ? "Stop Screen Share" : "Share Phone Screen");
+            PhoneUiKit.styleButton(shareScreenBtn,palette,scr ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_TINT_ACCENT,this);
+        }
+        if(shareCameraBtn!=null){
+            boolean cam=PhoneMediaService.isCameraSharingActive();
+            shareCameraBtn.setText(cam ? "Stop Camera & Mic" : "Share Camera & Mic");
+            PhoneUiKit.styleButton(shareCameraBtn,palette,cam ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
+        }
+    }
+
+    private void runFixConnectionAndBackground(){
+        PhoneMediaService.stopAll(this);
+        DeskTouchRuntime.resetRememberedStreams(this);
+        lastWindowsTaskbarSig="";
+        refreshLiveShareButtons();
+        refreshStreamOptionControls();
+        refreshLiveLinkAndKeyboard();
+        scan();
+        new AlertDialog.Builder(this)
+            .setTitle("Connection & Background Check")
+            .setMessage("Cleared inactive media streams and remembered route paths, and started a fresh network and cable scan.\n\n"
+                + "Make sure DeskTouch Vision is running on Windows (or click Fix Background & Network inside DeskTouch Windows).")
+            .setPositiveButton("OK",null)
+            .show();
+    }
+
+    private void showSharedShelfDialog(){
+        final String[] currentFilter={"all"};
+        LinearLayout outer=new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.setPadding(dp(14),dp(10),dp(14),dp(8));
+
+        LinearLayout filterRow=new LinearLayout(this);
+        filterRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout listWrap=new LinearLayout(this);
+        listWrap.setOrientation(LinearLayout.VERTICAL);
+
+        Runnable[] repopulate=new Runnable[1];
+        repopulate[0]=()->{
+            listWrap.removeAllViews();
+            List<EcosystemFeatures.ShelfEntry> items=EcosystemFeatures.listShelfEntries(this,currentFilter[0]);
+            if(items.isEmpty()){
+                TextView empty=new TextView(this);
+                empty.setText("No shared clips, verification codes, or files yet.");
+                empty.setTextSize(12.5f);
+                empty.setPadding(dp(4),dp(12),dp(4),dp(12));
+                listWrap.addView(empty);
+                return;
+            }
+            for(EcosystemFeatures.ShelfEntry item:items){
+                LinearLayout row=PhoneUiKit.createSubcard(this,palette,10);
+                TextView title=new TextView(this);
+                String tag="otp".equals(item.kind) ? "[CODE] " : ("file".equals(item.kind) ? "[FILE] " : "[CLIP] ");
+                title.setText(tag+item.title);
+                title.setTextSize(12.5f);
+                title.setTypeface(null,Typeface.BOLD);
+                row.addView(title);
+
+                TextView sub=new TextView(this);
+                sub.setText(item.preview+" • "+item.source);
+                sub.setTextSize(11f);
+                sub.setPadding(0,dp(2),0,dp(6));
+                row.addView(sub);
+
+                if(!item.payload.isEmpty() && !"file".equals(item.kind)){
+                    TextView copyPill=new TextView(this);
+                    copyPill.setText("Copy");
+                    copyPill.setTextSize(11f);
+                    copyPill.setTypeface(null,Typeface.BOLD);
+                    copyPill.setPadding(dp(10),dp(5),dp(10),dp(5));
+                    PhoneUiKit.stylePill(copyPill,palette.accentSoftBg,palette.border,palette.accentText,this);
+                    copyPill.setOnClickListener(v->{
+                        applyRemoteClipboardText(item.payload);
+                        setFeedback("Copied "+("otp".equals(item.kind)?"code":"text")+" cleanly.",true);
+                    });
+                    row.addView(copyPill,new LinearLayout.LayoutParams(-2,-2));
+                }
+                LinearLayout.LayoutParams rLp=new LinearLayout.LayoutParams(-1,-2);
+                rLp.topMargin=dp(6);
+                listWrap.addView(row,rLp);
+            }
+        };
+
+        String[][] tabs={{"All","all"},{"Clips","clip"},{"Codes","otp"},{"Files","file"}};
+        for(String[] t:tabs){
+            TextView pill=new TextView(this);
+            pill.setText(t[0]);
+            pill.setTextSize(11f);
+            pill.setTypeface(null,Typeface.BOLD);
+            pill.setPadding(dp(10),dp(5),dp(10),dp(5));
+            PhoneUiKit.stylePill(pill,palette.subtleBtnBg,palette.border,palette.textPrimary,this);
+            pill.setOnClickListener(v->{
+                currentFilter[0]=t[1];
+                repopulate[0].run();
+            });
+            LinearLayout.LayoutParams pLp=new LinearLayout.LayoutParams(-2,-2);
+            pLp.rightMargin=dp(6);
+            filterRow.addView(pill,pLp);
+        }
+        outer.addView(filterRow);
+        ScrollView scroll=new ScrollView(this);
+        scroll.addView(listWrap);
+        LinearLayout.LayoutParams sLp=new LinearLayout.LayoutParams(-1,dp(340));
+        sLp.topMargin=dp(8);
+        outer.addView(scroll,sLp);
+        repopulate[0].run();
+
+        new AlertDialog.Builder(this)
+            .setTitle("Recent Shared Shelf")
+            .setView(outer)
+            .setNeutralButton("Clear All",(d,w)->{
+                EcosystemFeatures.clearShelfEntries(this);
+                setFeedback("Cleared recent shelf history.",true);
+            })
+            .setPositiveButton("Close",null)
             .show();
     }
 }

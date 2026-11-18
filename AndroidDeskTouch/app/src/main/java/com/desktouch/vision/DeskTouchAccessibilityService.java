@@ -1549,6 +1549,71 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         field.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION,caret);
         return true;
     }
+    private int mirrorDownX, mirrorDownY;
+
+    static boolean injectMirrorTouch(int action, int px, int py){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || !ready(service)) return false;
+        service.ui.post(()->{
+            if(!ready(service)) return;
+            if(action==0){
+                service.mirrorDownX=px;
+                service.mirrorDownY=py;
+            }else if(action==2){
+                int sx=service.mirrorDownX, sy=service.mirrorDownY;
+                double dist=Math.hypot(px-sx,py-sy);
+                Path p=new Path();
+                p.moveTo(sx,sy);
+                long dur;
+                if(dist<20.0){
+                    p.lineTo(sx,sy);
+                    dur=55L;
+                }else{
+                    p.lineTo(px,py);
+                    dur=Math.max(110L,Math.min(340L,Math.round(dist/3.0)));
+                }
+                service.dispatchGesture(
+                    new GestureDescription.Builder()
+                        .addStroke(new GestureDescription.StrokeDescription(p,0,dur))
+                        .build(),
+                    null, service.ui);
+            }
+        });
+        return true;
+    }
+
+    static boolean injectMirrorNav(int navCode){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || !ready(service)) return false;
+        service.ui.post(()->{
+            if(!ready(service)) return;
+            if(navCode==1) service.performGlobalAction(GLOBAL_ACTION_BACK);
+            else if(navCode==2) service.performGlobalAction(GLOBAL_ACTION_HOME);
+            else if(navCode==3) service.performGlobalAction(GLOBAL_ACTION_RECENTS);
+        });
+        return true;
+    }
+
+    static boolean injectMirrorText(String incoming){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || !ready(service) || incoming==null || incoming.isEmpty() || incoming.length()>500)
+            return false;
+        service.ui.post(()->{
+            if(!ready(service)) return;
+            AccessibilityNodeInfo field=service.focusedEditor();
+            if(field!=null && field.isPassword()) return;
+            if(service.commitNativeText(incoming,field) || DeskTouchInputMethod.commitRemoteText(incoming))
+                return;
+            if(field==null || !field.isEditable() || field.isPassword()) return;
+            CharSequence orig=field.getText();
+            String val=(orig==null?"":orig.toString())+incoming;
+            Bundle args=new Bundle();
+            args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,val);
+            field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,args);
+        });
+        return true;
+    }
+
     private boolean isTextFieldFocused(){
         AccessibilityNodeInfo focused=focusedEditor();
         return focused!=null && focused.isEditable();

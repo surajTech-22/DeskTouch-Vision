@@ -172,9 +172,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private ProfilesAndRulesConfig _ecosystemConfig = AutomationAndProfilesStore.Load();
     private NotificationPreviewFlyout? _notifFlyout;
     private OtpBannerForm? _otpBanner;
+    private readonly SharedShelfStore _sharedShelf = new();
+    private PhoneScreenForm? _phoneScreenForm;
+    private PhoneWebcamForm? _phoneWebcamForm;
+    private SharedShelfDialog? _sharedShelfDialog;
+    private readonly Button _qrPairButton = Button("Scan QR", primary: true);
+    private readonly Button _repairButton = Button("Fix Background & Network");
     private readonly Button _profileButton = Button("Profile: Work");
     private readonly Button _clipboardToggleButton = Button("Clipboard: On");
     private readonly Button _sendFileButton = Button("Send file");
+    private readonly Button _phoneScreenButton = Button("Phone Screen");
+    private readonly Button _phoneWebcamButton = Button("Phone Camera");
+    private readonly Button _shelfButton = Button("Recent Shelf");
     private readonly Button _lockAllButton = Button("Lock all");
     private readonly Button _wakeAllButton = Button("Wake PCs");
     private readonly Button _rulesButton = Button("Profiles & rules");
@@ -243,7 +252,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _manageTrusted.Width = 128;
         _manageTrusted.Dock = DockStyle.Right;
         _manageTrusted.Margin = new Padding(5);
+        _repairButton.Name = "FixBackgroundNetworkButton";
+        _repairButton.Width = 180;
+        _repairButton.Dock = DockStyle.Right;
+        _repairButton.Margin = new Padding(5);
+        _repairButton.Click += async (_, _) => await RunOneClickRepairAsync();
         header.Controls.Add(_manageTrusted);
+        header.Controls.Add(_repairButton);
         header.Controls.Add(_checkUpdates);
         _targetChoice.SelectedIndexChanged += (_, _) =>
         {
@@ -287,10 +302,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _copyCode.Height = 28;
         _copyCode.Margin = new Padding(0, 0, 8, 0);
         _copyFullLink.Height = 28;
-        _copyFullLink.Margin = new Padding(0, 0, 10, 0);
+        _copyFullLink.Margin = new Padding(0, 0, 8, 0);
+        _qrPairButton.Width = 86;
+        _qrPairButton.Height = 28;
+        _qrPairButton.Margin = new Padding(0, 0, 10, 0);
         var pairingHint = new Label
         {
-            Text = "Editable (4-32 letters/digits). Enter on phone or another PC.",
+            Text = "Editable (4-32 letters/digits). Scan QR on phone or enter code.",
             AutoSize = true,
             ForeColor = Color.FromArgb(165, 173, 188),
             Font = new Font("Segoe UI", 8.5f),
@@ -301,6 +319,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         pairingFlow.Controls.Add(_savePairingCode);
         pairingFlow.Controls.Add(_copyCode);
         pairingFlow.Controls.Add(_copyFullLink);
+        pairingFlow.Controls.Add(_qrPairButton);
         pairingFlow.Controls.Add(pairingHint);
         pairingBar.Controls.Add(pairingFlow);
 
@@ -314,18 +333,24 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Padding = new Padding(0, 4, 0, 2),
             BackColor = BackColor
         };
-        _profileButton.Width = 148;
-        _clipboardToggleButton.Width = 128;
-        _sendFileButton.Width = 104;
-        _lockAllButton.Width = 96;
-        _wakeAllButton.Width = 102;
-        _rulesButton.Width = 140;
-        foreach (var eb in new[] { _profileButton, _clipboardToggleButton, _sendFileButton, _lockAllButton, _wakeAllButton, _rulesButton })
+        _phoneScreenButton.Width = 112;
+        _phoneWebcamButton.Width = 116;
+        _shelfButton.Width = 104;
+        _profileButton.Width = 140;
+        _clipboardToggleButton.Width = 122;
+        _sendFileButton.Width = 96;
+        _lockAllButton.Width = 86;
+        _wakeAllButton.Width = 94;
+        _rulesButton.Width = 132;
+        foreach (var eb in new[] { _phoneScreenButton, _phoneWebcamButton, _shelfButton, _profileButton, _clipboardToggleButton, _sendFileButton, _lockAllButton, _wakeAllButton, _rulesButton })
         {
             eb.Height = 29;
             eb.Margin = new Padding(0, 0, 8, 0);
             ecosystemBar.Controls.Add(eb);
         }
+        _phoneScreenButton.Click += (_, _) => OpenPhoneScreenWindow();
+        _phoneWebcamButton.Click += (_, _) => OpenPhoneWebcamWindow();
+        _shelfButton.Click += (_, _) => OpenSharedShelfDialog();
         _profileButton.Click += (_, _) => CycleScreenProfile();
         _clipboardToggleButton.Click += (_, _) => ToggleClipboardSync();
         _sendFileButton.Click += (_, _) => PromptAndSendFile(CurrentInputTargetId());
@@ -436,6 +461,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         _copyCode.Click += (_, _) => CopyShortPairingCode();
         _copyFullLink.Click += (_, _) => CopyPairingCode();
+        _qrPairButton.Click += (_, _) => ShowPairingQrDialog();
         _disconnect.Click += (_, _) => DisconnectByUser();
         _trustDevice.Click += async (_, _) => await TrustConnectedDeviceAsync();
         _manageTrusted.Click += (_, _) => ManageTrustedDevices();
@@ -574,6 +600,26 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         _trayMenu.Items.Add(_startupMenu);
         _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add("Phone Screen Window", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenPhoneScreenWindow();
+        });
+        _trayMenu.Items.Add("Phone Camera & Mic", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenPhoneWebcamWindow();
+        });
+        _trayMenu.Items.Add("Recent Shared Shelf", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenSharedShelfDialog();
+        });
+        _trayMenu.Items.Add("Fix Background & Network", null, async (_, _) =>
+        {
+            ShowFromTray();
+            await RunOneClickRepairAsync();
+        });
         _trayMenu.Items.Add("Profiles & Automation Rules...", null, (_, _) =>
         {
             ShowFromTray();
@@ -798,6 +844,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void ExitDeskTouch()
     {
         _exitRequested = true;
+        foreach (Form owned in OwnedForms)
+        {
+            try { owned.Close(); } catch { }
+        }
         Close();
     }
 
@@ -1626,15 +1676,51 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.ClipboardTextReceived += (h, t) => PostToUi(() =>
             {
                 if (_ecosystemConfig.ClipboardSyncEnabled)
+                {
                     SharedClipboardHelper.TryApplyTextOnStaThread(t, h);
+                    _sharedShelf.AddClipboardText(t, "Connected device");
+                }
             });
             _receiver.ClipboardImageReceived += (h, png) => PostToUi(() =>
             {
                 if (_ecosystemConfig.ClipboardSyncEnabled)
+                {
                     SharedClipboardHelper.TryApplyImageOnStaThread(png, h);
+                    _sharedShelf.AddClipboardImage(png.Length, "Connected device");
+                }
             });
             _receiver.FileReceived += (fromDev, savedPath) => PostToUi(() => OnIncomingFileSaved(fromDev, savedPath));
             _receiver.OtpOfferReceived += (app, code, title) => PostToUi(() => ShowOtpOfferToast(app, code, title));
+            _receiver.PhoneScreenFrameReceived += (peerId, jpg) => PostToUi(() =>
+            {
+                if (_phoneScreenForm is { IsDisposed: false } f && f.PeerId == peerId)
+                    f.UpdateFrame(jpg);
+            });
+            _receiver.PhoneScreenStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
+            {
+                if (_phoneScreenForm is { IsDisposed: false } f && f.PeerId == peerId)
+                    f.UpdateStreamStatus(stateCode, msg);
+            });
+            _receiver.PhoneCameraFrameReceived += (peerId, jpg) => PostToUi(() =>
+            {
+                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId)
+                    f.UpdateCameraFrame(jpg);
+            });
+            _receiver.PhoneCameraStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
+            {
+                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId && !string.IsNullOrWhiteSpace(msg))
+                    f.UpdateStatus(msg);
+            });
+            _receiver.PhoneMicAudioReceived += (peerId, pcm, rate) =>
+            {
+                try
+                {
+                    var w = _phoneWebcamForm;
+                    if (w != null && !w.IsDisposed && w.PeerId == peerId)
+                        w.HandleMicAudio(pcm, rate);
+                }
+                catch { }
+            };
             _receiver.LowBatteryDetected += (devName, pct, _) => PostToUi(() =>
             {
                 if (_ecosystemConfig.LowBatteryAlertEnabled)
@@ -2319,12 +2405,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.ClipboardTextReceived += (h, t) => PostToUi(() =>
         {
             if (_ecosystemConfig.ClipboardSyncEnabled)
+            {
                 SharedClipboardHelper.TryApplyTextOnStaThread(t, h);
+                _sharedShelf.AddClipboardText(t, name);
+            }
         });
         session.ClipboardImageReceived += (h, png) => PostToUi(() =>
         {
             if (_ecosystemConfig.ClipboardSyncEnabled)
+            {
                 SharedClipboardHelper.TryApplyImageOnStaThread(png, h);
+                _sharedShelf.AddClipboardImage(png.Length, name);
+            }
         });
         session.FileReceived += (fromDev, savedPath) => PostToUi(() => OnIncomingFileSaved(fromDev, savedPath));
         session.OtpOfferReceived += (app, code, title) => PostToUi(() => ShowOtpOfferToast(app, code, title));
@@ -3364,11 +3456,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _receiver?.BroadcastClipboardTextAsync(cap.Hash, cap.PayloadText);
             _host?.SendClipboardText(cap.Hash, cap.PayloadText);
+            _sharedShelf.AddClipboardText(cap.PayloadText, Environment.MachineName);
         }
         else if (cap.Kind == "image" && cap.ImagePng != null)
         {
             _receiver?.BroadcastClipboardImageAsync(cap.Hash, cap.ImagePng);
             _host?.SendClipboardImage(cap.Hash, cap.ImagePng);
+            _sharedShelf.AddClipboardImage(cap.ImagePng.Length, Environment.MachineName);
         }
     }
 
@@ -3505,7 +3599,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void ShowOtpOfferToast(string app, string code, string title)
     {
-        if (!_ecosystemConfig.OtpHelperEnabled || string.IsNullOrWhiteSpace(code)) return;
+        if (string.IsNullOrWhiteSpace(code)) return;
+        _sharedShelf.AddOtp(app, code, title, "Phone");
+        if (!_ecosystemConfig.OtpHelperEnabled) return;
         _otpBanner ??= new OtpBannerForm(CopyOneTimeCodeWithAutoClear);
         _otpBanner.ShowCode(app, code);
         Status($"Verification code received from {app}.");
@@ -3593,9 +3689,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 bool ok = targetId > 0 && _receiver != null
                     ? await _receiver.SendFileToTargetAsync(targetId, path)
                     : (_host != null && await _host.SendFileToMemberAsync(targetId < 0 ? -targetId : 0, path));
-                PostToUi(() => Status(ok
-                    ? $"Sent '{Path.GetFileName(path)}' cleanly."
-                    : $"Could not send '{Path.GetFileName(path)}' (max 25 MB)."));
+                PostToUi(() =>
+                {
+                    if (ok) _sharedShelf.AddFile(path, "Sent", Environment.MachineName);
+                    Status(ok
+                        ? $"Sent '{Path.GetFileName(path)}' cleanly."
+                        : $"Could not send '{Path.GetFileName(path)}' (max 25 MB).");
+                });
             }
         });
     }
@@ -3603,8 +3703,133 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private void OnIncomingFileSaved(string fromDevice, string savedPath)
     {
         string name = Path.GetFileName(savedPath);
+        _sharedShelf.AddFile(savedPath, "Received", fromDevice);
         Status($"Received '{name}' from {fromDevice} in Downloads\\DeskTouch Received.");
         _trayIcon?.ShowBalloonTip(4000, $"File from {fromDevice}", $"Saved '{name}' to Downloads\\DeskTouch Received.", ToolTipIcon.Info);
+    }
+
+    private (int Id, string Name)? PickConnectedAndroidPeer()
+    {
+        if (_receiver == null) return null;
+        int sel = _receiver.SelectedPeerId;
+        var peers = _receiver.ConnectedPeers;
+        var preferred = peers.FirstOrDefault(p => p.Id == sel && p.Peer.Platform == "Android");
+        if (preferred.Peer != null) return (preferred.Id, preferred.Peer.Name);
+        var any = peers.FirstOrDefault(p => p.Peer.Platform == "Android");
+        return any.Peer != null ? (any.Id, any.Peer.Name) : null;
+    }
+
+    private void OpenPhoneScreenWindow()
+    {
+        var phone = PickConnectedAndroidPeer();
+        if (phone == null)
+        {
+            MessageBox.Show(this,
+                "Connect an Android phone to this computer first to mirror and tap its screen here.",
+                "DeskTouch Vision — Phone Screen", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (_phoneScreenForm is { IsDisposed: false } existing && existing.PeerId == phone.Value.Id)
+        {
+            existing.Activate();
+            return;
+        }
+        _phoneScreenForm?.Close();
+        _phoneScreenForm = new PhoneScreenForm(
+            phone.Value.Id,
+            phone.Value.Name,
+            watchScreen: (id, en) => _receiver?.SendPhoneScreenWatch(id, en),
+            sendTouch: (id, act, nx, ny) => _receiver?.SendPhoneTouch(id, act, nx, ny),
+            sendNav: (id, nav) => _receiver?.SendPhoneNav(id, nav),
+            sendText: (id, txt) => _receiver?.SendPhoneText(id, txt));
+        _phoneScreenForm.Show(this);
+    }
+
+    private void OpenPhoneWebcamWindow()
+    {
+        var phone = PickConnectedAndroidPeer();
+        if (phone == null)
+        {
+            MessageBox.Show(this,
+                "Connect an Android phone to this computer first to use its camera and microphone wirelessly.",
+                "DeskTouch Vision — Phone Camera", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (_phoneWebcamForm is { IsDisposed: false } existing && existing.PeerId == phone.Value.Id)
+        {
+            existing.Activate();
+            return;
+        }
+        _phoneWebcamForm?.Close();
+        _phoneWebcamForm = new PhoneWebcamForm(
+            phone.Value.Id,
+            phone.Value.Name,
+            watchCamera: (id, en, lens, torch, mic) => _receiver?.SendPhoneCameraWatch(id, en, lens, torch, mic));
+        _phoneWebcamForm.Show(this);
+    }
+
+    private void OpenSharedShelfDialog()
+    {
+        if (_sharedShelfDialog is { IsDisposed: false } existing)
+        {
+            existing.Activate();
+            return;
+        }
+        _sharedShelfDialog = new SharedShelfDialog(_sharedShelf);
+        _sharedShelfDialog.Show(this);
+    }
+
+    private void ShowPairingQrDialog()
+    {
+        if (_receiver == null)
+        {
+            Status("Switch back to ready mode on this computer before generating a pairing QR.");
+            return;
+        }
+        using var dlg = new PairingQrDialog(_receiver.Fingerprint, _receiver.Secret, _customPairingCode);
+        dlg.ShowDialog(this);
+    }
+
+    private async Task RunOneClickRepairAsync()
+    {
+        _repairButton.Enabled = false;
+        Status("Checking and fixing background processes and network access...");
+        try
+        {
+            var report = await Task.Run(() => BackgroundAndNetworkRepairHelper.RunSelfRepair());
+            try
+            {
+                _discovery?.Dispose();
+                _discovery = null;
+                if (_receiver != null && _host == null)
+                {
+                    _discovery = new NearbyComputerDiscovery(_receiver.Fingerprint,
+                        () => Volatile.Read(ref _receiver)?.CanAcceptNewPeer == true,
+                        () => _receiver?.ConnectedDeviceFingerprints.ToList() ?? new List<string>(),
+                        () => _host == null,
+                        () => Volatile.Read(ref _receiver)?.ActiveEnvironmentDeviceCount ?? 1,
+                        _customPairingCode);
+                    _discovery.Start();
+                }
+            }
+            catch { }
+
+            string summary =
+                $"Stopped stuck updater helpers: {report.StoppedStaleUpdaters}\n" +
+                $"Cleared duplicate background processes: {report.StoppedDuplicateProcesses}\n" +
+                $"Cleaned old temporary folders: {report.CleanedDebrisFolders}\n" +
+                $"{report.FirewallNote}";
+            Status("Background & network check finished.");
+            if (!IsDisposed)
+            {
+                MessageBox.Show(this, summary, "DeskTouch Vision — Fix Background & Network",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+        finally
+        {
+            if (!IsDisposed) _repairButton.Enabled = true;
+        }
     }
 
     private void ExecutePowerActionFromUi(int targetId, string action)

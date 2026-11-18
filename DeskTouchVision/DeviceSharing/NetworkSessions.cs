@@ -519,6 +519,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly ConcurrentDictionary<string, string[]> _macsByFingerprint = new(StringComparer.OrdinalIgnoreCase);
     private string _lastBroadcastForeground = "";
     private string _latestProfileStateJson = "";
+    private readonly FileDropHelper.BufferedChunkAssembler _phoneScreenAssembler = new();
+    private readonly FileDropHelper.BufferedChunkAssembler _phoneCameraAssembler = new();
+    private int _phoneTouchSeq;
 
     internal event Action<string, string>? ClipboardTextReceived;
     internal event Action<string, byte[]>? ClipboardImageReceived;
@@ -528,6 +531,63 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<string, int, bool>? LowBatteryDetected;
     internal event Action<string>? RemoteProfileApplyRequested;
     internal event Action<string, string>? ForegroundAppChanged;
+    internal event Action<int, byte[]>? PhoneScreenFrameReceived;
+    internal event Action<int, int, string?>? PhoneScreenStatusReceived;
+    internal event Action<int, byte[]>? PhoneCameraFrameReceived;
+    internal event Action<int, int, string?>? PhoneCameraStatusReceived;
+    internal event Action<int, byte[], int>? PhoneMicAudioReceived;
+
+    internal void SendPhoneScreenWatch(int targetPeerId, bool enable)
+    {
+        if (!_sessions.TryGetValue(targetPeerId, out var target)) return;
+        _ = Task.Run(async () =>
+        {
+            try { await SendToAsync(target, new Packet("phone-screen-watch", enable ? 1 : 0, 540), _cancel.Token); }
+            catch { }
+        });
+    }
+
+    internal void SendPhoneTouch(int targetPeerId, int action, int normX, int normY)
+    {
+        if (!_sessions.TryGetValue(targetPeerId, out var target)) return;
+        int seq = Interlocked.Increment(ref _phoneTouchSeq);
+        _ = Task.Run(async () =>
+        {
+            try { await SendToAsync(target, new Packet("phone-touch", action, normX, normY, seq), _cancel.Token); }
+            catch { }
+        });
+    }
+
+    internal void SendPhoneNav(int targetPeerId, int navCode)
+    {
+        if (!_sessions.TryGetValue(targetPeerId, out var target)) return;
+        _ = Task.Run(async () =>
+        {
+            try { await SendToAsync(target, new Packet("phone-nav", navCode), _cancel.Token); }
+            catch { }
+        });
+    }
+
+    internal void SendPhoneText(int targetPeerId, string text)
+    {
+        if (string.IsNullOrEmpty(text) || !_sessions.TryGetValue(targetPeerId, out var target)) return;
+        string clean = text.Length > 500 ? text[..500] : text;
+        _ = Task.Run(async () =>
+        {
+            try { await SendToAsync(target, new Packet("phone-text", 0, 0, 0, 0, clean), _cancel.Token); }
+            catch { }
+        });
+    }
+
+    internal void SendPhoneCameraWatch(int targetPeerId, bool enable, int lens, bool torch, bool mic)
+    {
+        if (!_sessions.TryGetValue(targetPeerId, out var target)) return;
+        _ = Task.Run(async () =>
+        {
+            try { await SendToAsync(target, new Packet("phone-camera-watch", enable ? 1 : 0, lens, torch ? 1 : 0, mic ? 1 : 0), _cancel.Token); }
+            catch { }
+        });
+    }
 
     internal NotificationPreviewItem[] GetNotificationsForPeer(int peerId)
     {
@@ -4327,6 +4387,41 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if (p.Type == "profile-apply" && !string.IsNullOrWhiteSpace(p.Text))
                 {
                     RemoteProfileApplyRequested?.Invoke(p.Text.Trim());
+                    continue;
+                }
+                if (p.Type == "phone-screen-status" && session.Peer.Platform == "Android")
+                {
+                    PhoneScreenStatusReceived?.Invoke(session.Id, p.A, p.Text);
+                    continue;
+                }
+                if (p.Type == "phone-screen-chunk" && session.Peer.Platform == "Android" && !string.IsNullOrEmpty(p.Text))
+                {
+                    var assembled = _phoneScreenAssembler.AddChunk((session.Id << 16) ^ (p.A & 0xFFFF), p.B, p.C, p.Text);
+                    if (assembled.Complete && assembled.Data.Length > 0)
+                        PhoneScreenFrameReceived?.Invoke(session.Id, assembled.Data);
+                    continue;
+                }
+                if (p.Type == "phone-camera-status" && session.Peer.Platform == "Android")
+                {
+                    PhoneCameraStatusReceived?.Invoke(session.Id, p.A, p.Text);
+                    continue;
+                }
+                if (p.Type == "phone-camera-chunk" && session.Peer.Platform == "Android" && !string.IsNullOrEmpty(p.Text))
+                {
+                    var assembled = _phoneCameraAssembler.AddChunk((session.Id << 16) ^ (p.A & 0xFFFF), p.B, p.C, p.Text);
+                    if (assembled.Complete && assembled.Data.Length > 0)
+                        PhoneCameraFrameReceived?.Invoke(session.Id, assembled.Data);
+                    continue;
+                }
+                if (p.Type == "phone-mic-audio" && session.Peer.Platform == "Android" && !string.IsNullOrEmpty(p.Text))
+                {
+                    try
+                    {
+                        byte[] pcm = Convert.FromBase64String(p.Text);
+                        if (pcm.Length > 0)
+                            PhoneMicAudioReceived?.Invoke(session.Id, pcm, p.B > 0 ? p.B : 16000);
+                    }
+                    catch { }
                     continue;
                 }
                 (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;

@@ -1560,7 +1560,7 @@ public final class ProtocolSourceTest {
         assertNotNull(customMatched);
         assertEquals(fpMember, customMatched.fingerprint);
 
-        // Verify v0.3.77 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
+        // Verify v0.3.78 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
         String mainSource = readProjectSource("app/src/main/java/com/desktouch/vision/MainActivity.java");
         assertTrue(mainSource.contains("trackpadScreenScroll.setVisibility("));
         assertTrue(mainSource.replace("\r\n", "\n").contains("if(index==PhoneUiKit.TAB_TRACKPAD){\n            refreshTrackpadPcTaskbar();"));
@@ -1573,13 +1573,13 @@ public final class ProtocolSourceTest {
 
     private static String readProjectSource(String relFromAndroidRoot) {
         try {
-            java.nio.file.Path direct = java.nio.file.Path.of(relFromAndroidRoot);
+            java.nio.file.Path direct = java.nio.file.Paths.get(relFromAndroidRoot);
             if (java.nio.file.Files.isRegularFile(direct)) {
-                return java.nio.file.Files.readString(direct);
+                return new String(java.nio.file.Files.readAllBytes(direct), java.nio.charset.StandardCharsets.UTF_8);
             }
-            java.nio.file.Path nested = java.nio.file.Path.of("AndroidDeskTouch", relFromAndroidRoot);
+            java.nio.file.Path nested = java.nio.file.Paths.get("AndroidDeskTouch", relFromAndroidRoot);
             if (java.nio.file.Files.isRegularFile(nested)) {
-                return java.nio.file.Files.readString(nested);
+                return new String(java.nio.file.Files.readAllBytes(nested), java.nio.charset.StandardCharsets.UTF_8);
             }
             throw new java.io.FileNotFoundException("Cannot locate " + relFromAndroidRoot);
         } catch (java.io.IOException e) {

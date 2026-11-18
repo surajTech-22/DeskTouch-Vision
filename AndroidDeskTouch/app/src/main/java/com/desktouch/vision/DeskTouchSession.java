@@ -32,11 +32,7 @@ import javax.net.ssl.*;
  * No new Windows pairing protocol or replacement keyboard settings.
  */
 final class DeskTouchSession implements AutoCloseable {
-    // 12 ms (~83 Hz) keeps the phone transmitter in CAM between buffered
-    // mouse frames. Measured 2.4 GHz PC->phone ping was clean at 100 Hz
-    // (1% loss, 6.5 ms avg, 8 ms p90) but buffered at 50 ms and below,
-    // so 22 ms still allowed Wi-Fi power-save stalls on HyperOS.
-    static final int INTERACTIVE_KEEPALIVE_MS = 12;
+    static final int INTERACTIVE_KEEPALIVE_MS = 22;
 
     static boolean shouldSendInteractiveKeepalive(
         boolean running, boolean sameChannel, boolean confirmed,
@@ -1394,7 +1390,9 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS){
+                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS
+                            && now-lastUdpReverseMoveAtMs>=30L
+                            && now-ch.getLastSentMs()>=INTERACTIVE_KEEPALIVE_MS){
                             lastWarmSentMs=now;
                             ch.sendWarm();
                         }

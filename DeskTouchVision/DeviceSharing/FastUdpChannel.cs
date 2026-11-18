@@ -223,6 +223,8 @@ internal sealed class AdaptiveLinkTracker
     private ulong _maxSeq;
     private ulong _settledSeq;
     private ulong _seenMask;
+    private ulong _exemptMask;
+    private bool _prevWasInteractive;
     private double _ewmaLossRatio;
     private long _reorderedPackets;
     private long _lostPackets;
@@ -327,7 +329,12 @@ internal sealed class AdaptiveLinkTracker
     }
 
     internal static bool HasSenderTimestamp(FastUdpOp op) =>
-        op is FastUdpOp.Move or FastUdpOp.Warm or FastUdpOp.LinkPing;
+        op == FastUdpOp.Move;
+
+    internal static bool IsInteractiveOp(FastUdpOp op) => op is
+        FastUdpOp.ReverseMove or FastUdpOp.Move or FastUdpOp.ReverseEdgePush or
+        FastUdpOp.ReverseClaim or FastUdpOp.ReverseGranted or FastUdpOp.ReverseActive or
+        FastUdpOp.ReverseButton or FastUdpOp.ReverseWheel;
 
     internal int NextPingToken(long nowMs)
     {
@@ -460,13 +467,17 @@ internal sealed class AdaptiveLinkTracker
     internal void RecordAuthenticatedSeqOnly(ulong seq)
     {
         lock (_recvGate)
-            RecordSeqLocked(seq);
+            RecordSeqLocked(seq, interactiveOp: true, advanceInteractiveState: false);
     }
 
     internal void RecordInboundPacket(ulong seq, bool streamTimingOp, long nowMs) =>
-        RecordInboundPacket(seq, false, 0, nowMs);
+        RecordInboundPacket(seq, false, 0, nowMs, interactiveOp: true);
 
-    internal void RecordInboundPacket(ulong seq, bool hasSenderTimestamp, int senderTimestampMs, long nowMs)
+    internal void RecordInboundPacket(ulong seq, bool hasSenderTimestamp, int senderTimestampMs, long nowMs) =>
+        RecordInboundPacket(seq, hasSenderTimestamp, senderTimestampMs, nowMs, interactiveOp: true);
+
+    internal void RecordInboundPacket(
+        ulong seq, bool hasSenderTimestamp, int senderTimestampMs, long nowMs, bool interactiveOp)
     {
         bool isWiredEthernet = string.Equals(Band, "ethernet", StringComparison.Ordinal);
         lock (_recvGate)
@@ -477,7 +488,7 @@ internal sealed class AdaptiveLinkTracker
                 if (gapMs > 800)
                     _ewmaLossRatio *= Math.Pow(0.75, Math.Min(8.0, gapMs / 1000.0));
             }
-            RecordSeqLocked(seq);
+            RecordSeqLocked(seq, interactiveOp, advanceInteractiveState: true);
             if (nowMs <= 0) return;
             if (isWiredEthernet)
             {
@@ -520,7 +531,7 @@ internal sealed class AdaptiveLinkTracker
         }
     }
 
-    private void RecordSeqLocked(ulong seq)
+    private void RecordSeqLocked(ulong seq, bool interactiveOp, bool advanceInteractiveState)
     {
         if (seq == 0) return;
         if (_maxSeq == 0)
@@ -528,6 +539,8 @@ internal sealed class AdaptiveLinkTracker
             _maxSeq = seq;
             _settledSeq = seq;
             _seenMask = 1UL;
+            _exemptMask = interactiveOp ? 0UL : 1UL;
+            if (advanceInteractiveState) _prevWasInteractive = interactiveOp;
             return;
         }
         if (seq > _maxSeq)
@@ -536,20 +549,36 @@ internal sealed class AdaptiveLinkTracker
             if (diff >= 64)
             {
                 _seenMask = 1UL;
-                ulong skipped = diff >= 65 ? 64UL : diff - 1;
-                _lostPackets += (long)skipped;
-                ulong ewmaSteps = Math.Min(8UL, skipped);
-                for (ulong i = 0; i < ewmaSteps; i++)
+                _exemptMask = interactiveOp ? 0UL : 1UL;
+                if (_prevWasInteractive)
                 {
-                    _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
+                    ulong skipped = diff >= 65 ? 64UL : diff - 1;
+                    _lostPackets += (long)skipped;
+                    ulong ewmaSteps = Math.Min(8UL, skipped);
+                    for (ulong i = 0; i < ewmaSteps; i++)
+                    {
+                        _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
+                    }
                 }
                 _settledSeq = seq;
             }
             else
             {
-                _seenMask = (_seenMask << (int)diff) | 1UL;
+                int shift = (int)diff;
+                _seenMask = (_seenMask << shift) | 1UL;
+                _exemptMask = _exemptMask << shift;
+                if (!interactiveOp)
+                    _exemptMask |= 1UL;
+                if (!_prevWasInteractive && diff > 1)
+                {
+                    // Missing frames during an idle pause came from background
+                    // keepalives/probes rather than cursor moves; exempt them.
+                    for (int k = 1; k < shift; k++)
+                        _exemptMask |= 1UL << k;
+                }
             }
             _maxSeq = seq;
+            if (advanceInteractiveState) _prevWasInteractive = interactiveOp;
             SettleOldSlotsLocked();
         }
         else
@@ -560,9 +589,10 @@ internal sealed class AdaptiveLinkTracker
                 ulong bit = 1UL << (int)back;
                 if ((_seenMask & bit) == 0)
                 {
+                    bool wasExempt = (_exemptMask & bit) != 0;
                     _seenMask |= bit;
-                    if (back >= 1) _reorderedPackets++;
-                    if (seq <= _settledSeq)
+                    if (back >= 1 && !wasExempt) _reorderedPackets++;
+                    if (!wasExempt && seq <= _settledSeq)
                     {
                         // This slot was already counted as lost when the
                         // settle window advanced, but it has now arrived
@@ -592,15 +622,14 @@ internal sealed class AdaptiveLinkTracker
             // A slot older than the 64-bit sliding window is no longer
             // representable (this happens whenever one or more frames arrive
             // back-to-back and the settle target jumps). Treat it as unknown
-            // rather than lost: the old code counted these boundary slots as
-            // loss, which is what produced 39-61% "loss" from a single
-            // reordered burst.
-            bool seen = back >= 64 || ((_seenMask & (1UL << (int)back)) != 0);
-            if (seen)
+            // rather than lost.
+            if (back >= 64) continue;
+            ulong bit = 1UL << (int)back;
+            if ((_seenMask & bit) != 0)
             {
                 _ewmaLossRatio *= 0.94;
             }
-            else
+            else if ((_exemptMask & bit) == 0)
             {
                 _ewmaLossRatio = _ewmaLossRatio * 0.94 + 0.06;
                 _lostPackets++;
@@ -735,7 +764,6 @@ internal sealed class FastUdpHub : IDisposable
         internal long LastLinkPingMs;
         internal int PendingWakePing;
         internal long LastWakePrimerMs;
-        internal long LastCamPulseMs;
         internal ulong HighestMoveSeq;
 
         internal bool TryMarkConfirmedLogged() =>
@@ -883,7 +911,8 @@ internal sealed class FastUdpHub : IDisposable
 
                 long nowMs = Environment.TickCount64;
                 peer.LinkTracker.RecordInboundPacket(
-                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs);
+                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs,
+                    AdaptiveLinkTracker.IsInteractiveOp(msg.Op));
 
                 if (msg.Op == FastUdpOp.Probe)
                 {
@@ -1021,7 +1050,8 @@ internal sealed class FastUdpClient : IDisposable
                     _serverEndPoint = new IPEndPoint(normalized, srcIp.Port);
                 long nowMs = Environment.TickCount64;
                 LinkTracker.RecordInboundPacket(
-                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs);
+                    msg.Seq, AdaptiveLinkTracker.HasSenderTimestamp(msg.Op), msg.TimestampMs, nowMs,
+                    AdaptiveLinkTracker.IsInteractiveOp(msg.Op));
                 if (msg.Op == FastUdpOp.Probe)
                 {
                     Send(FastUdpOp.ProbeAck, LocalPort, 0, 0);
@@ -1125,7 +1155,7 @@ internal sealed class FastMovePacer : IDisposable
     private const double MinUdpIntervalMs = 1.5;
     private const int TrailingTcpSyncDelayMs = 130;
     private const int WarmKeepaliveIntervalMs = 22;
-    private const int WarmCooldownSeconds = 2;
+    private const int WarmCooldownSeconds = 1;
 
     private readonly object _gate = new();
     private readonly object _udpSendGate = new();
@@ -1178,19 +1208,7 @@ internal sealed class FastMovePacer : IDisposable
             if (_disposed || order <= _lastSentUdpOrder)
                 return false;
             _lastSentUdpOrder = order;
-            Packet stamped = StampSeq(move);
-            bool sent = _sendUdp(stamped);
-            if (sent && Volatile.Read(ref _duplicateMoves))
-            {
-                // 2.4 GHz workaround: a second authenticated frame carries the
-                // same move sequence, so independent air loss cannot remove
-                // both copies. Android's move dedup discards the copy when
-                // the first one already landed; 48 bytes is ~0.03% of the
-                // 144 Mbps link at the 2.4 GHz move rate.
-                if (_sendUdp(stamped))
-                    Interlocked.Increment(ref _duplicateSentCount);
-            }
-            return sent;
+            return _sendUdp(StampSeq(move));
         }
     }
 
@@ -1253,8 +1271,6 @@ internal sealed class FastMovePacer : IDisposable
     private double _effectiveMinIntervalMs = -1;
     private int _effectiveWarmIntervalMs = WarmKeepaliveIntervalMs;
     private long _udpDirectCount, _udpFlushedCount, _trailingTcpSyncCount;
-    private bool _duplicateMoves;
-    private long _duplicateSentCount;
 
     internal double EffectiveMinIntervalMs
     {
@@ -1269,29 +1285,18 @@ internal sealed class FastMovePacer : IDisposable
 
     internal void SetWarmIntervalMs(int ms)
     {
-        int clamped = Math.Clamp(ms, 8, 120);
+        int clamped = Math.Clamp(ms, 18, 120);
         lock (_gate)
         {
             if (_effectiveWarmIntervalMs == clamped) return;
             _effectiveWarmIntervalMs = clamped;
-            if (!_disposed && _throttledUdp == null && _pendingTcpSync == null &&
+            if (!_disposed && _throttledUdp == null &&
                 IsWarmWindowOpenLocked(Stopwatch.GetTimestamp()) && _sendWarm != null)
             {
                 UpdateTimerLocked();
             }
         }
     }
-
-    internal void SetDuplicateMoves(bool enabled)
-    {
-        lock (_gate)
-        {
-            if (_duplicateMoves == enabled) return;
-            Volatile.Write(ref _duplicateMoves, enabled);
-        }
-    }
-
-    internal long TakeDuplicateCount() => Interlocked.Exchange(ref _duplicateSentCount, 0);
 
     internal (long UdpDirect, long UdpPacedFlush, long TrailingTcpSync) TakeStats() => (
         Interlocked.Exchange(ref _udpDirectCount, 0),
@@ -1485,11 +1490,21 @@ internal sealed class FastMovePacer : IDisposable
         else
         {
             long now = Stopwatch.GetTimestamp();
-            dueMs = _pendingTcpSync != null
-                ? TrailingTcpSyncDelayMs
-                : IsWarmWindowOpenLocked(now) && _sendWarm != null
+            dueMs = Timeout.Infinite;
+            if (_pendingTcpSync != null)
+            {
+                double tcpElapsed = (now - _lastMoveTicks) * 1000.0 / Stopwatch.Frequency;
+                dueMs = Math.Max(1, (int)Math.Round(TrailingTcpSyncDelayMs - tcpElapsed));
+            }
+            if (IsWarmWindowOpenLocked(now) && _sendWarm != null)
+            {
+                long lastActivityTicks = Math.Max(_lastMoveUdpTicks, _lastWarmTicks);
+                double warmElapsed = lastActivityTicks == 0
                     ? _effectiveWarmIntervalMs
-                    : Timeout.Infinite;
+                    : (now - lastActivityTicks) * 1000.0 / Stopwatch.Frequency;
+                int warmDue = Math.Max(1, (int)Math.Round(_effectiveWarmIntervalMs - warmElapsed));
+                dueMs = dueMs == Timeout.Infinite ? warmDue : Math.Min(dueMs, warmDue);
+            }
         }
         try { _timer.Change(dueMs, Timeout.Infinite); }
         catch (ObjectDisposedException) { }

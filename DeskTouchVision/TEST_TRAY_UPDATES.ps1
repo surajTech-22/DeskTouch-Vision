@@ -40,5 +40,8 @@ $publishedVersion = [regex]::Match($csproj,
   '<Version>([0-9]+\.[0-9]+\.[0-9]+)-preview</Version>').Groups[1].Value
 if (-not $publishedVersion) { throw 'DeskTouch project version not found.' }
 RequireText 'RECOVER_DESKTOUCH.ps1' ('$' + "release = 'v" + $publishedVersion + "'")
+RequireText 'RECOVER_DESKTOUCH.ps1' ('$' + "expectedAppVersion = '" + $publishedVersion + ".0'")
+RequireText 'DeviceSharing\DeviceSharing.csproj' "<Version>$publishedVersion-preview</Version>"
+RequireText '..\AndroidDeskTouch\app\build.gradle' "versionName '$publishedVersion'"
 Write-Host 'PASS: both Windows executables share the release-event auto-updater.'
 Write-Host 'PASS: X-to-tray retains window; verified update closes it and restarts quietly in tray.'

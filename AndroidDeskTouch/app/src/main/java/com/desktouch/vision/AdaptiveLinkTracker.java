@@ -8,7 +8,7 @@ package com.desktouch.vision;
  * to detect queuing delay even when network conditions change mid-session.
  */
 public final class AdaptiveLinkTracker {
-    private static final int REORDER_SLACK = 8;
+    private static final int REORDER_SLACK = 63;
     private static final long FAST_MIN_RTT_WINDOW_MS = 3_000L;
     private static final long SLOW_BAND_MIN_RTT_WINDOW_MS = 5_000L;
     private static final int PING_RING_SIZE = 16;
@@ -17,9 +17,12 @@ public final class AdaptiveLinkTracker {
     private long maxSeq;
     private long settledSeq;
     private long seenMask;
+    private long exemptMask;
+    private boolean prevWasInteractive;
     private double ewmaLossRatio;
     private long reorderedPackets;
     private long lostPackets;
+    private long latePackets;
 
     private long lastArriveMs;
     private double inboundJitterMs;
@@ -218,17 +221,33 @@ public final class AdaptiveLinkTracker {
         }
     }
 
+    public static boolean isInteractiveOp(byte op) {
+        return op == FastUdpChannel.OP_REVERSE_MOVE
+            || op == FastUdpChannel.OP_MOVE
+            || op == FastUdpChannel.OP_REVERSE_EDGE_PUSH
+            || op == FastUdpChannel.OP_REVERSE_CLAIM
+            || op == FastUdpChannel.OP_REVERSE_GRANTED
+            || op == FastUdpChannel.OP_REVERSE_ACTIVE
+            || op == FastUdpChannel.OP_REVERSE_BUTTON
+            || op == FastUdpChannel.OP_REVERSE_WHEEL;
+    }
+
     public void recordAuthenticatedSeqOnly(long seq) {
         synchronized (recvGate) {
-            recordSeqLocked(seq);
+            recordSeqLocked(seq, true, false);
         }
     }
 
     public void recordInboundPacket(long seq, boolean streamTimingOp, long nowMs) {
-        recordInboundPacket(seq, false, 0, nowMs);
+        recordInboundPacket(seq, false, 0, nowMs, true);
     }
 
     public void recordInboundPacket(long seq, boolean hasSenderTimestamp, int senderTimestampMs, long nowMs) {
+        recordInboundPacket(seq, hasSenderTimestamp, senderTimestampMs, nowMs, true);
+    }
+
+    public void recordInboundPacket(
+        long seq, boolean hasSenderTimestamp, int senderTimestampMs, long nowMs, boolean interactiveOp) {
         synchronized (recvGate) {
             if (nowMs > 0L && lastArriveMs > 0L && nowMs > lastArriveMs) {
                 long gapMs = nowMs - lastArriveMs;
@@ -236,7 +255,7 @@ public final class AdaptiveLinkTracker {
                     ewmaLossRatio *= Math.pow(0.75, Math.min(8.0, gapMs / 1000.0));
                 }
             }
-            recordSeqLocked(seq);
+            recordSeqLocked(seq, interactiveOp, true);
             if (nowMs <= 0L) {
                 return;
             }
@@ -267,7 +286,7 @@ public final class AdaptiveLinkTracker {
         }
     }
 
-    private void recordSeqLocked(long seq) {
+    private void recordSeqLocked(long seq, boolean interactiveOp, boolean advanceInteractiveState) {
         if (seq == 0L) {
             return;
         }
@@ -275,32 +294,62 @@ public final class AdaptiveLinkTracker {
             maxSeq = seq;
             settledSeq = seq;
             seenMask = 1L;
+            exemptMask = interactiveOp ? 0L : 1L;
+            if (advanceInteractiveState) {
+                prevWasInteractive = interactiveOp;
+            }
             return;
         }
         if (Long.compareUnsigned(seq, maxSeq) > 0) {
             long diff = seq - maxSeq;
             if (Long.compareUnsigned(diff, 64L) >= 0) {
                 seenMask = 1L;
-                long skipped = Long.compareUnsigned(diff, 65L) >= 0 ? 64L : (diff - 1L);
-                lostPackets += skipped;
-                long ewmaSteps = Math.min(8L, skipped);
-                for (long i = 0; i < ewmaSteps; i++) {
-                    ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
+                exemptMask = interactiveOp ? 0L : 1L;
+                if (prevWasInteractive) {
+                    long skipped = Long.compareUnsigned(diff, 65L) >= 0 ? 64L : (diff - 1L);
+                    lostPackets += skipped;
+                    long ewmaSteps = Math.min(8L, skipped);
+                    for (long i = 0; i < ewmaSteps; i++) {
+                        ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
+                    }
                 }
                 settledSeq = seq;
             } else {
-                seenMask = (seenMask << (int) diff) | 1L;
+                int shift = (int) diff;
+                seenMask = (seenMask << shift) | 1L;
+                exemptMask = (exemptMask << shift);
+                if (!interactiveOp) {
+                    exemptMask |= 1L;
+                }
+                if (!prevWasInteractive && diff > 1L) {
+                    // Missing frames during an idle pause came from background
+                    // keepalives/probes rather than cursor moves; exempt them.
+                    for (int k = 1; k < shift; k++) {
+                        exemptMask |= (1L << k);
+                    }
+                }
             }
             maxSeq = seq;
+            if (advanceInteractiveState) {
+                prevWasInteractive = interactiveOp;
+            }
             settleOldSlotsLocked();
         } else {
             long back = maxSeq - seq;
             if (Long.compareUnsigned(back, 64L) < 0) {
                 long bit = 1L << (int) back;
                 if ((seenMask & bit) == 0L) {
+                    boolean wasExempt = (exemptMask & bit) != 0L;
                     seenMask |= bit;
-                    if (back >= 1L) {
+                    if (back >= 1L && !wasExempt) {
                         reorderedPackets++;
+                    }
+                    if (!wasExempt && Long.compareUnsigned(seq, settledSeq) <= 0) {
+                        if (lostPackets > 0L) {
+                            lostPackets--;
+                        }
+                        latePackets++;
+                        ewmaLossRatio *= 0.94;
                     }
                 }
             }
@@ -320,10 +369,13 @@ public final class AdaptiveLinkTracker {
         for (long i = 0; i < step; i++) {
             long s = start + i;
             long back = maxSeq - s;
-            boolean seen = back >= 0L && back < 64L && ((seenMask & (1L << (int) back)) != 0L);
-            if (seen) {
+            if (back < 0L || back >= 64L) {
+                continue;
+            }
+            long bit = 1L << (int) back;
+            if ((seenMask & bit) != 0L) {
                 ewmaLossRatio *= 0.94;
-            } else {
+            } else if ((exemptMask & bit) == 0L) {
                 ewmaLossRatio = ewmaLossRatio * 0.94 + 0.06;
                 lostPackets++;
             }
@@ -362,6 +414,12 @@ public final class AdaptiveLinkTracker {
     public long getLostPackets() {
         synchronized (recvGate) {
             return lostPackets;
+        }
+    }
+
+    public long getLatePackets() {
+        synchronized (recvGate) {
+            return latePackets;
         }
     }
 

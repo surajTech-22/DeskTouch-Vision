@@ -1,3 +1,14 @@
+# DeskTouch Vision v0.3.63 — Clean Mobile Wireless Streaming, Zero Keepalive Echo Storms & Synced Android Build
+
+Fixes the wireless packet-loss/jitter inflation and restores a complete matching Android and Windows release:
+
+- **Zero keepalive collision & echo storms (`DeskTouchSession`, `FastUdpChannel`, `NetworkSessions`):** Restores Android's test-compliant 22 ms keepalive ceiling, suppresses upstream phone keepalives while live cursor movements are arriving, removes routine `OP_WARM(0) <-> OP_WARM(2)` ping-pong echoes, removes the redundant Windows background keepalive loop, and fixes `FastMovePacer.UpdateTimerLocked` so idle keepalive pulses (`22–36 ms` on 2.4 GHz) are no longer blocked for 130 ms behind trailing TCP sync.
+- **Preserves `(-)` / `(+)` waypoint continuity (`NetworkSessions`, `FastUdpChannel`):** Removes the double-send cursor duplication workaround that mutated `TakeWirePrevious` on the first send, destroyed `(-)` recovery waypoints on the second copy, and doubled wireless contention.
+- **Honest jitter & idle-exempt loss accounting (`AdaptiveLinkTracker` on Windows & Android, `FastUdpChannel`):** Excludes background `OP_WARM` / `OP_LINK_PING` control timers (and coarse Windows `Environment.TickCount` quantization) from movement transit-jitter measurements while preserving sub-millisecond `LinkPing` RTT jitter, synchronizes Android's `REORDER_SLACK = 63` + `latePackets` reclassification with Windows, and exempts dropped idle keepalive/probe pulses during stationary pauses from fabricating cursor packet loss.
+- **Synced Windows & Android v0.3.63 release:** Bumps `DeskTouchVision`, `DeviceSharing`, Android (`versionCode 64`), and `RECOVER_DESKTOUCH.ps1` together and validates all version/protocol tests across both platforms.
+
+---
+
 # DeskTouch Vision v0.3.62 - 2.4 GHz Wireless Low-Latency Workarounds & Honest Loss Accounting
 
 Makes phone control over 2.4 GHz faster and steadier without forcing the phone onto another band, and stops late-but-delivered frames from being reported as packet loss:

@@ -477,23 +477,64 @@ public final class ProtocolSourceTest {
     }
 
     @Test public void adaptiveLinkTrackerCapsPacingAndRecoversLossQuickly() {
-        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker();
-        tracker.recordInboundPacket(1L, true, 1000, 1000);
-        for (long s = 6L; s <= 15L; s++) {
-            tracker.recordInboundPacket(s, true, (int) (1000L + s * 7L), 1000L + s * 7L);
+        AdaptiveLinkTracker tracker = new AdaptiveLinkTracker("2.4GHz");
+        long burstMs = 1000L;
+        for (long s = 1L; s <= 30L; s++) {
+            burstMs += 16L;
+            tracker.recordInboundPacket(s, true, burstMs);
         }
-        double spikeLoss = tracker.getInboundLossPermille();
-        for (long s = 16L; s <= 65L; s++) {
-            tracker.recordInboundPacket(s, true, (int) (1000L + s * 7L), 1000L + s * 7L);
+        for (long s = 40L; s >= 31L; s--) {
+            burstMs += 1L;
+            tracker.recordInboundPacket(s, true, burstMs);
         }
-        double recovered = tracker.getInboundLossPermille();
-        assertTrue(spikeLoss > 40.0 && recovered < spikeLoss * 0.25 && recovered < 15.0);
+        assertEquals(0L, tracker.getLostPackets());
+        assertTrue(tracker.getReorderedPackets() >= 9L && tracker.getInboundLossPermille() < 1.0);
 
-        tracker.recordRttSample(48.0, 2000L);
-        tracker.onFeedbackReceived(0, AdaptiveLinkTracker.packLossJitter(30.0, 22.0), -1, 2000L);
-        double p144 = tracker.computeAdaptiveSendIntervalMs(144);
-        double p90 = tracker.computeAdaptiveSendIntervalMs(90);
-        double p60 = tracker.computeAdaptiveSendIntervalMs(60);
+        AdaptiveLinkTracker lateTracker = new AdaptiveLinkTracker("2.4GHz");
+        long lateMs = 1000L;
+        for (long s = 1L; s <= 69L; s++) {
+            lateMs += 8L;
+            lateTracker.recordInboundPacket(s, true, lateMs);
+        }
+        for (long s = 71L; s <= 133L; s++) {
+            lateMs += 8L;
+            lateTracker.recordInboundPacket(s, true, lateMs);
+        }
+        assertEquals(1L, lateTracker.getLostPackets());
+        assertEquals(0L, lateTracker.getLatePackets());
+        lateMs += 8L;
+        lateTracker.recordInboundPacket(70L, true, lateMs);
+        assertEquals(0L, lateTracker.getLostPackets());
+        assertEquals(1L, lateTracker.getLatePackets());
+        double spikeLoss = lateTracker.getInboundLossPermille();
+        for (long s = 134L; s <= 200L; s++) {
+            lateMs += 8L;
+            lateTracker.recordInboundPacket(s, true, lateMs);
+        }
+        double recovered = lateTracker.getInboundLossPermille();
+        assertTrue(spikeLoss > 0.0 && recovered < spikeLoss * 0.25 && spikeLoss < 100.0);
+
+        // Idle keepalive/probe drops during mouse pause must not fabricate mouse packet loss.
+        AdaptiveLinkTracker idleTracker = new AdaptiveLinkTracker("2.4GHz");
+        long idleMs = 5000L;
+        for (long s = 1L; s <= 10L; s++) {
+            idleMs += 8L;
+            idleTracker.recordInboundPacket(s, false, 0, idleMs, true);
+        }
+        for (long s = 11L; s <= 120L; s++) {
+            idleMs += 24L;
+            if (s % 5L == 0L) continue;
+            idleTracker.recordInboundPacket(s, false, 0, idleMs, false);
+        }
+        assertEquals(0L, idleTracker.getLostPackets());
+        assertTrue(idleTracker.getInboundLossPermille() < 0.01);
+
+        AdaptiveLinkTracker pacingTracker = new AdaptiveLinkTracker();
+        pacingTracker.recordRttSample(48.0, 2000L);
+        pacingTracker.onFeedbackReceived(0, AdaptiveLinkTracker.packLossJitter(30.0, 22.0), -1, 2000L);
+        double p144 = pacingTracker.computeAdaptiveSendIntervalMs(144);
+        double p90 = pacingTracker.computeAdaptiveSendIntervalMs(90);
+        double p60 = pacingTracker.computeAdaptiveSendIntervalMs(60);
         assertTrue(p144 <= 14.0 && p90 <= 16.0 && p60 <= 18.5);
     }
 
@@ -543,8 +584,8 @@ public final class ProtocolSourceTest {
         assertTrue(tracker.getReorderedPackets() >= 1);
         assertEquals(0L, tracker.getLostPackets());
 
-        // Skipping seq 18 completely past REORDER_SLACK must detect genuine loss.
-        for (long s = 17; s <= 35; s++) {
+        // Skipping seq 18 completely past REORDER_SLACK (63) must detect genuine loss.
+        for (long s = 17; s <= 100; s++) {
             if (s == 18) continue;
             ms += 8L;
             tracker.recordInboundPacket(s, true, ms);
@@ -1071,11 +1112,11 @@ public final class ProtocolSourceTest {
         // Verify v0.3.52 wireless loss recovery after brief radio idle gap without masking streaming loss.
         AdaptiveLinkTracker wifiRecovery = new AdaptiveLinkTracker("2.4GHz");
         wifiRecovery.recordInboundPacket(1L, true, 1000, 1000L);
-        wifiRecovery.recordInboundPacket(10L, true, 1070, 1070L);
-        wifiRecovery.recordInboundPacket(19L, true, 1140, 1140L);
+        wifiRecovery.recordInboundPacket(100L, true, 1100, 1100L);
+        wifiRecovery.recordInboundPacket(200L, true, 1200, 1200L);
         double burstLoss = wifiRecovery.getInboundLossPermille();
         assertTrue("Burst skip should register non-zero loss", burstLoss > 50.0);
-        wifiRecovery.recordInboundPacket(20L, true, 4140, 4140L);
+        wifiRecovery.recordInboundPacket(201L, true, 4200, 4200L);
         assertTrue("Quiet radio gap must decay stale loss rather than freezing UI above 30%",
             wifiRecovery.getInboundLossPermille() < burstLoss * 0.6);
     }

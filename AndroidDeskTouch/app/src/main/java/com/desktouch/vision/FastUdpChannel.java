@@ -239,7 +239,6 @@ final class FastUdpChannel implements Closeable {
     volatile boolean confirmed;
     private long highestReverseMoveSeq;
     private volatile long lastSentMs;
-    private volatile long lastWarmEchoSentMs;
     private volatile boolean pendingWakePing;
     private volatile int pendingPingPaceTenths;
     private volatile int pendingPingLease;
@@ -269,6 +268,10 @@ final class FastUdpChannel implements Closeable {
 
     int localPort() {
         return socket.getLocalPort();
+    }
+
+    long getLastSentMs() {
+        return lastSentMs;
     }
 
     void sendProbe() {
@@ -357,10 +360,9 @@ final class FastUdpChannel implements Closeable {
                     }
                 }
                 long nowMs = SystemClock.uptimeMillis();
-                boolean hasSenderTimestamp = msg.op == OP_MOVE
-                    || msg.op == OP_WARM
-                    || msg.op == OP_LINK_PING;
-                linkTracker.recordInboundPacket(msg.seq, hasSenderTimestamp, msg.timestampMs, nowMs);
+                boolean hasSenderTimestamp = msg.op == OP_MOVE;
+                boolean interactiveOp = AdaptiveLinkTracker.isInteractiveOp(msg.op);
+                linkTracker.recordInboundPacket(msg.seq, hasSenderTimestamp, msg.timestampMs, nowMs, interactiveOp);
                 if (msg.op == OP_PROBE) {
                     send(OP_PROBE_ACK, localPort(), 0, 0);
                     markConfirmed();
@@ -368,8 +370,7 @@ final class FastUdpChannel implements Closeable {
                     markConfirmed();
                 } else if (msg.op == OP_WARM) {
                     markConfirmed();
-                    if (msg.a == 1 || (msg.a == 0 && nowMs - lastSentMs >= 14L && nowMs - lastWarmEchoSentMs >= 16L)) {
-                        lastWarmEchoSentMs = nowMs;
+                    if (msg.a == 1) {
                         send(OP_WARM, 2, 0, 0);
                     }
                     if (pendingWakePing) {

@@ -441,19 +441,24 @@ Console.WriteLine("PASS: speed-aware Windows raw mouse scaling preserves slow mo
         Check(Math.Abs(dynPacer.EffectiveMinIntervalMs - 14.5) < 0.01,
             "FastMovePacer must expose live adaptive pacing interval");
 
-        var duplicatePackets = new List<Packet>();
-        using var duplicatePacer = new FastMovePacer(
-            canSendUdp: () => true,
-            sendUdp: packet => { duplicatePackets.Add(packet); return true; },
-            queueReliableTcp: _ => { },
-            nextSeq: () => 42);
-        duplicatePacer.SetMinIntervalMs(7.5);
-        duplicatePacer.SetDuplicateMoves(true);
-        duplicatePacer.TryHandleMove(new Packet("move", 10, 20));
-        Check(duplicatePackets.Count == 2 &&
-              duplicatePackets[0].C == 42 && duplicatePackets[1].C == 42 &&
-              duplicatePacer.TakeDuplicateCount() == 1,
-            "2.4 GHz duplicate move must carry the same move sequence so Android dedup drops the copy");
+        var idleTracker = new AdaptiveLinkTracker("2.4GHz");
+        long idleMs = 5000;
+        for (ulong s = 1; s <= 10; s++)
+        {
+            idleMs += 8;
+            idleTracker.RecordInboundPacket(s, hasSenderTimestamp: false, 0, idleMs, interactiveOp: true);
+        }
+        for (ulong s = 11; s <= 120; s++)
+        {
+            idleMs += 24;
+            if (s % 5 == 0) continue;
+            idleTracker.RecordInboundPacket(s, hasSenderTimestamp: false, 0, idleMs, interactiveOp: false);
+        }
+        Check(idleTracker.LostPackets == 0 && idleTracker.InboundLossPermille < 0.01,
+            "Idle keepalive/probe drops during mouse pause must not fabricate mouse packet loss");
+        Check(!AdaptiveLinkTracker.HasSenderTimestamp(FastUdpOp.Warm) &&
+              !AdaptiveLinkTracker.HasSenderTimestamp(FastUdpOp.LinkPing),
+            "Coarse background Warm/LinkPing timers must never inject tick quantization into transit jitter");
     }
 
     byte[] extSrvKey = Enumerable.Range(21, 32).Select(x => (byte)x).ToArray();
@@ -1839,6 +1844,12 @@ var uiThread = new Thread(() =>
                 queueReliableTcp: _ => { },
                 sendWarm: () => { if (Interlocked.Increment(ref warmCount) >= 1) warmEvent.Set(); });
             warmPacer.SetWarmActive(true);
+            warmPacer.SetWarmIntervalMs(22);
+            warmPacer.TryHandleMove(new Packet("move", 320, 480));
+            Check(warmEvent.Wait(TimeSpan.FromMilliseconds(90)) && warmCount >= 1,
+                "FastMovePacer must emit idle warm keepalive promptly without waiting 130 ms for trailing TCP sync");
+            warmEvent.Reset();
+            Interlocked.Exchange(ref warmCount, 0);
             warmPacer.SetWarmActive(false);
             Check(warmEvent.Wait(TimeSpan.FromSeconds(2)) && warmCount >= 1,
                 "FastMovePacer must keep warm keepalive window open briefly after leaving phone");
@@ -2332,12 +2343,12 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
           wifiText.Contains("loss 3.0%", StringComparison.Ordinal),
         "Wireless status display must report ping, jitter, and percent loss accurately");
 
-    Check(ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 0, 0) is >= 10 and <= 20 &&
-          ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 40, 400) <= 20 &&
+    Check(ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 0, 0) is >= 20 and <= 36 &&
+          ReceiverServer.ComputeWarmIntervalMs("2.4GHz", 40, 400) <= 36 &&
           ReceiverServer.ComputeWarmIntervalMs("5GHz", 0, 0) == 24 &&
           ReceiverServer.SupportsUdpEdgePush("0.3.50") &&
           !ReceiverServer.SupportsUdpEdgePush("0.3.49"),
-        "2.4 GHz keepalive must hold ~100 Hz CAM pacing while 5 GHz stays low-rate");
+        "2.4 GHz idle keepalive must stay balanced (20-36 ms) without 100 Hz air collisions");
 
     var cableProbeTracker = new AdaptiveLinkTracker("cable");
     cableProbeTracker.OnLinkProfileChanged("cable", 480, 0);

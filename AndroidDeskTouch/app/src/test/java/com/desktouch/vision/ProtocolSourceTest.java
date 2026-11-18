@@ -1372,4 +1372,54 @@ public final class ProtocolSourceTest {
         assertTrue(splitUiText.contains("Keys: Wireless (4.2 ms)"));
         assertTrue(splitUiText.contains("[Dual-path]"));
     }
+
+    @Test
+    public void phoneUiKitThemeAndSegmentMappingWorkSafely() {
+        assertEquals(PhoneUiKit.THEME_SLATE, PhoneUiKit.clampTheme(-1));
+        assertEquals(PhoneUiKit.THEME_SLATE, PhoneUiKit.clampTheme(99));
+        assertEquals(PhoneUiKit.THEME_AMOLED, PhoneUiKit.clampTheme(PhoneUiKit.THEME_AMOLED));
+        assertEquals(PhoneUiKit.THEME_LIGHT, PhoneUiKit.clampTheme(PhoneUiKit.THEME_LIGHT));
+        assertEquals(PhoneUiKit.THEME_SLATE, PhoneUiKit.readTheme(null));
+        PhoneUiKit.writeTheme(null, PhoneUiKit.THEME_LIGHT);
+
+        PhoneUiKit.Palette slate = PhoneUiKit.palette(PhoneUiKit.THEME_SLATE);
+        PhoneUiKit.Palette amoled = PhoneUiKit.palette(PhoneUiKit.THEME_AMOLED);
+        PhoneUiKit.Palette light = PhoneUiKit.palette(PhoneUiKit.THEME_LIGHT);
+        assertEquals(0xFF12161F, slate.canvasBg);
+        assertEquals(0xFF171D29, slate.chromeBg);
+        assertEquals(0xFF1B2230, slate.cardBg);
+        assertEquals(0xFF0EA5E9, slate.accent);
+        assertFalse(slate.lightBars);
+        assertEquals(0xFF000000, amoled.canvasBg);
+        assertFalse(amoled.lightBars);
+        assertEquals(0xFFF1F5F9, light.canvasBg);
+        assertTrue(light.lightBars);
+        assertEquals("Midnight Slate", PhoneUiKit.themeName(PhoneUiKit.THEME_SLATE));
+        assertEquals("AMOLED Black", PhoneUiKit.themeName(PhoneUiKit.THEME_AMOLED));
+        assertEquals("Crisp Light", PhoneUiKit.themeName(PhoneUiKit.THEME_LIGHT));
+
+        assertEquals(0, PhoneUiKit.mouseModeToSegment(DeskTouchSession.STREAM_MODE_AUTO));
+        assertEquals(1, PhoneUiKit.mouseModeToSegment(DeskTouchSession.STREAM_MODE_FORCE_MOBILE));
+        assertEquals(2, PhoneUiKit.mouseModeToSegment(DeskTouchSession.STREAM_MODE_FORCE_WIFI));
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, PhoneUiKit.segmentToMouseMode(0));
+        assertEquals(DeskTouchSession.STREAM_MODE_FORCE_MOBILE, PhoneUiKit.segmentToMouseMode(1));
+        assertEquals(DeskTouchSession.STREAM_MODE_FORCE_WIFI, PhoneUiKit.segmentToMouseMode(2));
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, PhoneUiKit.segmentToMouseMode(99));
+
+        assertEquals(0, PhoneUiKit.keyboardModeToSegment(DeskTouchSession.STREAM_MODE_AUTO));
+        assertEquals(1, PhoneUiKit.keyboardModeToSegment(DeskTouchSession.STREAM_MODE_FORCE_WIFI));
+        assertEquals(2, PhoneUiKit.keyboardModeToSegment(DeskTouchSession.STREAM_MODE_FORCE_MOBILE));
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, PhoneUiKit.segmentToKeyboardMode(0));
+        assertEquals(DeskTouchSession.STREAM_MODE_FORCE_WIFI, PhoneUiKit.segmentToKeyboardMode(1));
+        assertEquals(DeskTouchSession.STREAM_MODE_FORCE_MOBILE, PhoneUiKit.segmentToKeyboardMode(2));
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, PhoneUiKit.segmentToKeyboardMode(-5));
+
+        assertEquals(0, PhoneUiKit.pointerFeelToSegment(PointerSmoother.FEEL_AUTO));
+        assertEquals(1, PhoneUiKit.pointerFeelToSegment(PointerSmoother.FEEL_RAW_DIRECT));
+        assertEquals(2, PhoneUiKit.pointerFeelToSegment(PointerSmoother.FEEL_SMOOTH));
+        assertEquals(PointerSmoother.FEEL_AUTO, PhoneUiKit.segmentToPointerFeel(0));
+        assertEquals(PointerSmoother.FEEL_RAW_DIRECT, PhoneUiKit.segmentToPointerFeel(1));
+        assertEquals(PointerSmoother.FEEL_SMOOTH, PhoneUiKit.segmentToPointerFeel(2));
+        assertEquals(PointerSmoother.FEEL_AUTO, PhoneUiKit.segmentToPointerFeel(7));
+    }
 }

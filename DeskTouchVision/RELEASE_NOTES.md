@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.70 — Modern 4-Tab Mobile App Redesign
+
+Introduces the completely redesigned Android app interface while keeping every `v0.3.69` speed, channel, and security capability intact:
+
+- **Sticky top header + instant Pay Mode switch (`MainActivity`, `PhoneUiKit`):** Keeps device connection status visible at all times alongside a single-tap `Pay Mode` / `Pay Safe: ON` Accessibility toggle right at the top.
+- **Focused 4-tab layout (`Home`, `Trackpad`, `Speed`, `Setup`):** Replaces the long vertical scroll list with clean rounded Midnight Slate cards, live Wireless vs Mobile comparison badges, three-way segmented pickers (`Mouse Channel`, `Keyboard Channel`, `Cursor Feel`), material switch rows, interactive Trackpad surface + sensitivity card, and grouped `Setup` sections for Permissions, Xiaomi Battery, Trust, Updates, and Theme (`Midnight Slate`, `AMOLED Black`, `Crisp Light`).
+
+---
+
 # DeskTouch Vision v0.3.69 — Zero-Lag Hardware ReverseKey Keyboard, Dual-Path Key/Click Redundancy & Input Channel Controls
 
 Eliminates intermittent Wi-Fi keyboard latency and gives direct Android UI control over Mouse/Keyboard channels, Cursor Feel, Dual-Path Boost, and Radio Wake:

@@ -2,7 +2,9 @@ package com.desktouch.vision;
 
 import android.app.*;
 import android.content.*;
+import android.content.res.ColorStateList;
 import android.graphics.*;
+import android.graphics.drawable.GradientDrawable;
 import android.os.*;
 import android.provider.Settings;
 import android.text.*;
@@ -12,19 +14,53 @@ import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.*;
+import androidx.core.graphics.Insets;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.function.Consumer;
 
 /** DeskTouch Vision Android: hardware keyboard/mouse settings belong to Android itself. */
 public final class MainActivity extends Activity {
     private static final String PREFS="desktouch_prefs";
     private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
-    private TextView status,devices;
-    private LinearLayout deviceList,environmentList;
-    private TextView connectionSummary;
-    private TextView liveLinkView;
-    private TextView keyboardBindingsView;
-    private TextView permissionState;
-    private TextView trustSummary;
+    private static final int TAB_COUNT=4;
+
+    private PhoneUiKit.Palette palette;
+    private final List<Consumer<PhoneUiKit.Palette>> themeUpdaters=new ArrayList<>();
+    private final List<Runnable> dynamicDeviceThemeUpdaters=new ArrayList<>();
+
+    private LinearLayout rootLayout,appHeader,bottomNav;
+    private FrameLayout tabFrame;
+    private View headerDivider,navDivider;
+    private TextView headerTitle,headerVersion,headerSub;
+    private TextView status,connectionSummary,liveLinkView,keyboardBindingsView;
+    private TextView permissionState,trustSummary,protectionDesc,safetyBadge;
+    private LinearLayout liveBadge,deviceList,environmentList;
+    private View liveDot;
+    private TextView liveBadgeText,mouseTag,mouseMetric,kbTag,kbMetric;
+    private Button scanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
+    private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn;
+    private TextView trackpadTargetTitle,trackpadReadout,sensReadout;
+    private TextView speedWifiRtt,speedWifiSub,wifiLossBadge,speedMobRtt,speedMobSub,mobLossBadge;
+    private SeekBar pointerSensitivity;
+    private EditText keyboardInput;
+    private Toast activeToast;
+
+    private final ScrollView[] tabScrolls=new ScrollView[TAB_COUNT];
+    private final LinearLayout[] tabButtons=new LinearLayout[TAB_COUNT];
+    private final PhoneUiKit.TabIconView[] tabIcons=new PhoneUiKit.TabIconView[TAB_COUNT];
+    private final TextView[] tabLabels=new TextView[TAB_COUNT];
+    private int activeTab;
+
+    private PhoneUiKit.SegmentedControl mouseModeSeg,keyboardModeSeg,pointerFeelSeg,themeSeg;
+    private PhoneUiKit.SwitchRow dualPathControlsSwitch,keepChannelsWarmSwitch;
+    private PhoneUiKit.SwitchRow autoStartSwitch,allowWindowsSwitch,allowShellBridgeSwitch;
+    private PhoneUiKit.SwitchRow autoPausePaymentsSwitch,autoPauseDisconnectSwitch;
+
     private final Handler liveUiHandler=new Handler(Looper.getMainLooper());
     private boolean liveUiRunning;
     private android.hardware.input.InputManager inputManager;
@@ -36,14 +72,12 @@ public final class MainActivity extends Activity {
             liveUiHandler.postDelayed(this,750L);
         }
     };
-    private CheckBox autoStartCheck;
-    private CheckBox allowWindowsCheck,allowShellBridgeCheck,autoPausePaymentsCheck,autoPauseDisconnectCheck;
-    private Button pauseBankingButton;
-    private Button mouseModeBtn,keyboardModeBtn,pointerFeelBtn,resetPathsBtn;
-    private CheckBox dualPathControlsCheck,keepChannelsWarmCheck;
+
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
+    private float touchGlowX,touchGlowY;
+    private boolean touchGlowActive;
     private boolean dragged,twoFingerMoved;
     private int maxPointerCount;
     private volatile boolean scanning;
@@ -52,6 +86,7 @@ public final class MainActivity extends Activity {
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
+        palette=PhoneUiKit.palette(PhoneUiKit.readTheme(this));
         int savedProgress=getSharedPreferences(PREFS,MODE_PRIVATE)
             .getInt(PREF_POINTER_PROGRESS,180);
         savedProgress=Math.max(0,Math.min(400,savedProgress));
@@ -59,10 +94,12 @@ public final class MainActivity extends Activity {
         session=DeskTouchRuntime.session(this);
         DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{
+                if(isFinishing()||isDestroyed())return;
                 if(status!=null)status.setText(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
                 refreshPermissionState();
                 refreshTrustSummary();
+                refreshLiveLinkAndKeyboard();
                 updateVisibleScreenAwake();
             }));
         // Android 13+ requires permission to show the persistent connection
@@ -79,351 +116,472 @@ public final class MainActivity extends Activity {
                 android.util.Log.w("DeskTouch","Background startup not available",startupError);
             }
         }
-        LinearLayout page=new LinearLayout(this);
-        page.setOrientation(LinearLayout.VERTICAL);
-        page.setPadding(dp(16),dp(16),dp(16),dp(12));
-        page.setBackgroundColor(Color.rgb(30,32,37));
+
+        WindowCompat.setDecorFitsSystemWindows(getWindow(),false);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+
+        buildRootLayout(savedProgress);
+        setContentView(rootLayout);
+        applyWindowInsets();
+        applyTheme(palette.themeId);
+        selectTab(0);
+
+        DeskTouchRuntime.setLiveStatusListener(()->runOnUiThread(()->{
+            if(!isFinishing()&&!isDestroyed())refreshLiveLinkAndKeyboard();
+        }));
+        registerKeyboardDeviceListener();
+        refreshEnvironmentMembers();
+        refreshPermissionState();
+        refreshTrustSummary();
+        refreshStreamOptionControls();
+        refreshLiveLinkAndKeyboard();
+
+        // Only checks official GitHub metadata; never downloads or silently
+        // installs an executable without explicit user action.
+        AndroidUpdater.checkForUpdates(this,false);
+    }
+
+    private void buildRootLayout(int initialSensitivityProgress){
+        rootLayout=new LinearLayout(this);
+        rootLayout.setOrientation(LinearLayout.VERTICAL);
+
+        buildHeader();
+        rootLayout.addView(appHeader,new LinearLayout.LayoutParams(-1,-2));
+        headerDivider=new View(this);
+        rootLayout.addView(headerDivider,new LinearLayout.LayoutParams(-1,Math.max(1,dp(1))));
+
+        tabFrame=new FrameLayout(this);
+        LinearLayout.LayoutParams frameParams=new LinearLayout.LayoutParams(-1,0,1f);
+        rootLayout.addView(tabFrame,frameParams);
+
+        LinearLayout homePage=createTabPage(0);
+        LinearLayout trackpadPage=createTabPage(1);
+        LinearLayout speedPage=createTabPage(2);
+        LinearLayout setupPage=createTabPage(3);
+
+        buildHomeTab(homePage);
+        buildTrackpadTab(trackpadPage,initialSensitivityProgress);
+        buildSpeedTab(speedPage);
+        buildSetupTab(setupPage);
+
+        navDivider=new View(this);
+        rootLayout.addView(navDivider,new LinearLayout.LayoutParams(-1,Math.max(1,dp(1))));
+        buildBottomNav();
+        rootLayout.addView(bottomNav,new LinearLayout.LayoutParams(-1,-2));
+    }
+
+    private LinearLayout createTabPage(int index){
         ScrollView scroll=new ScrollView(this);
         scroll.setFillViewport(true);
-        scroll.addView(page);
-        setContentView(scroll);
-        TextView heading=new TextView(this);
-        heading.setText("DeskTouch Vision");
-        heading.setTextSize(27);
-        heading.setTextColor(Color.WHITE);
-        page.addView(heading);
-        TextView hint=new TextView(this);
-        hint.setText("One linked network • Windows ↔ Android mouse and keyboard sharing");
-        hint.setTextColor(Color.LTGRAY);
-        hint.setPadding(0,dp(4),0,dp(12));
-        page.addView(hint);
-        status=new TextView(this);
-        status.setText("Scan for your Windows computer on the same private Wi-Fi.");
-        status.setTextColor(Color.rgb(157,203,245));
-        status.setTextSize(15);
-        status.setPadding(0,dp(6),0,dp(14));
-        page.addView(status);
-        addButton(page,"Find devices",this::scan);
-        addButton(page,"Take control of active environment screen",()->{
-            DeskTouchRuntime.releaseAll();
-            session=DeskTouchRuntime.session(this);
-            session.claimControl();
-        });
-        addButton(page,"Return keyboard and mouse control to this device",()->{
-            DeskTouchRuntime.releaseAll();
-            status.setText("Remote Windows input returned. Secure connections remain open.");
-        });
-        connectionSummary=new TextView(this);
-        connectionSummary.setTextColor(Color.rgb(171,216,188));
-        connectionSummary.setPadding(0,dp(5),0,dp(4));
-        connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
-        page.addView(connectionSummary);
-        liveLinkView=new TextView(this);
-        liveLinkView.setTextColor(Color.rgb(138,208,255));
-        liveLinkView.setPadding(0,0,0,dp(8));
-        liveLinkView.setText("Live link: waiting for connection");
-        page.addView(liveLinkView);
-        TextView streamControlsTitle=new TextView(this);
-        streamControlsTitle.setText("Input Channels & Speed");
-        streamControlsTitle.setTextColor(Color.WHITE);
-        streamControlsTitle.setTextSize(14f);
-        streamControlsTitle.setPadding(0,0,0,dp(4));
-        page.addView(streamControlsTitle);
-        LinearLayout streamRow=new LinearLayout(this);
-        streamRow.setOrientation(LinearLayout.HORIZONTAL);
-        streamRow.setPadding(0,0,0,dp(4));
-        page.addView(streamRow,new LinearLayout.LayoutParams(-1,-2));
-        mouseModeBtn=new Button(this);
-        mouseModeBtn.setAllCaps(false);mouseModeBtn.setTextSize(11.5f);
-        mouseModeBtn.setMinWidth(0);mouseModeBtn.setMinimumWidth(0);
-        mouseModeBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
-        mouseModeBtn.setOnClickListener(v->{
-            int cur=DeskTouchSession.readMouseMode(this);
-            int next=cur==DeskTouchSession.STREAM_MODE_AUTO
-                ? DeskTouchSession.STREAM_MODE_FORCE_MOBILE
-                : (cur==DeskTouchSession.STREAM_MODE_FORCE_MOBILE
-                    ? DeskTouchSession.STREAM_MODE_FORCE_WIFI
-                    : DeskTouchSession.STREAM_MODE_AUTO);
-            DeskTouchSession.writeMouseMode(this,next);
-            DeskTouchRuntime.applyStreamOptions(this);
-            refreshStreamOptionControls();
-            refreshLiveLinkAndKeyboard();
-        });
-        LinearLayout.LayoutParams srp1=new LinearLayout.LayoutParams(0,-2,1f);
-        srp1.setMargins(0,0,dp(2),0);
-        streamRow.addView(mouseModeBtn,srp1);
-        keyboardModeBtn=new Button(this);
-        keyboardModeBtn.setAllCaps(false);keyboardModeBtn.setTextSize(11.5f);
-        keyboardModeBtn.setMinWidth(0);keyboardModeBtn.setMinimumWidth(0);
-        keyboardModeBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
-        keyboardModeBtn.setOnClickListener(v->{
-            int cur=DeskTouchSession.readKeyboardMode(this);
-            int next=cur==DeskTouchSession.STREAM_MODE_AUTO
-                ? DeskTouchSession.STREAM_MODE_FORCE_WIFI
-                : (cur==DeskTouchSession.STREAM_MODE_FORCE_WIFI
-                    ? DeskTouchSession.STREAM_MODE_FORCE_MOBILE
-                    : DeskTouchSession.STREAM_MODE_AUTO);
-            DeskTouchSession.writeKeyboardMode(this,next);
-            DeskTouchRuntime.applyStreamOptions(this);
-            refreshStreamOptionControls();
-            refreshLiveLinkAndKeyboard();
-        });
-        LinearLayout.LayoutParams srp2=new LinearLayout.LayoutParams(0,-2,1f);
-        srp2.setMargins(dp(2),0,dp(2),0);
-        streamRow.addView(keyboardModeBtn,srp2);
-        pointerFeelBtn=new Button(this);
-        pointerFeelBtn.setAllCaps(false);pointerFeelBtn.setTextSize(11.5f);
-        pointerFeelBtn.setMinWidth(0);pointerFeelBtn.setMinimumWidth(0);
-        pointerFeelBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
-        pointerFeelBtn.setOnClickListener(v->{
-            int cur=DeskTouchSession.readPointerFeelMode(this);
-            int next=cur==PointerSmoother.FEEL_AUTO
-                ? PointerSmoother.FEEL_RAW_DIRECT
-                : (cur==PointerSmoother.FEEL_RAW_DIRECT
-                    ? PointerSmoother.FEEL_SMOOTH
-                    : PointerSmoother.FEEL_AUTO);
-            DeskTouchSession.writePointerFeelMode(this,next);
-            DeskTouchRuntime.applyStreamOptions(this);
-            refreshStreamOptionControls();
-        });
-        LinearLayout.LayoutParams srp3=new LinearLayout.LayoutParams(0,-2,1f);
-        srp3.setMargins(dp(2),0,0,0);
-        streamRow.addView(pointerFeelBtn,srp3);
-        dualPathControlsCheck=new CheckBox(this);
-        dualPathControlsCheck.setText("Dual-path keys & clicks (anti-lag boost)");
-        dualPathControlsCheck.setTextColor(Color.WHITE);
-        dualPathControlsCheck.setChecked(DeskTouchSession.readDualPathControls(this));
-        dualPathControlsCheck.setOnClickListener(v->{
-            DeskTouchSession.writeDualPathControls(this,dualPathControlsCheck.isChecked());
-            DeskTouchRuntime.applyStreamOptions(this);
-            refreshStreamOptionControls();
-            refreshLiveLinkAndKeyboard();
-        });
-        page.addView(dualPathControlsCheck);
-        keepChannelsWarmCheck=new CheckBox(this);
-        keepChannelsWarmCheck.setText("Keep wireless radio awake during control");
-        keepChannelsWarmCheck.setTextColor(Color.WHITE);
-        keepChannelsWarmCheck.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
-        keepChannelsWarmCheck.setOnClickListener(v->{
-            DeskTouchSession.writeKeepChannelsWarm(this,keepChannelsWarmCheck.isChecked());
-            DeskTouchRuntime.applyStreamOptions(this);
-            refreshStreamOptionControls();
-        });
-        page.addView(keepChannelsWarmCheck);
-        resetPathsBtn=new Button(this);
-        resetPathsBtn.setText("Reset Saved Paths");
-        resetPathsBtn.setAllCaps(false);resetPathsBtn.setTextSize(12f);
-        resetPathsBtn.setOnClickListener(v->{
-            DeskTouchRuntime.resetRememberedStreams(this);
-            refreshStreamOptionControls();
-            refreshLiveLinkAndKeyboard();
-            Toast.makeText(this,"Cleared remembered network paths.",Toast.LENGTH_SHORT).show();
-        });
-        page.addView(resetPathsBtn,new LinearLayout.LayoutParams(-1,-2));
-        refreshStreamOptionControls();
-        deviceList=new LinearLayout(this);
-        deviceList.setOrientation(LinearLayout.VERTICAL);
-        page.addView(deviceList);
-        environmentList=new LinearLayout(this);
-        environmentList.setOrientation(LinearLayout.VERTICAL);
-        page.addView(environmentList);
-        refreshEnvironmentMembers();
-        allowWindowsCheck=new android.widget.CheckBox(this);
-        allowWindowsCheck.setText("Allow approved Windows PCs to control this Android screen");
-        allowWindowsCheck.setTextColor(Color.WHITE);
-        allowWindowsCheck.setChecked(DeskTouchAccessibilityService.allowed(this));
-        allowWindowsCheck.setOnClickListener(v->{
-            boolean enabled=allowWindowsCheck.isChecked();
-            DeskTouchAccessibilityService.setAllowed(this,enabled);
-            DeskTouchRuntime.accessibilityPermissionChanged(this);
-            refreshPermissionState();
-            updateVisibleScreenAwake();
-            if(enabled && !DeskTouchAccessibilityService.ready(this)){
-                status.setText("Enable 'DeskTouch Windows control' in Android Accessibility settings.");
-                DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
-            }else status.setText(enabled
-                ? "Windows control enabled."
-                : "Windows control disabled. Android touch has priority.");
-        });
-        page.addView(allowWindowsCheck);
-        allowShellBridgeCheck=new CheckBox(this);
-        allowShellBridgeCheck.setText("Allow Accessibility-free Virtual Bridge from connected Windows PC (recommended for payment apps)");
-        allowShellBridgeCheck.setTextColor(Color.WHITE);
-        allowShellBridgeCheck.setChecked(ShellInputClient.allowed(this));
-        allowShellBridgeCheck.setOnClickListener(v->{
-            boolean enabled=allowShellBridgeCheck.isChecked();
-            ShellInputClient.setAllowed(this,enabled);
-            refreshPermissionState();
-            updateVisibleScreenAwake();
-            status.setText(enabled
-                ? (ShellInputClient.ready(this)
-                    ? "Accessibility-free Virtual Bridge enabled and ready."
-                    : "Virtual Bridge enabled. Plug in the data cable while DeskTouch is running on Windows to start it without Accessibility.")
-                : "Virtual Bridge disabled in DeskTouch.");
-        });
-        page.addView(allowShellBridgeCheck);
-        permissionState=new TextView(this);
-        permissionState.setTextColor(Color.rgb(243,208,145));
-        permissionState.setPadding(0,dp(5),0,dp(6));
-        page.addView(permissionState);
-        keyboardBindingsView=new TextView(this);
-        keyboardBindingsView.setTextColor(Color.rgb(188,214,238));
-        keyboardBindingsView.setPadding(0,dp(2),0,dp(6));
-        keyboardBindingsView.setTextSize(12.5f);
-        page.addView(keyboardBindingsView);
-        addButton(page,"Show connected keyboard shortcuts",this::showKeyboardShortcutsDialog);
-        DeskTouchRuntime.setLiveStatusListener(()->runOnUiThread(this::refreshLiveLinkAndKeyboard));
-        registerKeyboardDeviceListener();
-        addButton(page,"Open Android Accessibility settings",()->
-            DeskTouchAccessibilityService.openAccessibilitySettings(
-                this,!PermissionContinuity.systemAccessibilityEnabled(this)));
-        // A dedicated input method improves editor typing (including WebViews)
-        // without requiring root, developer mode or a Bluetooth pairing.
-        // Android always requires the user to enable/select a third-party IME.
-        addButton(page,"Enable DeskTouch remote keyboard",()->
-            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
-        addButton(page,"Select DeskTouch remote keyboard",()->{
-            android.view.inputmethod.InputMethodManager manager=
-                (android.view.inputmethod.InputMethodManager)
-                getSystemService(INPUT_METHOD_SERVICE);
-            if(manager!=null)manager.showInputMethodPicker();
-        });
-        addButton(page,"Stop Windows control on this phone",()->{
-            DeskTouchRuntime.remoteNativeTouch();
-            status.setText("Windows input authority returned to Android.");
-        });
-        pauseBankingButton=new Button(this);
-        pauseBankingButton.setAllCaps(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout page=new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(14),dp(12),dp(14),dp(18));
+        scroll.addView(page,new FrameLayout.LayoutParams(-1,-2));
+        tabScrolls[index]=scroll;
+        tabFrame.addView(scroll,new FrameLayout.LayoutParams(-1,-1));
+        return page;
+    }
+
+    private void buildHeader(){
+        appHeader=new LinearLayout(this);
+        appHeader.setOrientation(LinearLayout.HORIZONTAL);
+        appHeader.setGravity(Gravity.CENTER_VERTICAL);
+        appHeader.setPadding(dp(16),dp(10),dp(16),dp(10));
+
+        TextView logo=new TextView(this);
+        logo.setText("DT");
+        logo.setTextColor(Color.WHITE);
+        logo.setTextSize(13f);
+        logo.setTypeface(null,Typeface.BOLD);
+        logo.setGravity(Gravity.CENTER);
+        GradientDrawable logoBg=new GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,new int[]{0xFF0EA5E9,0xFF4F46E5});
+        logoBg.setCornerRadius(dp(11));
+        logo.setBackground(logoBg);
+        LinearLayout.LayoutParams logoParams=new LinearLayout.LayoutParams(dp(36),dp(36));
+        logoParams.rightMargin=dp(10);
+        appHeader.addView(logo,logoParams);
+
+        LinearLayout titleCol=new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout titleRow=new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        headerTitle=new TextView(this);
+        headerTitle.setText("DeskTouch Vision");
+        headerTitle.setTextSize(15.5f);
+        headerTitle.setTypeface(null,Typeface.BOLD);
+        headerTitle.setSingleLine(true);
+        headerTitle.setEllipsize(TextUtils.TruncateAt.END);
+        titleRow.addView(headerTitle);
+
+        headerVersion=new TextView(this);
+        headerVersion.setText("v"+readVersionName());
+        headerVersion.setTextSize(10f);
+        headerVersion.setTypeface(null,Typeface.BOLD);
+        headerVersion.setPadding(dp(6),dp(2),dp(6),dp(2));
+        LinearLayout.LayoutParams verLp=new LinearLayout.LayoutParams(-2,-2);
+        verLp.leftMargin=dp(6);
+        titleRow.addView(headerVersion,verLp);
+
+        titleCol.addView(titleRow);
+
+        headerSub=new TextView(this);
+        headerSub.setText("Not connected • Ready to scan");
+        headerSub.setTextSize(11.5f);
+        headerSub.setSingleLine(true);
+        headerSub.setEllipsize(TextUtils.TruncateAt.END);
+        titleCol.addView(headerSub);
+
+        LinearLayout.LayoutParams colParams=new LinearLayout.LayoutParams(0,-2,1f);
+        colParams.rightMargin=dp(8);
+        appHeader.addView(titleCol,colParams);
+
+        pauseBankingButton=PhoneUiKit.createButton(this,"Pay Mode",palette,PhoneUiKit.BTN_TINT_EMERALD);
+        pauseBankingButton.setTextSize(11.5f);
+        pauseBankingButton.setPadding(dp(11),dp(7),dp(11),dp(7));
         pauseBankingButton.setOnClickListener(v->{
             if(!PermissionContinuity.systemAccessibilityEnabled(this)){
                 DeskTouchAccessibilityService.setAllowed(this,true);
                 DeskTouchRuntime.accessibilityPermissionChanged(this);
                 refreshPermissionState();
                 DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
-                status.setText("Turn DeskTouch Windows control back on in Accessibility settings.");
+                setFeedback("Turn DeskTouch Windows control back on in Accessibility settings.",true);
             }else{
                 boolean selfDisabled=DeskTouchAccessibilityService.pauseForBanking(
                     this,"Turned off from app");
                 refreshPermissionState();
                 updateVisibleScreenAwake();
                 if(selfDisabled){
-                    status.setText("Android Accessibility turned off. Payment apps work normally; connections stay ready.");
+                    setFeedback("Android Accessibility turned off. Payment apps work normally; connections stay ready.",true);
                 }else{
                     DeskTouchAccessibilityService.openAccessibilitySettings(this,false);
-                    status.setText("Tap DeskTouch Windows control in Accessibility settings to turn it off.");
+                    setFeedback("Tap DeskTouch Windows control in Accessibility settings to turn it off.",true);
                 }
             }
         });
-        page.addView(pauseBankingButton,new LinearLayout.LayoutParams(-1,-2));
-        autoPausePaymentsCheck=new CheckBox(this);
-        autoPausePaymentsCheck.setText("Auto-turn off Accessibility when opening payment/banking apps");
-        autoPausePaymentsCheck.setTextColor(Color.WHITE);
-        autoPausePaymentsCheck.setChecked(
-            DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this));
-        autoPausePaymentsCheck.setOnClickListener(v->{
-            boolean checked=autoPausePaymentsCheck.isChecked();
-            DeskTouchAccessibilityService.setAutoPausePaymentApps(this,checked);
-            status.setText(checked
-                ? "DeskTouch will automatically turn off Accessibility when you open UPI/payment or bank apps."
-                : "Automatic payment-app pause turned off; use the notification, widget, or Quick Tile instead.");
+        appHeader.addView(pauseBankingButton,new LinearLayout.LayoutParams(-2,-2));
+
+        onTheme(p->{
+            appHeader.setBackgroundColor(p.chromeBg);
+            headerTitle.setTextColor(p.textPrimary);
+            headerSub.setTextColor(p.textSecondary);
+            headerVersion.setBackground(PhoneUiKit.roundedBox(
+                p.accentSoftBg,Color.TRANSPARENT,dp(6),0));
+            headerVersion.setTextColor(p.accentText);
         });
-        page.addView(autoPausePaymentsCheck);
-        autoPauseDisconnectCheck=new CheckBox(this);
-        autoPauseDisconnectCheck.setText("Auto-turn off Accessibility 15s after Windows disconnects");
-        autoPauseDisconnectCheck.setTextColor(Color.WHITE);
-        autoPauseDisconnectCheck.setChecked(
-            DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this));
-        autoPauseDisconnectCheck.setOnClickListener(v->{
-            boolean checked=autoPauseDisconnectCheck.isChecked();
-            DeskTouchAccessibilityService.setAutoPauseOnDisconnect(this,checked);
-            status.setText(checked
-                ? "Accessibility will automatically turn off 15 seconds after leaving your Windows PC."
-                : "Accessibility will remain on after Windows disconnects until you turn it off.");
+    }
+
+    private void buildHomeTab(LinearLayout page){
+        LinearLayout hero=PhoneUiKit.createCard(this,palette,14);
+        page.addView(hero,cardParams(0));
+
+        LinearLayout heroTop=new LinearLayout(this);
+        heroTop.setOrientation(LinearLayout.HORIZONTAL);
+        heroTop.setGravity(Gravity.CENTER_VERTICAL);
+
+        liveBadge=new LinearLayout(this);
+        liveBadge.setOrientation(LinearLayout.HORIZONTAL);
+        liveBadge.setGravity(Gravity.CENTER_VERTICAL);
+        liveBadge.setPadding(dp(10),dp(5),dp(10),dp(5));
+
+        liveDot=new View(this);
+        LinearLayout.LayoutParams dotLp=new LinearLayout.LayoutParams(dp(7),dp(7));
+        dotLp.rightMargin=dp(6);
+        liveBadge.addView(liveDot,dotLp);
+
+        liveBadgeText=new TextView(this);
+        liveBadgeText.setText("Offline");
+        liveBadgeText.setTextSize(11.5f);
+        liveBadgeText.setTypeface(null,Typeface.BOLD);
+        liveBadge.addView(liveBadgeText);
+
+        LinearLayout badgeWrap=new LinearLayout(this);
+        badgeWrap.setOrientation(LinearLayout.HORIZONTAL);
+        badgeWrap.addView(liveBadge);
+        heroTop.addView(badgeWrap,new LinearLayout.LayoutParams(0,-2,1f));
+
+        scanBtn=PhoneUiKit.createButton(this,"Find Devices",palette,PhoneUiKit.BTN_SUBTLE);
+        scanBtn.setTextSize(12f);
+        scanBtn.setPadding(dp(12),dp(7),dp(12),dp(7));
+        scanBtn.setOnClickListener(v->scan());
+        heroTop.addView(scanBtn,new LinearLayout.LayoutParams(-2,-2));
+        hero.addView(heroTop);
+
+        status=new TextView(this);
+        status.setText("Scan for your Windows computer on the same private Wi-Fi.");
+        status.setTextSize(14f);
+        status.setTypeface(null,Typeface.BOLD);
+        status.setPadding(0,dp(10),0,0);
+        hero.addView(status);
+
+        liveLinkView=new TextView(this);
+        liveLinkView.setText("Live link: waiting for connection");
+        liveLinkView.setTextSize(12f);
+        liveLinkView.setPadding(0,dp(4),0,0);
+        liveLinkView.setLineSpacing(dp(2),1f);
+        hero.addView(liveLinkView);
+
+        LinearLayout splitRow=new LinearLayout(this);
+        splitRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams splitLp=new LinearLayout.LayoutParams(-1,-2);
+        splitLp.topMargin=dp(10);
+        hero.addView(splitRow,splitLp);
+
+        LinearLayout mouseBox=PhoneUiKit.createSubcard(this,palette,10);
+        LinearLayout.LayoutParams leftSub=new LinearLayout.LayoutParams(0,-2,1f);
+        leftSub.rightMargin=dp(4);
+        splitRow.addView(mouseBox,leftSub);
+
+        LinearLayout mTop=new LinearLayout(this);
+        mTop.setOrientation(LinearLayout.HORIZONTAL);
+        TextView mLbl=new TextView(this);
+        mLbl.setText("Mouse Path");
+        mLbl.setTextSize(11f);
+        mTop.addView(mLbl,new LinearLayout.LayoutParams(0,-2,1f));
+        mouseTag=new TextView(this);
+        mouseTag.setText("Offline");
+        mouseTag.setTextSize(11f);
+        mouseTag.setTypeface(null,Typeface.BOLD);
+        mTop.addView(mouseTag);
+        mouseBox.addView(mTop);
+
+        mouseMetric=new TextView(this);
+        mouseMetric.setText("Tap Find Devices");
+        mouseMetric.setTextSize(12.5f);
+        mouseMetric.setTypeface(null,Typeface.BOLD);
+        mouseMetric.setPadding(0,dp(4),0,0);
+        mouseMetric.setSingleLine(true);
+        mouseMetric.setEllipsize(TextUtils.TruncateAt.END);
+        mouseBox.addView(mouseMetric);
+
+        LinearLayout kbBox=PhoneUiKit.createSubcard(this,palette,10);
+        LinearLayout.LayoutParams rightSub=new LinearLayout.LayoutParams(0,-2,1f);
+        rightSub.leftMargin=dp(4);
+        splitRow.addView(kbBox,rightSub);
+
+        LinearLayout kTop=new LinearLayout(this);
+        kTop.setOrientation(LinearLayout.HORIZONTAL);
+        TextView kLbl=new TextView(this);
+        kLbl.setText("Keys Path");
+        kLbl.setTextSize(11f);
+        kTop.addView(kLbl,new LinearLayout.LayoutParams(0,-2,1f));
+        kbTag=new TextView(this);
+        kbTag.setText("Offline");
+        kbTag.setTextSize(11f);
+        kbTag.setTypeface(null,Typeface.BOLD);
+        kTop.addView(kbTag);
+        kbBox.addView(kTop);
+
+        kbMetric=new TextView(this);
+        kbMetric.setText("Auto-reconnect ready");
+        kbMetric.setTextSize(12.5f);
+        kbMetric.setTypeface(null,Typeface.BOLD);
+        kbMetric.setPadding(0,dp(4),0,0);
+        kbMetric.setSingleLine(true);
+        kbMetric.setEllipsize(TextUtils.TruncateAt.END);
+        kbBox.addView(kbMetric);
+
+        deviceList=new LinearLayout(this);
+        deviceList.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams devLp=new LinearLayout.LayoutParams(-1,-2);
+        devLp.topMargin=dp(6);
+        hero.addView(deviceList,devLp);
+
+        LinearLayout heroActions=new LinearLayout(this);
+        heroActions.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams actLp=new LinearLayout.LayoutParams(-1,-2);
+        actLp.topMargin=dp(10);
+        hero.addView(heroActions,actLp);
+
+        takeControlBtn=PhoneUiKit.createButton(this,"Control PC Screen",palette,PhoneUiKit.BTN_PRIMARY);
+        takeControlBtn.setOnClickListener(v->{
+            DeskTouchRuntime.releaseAll();
+            session=DeskTouchRuntime.session(this);
+            session.claimControl();
+            refreshLiveLinkAndKeyboard();
         });
-        page.addView(autoPauseDisconnectCheck);
-        addButton(page,"Add 1-tap Pay Mode button to Home screen",()->{
-            boolean requested=PaymentPauseWidgetProvider.requestPin(this);
-            status.setText(requested
-                ? "Confirm adding the DeskTouch Pay Mode button on your home screen."
-                : "Long-press your Home screen -> Widgets -> add DeskTouch Pay Mode.");
+        LinearLayout.LayoutParams b1Lp=new LinearLayout.LayoutParams(0,-2,1f);
+        b1Lp.rightMargin=dp(4);
+        heroActions.addView(takeControlBtn,b1Lp);
+
+        returnControlBtn=PhoneUiKit.createButton(this,"Return to Phone",palette,PhoneUiKit.BTN_SUBTLE);
+        returnControlBtn.setOnClickListener(v->{
+            DeskTouchRuntime.releaseAll();
+            setFeedback("Remote Windows input returned. Secure connections remain open.",false);
+            refreshLiveLinkAndKeyboard();
         });
-        refreshPermissionState();
-        addButton(page,"Trust connected PC (auto reconnect identity)",()->{
+        LinearLayout.LayoutParams b2Lp=new LinearLayout.LayoutParams(0,-2,1f);
+        b2Lp.leftMargin=dp(4);
+        heroActions.addView(returnControlBtn,b2Lp);
+
+        LinearLayout envCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(envCard,cardParams(10));
+
+        LinearLayout envTop=new LinearLayout(this);
+        envTop.setOrientation(LinearLayout.HORIZONTAL);
+        envTop.setGravity(Gravity.CENTER_VERTICAL);
+
+        connectionSummary=new TextView(this);
+        connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
+        connectionSummary.setTextSize(11.5f);
+        connectionSummary.setTypeface(null,Typeface.BOLD);
+        envTop.addView(connectionSummary,new LinearLayout.LayoutParams(0,-2,1f));
+
+        trustBadgeBtn=PhoneUiKit.createButton(this,"Trust PC",palette,PhoneUiKit.BTN_SUBTLE);
+        trustBadgeBtn.setTextSize(11f);
+        trustBadgeBtn.setPadding(dp(10),dp(5),dp(10),dp(5));
+        trustBadgeBtn.setOnClickListener(v->{
             DeskTouchSession current=DeskTouchRuntime.session(this);
             session=current;
-            current.requestTrust();
-        });
-        addButton(page,"Leave shared environment",()->{
-            DeskTouchSession current=DeskTouchRuntime.session(this);
-            session=current;
-            AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
-            current.releaseControl();
-            current.disconnect();
-            refreshTrustSummary();
-            status.setText("Selected device disconnected. Other peers stay connected; "+
-                "auto reconnect paused only for this device.");
-        });
-        trustSummary=new TextView(this);
-        trustSummary.setTextColor(Color.rgb(185,225,195));
-        trustSummary.setPadding(0,dp(4),0,dp(4));
-        page.addView(trustSummary);
-        addButton(page,"Forget trusted computers",()->{
-            new TrustedWindows(this).clearAll();
-            refreshTrustSummary();
-            status.setText("Cleared saved trusted computers on this phone.");
-        });
-        autoStartCheck=new android.widget.CheckBox(this);
-        autoStartCheck.setText("Launch on Android startup and reconnect trusted devices");
-        autoStartCheck.setTextColor(Color.WHITE);
-        autoStartCheck.setChecked(AutoConnectService.enabled(this));
-        autoStartCheck.setOnClickListener(button->{
-            boolean checked=autoStartCheck.isChecked();
-            AutoConnectService.setEnabled(this,checked);
-            AutoConnectService.setReconnect(this,checked);
-            status.setText(checked
-                ? "Android startup enabled; trusted PCs reconnect automatically when reachable."
-                : "Android startup and background reconnect disabled.");
-        });
-        page.addView(autoStartCheck);
-        refreshTrustSummary();
-        addButton(page,"Get updates",()->AndroidUpdater.checkForUpdates(this,true));
-        addButton(page,"Update existing application",()->AndroidUpdater.installAvailableUpdate(this));
-        // Only checks official GitHub metadata; never downloads or silently
-        // installs an executable without explicit user action.
-        AndroidUpdater.checkForUpdates(this,false);
-        int initialSensitivityProgress=Math.max(0,Math.min(400,
-            Math.round((pointerSpeed-1f)*100f)));
-        TextView padLabel=new TextView(this);
-        padLabel.setText("Mouse pointer sensitivity: "+
-            Math.round(pointerSpeed*100f/2.8f)+"%");
-        padLabel.setTextColor(Color.WHITE);padLabel.setTextSize(16);
-        padLabel.setPadding(0,dp(12),0,dp(6));page.addView(padLabel);
-        SeekBar pointerSensitivity=new SeekBar(this);
-        pointerSensitivity.setMax(400);pointerSensitivity.setProgress(initialSensitivityProgress);
-        pointerSensitivity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
-            public void onProgressChanged(SeekBar b,int progress,boolean fromUser){
-                pointerSpeed=1f+progress/100f;
-                padLabel.setText("Mouse pointer sensitivity: "+
-                    Math.round(pointerSpeed*100f/2.8f)+"%");
-                if(fromUser){
-                    getSharedPreferences(PREFS,MODE_PRIVATE).edit()
-                        .putInt(PREF_POINTER_PROGRESS,progress).apply();
-                }
+            if(current.connectedFingerprint()!=null){
+                current.requestTrust();
+                setFeedback("Requested trust approval on connected Windows PC.",true);
+            }else{
+                selectTab(3);
             }
-            public void onStartTrackingTouch(SeekBar b){}
-            public void onStopTrackingTouch(SeekBar b){}
         });
-        page.addView(pointerSensitivity);
+        envTop.addView(trustBadgeBtn,new LinearLayout.LayoutParams(-2,-2));
+        envCard.addView(envTop);
+
+        environmentList=new LinearLayout(this);
+        environmentList.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams envListLp=new LinearLayout.LayoutParams(-1,-2);
+        envListLp.topMargin=dp(8);
+        envCard.addView(environmentList,envListLp);
+
+        LinearLayout protCard=PhoneUiKit.createCard(this,palette,14);
+        protCard.setOrientation(LinearLayout.HORIZONTAL);
+        protCard.setGravity(Gravity.CENTER_VERTICAL);
+        page.addView(protCard,cardParams(10));
+
+        LinearLayout protTextCol=new LinearLayout(this);
+        protTextCol.setOrientation(LinearLayout.VERTICAL);
+        TextView protTitle=new TextView(this);
+        protTitle.setText("Control & Payment Protection");
+        protTitle.setTextSize(13f);
+        protTitle.setTypeface(null,Typeface.BOLD);
+        protTextCol.addView(protTitle);
+
+        protectionDesc=new TextView(this);
+        protectionDesc.setText("Accessibility Ready • Virtual Bridge Ready");
+        protectionDesc.setTextSize(11.5f);
+        protectionDesc.setPadding(0,dp(2),0,0);
+        protTextCol.addView(protectionDesc);
+
+        LinearLayout.LayoutParams protColLp=new LinearLayout.LayoutParams(0,-2,1f);
+        protColLp.rightMargin=dp(10);
+        protCard.addView(protTextCol,protColLp);
+
+        openPadBtn=PhoneUiKit.createButton(this,"Open Pad →",palette,PhoneUiKit.BTN_TINT_INDIGO);
+        openPadBtn.setTextSize(12f);
+        openPadBtn.setPadding(dp(12),dp(8),dp(12),dp(8));
+        openPadBtn.setOnClickListener(v->selectTab(1));
+        protCard.addView(openPadBtn,new LinearLayout.LayoutParams(-2,-2));
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(hero,p,this);
+            PhoneUiKit.styleButton(scanBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            status.setTextColor(p.textPrimary);
+            liveLinkView.setTextColor(p.accentText);
+            PhoneUiKit.styleSubcard(mouseBox,p,this);
+            PhoneUiKit.styleSubcard(kbBox,p,this);
+            mLbl.setTextColor(p.textSecondary);
+            kLbl.setTextColor(p.textSecondary);
+            mouseMetric.setTextColor(p.textPrimary);
+            kbMetric.setTextColor(p.textPrimary);
+            PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleCard(envCard,p,this);
+            connectionSummary.setTextColor(p.textSecondary);
+            PhoneUiKit.styleCard(protCard,p,this);
+            protTitle.setTextColor(p.textPrimary);
+            protectionDesc.setTextColor(p.textSecondary);
+            PhoneUiKit.styleButton(openPadBtn,p,PhoneUiKit.BTN_TINT_INDIGO,this);
+            for(Runnable updater:dynamicDeviceThemeUpdaters)updater.run();
+        });
+    }
+
+    private void buildTrackpadTab(LinearLayout page,int initialSensitivityProgress){
+        LinearLayout padCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(padCard,cardParams(0));
+
+        LinearLayout padHeader=new LinearLayout(this);
+        padHeader.setOrientation(LinearLayout.HORIZONTAL);
+        padHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout padTitleCol=new LinearLayout(this);
+        padTitleCol.setOrientation(LinearLayout.VERTICAL);
+        trackpadTargetTitle=new TextView(this);
+        trackpadTargetTitle.setText("Touchpad Ready");
+        trackpadTargetTitle.setTextSize(14f);
+        trackpadTargetTitle.setTypeface(null,Typeface.BOLD);
+        padTitleCol.addView(trackpadTargetTitle);
+
+        trackpadReadout=new TextView(this);
+        trackpadReadout.setText("Drag to move • Tap to click • 2 fingers scroll");
+        trackpadReadout.setTextSize(11.5f);
+        trackpadReadout.setPadding(0,dp(2),0,0);
+        padTitleCol.addView(trackpadReadout);
+
+        LinearLayout.LayoutParams padColLp=new LinearLayout.LayoutParams(0,-2,1f);
+        padColLp.rightMargin=dp(8);
+        padHeader.addView(padTitleCol,padColLp);
+
+        captureMouseBtn=PhoneUiKit.createButton(this,"Capture Mouse",palette,PhoneUiKit.BTN_SUBTLE);
+        captureMouseBtn.setTextSize(11.5f);
+        captureMouseBtn.setPadding(dp(10),dp(7),dp(10),dp(7));
+        captureMouseBtn.setOnClickListener(v->{
+            pointerPad.requestFocus();
+            pointerPad.requestPointerCapture();
+            setFeedback("Physical mouse captured; use Back to release it.",true);
+        });
+        padHeader.addView(captureMouseBtn,new LinearLayout.LayoutParams(-2,-2));
+        padCard.addView(padHeader);
+
         pointerPad=new View(this){
-            final Paint paint=new Paint(3);
+            final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
+            final RectF bounds=new RectF();
             @Override protected void onDraw(Canvas c){
-                paint.setColor(Color.rgb(49,56,69));
-                c.drawRoundRect(0,0,getWidth(),getHeight(),dp(12),dp(12),paint);
-                paint.setColor(Color.rgb(200,208,220));
-                paint.setTextAlign(Paint.Align.CENTER);paint.setTextSize(dp(14));
-                c.drawText("Move to navigate • tap to click",getWidth()/2f,getHeight()/2f,paint);
-                c.drawText("Swipe across a group edge to switch PC",getWidth()/2f,
-                    getHeight()/2f+dp(22),paint);
+                PhoneUiKit.Palette p=palette;
+                float r=dp(14);
+                bounds.set(0,0,getWidth(),getHeight());
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(p.touchpadBg);
+                c.drawRoundRect(bounds,r,r,paint);
+
+                paint.setColor(p.touchpadGrid);
+                paint.setStrokeWidth(Math.max(1f,dp(1)));
+                int step=dp(24);
+                for(int gx=step;gx<getWidth();gx+=step)c.drawLine(gx,0,gx,getHeight(),paint);
+                for(int gy=step;gy<getHeight();gy+=step)c.drawLine(0,gy,getWidth(),gy,paint);
+
+                if(touchGlowActive){
+                    paint.setColor(p.accentSoftBg);
+                    c.drawCircle(touchGlowX,touchGlowY,dp(26),paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(Math.max(2f,dp(1)*1.5f));
+                    paint.setColor(p.accentText);
+                    c.drawCircle(touchGlowX,touchGlowY,dp(14),paint);
+                }
+
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(Math.max(1.5f,dp(1)));
+                paint.setColor(p.touchpadBorder);
+                c.drawRoundRect(0.5f,0.5f,getWidth()-0.5f,getHeight()-0.5f,r,r,paint);
+
+                paint.setStyle(Paint.Style.FILL);
+                paint.setTextAlign(Paint.Align.CENTER);
+                paint.setColor(p.touchpadText);
+                paint.setTextSize(dp(14));
+                c.drawText("Interactive Touchpad Surface",getWidth()/2f,getHeight()/2f-dp(4),paint);
+                paint.setColor(p.touchpadSubText);
+                paint.setTextSize(dp(11));
+                c.drawText("Move to navigate • tap to click • swipe edge to switch PC",
+                    getWidth()/2f,getHeight()/2f+dp(16),paint);
             }
             @Override public boolean onCapturedPointerEvent(MotionEvent e){
                 if(e.getActionMasked()==MotionEvent.ACTION_MOVE){
@@ -445,12 +603,18 @@ public final class MainActivity extends Activity {
                 return super.onCapturedPointerEvent(e);
             }
         };
-        pointerPad.setFocusable(true);pointerPad.setFocusableInTouchMode(true);
-        page.addView(pointerPad,new LinearLayout.LayoutParams(-1,dp(185)));
+        pointerPad.setFocusable(true);
+        pointerPad.setFocusableInTouchMode(true);
+        LinearLayout.LayoutParams padLp=new LinearLayout.LayoutParams(-1,dp(220));
+        padLp.topMargin=dp(10);
+        padCard.addView(pointerPad,padLp);
         pointerPad.setOnTouchListener((v,event)->{
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:
+                    if(v.getParent()!=null)v.getParent().requestDisallowInterceptTouchEvent(true);
                     prevX=downX=event.getX();prevY=downY=event.getY();
+                    touchGlowX=event.getX();touchGlowY=event.getY();touchGlowActive=true;
+                    v.invalidate();
                     dragged=false;twoFingerMoved=false;maxPointerCount=1;
                     twoFingerScrollCarry=0f;
                     v.requestFocus();return true;
@@ -462,6 +626,8 @@ public final class MainActivity extends Activity {
                     }
                     return true;
                 case MotionEvent.ACTION_MOVE:
+                    touchGlowX=event.getX();touchGlowY=event.getY();touchGlowActive=true;
+                    v.invalidate();
                     if(event.getPointerCount()>=2){
                         maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
                         float avgY=(event.getY(0)+event.getY(1))*0.5f;
@@ -486,23 +652,23 @@ public final class MainActivity extends Activity {
                     DeskTouchRuntime.session(MainActivity.this).moveBy(dx*pointerSpeed,dy*pointerSpeed);
                     prevX=event.getX();prevY=event.getY();return true;
                 case MotionEvent.ACTION_UP:
+                    if(v.getParent()!=null)v.getParent().requestDisallowInterceptTouchEvent(false);
+                    touchGlowActive=false;v.invalidate();
                     if(maxPointerCount>=2){
                         if(!twoFingerMoved)DeskTouchRuntime.session(MainActivity.this).click(2);
                     }else if(!dragged){
                         DeskTouchRuntime.session(MainActivity.this).click(1);
                     }
                     v.performClick();return true;
+                case MotionEvent.ACTION_CANCEL:
+                    if(v.getParent()!=null)v.getParent().requestDisallowInterceptTouchEvent(false);
+                    touchGlowActive=false;v.invalidate();
+                    return true;
                 default:return true;
             }
         });
-        addButton(page,"Capture connected physical mouse",()->{
-            pointerPad.requestFocus();pointerPad.requestPointerCapture();
-            status.setText("Physical mouse captured; use Back to release it.");
-        });
-        TextView keyboardLabel=new TextView(this);
-        keyboardLabel.setText("Type on the selected Windows screen using Android keyboard");
-        keyboardLabel.setTextColor(Color.WHITE);page.addView(keyboardLabel);
-        EditText keyboardInput=new EditText(this){
+
+        keyboardInput=new EditText(this){
             @Override public InputConnection onCreateInputConnection(EditorInfo outAttrs){
                 InputConnection base=super.onCreateInputConnection(outAttrs);
                 if(outAttrs!=null){
@@ -536,29 +702,67 @@ public final class MainActivity extends Activity {
                 };
             }
         };
-        keyboardInput.setHint("Tap to open the Android keyboard");
+        keyboardInput.setHint("Type on selected computer...");
         keyboardInput.setSingleLine(false);
+        keyboardInput.setTextSize(13f);
+        keyboardInput.setPadding(dp(12),dp(10),dp(12),dp(10));
+        keyboardInput.setMinHeight(dp(44));
         keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
             android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+
         LinearLayout mouseActions=new LinearLayout(this);
         mouseActions.setOrientation(LinearLayout.HORIZONTAL);
-        mouseActions.setPadding(0,dp(6),0,dp(10));
-        addCompactButton(mouseActions,"Left Click",
+        LinearLayout.LayoutParams maLp=new LinearLayout.LayoutParams(-1,-2);
+        maLp.topMargin=dp(10);
+        padCard.addView(mouseActions,maLp);
+
+        Button leftBtn=addPadActionButton(mouseActions,"Left",PhoneUiKit.BTN_SUBTLE,true,
             ()->DeskTouchRuntime.session(MainActivity.this).click(1));
-        addCompactButton(mouseActions,"Right Click",
+        Button rightBtn=addPadActionButton(mouseActions,"Right",PhoneUiKit.BTN_SUBTLE,false,
             ()->DeskTouchRuntime.session(MainActivity.this).click(2));
-        addCompactButton(mouseActions,"Scroll ↑",
+        Button upBtn=addPadActionButton(mouseActions,"↑",PhoneUiKit.BTN_SUBTLE,false,
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(120,false));
-        addCompactButton(mouseActions,"Scroll ↓",
+        Button downBtn=addPadActionButton(mouseActions,"↓",PhoneUiKit.BTN_SUBTLE,false,
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(-120,false));
-        addCompactButton(mouseActions,"Keyboard",()->{
+        Button keysBtn=addPadActionButton(mouseActions,"Keys",PhoneUiKit.BTN_TINT_ACCENT,false,()->{
             keyboardInput.requestFocus();
             InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
             if(imm!=null)imm.showSoftInput(keyboardInput,InputMethodManager.SHOW_IMPLICIT);
         });
-        page.addView(mouseActions);
-        page.addView(keyboardInput);
+
+        LinearLayout kbCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(kbCard,cardParams(10));
+
+        LinearLayout kbTop=new LinearLayout(this);
+        kbTop.setOrientation(LinearLayout.HORIZONTAL);
+        kbTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView kbTitle=new TextView(this);
+        kbTitle.setText("Remote Keyboard Box");
+        kbTitle.setTextSize(12.5f);
+        kbTitle.setTypeface(null,Typeface.BOLD);
+        kbTop.addView(kbTitle,new LinearLayout.LayoutParams(0,-2,1f));
+
         final String[] previousTyped={""};
+        TextView clearBtn=new TextView(this);
+        clearBtn.setText("Clear");
+        clearBtn.setTextSize(12f);
+        clearBtn.setTypeface(null,Typeface.BOLD);
+        clearBtn.setPadding(dp(8),dp(4),dp(4),dp(4));
+        clearBtn.setClickable(true);
+        clearBtn.setFocusable(true);
+        clearBtn.setOnClickListener(v->{
+            suppressTypedText=true;
+            keyboardInput.setText("");
+            previousTyped[0]="";
+            suppressTypedText=false;
+        });
+        kbTop.addView(clearBtn);
+        kbCard.addView(kbTop);
+
+        LinearLayout.LayoutParams inputLp=new LinearLayout.LayoutParams(-1,-2);
+        inputLp.topMargin=dp(8);
+        kbCard.addView(keyboardInput,inputLp);
+
         keyboardInput.addTextChangedListener(new TextWatcher(){
             public void beforeTextChanged(CharSequence text,int start,int count,int after){}
             public void onTextChanged(CharSequence text,int start,int before,int count){}
@@ -583,34 +787,792 @@ public final class MainActivity extends Activity {
                 }
             }
         });
-        addButton(page,"Clear mobile typing field",()->{
-            suppressTypedText=true;
-            keyboardInput.setText("");previousTyped[0]="";
-            suppressTypedText=false;
-        });
-        addButton(page,"Android keyboard settings",()->
-            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
-        addButton(page,"Open App Info & Xiaomi Battery settings",()->{
-            Intent appInfo=new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                android.net.Uri.fromParts("package",getPackageName(),null));
-            startActivity(appInfo);
-        });
-        TextView note=new TextView(this);
-        note.setText("Join one DeskTouch environment hub on your Wi-Fi to share " +
-            "keyboard and mouse with Windows without developer mode or cables. " +
-            "Xiaomi / Redmi setup tip: in App Info -> tap 3 dots at top-right -> " +
-            "Allow restricted settings, and set Battery to No restrictions so " +
-            "control and Wi-Fi auto-reconnect stay reliable. " +
-            "Use Pause for Banking anytime before opening bank or UPI apps.");
-        note.setTextColor(Color.LTGRAY);
-        note.setPadding(0,dp(14),0,0);
-        page.addView(note);
 
+        keyboardBindingsView=new TextView(this);
+        keyboardBindingsView.setTextSize(11.5f);
+        keyboardBindingsView.setPadding(0,dp(8),0,0);
+        kbCard.addView(keyboardBindingsView);
+
+        LinearLayout sensCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(sensCard,cardParams(10));
+
+        LinearLayout sensTop=new LinearLayout(this);
+        sensTop.setOrientation(LinearLayout.HORIZONTAL);
+        sensTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView sensTitle=new TextView(this);
+        sensTitle.setText("Pointer Sensitivity");
+        sensTitle.setTextSize(12.5f);
+        sensTitle.setTypeface(null,Typeface.BOLD);
+        sensTop.addView(sensTitle,new LinearLayout.LayoutParams(0,-2,1f));
+
+        sensReadout=new TextView(this);
+        sensReadout.setText(Math.round(pointerSpeed*100f/2.8f)+"%");
+        sensReadout.setTextSize(13f);
+        sensReadout.setTypeface(null,Typeface.BOLD);
+        sensTop.addView(sensReadout);
+        sensCard.addView(sensTop);
+
+        pointerSensitivity=new SeekBar(this);
+        pointerSensitivity.setMax(400);
+        pointerSensitivity.setProgress(initialSensitivityProgress);
+        pointerSensitivity.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
+            public void onProgressChanged(SeekBar b,int progress,boolean fromUser){
+                pointerSpeed=1f+progress/100f;
+                sensReadout.setText(Math.round(pointerSpeed*100f/2.8f)+"%");
+                if(fromUser){
+                    getSharedPreferences(PREFS,MODE_PRIVATE).edit()
+                        .putInt(PREF_POINTER_PROGRESS,progress).apply();
+                }
+            }
+            public void onStartTrackingTouch(SeekBar b){}
+            public void onStopTrackingTouch(SeekBar b){}
+        });
+        LinearLayout.LayoutParams seekLp=new LinearLayout.LayoutParams(-1,-2);
+        seekLp.topMargin=dp(8);
+        sensCard.addView(pointerSensitivity,seekLp);
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(padCard,p,this);
+            trackpadTargetTitle.setTextColor(p.textPrimary);
+            trackpadReadout.setTextColor(p.textSecondary);
+            PhoneUiKit.styleButton(captureMouseBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            pointerPad.invalidate();
+            PhoneUiKit.styleButton(leftBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(rightBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(upBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(downBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(keysBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
+            PhoneUiKit.styleCard(kbCard,p,this);
+            kbTitle.setTextColor(p.textPrimary);
+            clearBtn.setTextColor(p.accentText);
+            PhoneUiKit.styleSubcard(keyboardInput,p,this);
+            keyboardInput.setTextColor(p.textPrimary);
+            keyboardInput.setHintTextColor(p.textMuted);
+            keyboardBindingsView.setTextColor(p.textSecondary);
+            PhoneUiKit.styleCard(sensCard,p,this);
+            sensTitle.setTextColor(p.textPrimary);
+            sensReadout.setTextColor(p.accentText);
+            pointerSensitivity.setProgressTintList(ColorStateList.valueOf(p.accent));
+            pointerSensitivity.setProgressBackgroundTintList(ColorStateList.valueOf(p.switchTrackOff));
+            pointerSensitivity.setThumbTintList(ColorStateList.valueOf(p.accent));
+        });
     }
+
+    private void buildSpeedTab(LinearLayout page){
+        LinearLayout compRow=new LinearLayout(this);
+        compRow.setOrientation(LinearLayout.HORIZONTAL);
+        page.addView(compRow,new LinearLayout.LayoutParams(-1,-2));
+
+        LinearLayout wifiCard=PhoneUiKit.createCard(this,palette,12);
+        LinearLayout.LayoutParams wLp=new LinearLayout.LayoutParams(0,-2,1f);
+        wLp.rightMargin=dp(5);
+        compRow.addView(wifiCard,wLp);
+
+        LinearLayout wTop=new LinearLayout(this);
+        wTop.setOrientation(LinearLayout.HORIZONTAL);
+        wTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView wTitle=new TextView(this);
+        wTitle.setText("Wireless Link");
+        wTitle.setTextSize(12f);
+        wTitle.setTypeface(null,Typeface.BOLD);
+        wTop.addView(wTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        wifiLossBadge=new TextView(this);
+        wifiLossBadge.setText("Offline");
+        wifiLossBadge.setTextSize(10f);
+        wifiLossBadge.setTypeface(null,Typeface.BOLD);
+        wifiLossBadge.setPadding(dp(6),dp(2),dp(6),dp(2));
+        wTop.addView(wifiLossBadge);
+        wifiCard.addView(wTop);
+
+        speedWifiRtt=new TextView(this);
+        speedWifiRtt.setText("—");
+        speedWifiRtt.setTextSize(17f);
+        speedWifiRtt.setTypeface(null,Typeface.BOLD);
+        speedWifiRtt.setPadding(0,dp(5),0,dp(2));
+        wifiCard.addView(speedWifiRtt);
+
+        speedWifiSub=new TextView(this);
+        speedWifiSub.setText("Waiting for wireless");
+        speedWifiSub.setTextSize(11f);
+        speedWifiSub.setMaxLines(2);
+        wifiCard.addView(speedWifiSub);
+
+        LinearLayout mobCard=PhoneUiKit.createCard(this,palette,12);
+        LinearLayout.LayoutParams mLp=new LinearLayout.LayoutParams(0,-2,1f);
+        mLp.leftMargin=dp(5);
+        compRow.addView(mobCard,mLp);
+
+        LinearLayout mTop=new LinearLayout(this);
+        mTop.setOrientation(LinearLayout.HORIZONTAL);
+        mTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView mTitle=new TextView(this);
+        mTitle.setText("Mobile Network");
+        mTitle.setTextSize(12f);
+        mTitle.setTypeface(null,Typeface.BOLD);
+        mTop.addView(mTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        mobLossBadge=new TextView(this);
+        mobLossBadge.setText("Standby");
+        mobLossBadge.setTextSize(10f);
+        mobLossBadge.setTypeface(null,Typeface.BOLD);
+        mobLossBadge.setPadding(dp(6),dp(2),dp(6),dp(2));
+        mTop.addView(mobLossBadge);
+        mobCard.addView(mTop);
+
+        speedMobRtt=new TextView(this);
+        speedMobRtt.setText("—");
+        speedMobRtt.setTextSize(17f);
+        speedMobRtt.setTypeface(null,Typeface.BOLD);
+        speedMobRtt.setPadding(0,dp(5),0,dp(2));
+        mobCard.addView(speedMobRtt);
+
+        speedMobSub=new TextView(this);
+        speedMobSub.setText("Ready alongside Wi-Fi");
+        speedMobSub.setTextSize(11f);
+        speedMobSub.setMaxLines(2);
+        mobCard.addView(speedMobSub);
+
+        LinearLayout segCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(segCard,cardParams(10));
+
+        addSegHeader(segCard,"Mouse Channel","Switches only on 1%+ loss",false);
+        mouseModeSeg=new PhoneUiKit.SegmentedControl(this,palette,
+            new String[]{"Auto","Mobile","Wireless"},
+            PhoneUiKit.mouseModeToSegment(DeskTouchSession.readMouseMode(this)),
+            idx->{
+                DeskTouchSession.writeMouseMode(this,PhoneUiKit.segmentToMouseMode(idx));
+                DeskTouchRuntime.applyStreamOptions(this);
+                refreshStreamOptionControls();
+                refreshLiveLinkAndKeyboard();
+            });
+        segCard.addView(mouseModeSeg.getView(),segParams());
+
+        addSegHeader(segCard,"Keyboard Channel","Picks lowest ping 0%-loss",true);
+        keyboardModeSeg=new PhoneUiKit.SegmentedControl(this,palette,
+            new String[]{"Fastest","Wireless","Mobile"},
+            PhoneUiKit.keyboardModeToSegment(DeskTouchSession.readKeyboardMode(this)),
+            idx->{
+                DeskTouchSession.writeKeyboardMode(this,PhoneUiKit.segmentToKeyboardMode(idx));
+                DeskTouchRuntime.applyStreamOptions(this);
+                refreshStreamOptionControls();
+                refreshLiveLinkAndKeyboard();
+            });
+        segCard.addView(keyboardModeSeg.getView(),segParams());
+
+        addSegHeader(segCard,"Cursor Feel","Smart anti-jitter filter",true);
+        pointerFeelSeg=new PhoneUiKit.SegmentedControl(this,palette,
+            new String[]{"Auto","Raw 0ms","Smooth"},
+            PhoneUiKit.pointerFeelToSegment(DeskTouchSession.readPointerFeelMode(this)),
+            idx->{
+                DeskTouchSession.writePointerFeelMode(this,PhoneUiKit.segmentToPointerFeel(idx));
+                DeskTouchRuntime.applyStreamOptions(this);
+                refreshStreamOptionControls();
+            });
+        segCard.addView(pointerFeelSeg.getView(),segParams());
+
+        LinearLayout boostCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(boostCard,cardParams(10));
+
+        dualPathControlsSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Dual-path keys & clicks",
+            "Send over both paths at once; first packet wins",
+            DeskTouchSession.readDualPathControls(this),
+            checked->{
+                DeskTouchSession.writeDualPathControls(this,checked);
+                DeskTouchRuntime.applyStreamOptions(this);
+                refreshStreamOptionControls();
+                refreshLiveLinkAndKeyboard();
+            });
+        boostCard.addView(dualPathControlsSwitch.getView());
+
+        View boostDiv=PhoneUiKit.createDivider(this,palette);
+        boostCard.addView(boostDiv);
+
+        keepChannelsWarmSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Keep wireless radio awake",
+            "Tiny wake pulses stop typing lag between pauses",
+            DeskTouchSession.readKeepChannelsWarm(this),
+            checked->{
+                DeskTouchSession.writeKeepChannelsWarm(this,checked);
+                DeskTouchRuntime.applyStreamOptions(this);
+                refreshStreamOptionControls();
+            });
+        boostCard.addView(keepChannelsWarmSwitch.getView());
+
+        LinearLayout actionRow=new LinearLayout(this);
+        actionRow.setOrientation(LinearLayout.HORIZONTAL);
+        page.addView(actionRow,cardParams(10));
+
+        shortcutsBtn=PhoneUiKit.createButton(this,"Keyboard Shortcuts",palette,PhoneUiKit.BTN_SUBTLE);
+        shortcutsBtn.setOnClickListener(v->showKeyboardShortcutsDialog());
+        LinearLayout.LayoutParams sLp=new LinearLayout.LayoutParams(0,-2,1f);
+        sLp.rightMargin=dp(4);
+        actionRow.addView(shortcutsBtn,sLp);
+
+        resetPathsBtn=PhoneUiKit.createButton(this,"Reset Saved Paths",palette,PhoneUiKit.BTN_SUBTLE);
+        resetPathsBtn.setOnClickListener(v->{
+            DeskTouchRuntime.resetRememberedStreams(this);
+            refreshStreamOptionControls();
+            refreshLiveLinkAndKeyboard();
+            showToast("Cleared remembered network paths.");
+        });
+        LinearLayout.LayoutParams rLp=new LinearLayout.LayoutParams(0,-2,1f);
+        rLp.leftMargin=dp(4);
+        actionRow.addView(resetPathsBtn,rLp);
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(wifiCard,p,this);
+            PhoneUiKit.styleCard(mobCard,p,this);
+            wTitle.setTextColor(p.textPrimary);
+            mTitle.setTextColor(p.textPrimary);
+            speedWifiRtt.setTextColor(p.textPrimary);
+            speedMobRtt.setTextColor(p.textPrimary);
+            speedWifiSub.setTextColor(p.textSecondary);
+            speedMobSub.setTextColor(p.textSecondary);
+            PhoneUiKit.styleCard(segCard,p,this);
+            mouseModeSeg.applyPalette(p);
+            keyboardModeSeg.applyPalette(p);
+            pointerFeelSeg.applyPalette(p);
+            PhoneUiKit.styleCard(boostCard,p,this);
+            dualPathControlsSwitch.applyPalette(p);
+            boostDiv.setBackgroundColor(p.divider);
+            keepChannelsWarmSwitch.applyPalette(p);
+            PhoneUiKit.styleButton(shortcutsBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(resetPathsBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+        });
+    }
+
+    private void buildSetupTab(LinearLayout page){
+        LinearLayout safetyCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(safetyCard,cardParams(0));
+
+        LinearLayout safetyTop=new LinearLayout(this);
+        safetyTop.setOrientation(LinearLayout.HORIZONTAL);
+        safetyTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView safetyTitle=PhoneUiKit.createSectionLabel(this,"CONTROL & PAYMENT SAFETY",palette);
+        safetyTop.addView(safetyTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        safetyBadge=new TextView(this);
+        safetyBadge.setText("Ready");
+        safetyBadge.setTextSize(11f);
+        safetyBadge.setTypeface(null,Typeface.BOLD);
+        safetyBadge.setPadding(dp(8),dp(3),dp(8),dp(3));
+        safetyTop.addView(safetyBadge);
+        safetyCard.addView(safetyTop);
+
+        allowWindowsSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Allow Windows control",
+            "Approved computers can steer this screen",
+            DeskTouchAccessibilityService.allowed(this),
+            enabled->{
+                DeskTouchAccessibilityService.setAllowed(this,enabled);
+                DeskTouchRuntime.accessibilityPermissionChanged(this);
+                refreshPermissionState();
+                updateVisibleScreenAwake();
+                if(enabled && !DeskTouchAccessibilityService.ready(this)){
+                    setFeedback("Enable 'DeskTouch Windows control' in Android Accessibility settings.",true);
+                    DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
+                }else{
+                    setFeedback(enabled
+                        ? "Windows control enabled."
+                        : "Windows control disabled. Android touch has priority.",true);
+                }
+            });
+        LinearLayout.LayoutParams sw1Lp=new LinearLayout.LayoutParams(-1,-2);
+        sw1Lp.topMargin=dp(8);
+        safetyCard.addView(allowWindowsSwitch.getView(),sw1Lp);
+
+        View sd1=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd1);
+
+        allowShellBridgeSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Virtual Bridge (Accessibility-free)",
+            "Works automatically over cable or Wireless Debugging",
+            ShellInputClient.allowed(this),
+            enabled->{
+                ShellInputClient.setAllowed(this,enabled);
+                refreshPermissionState();
+                updateVisibleScreenAwake();
+                setFeedback(enabled
+                    ? (ShellInputClient.ready(this)
+                        ? "Accessibility-free Virtual Bridge enabled and ready."
+                        : "Virtual Bridge enabled. Plug in the data cable while DeskTouch is running on Windows to start it without Accessibility.")
+                    : "Virtual Bridge disabled in DeskTouch.",true);
+            });
+        safetyCard.addView(allowShellBridgeSwitch.getView());
+
+        View sd2=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd2);
+
+        autoPausePaymentsSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Auto-pause in UPI & bank apps",
+            "Turns off Accessibility during payments",
+            DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this),
+            checked->{
+                DeskTouchAccessibilityService.setAutoPausePaymentApps(this,checked);
+                setFeedback(checked
+                    ? "DeskTouch will automatically turn off Accessibility when you open UPI/payment or bank apps."
+                    : "Automatic payment-app pause turned off; use the notification, widget, or Quick Tile instead.",true);
+            });
+        safetyCard.addView(autoPausePaymentsSwitch.getView());
+
+        View sd3=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd3);
+
+        autoPauseDisconnectSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Auto-pause 15s after disconnect",
+            "Cleanly turns off Accessibility when idle",
+            DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this),
+            checked->{
+                DeskTouchAccessibilityService.setAutoPauseOnDisconnect(this,checked);
+                setFeedback(checked
+                    ? "Accessibility will automatically turn off 15 seconds after leaving your Windows PC."
+                    : "Accessibility will remain on after Windows disconnects until you turn it off.",true);
+            });
+        safetyCard.addView(autoPauseDisconnectSwitch.getView());
+
+        LinearLayout permBox=PhoneUiKit.createSubcard(this,palette,10);
+        LinearLayout.LayoutParams permBoxLp=new LinearLayout.LayoutParams(-1,-2);
+        permBoxLp.topMargin=dp(10);
+        safetyCard.addView(permBox,permBoxLp);
+
+        permissionState=new TextView(this);
+        permissionState.setTextSize(11.5f);
+        permissionState.setLineSpacing(dp(2),1f);
+        permBox.addView(permissionState);
+
+        LinearLayout safetyBtns1=new LinearLayout(this);
+        safetyBtns1.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams sb1Lp=new LinearLayout.LayoutParams(-1,-2);
+        sb1Lp.topMargin=dp(10);
+        safetyCard.addView(safetyBtns1,sb1Lp);
+
+        Button accBtn=PhoneUiKit.createButton(this,"Accessibility Settings",palette,PhoneUiKit.BTN_SUBTLE);
+        accBtn.setOnClickListener(v->DeskTouchAccessibilityService.openAccessibilitySettings(
+            this,!PermissionContinuity.systemAccessibilityEnabled(this)));
+        LinearLayout.LayoutParams accLp=new LinearLayout.LayoutParams(0,-2,1f);
+        accLp.rightMargin=dp(4);
+        safetyBtns1.addView(accBtn,accLp);
+
+        Button pinWidgetBtn=PhoneUiKit.createButton(this,"Pin Pay Widget",palette,PhoneUiKit.BTN_SUBTLE);
+        pinWidgetBtn.setOnClickListener(v->{
+            boolean requested=PaymentPauseWidgetProvider.requestPin(this);
+            setFeedback(requested
+                ? "Confirm adding the DeskTouch Pay Mode button on your home screen."
+                : "Long-press your Home screen -> Widgets -> add DeskTouch Pay Mode.",true);
+        });
+        LinearLayout.LayoutParams pinLp=new LinearLayout.LayoutParams(0,-2,1f);
+        pinLp.leftMargin=dp(4);
+        safetyBtns1.addView(pinWidgetBtn,pinLp);
+
+        Button stopCtrlBtn=PhoneUiKit.createButton(this,"Stop Windows Control",palette,PhoneUiKit.BTN_DANGER);
+        stopCtrlBtn.setOnClickListener(v->{
+            DeskTouchRuntime.remoteNativeTouch();
+            setFeedback("Windows input authority returned to Android.",true);
+        });
+        LinearLayout.LayoutParams stopLp=new LinearLayout.LayoutParams(-1,-2);
+        stopLp.topMargin=dp(8);
+        safetyCard.addView(stopCtrlBtn,stopLp);
+
+        LinearLayout kbXiaomiCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(kbXiaomiCard,cardParams(10));
+
+        LinearLayout kxTop=new LinearLayout(this);
+        kxTop.setOrientation(LinearLayout.HORIZONTAL);
+        kxTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView kxTitle=PhoneUiKit.createSectionLabel(this,"KEYBOARD & XIAOMI POWER",palette);
+        kxTop.addView(kxTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        TextView xiaomiTipBadge=new TextView(this);
+        xiaomiTipBadge.setText("Xiaomi Tip");
+        xiaomiTipBadge.setTextSize(11f);
+        xiaomiTipBadge.setTypeface(null,Typeface.BOLD);
+        xiaomiTipBadge.setPadding(dp(8),dp(3),dp(8),dp(3));
+        kxTop.addView(xiaomiTipBadge);
+        kbXiaomiCard.addView(kxTop);
+
+        TextView xiaomiNote=new TextView(this);
+        xiaomiNote.setText("Join one DeskTouch environment hub on your Wi-Fi without developer mode or cables. "
+            +"Xiaomi / Redmi setup tip: in App Info -> tap 3 dots at top-right -> Allow restricted settings, "
+            +"and set Battery to No restrictions so control and auto-reconnect stay instant.");
+        xiaomiNote.setTextSize(11.5f);
+        xiaomiNote.setLineSpacing(dp(2),1f);
+        xiaomiNote.setPadding(0,dp(8),0,dp(10));
+        kbXiaomiCard.addView(xiaomiNote);
+
+        LinearLayout kxRow1=new LinearLayout(this);
+        kxRow1.setOrientation(LinearLayout.HORIZONTAL);
+        kbXiaomiCard.addView(kxRow1,new LinearLayout.LayoutParams(-1,-2));
+
+        // A dedicated input method improves editor typing (including WebViews)
+        // without requiring root, developer mode or a Bluetooth pairing.
+        Button enableKbBtn=PhoneUiKit.createButton(this,"Enable Keyboard",palette,PhoneUiKit.BTN_SUBTLE);
+        enableKbBtn.setOnClickListener(v->startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
+        LinearLayout.LayoutParams ekLp=new LinearLayout.LayoutParams(0,-2,1f);
+        ekLp.rightMargin=dp(4);
+        kxRow1.addView(enableKbBtn,ekLp);
+
+        Button selectKbBtn=PhoneUiKit.createButton(this,"Select Keyboard",palette,PhoneUiKit.BTN_SUBTLE);
+        selectKbBtn.setOnClickListener(v->{
+            InputMethodManager manager=(InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);
+            if(manager!=null)manager.showInputMethodPicker();
+        });
+        LinearLayout.LayoutParams skLp=new LinearLayout.LayoutParams(0,-2,1f);
+        skLp.leftMargin=dp(4);
+        kxRow1.addView(selectKbBtn,skLp);
+
+        LinearLayout kxRow2=new LinearLayout(this);
+        kxRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams kx2Lp=new LinearLayout.LayoutParams(-1,-2);
+        kx2Lp.topMargin=dp(8);
+        kbXiaomiCard.addView(kxRow2,kx2Lp);
+
+        Button androidKbBtn=PhoneUiKit.createButton(this,"Android Keyboard Settings",palette,PhoneUiKit.BTN_SUBTLE);
+        androidKbBtn.setOnClickListener(v->startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
+        LinearLayout.LayoutParams akLp=new LinearLayout.LayoutParams(0,-2,1f);
+        akLp.rightMargin=dp(4);
+        kxRow2.addView(androidKbBtn,akLp);
+
+        Button xiaomiBatBtn=PhoneUiKit.createButton(this,"Open App Info & Xiaomi Battery",palette,PhoneUiKit.BTN_SUBTLE);
+        xiaomiBatBtn.setOnClickListener(v->startActivity(new Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            android.net.Uri.fromParts("package",getPackageName(),null))));
+        LinearLayout.LayoutParams xbLp=new LinearLayout.LayoutParams(0,-2,1f);
+        xbLp.leftMargin=dp(4);
+        kxRow2.addView(xiaomiBatBtn,xbLp);
+
+        LinearLayout trustCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(trustCard,cardParams(10));
+
+        TextView trustTitle=PhoneUiKit.createSectionLabel(this,"TRUST & UPDATES",palette);
+        trustCard.addView(trustTitle);
+
+        LinearLayout trustBox=PhoneUiKit.createSubcard(this,palette,10);
+        LinearLayout.LayoutParams tbLp=new LinearLayout.LayoutParams(-1,-2);
+        tbLp.topMargin=dp(8);
+        trustCard.addView(trustBox,tbLp);
+
+        trustSummary=new TextView(this);
+        trustSummary.setTextSize(12f);
+        trustBox.addView(trustSummary);
+
+        autoStartSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Auto-launch & reconnect",
+            "Rejoins your trusted computers on Android startup",
+            AutoConnectService.enabled(this),
+            checked->{
+                AutoConnectService.setEnabled(this,checked);
+                AutoConnectService.setReconnect(this,checked);
+                setFeedback(checked
+                    ? "Android startup enabled; trusted PCs reconnect automatically when reachable."
+                    : "Android startup and background reconnect disabled.",true);
+            });
+        LinearLayout.LayoutParams asLp=new LinearLayout.LayoutParams(-1,-2);
+        asLp.topMargin=dp(8);
+        trustCard.addView(autoStartSwitch.getView(),asLp);
+
+        Button trustPcBtn=PhoneUiKit.createButton(this,"Trust Connected PC",palette,PhoneUiKit.BTN_TINT_EMERALD);
+        trustPcBtn.setOnClickListener(v->{
+            DeskTouchSession current=DeskTouchRuntime.session(this);
+            session=current;
+            current.requestTrust();
+            setFeedback("Trust request sent to connected Windows PC.",true);
+        });
+        LinearLayout.LayoutParams tpLp=new LinearLayout.LayoutParams(-1,-2);
+        tpLp.topMargin=dp(10);
+        trustCard.addView(trustPcBtn,tpLp);
+
+        LinearLayout tuRow1=new LinearLayout(this);
+        tuRow1.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams tu1Lp=new LinearLayout.LayoutParams(-1,-2);
+        tu1Lp.topMargin=dp(8);
+        trustCard.addView(tuRow1,tu1Lp);
+
+        Button checkUpdBtn=PhoneUiKit.createButton(this,"Check Updates",palette,PhoneUiKit.BTN_SUBTLE);
+        checkUpdBtn.setOnClickListener(v->AndroidUpdater.checkForUpdates(this,true));
+        LinearLayout.LayoutParams cuLp=new LinearLayout.LayoutParams(0,-2,1f);
+        cuLp.rightMargin=dp(4);
+        tuRow1.addView(checkUpdBtn,cuLp);
+
+        Button installUpdBtn=PhoneUiKit.createButton(this,"Update App",palette,PhoneUiKit.BTN_TINT_ACCENT);
+        installUpdBtn.setOnClickListener(v->AndroidUpdater.installAvailableUpdate(this));
+        LinearLayout.LayoutParams iuLp=new LinearLayout.LayoutParams(0,-2,1f);
+        iuLp.leftMargin=dp(4);
+        tuRow1.addView(installUpdBtn,iuLp);
+
+        LinearLayout tuRow2=new LinearLayout(this);
+        tuRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams tu2Lp=new LinearLayout.LayoutParams(-1,-2);
+        tu2Lp.topMargin=dp(8);
+        trustCard.addView(tuRow2,tu2Lp);
+
+        Button leaveBtn=PhoneUiKit.createButton(this,"Leave Group",palette,PhoneUiKit.BTN_SUBTLE);
+        leaveBtn.setOnClickListener(v->{
+            DeskTouchSession current=DeskTouchRuntime.session(this);
+            session=current;
+            AutoConnectService.pausePeer(this,DeskTouchRuntime.selectedIdentity());
+            current.releaseControl();
+            current.disconnect();
+            refreshTrustSummary();
+            refreshEnvironmentMembers();
+            refreshLiveLinkAndKeyboard();
+            setFeedback("Selected device disconnected. Other peers stay connected; "
+                +"auto reconnect paused only for this device.",true);
+        });
+        LinearLayout.LayoutParams lgLp=new LinearLayout.LayoutParams(0,-2,1f);
+        lgLp.rightMargin=dp(4);
+        tuRow2.addView(leaveBtn,lgLp);
+
+        Button forgetBtn=PhoneUiKit.createButton(this,"Forget Trusted",palette,PhoneUiKit.BTN_DANGER);
+        forgetBtn.setOnClickListener(v->{
+            new TrustedWindows(this).clearAll();
+            refreshTrustSummary();
+            setFeedback("Cleared saved trusted computers on this phone.",true);
+        });
+        LinearLayout.LayoutParams fgLp=new LinearLayout.LayoutParams(0,-2,1f);
+        fgLp.leftMargin=dp(4);
+        tuRow2.addView(forgetBtn,fgLp);
+
+        LinearLayout appearCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(appearCard,cardParams(10));
+
+        TextView appearTitle=PhoneUiKit.createSectionLabel(this,"APPEARANCE",palette);
+        appearCard.addView(appearTitle);
+
+        TextView appearSub=new TextView(this);
+        appearSub.setText("Switch themes smoothly without dropping active connections");
+        appearSub.setTextSize(11.5f);
+        appearSub.setPadding(0,dp(4),0,dp(8));
+        appearCard.addView(appearSub);
+
+        themeSeg=new PhoneUiKit.SegmentedControl(this,palette,
+            new String[]{"Midnight Slate","AMOLED Black","Crisp Light"},
+            palette.themeId,
+            idx->{
+                PhoneUiKit.writeTheme(this,idx);
+                applyTheme(idx);
+            });
+        appearCard.addView(themeSeg.getView(),new LinearLayout.LayoutParams(-1,-2));
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(safetyCard,p,this);
+            safetyTitle.setTextColor(p.textSecondary);
+            allowWindowsSwitch.applyPalette(p);
+            sd1.setBackgroundColor(p.divider);
+            allowShellBridgeSwitch.applyPalette(p);
+            sd2.setBackgroundColor(p.divider);
+            autoPausePaymentsSwitch.applyPalette(p);
+            sd3.setBackgroundColor(p.divider);
+            autoPauseDisconnectSwitch.applyPalette(p);
+            PhoneUiKit.styleSubcard(permBox,p,this);
+            permissionState.setTextColor(p.amberText);
+            PhoneUiKit.styleButton(accBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(pinWidgetBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(stopCtrlBtn,p,PhoneUiKit.BTN_DANGER,this);
+
+            PhoneUiKit.styleCard(kbXiaomiCard,p,this);
+            kxTitle.setTextColor(p.textSecondary);
+            PhoneUiKit.stylePill(xiaomiTipBadge,p.amberSoftBg,Color.TRANSPARENT,p.amberText,this);
+            xiaomiNote.setTextColor(p.textSecondary);
+            PhoneUiKit.styleButton(enableKbBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(selectKbBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(androidKbBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(xiaomiBatBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+
+            PhoneUiKit.styleCard(trustCard,p,this);
+            trustTitle.setTextColor(p.textSecondary);
+            PhoneUiKit.styleSubcard(trustBox,p,this);
+            trustSummary.setTextColor(p.emeraldText);
+            autoStartSwitch.applyPalette(p);
+            PhoneUiKit.styleButton(trustPcBtn,p,PhoneUiKit.BTN_TINT_EMERALD,this);
+            PhoneUiKit.styleButton(checkUpdBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(installUpdBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
+            PhoneUiKit.styleButton(leaveBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(forgetBtn,p,PhoneUiKit.BTN_DANGER,this);
+
+            PhoneUiKit.styleCard(appearCard,p,this);
+            appearTitle.setTextColor(p.textSecondary);
+            appearSub.setTextColor(p.textSecondary);
+            themeSeg.applyPalette(p);
+        });
+    }
+
+    private void buildBottomNav(){
+        bottomNav=new LinearLayout(this);
+        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
+        bottomNav.setPadding(dp(8),dp(6),dp(8),dp(6));
+        String[] titles={"Home","Trackpad","Speed","Setup"};
+        int[] icons={PhoneUiKit.TAB_HOME,PhoneUiKit.TAB_TRACKPAD,PhoneUiKit.TAB_SPEED,PhoneUiKit.TAB_SETUP};
+        for(int i=0;i<TAB_COUNT;i++){
+            final int tabIdx=i;
+            LinearLayout item=new LinearLayout(this);
+            item.setOrientation(LinearLayout.VERTICAL);
+            item.setGravity(Gravity.CENTER);
+            item.setPadding(dp(4),dp(6),dp(4),dp(6));
+            item.setClickable(true);
+            item.setFocusable(true);
+            item.setOnClickListener(v->selectTab(tabIdx));
+
+            PhoneUiKit.TabIconView icon=new PhoneUiKit.TabIconView(this,icons[i]);
+            item.addView(icon,new LinearLayout.LayoutParams(dp(20),dp(20)));
+
+            TextView label=new TextView(this);
+            label.setText(titles[i]);
+            label.setTextSize(11f);
+            label.setGravity(Gravity.CENTER);
+            label.setPadding(0,dp(3),0,0);
+            item.addView(label);
+
+            tabButtons[i]=item;
+            tabIcons[i]=icon;
+            tabLabels[i]=label;
+            bottomNav.addView(item,new LinearLayout.LayoutParams(0,-2,1f));
+        }
+
+        onTheme(p->{
+            bottomNav.setBackgroundColor(p.chromeBg);
+            refreshTabBarStyles();
+        });
+    }
+
+    private void applyWindowInsets(){
+        rootLayout.setOnApplyWindowInsetsListener((v,windowInsets)->{
+            WindowInsetsCompat compat=WindowInsetsCompat.toWindowInsetsCompat(windowInsets,v);
+            Insets bars=compat.getInsets(WindowInsetsCompat.Type.systemBars()|WindowInsetsCompat.Type.displayCutout());
+            Insets ime=compat.getInsets(WindowInsetsCompat.Type.ime());
+            boolean imeVisible=ime.bottom>bars.bottom;
+            rootLayout.setPadding(bars.left,0,bars.right,imeVisible ? ime.bottom : 0);
+            appHeader.setPadding(dp(16),bars.top+dp(10),dp(16),dp(10));
+            bottomNav.setPadding(dp(8),dp(6),dp(8),(imeVisible ? 0 : bars.bottom)+dp(6));
+            return windowInsets;
+        });
+        rootLayout.requestApplyInsets();
+    }
+
+    private void selectTab(int index){
+        if(index<0 || index>=TAB_COUNT)return;
+        activeTab=index;
+        for(int i=0;i<TAB_COUNT;i++){
+            if(tabScrolls[i]!=null){
+                tabScrolls[i].setVisibility(i==index ? View.VISIBLE : View.GONE);
+            }
+        }
+        refreshTabBarStyles();
+    }
+
+    private void refreshTabBarStyles(){
+        PhoneUiKit.Palette p=palette;
+        for(int i=0;i<TAB_COUNT;i++){
+            if(tabButtons[i]==null)continue;
+            boolean active=i==activeTab;
+            tabButtons[i].setBackground(active
+                ? PhoneUiKit.roundedBox(p.accentSoftBg,Color.TRANSPARENT,dp(12),0)
+                : PhoneUiKit.interactiveBg(Color.TRANSPARENT,p.subtleBtnBg,Color.TRANSPARENT,dp(12),0,p.rippleColor));
+            tabIcons[i].setColor(active ? p.accentText : p.textSecondary);
+            tabLabels[i].setTextColor(active ? p.accentText : p.textSecondary);
+            tabLabels[i].setTypeface(null,active ? Typeface.BOLD : Typeface.NORMAL);
+        }
+    }
+
+    private void applyTheme(int themeId){
+        palette=PhoneUiKit.palette(themeId);
+        rootLayout.setBackgroundColor(palette.chromeBg);
+        tabFrame.setBackgroundColor(palette.canvasBg);
+        headerDivider.setBackgroundColor(palette.chromeBorder);
+        navDivider.setBackgroundColor(palette.chromeBorder);
+
+        Window window=getWindow();
+        if(window!=null){
+            window.setStatusBarColor(palette.chromeBg);
+            window.setNavigationBarColor(palette.chromeBg);
+            WindowInsetsControllerCompat controller=WindowCompat.getInsetsController(window,rootLayout);
+            if(controller!=null){
+                controller.setAppearanceLightStatusBars(palette.lightBars);
+                controller.setAppearanceLightNavigationBars(palette.lightBars);
+            }
+        }
+
+        for(Consumer<PhoneUiKit.Palette> updater:themeUpdaters){
+            updater.accept(palette);
+        }
+        refreshEnvironmentMembers();
+        refreshPermissionState();
+        refreshLiveLinkAndKeyboard();
+    }
+
+    private void onTheme(Consumer<PhoneUiKit.Palette> updater){
+        themeUpdaters.add(updater);
+    }
+
+    private void addSegHeader(LinearLayout parent,String title,String hint,boolean topSpace){
+        LinearLayout row=new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);
+        lp.topMargin=topSpace ? dp(12) : 0;
+        lp.bottomMargin=dp(6);
+        parent.addView(row,lp);
+
+        TextView titleView=new TextView(this);
+        titleView.setText(title);
+        titleView.setTextSize(12.5f);
+        titleView.setTypeface(null,Typeface.BOLD);
+        row.addView(titleView,new LinearLayout.LayoutParams(0,-2,1f));
+
+        TextView hintView=new TextView(this);
+        hintView.setText(hint);
+        hintView.setTextSize(11f);
+        row.addView(hintView);
+
+        onTheme(p->{
+            titleView.setTextColor(p.textPrimary);
+            hintView.setTextColor(p.textSecondary);
+        });
+    }
+
+    private Button addPadActionButton(LinearLayout parent,String label,int style,boolean first,Runnable action){
+        Button b=PhoneUiKit.createButton(this,label,palette,style);
+        b.setTextSize(12f);
+        b.setPadding(dp(4),dp(10),dp(4),dp(10));
+        b.setOnClickListener(v->action.run());
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-2,1f);
+        lp.setMargins(first ? 0 : dp(3),0,dp(3),0);
+        parent.addView(b,lp);
+        return b;
+    }
+
+    private LinearLayout.LayoutParams cardParams(int topDp){
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);
+        lp.topMargin=dp(topDp);
+        return lp;
+    }
+
+    private LinearLayout.LayoutParams segParams(){
+        return new LinearLayout.LayoutParams(-1,-2);
+    }
+
+    private String readVersionName(){
+        try{
+            String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.70";
+        }catch(Exception ignored){
+            return "0.3.70";
+        }
+    }
+
+    private void setFeedback(String msg,boolean toast){
+        if(status!=null)status.setText(msg);
+        if(toast)showToast(msg);
+    }
+
+    private void showToast(String msg){
+        if(activeToast!=null)activeToast.cancel();
+        activeToast=Toast.makeText(this,msg,Toast.LENGTH_SHORT);
+        activeToast.show();
+    }
+
     @Override public void onConfigurationChanged(android.content.res.Configuration config){
         super.onConfigurationChanged(config);
         DeskTouchRuntime.publishPhoneGeometry();
     }
+
     private void updateVisibleScreenAwake(){
         // A connected, explicitly enabled phone must not fall asleep while
         // this setup/control screen is visible. Android owns this Activity
@@ -620,6 +1582,7 @@ public final class MainActivity extends Activity {
         if(keep)getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
+
     @Override protected void onResume(){
         super.onResume();
         updateVisibleScreenAwake();
@@ -628,78 +1591,97 @@ public final class MainActivity extends Activity {
         refreshStreamOptionControls();
         refreshLiveLinkAndKeyboard();
         startLiveUiTicker();
-        if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
+        if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
     }
+
     private void refreshStreamOptionControls(){
-        if(mouseModeBtn!=null){
-            int m=DeskTouchSession.readMouseMode(this);
-            String label=m==DeskTouchSession.STREAM_MODE_FORCE_MOBILE ? "Mobile"
-                : (m==DeskTouchSession.STREAM_MODE_FORCE_WIFI ? "Wireless" : "Auto");
-            mouseModeBtn.setText("Mouse: "+label);
+        if(mouseModeSeg!=null){
+            mouseModeSeg.setSelectedIndex(PhoneUiKit.mouseModeToSegment(DeskTouchSession.readMouseMode(this)));
         }
-        if(keyboardModeBtn!=null){
-            int k=DeskTouchSession.readKeyboardMode(this);
-            String label=k==DeskTouchSession.STREAM_MODE_FORCE_WIFI ? "Wireless"
-                : (k==DeskTouchSession.STREAM_MODE_FORCE_MOBILE ? "Mobile" : "Fastest");
-            keyboardModeBtn.setText("Keys: "+label);
+        if(keyboardModeSeg!=null){
+            keyboardModeSeg.setSelectedIndex(PhoneUiKit.keyboardModeToSegment(DeskTouchSession.readKeyboardMode(this)));
         }
-        if(pointerFeelBtn!=null){
-            int f=DeskTouchSession.readPointerFeelMode(this);
-            String label=f==PointerSmoother.FEEL_RAW_DIRECT ? "Raw 0ms"
-                : (f==PointerSmoother.FEEL_SMOOTH ? "Smooth" : "Auto");
-            pointerFeelBtn.setText("Feel: "+label);
+        if(pointerFeelSeg!=null){
+            pointerFeelSeg.setSelectedIndex(PhoneUiKit.pointerFeelToSegment(DeskTouchSession.readPointerFeelMode(this)));
         }
-        if(dualPathControlsCheck!=null){
-            dualPathControlsCheck.setChecked(DeskTouchSession.readDualPathControls(this));
+        if(dualPathControlsSwitch!=null){
+            dualPathControlsSwitch.setChecked(DeskTouchSession.readDualPathControls(this));
         }
-        if(keepChannelsWarmCheck!=null){
-            keepChannelsWarmCheck.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
+        if(keepChannelsWarmSwitch!=null){
+            keepChannelsWarmSwitch.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
         }
     }
+
     @Override protected void onPause(){
         stopLiveUiTicker();
         super.onPause();
     }
+
     private void startLiveUiTicker(){
         if(liveUiRunning)return;
         liveUiRunning=true;
         liveUiHandler.removeCallbacks(liveUiTick);
         liveUiHandler.postDelayed(liveUiTick,750L);
     }
+
     private void stopLiveUiTicker(){
         liveUiRunning=false;
         liveUiHandler.removeCallbacks(liveUiTick);
     }
+
     private void registerKeyboardDeviceListener(){
         inputManager=(android.hardware.input.InputManager)getSystemService(Context.INPUT_SERVICE);
         if(inputManager==null)return;
         inputDeviceListener=new android.hardware.input.InputManager.InputDeviceListener(){
             @Override public void onInputDeviceAdded(int deviceId){
                 DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
-                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+                runOnUiThread(()->{
+                    if(!isFinishing()&&!isDestroyed())refreshLiveLinkAndKeyboard();
+                });
             }
             @Override public void onInputDeviceRemoved(int deviceId){
                 DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
-                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+                runOnUiThread(()->{
+                    if(!isFinishing()&&!isDestroyed())refreshLiveLinkAndKeyboard();
+                });
             }
             @Override public void onInputDeviceChanged(int deviceId){
                 DeskTouchRuntime.refreshKeyboardBindings(MainActivity.this);
-                runOnUiThread(()->refreshLiveLinkAndKeyboard());
+                runOnUiThread(()->{
+                    if(!isFinishing()&&!isDestroyed())refreshLiveLinkAndKeyboard();
+                });
             }
         };
         inputManager.registerInputDeviceListener(inputDeviceListener,liveUiHandler);
     }
+
     private void refreshLiveLinkAndKeyboard(){
         DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
+        String targetName=resolveTargetName(active,targets,snap);
+
         if(connectionSummary!=null){
-            connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
+            connectionSummary.setText(targets.isEmpty()
+                ? "Linked Devices ("+DeskTouchRuntime.connectedCount()+" / 8)"
+                : "Linked Devices ("+targets.size()+" / 8)");
         }
+        if(headerSub!=null){
+            if(snap!=null && snap.connected){
+                int online=targets.isEmpty() ? Math.max(1,DeskTouchRuntime.connectedCount()) : targets.size();
+                headerSub.setText(targetName+" • "+online+" online");
+            }else{
+                headerSub.setText("Not connected • Ready to scan");
+            }
+        }
+        WifiLinkMonitor.LinkSnapshot local=(snap==null || !snap.connected)
+            ? WifiLinkMonitor.inspect(this,false,0) : null;
         if(liveLinkView!=null){
-            WifiLinkMonitor.LinkSnapshot local=(snap==null || !snap.connected)
-                ? WifiLinkMonitor.inspect(this,false,0) : null;
-            liveLinkView.setText(formatLiveLinkText(snap, local!=null ? local.describePlainLabel() : ""));
+            liveLinkView.setText(formatLiveLinkText(snap,local!=null ? local.describePlainLabel() : ""));
         }
+        refreshTelemetryCards(snap,local);
+        refreshControlButtons(active,snap,targetName);
         if(keyboardBindingsView!=null && snap!=null && snap.keyboardReport!=null){
             KeyboardBindingInspector.KeyboardReport kb=snap.keyboardReport;
             String pcTag=(kb.pcLayoutName!=null && !kb.pcLayoutName.isEmpty())
@@ -712,6 +1694,176 @@ public final class MainActivity extends Activity {
         }
         refreshTrustSummary();
     }
+
+    private String resolveTargetName(DeskTouchSession active,
+            List<DeskTouchSession.EnvironmentTarget> targets,
+            DeskTouchSession.LiveStatusSnapshot snap){
+        int selId=active!=null ? active.selectedEnvironmentTarget() : -1;
+        if(targets!=null){
+            for(DeskTouchSession.EnvironmentTarget t:targets){
+                if(t.id==selId && t.name!=null && !t.name.isEmpty())return t.name;
+            }
+        }
+        if(snap!=null && !snap.peerName.isEmpty())return snap.peerName;
+        return "Windows PC";
+    }
+
+    private void refreshControlButtons(DeskTouchSession active,
+            DeskTouchSession.LiveStatusSnapshot snap,String targetName){
+        PhoneUiKit.Palette p=palette;
+        boolean connected=snap!=null && snap.connected;
+        boolean controlling=active!=null && active.hasClaim();
+        if(takeControlBtn!=null){
+            if(controlling){
+                takeControlBtn.setText("Controlling "+targetName+" ●");
+                PhoneUiKit.styleButton(takeControlBtn,p,PhoneUiKit.BTN_ACTIVE_GREEN,this);
+            }else{
+                takeControlBtn.setText("Control PC Screen");
+                PhoneUiKit.styleButton(takeControlBtn,p,PhoneUiKit.BTN_PRIMARY,this);
+            }
+        }
+        if(trackpadTargetTitle!=null){
+            trackpadTargetTitle.setText(connected
+                ? (controlling ? "Controlling "+targetName : "Target: "+targetName)
+                : "Touchpad (Not Connected)");
+        }
+    }
+
+    private void refreshTelemetryCards(DeskTouchSession.LiveStatusSnapshot snap,
+            WifiLinkMonitor.LinkSnapshot local){
+        PhoneUiKit.Palette p=palette;
+        if(snap==null || !snap.connected){
+            setBadgeState(p.neutralBadgeBg,p.textSecondary,"Offline");
+            if(mouseTag!=null){mouseTag.setText("Offline");mouseTag.setTextColor(p.textMuted);}
+            if(mouseMetric!=null)mouseMetric.setText("Tap Find Devices");
+            if(kbTag!=null){kbTag.setText("Offline");kbTag.setTextColor(p.textMuted);}
+            if(kbMetric!=null)kbMetric.setText("Auto-reconnect ready");
+            if(speedWifiRtt!=null)speedWifiRtt.setText("—");
+            if(speedWifiSub!=null)speedWifiSub.setText(local!=null ? local.describePlainLabel() : "Waiting for link");
+            if(wifiLossBadge!=null){
+                wifiLossBadge.setText("Offline");
+                PhoneUiKit.stylePill(wifiLossBadge,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            }
+            if(speedMobRtt!=null)speedMobRtt.setText("—");
+            if(speedMobSub!=null)speedMobSub.setText("Ready alongside Wi-Fi");
+            if(mobLossBadge!=null){
+                mobLossBadge.setText("Standby");
+                PhoneUiKit.stylePill(mobLossBadge,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            }
+            return;
+        }
+
+        if(snap.cable){
+            setBadgeState(p.emeraldSoftBg,p.emeraldText,"Data Cable Active");
+            if(mouseTag!=null){mouseTag.setText("Cable");mouseTag.setTextColor(p.emeraldText);}
+            if(mouseMetric!=null)mouseMetric.setText("< 1 ms • 0% loss");
+            if(kbTag!=null){kbTag.setText("Cable");kbTag.setTextColor(p.emeraldText);}
+            if(kbMetric!=null)kbMetric.setText("< 1 ms • Instant");
+            if(speedWifiRtt!=null)speedWifiRtt.setText("Cable");
+            if(speedWifiSub!=null)speedWifiSub.setText("USB direct link");
+            if(wifiLossBadge!=null){
+                wifiLossBadge.setText("0% loss");
+                PhoneUiKit.stylePill(wifiLossBadge,p.emeraldSoftBg,Color.TRANSPARENT,p.emeraldText,this);
+            }
+            if(speedMobRtt!=null)speedMobRtt.setText("Standby");
+            if(speedMobSub!=null)speedMobSub.setText("Cable has priority");
+            if(mobLossBadge!=null){
+                mobLossBadge.setText("Idle");
+                PhoneUiKit.stylePill(mobLossBadge,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            }
+            return;
+        }
+
+        boolean dualActive=snap.mobConfirmed && (snap.preferMobileMouse || snap.preferMobileKeyboard);
+        if(dualActive){
+            setBadgeState(p.emeraldSoftBg,p.emeraldText,"Dual-Path Connected");
+        }else if(WifiLinkMonitor.BAND_CELLULAR.equals(snap.band)){
+            setBadgeState(p.emeraldSoftBg,p.emeraldText,"Mobile Connected");
+        }else{
+            setBadgeState(p.accentSoftBg,p.accentText,"Wireless Active");
+        }
+
+        double wifiMs=snap.wifiRttMs>0.0 ? snap.wifiRttMs : snap.rttMs;
+        double mobMs=snap.mobRttMs;
+        boolean mMob=snap.preferMobileMouse && snap.mobConfirmed;
+        boolean kMob=snap.preferMobileKeyboard && snap.mobConfirmed;
+
+        if(mouseTag!=null){
+            mouseTag.setText(mMob ? "Mobile" : "Wireless");
+            mouseTag.setTextColor(mMob ? p.emeraldText : p.accentText);
+        }
+        if(mouseMetric!=null){
+            double mRtt=mMob ? mobMs : wifiMs;
+            double mLoss=mMob ? snap.mobLossPermille : snap.wifiLossPermille;
+            mouseMetric.setText((mRtt>0.0 ? formatMs(mRtt) : "Measuring...")+" • "+formatLossPct(mLoss));
+        }
+
+        if(kbTag!=null){
+            kbTag.setText(kMob ? "Mobile" : "Wireless");
+            kbTag.setTextColor(kMob ? p.emeraldText : p.accentText);
+        }
+        if(kbMetric!=null){
+            double kRtt=kMob ? mobMs : wifiMs;
+            kbMetric.setText((kRtt>0.0 ? formatMs(kRtt) : "Measuring...")
+                +(snap.dualPathControls ? " • Dual-path" : " • Single"));
+        }
+
+        if(speedWifiRtt!=null)speedWifiRtt.setText(wifiMs>0.0 ? formatMs(wifiMs) : "Measuring...");
+        if(speedWifiSub!=null){
+            String bandText=formatBandPlain(snap.band,snap.speedMbps);
+            String jitterText=snap.jitterMs>=0.2
+                ? String.format(Locale.US," • jitter %.1f ms",snap.jitterMs) : "";
+            speedWifiSub.setText(bandText+jitterText);
+        }
+        if(wifiLossBadge!=null){
+            boolean clean=snap.wifiLossPermille<10.0;
+            wifiLossBadge.setText(formatLossPct(snap.wifiLossPermille));
+            PhoneUiKit.stylePill(wifiLossBadge,
+                clean ? p.emeraldSoftBg : p.amberSoftBg,
+                Color.TRANSPARENT,
+                clean ? p.emeraldText : p.amberText,this);
+        }
+
+        if(snap.mobConfirmed){
+            if(speedMobRtt!=null)speedMobRtt.setText(mobMs>0.0 ? formatMs(mobMs) : "Active");
+            if(speedMobSub!=null)speedMobSub.setText("Ready alongside Wi-Fi");
+            if(mobLossBadge!=null){
+                boolean clean=snap.mobLossPermille<10.0;
+                mobLossBadge.setText(formatLossPct(snap.mobLossPermille));
+                PhoneUiKit.stylePill(mobLossBadge,
+                    clean ? p.emeraldSoftBg : p.amberSoftBg,
+                    Color.TRANSPARENT,
+                    clean ? p.emeraldText : p.amberText,this);
+            }
+        }else{
+            if(speedMobRtt!=null)speedMobRtt.setText("Standby");
+            if(speedMobSub!=null)speedMobSub.setText("Engages automatically if needed");
+            if(mobLossBadge!=null){
+                mobLossBadge.setText("Ready");
+                PhoneUiKit.stylePill(mobLossBadge,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            }
+        }
+    }
+
+    private void setBadgeState(int bg,int fg,String text){
+        if(liveBadge==null)return;
+        liveBadge.setBackground(PhoneUiKit.roundedBox(bg,Color.TRANSPARENT,dp(999),0));
+        if(liveDot!=null)liveDot.setBackground(PhoneUiKit.roundedBox(fg,Color.TRANSPARENT,dp(999),0));
+        if(liveBadgeText!=null){
+            liveBadgeText.setText(text);
+            liveBadgeText.setTextColor(fg);
+        }
+    }
+
+    private static String formatMs(double ms){
+        return String.format(Locale.US,"%.1f ms",ms);
+    }
+
+    private static String formatLossPct(double lossPermille){
+        if(lossPermille<1.0)return "0% loss";
+        return String.format(Locale.US,"%.1f%% loss",lossPermille/10.0);
+    }
+
     static String formatLiveLinkText(DeskTouchSession.LiveStatusSnapshot snap, String offlineNetworkLabel){
         if(snap==null){
             return "Live link: waiting for connection";
@@ -746,6 +1898,7 @@ public final class MainActivity extends Activity {
         }
         return base;
     }
+
     private static String formatBandPlain(String band, int speedMbps){
         String base;
         if(WifiLinkMonitor.BAND_24_GHZ.equals(band)) base="2.4 GHz wireless";
@@ -756,6 +1909,7 @@ public final class MainActivity extends Activity {
         else base="Wireless";
         return speedMbps>0 ? base+" ("+speedMbps+" Mbps)" : base;
     }
+
     private void showKeyboardShortcutsDialog(){
         DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
         KeyboardBindingInspector.KeyboardReport kb=snap!=null ? snap.keyboardReport : null;
@@ -769,6 +1923,7 @@ public final class MainActivity extends Activity {
             .setPositiveButton("Close",null)
             .show();
     }
+
     private void refreshTrustSummary(){
         if(trustSummary==null)return;
         int count=new TrustedWindows(this).fingerprints().size();
@@ -783,8 +1938,21 @@ public final class MainActivity extends Activity {
                 ?" • Current computer is trusted"
                 :" • Current computer not trusted yet";
         trustSummary.setText(base);
-        if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
+        if(trustBadgeBtn!=null){
+            if(connectedFp==null){
+                trustBadgeBtn.setText("Unpaired");
+                PhoneUiKit.styleButton(trustBadgeBtn,palette,PhoneUiKit.BTN_SUBTLE,this);
+            }else if(currentTrusted){
+                trustBadgeBtn.setText("Trusted ✓");
+                PhoneUiKit.styleButton(trustBadgeBtn,palette,PhoneUiKit.BTN_TINT_EMERALD,this);
+            }else{
+                trustBadgeBtn.setText("Trust PC");
+                PhoneUiKit.styleButton(trustBadgeBtn,palette,PhoneUiKit.BTN_TINT_AMBER,this);
+            }
+        }
+        if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
     }
+
     private static void sendRemoteTextWithNewlines(DeskTouchSession target,String added){
         int start=0;
         for(int i=0;i<added.length();i++){
@@ -796,24 +1964,58 @@ public final class MainActivity extends Activity {
         }
         if(start<added.length())target.text(added.substring(start));
     }
+
     private void refreshPermissionState(){
         boolean sysEnabled=PermissionContinuity.systemAccessibilityEnabled(this);
-        if(allowWindowsCheck!=null)
-            allowWindowsCheck.setChecked(DeskTouchAccessibilityService.allowed(this));
-        if(allowShellBridgeCheck!=null)
-            allowShellBridgeCheck.setChecked(ShellInputClient.allowed(this));
-        if(autoPausePaymentsCheck!=null)
-            autoPausePaymentsCheck.setChecked(
-                DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this));
-        if(autoPauseDisconnectCheck!=null)
-            autoPauseDisconnectCheck.setChecked(
-                DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this));
-        if(pauseBankingButton!=null)
-            pauseBankingButton.setText(sysEnabled
-                ? "Turn Off Accessibility for Payment Apps (1 tap)"
-                : "Resume Accessibility Control (after payments)");
-        if(permissionState==null)return;
         boolean shellReady=ShellInputClient.ready(this);
+        if(allowWindowsSwitch!=null)
+            allowWindowsSwitch.setChecked(DeskTouchAccessibilityService.allowed(this));
+        if(allowShellBridgeSwitch!=null)
+            allowShellBridgeSwitch.setChecked(ShellInputClient.allowed(this));
+        if(autoPausePaymentsSwitch!=null)
+            autoPausePaymentsSwitch.setChecked(
+                DeskTouchAccessibilityService.autoPausePaymentAppsEnabled(this));
+        if(autoPauseDisconnectSwitch!=null)
+            autoPauseDisconnectSwitch.setChecked(
+                DeskTouchAccessibilityService.autoPauseOnDisconnectEnabled(this));
+
+        if(pauseBankingButton!=null){
+            pauseBankingButton.setText(sysEnabled ? "Pay Mode" : "Pay Safe: ON");
+            PhoneUiKit.styleButton(pauseBankingButton,palette,
+                sysEnabled ? PhoneUiKit.BTN_TINT_EMERALD : PhoneUiKit.BTN_TINT_AMBER,this);
+        }
+
+        if(safetyBadge!=null){
+            if(shellReady){
+                safetyBadge.setText("Bridge Active");
+                PhoneUiKit.stylePill(safetyBadge,palette.emeraldSoftBg,Color.TRANSPARENT,palette.emeraldText,this);
+            }else if(sysEnabled){
+                safetyBadge.setText("Ready");
+                PhoneUiKit.stylePill(safetyBadge,palette.emeraldSoftBg,Color.TRANSPARENT,palette.emeraldText,this);
+            }else if(DeskTouchAccessibilityService.isPausedForBanking(this)){
+                safetyBadge.setText("Pay Safe");
+                PhoneUiKit.stylePill(safetyBadge,palette.amberSoftBg,Color.TRANSPARENT,palette.amberText,this);
+            }else{
+                safetyBadge.setText("Off");
+                PhoneUiKit.stylePill(safetyBadge,palette.neutralBadgeBg,Color.TRANSPARENT,palette.neutralBadgeText,this);
+            }
+        }
+
+        if(protectionDesc!=null){
+            if(shellReady){
+                protectionDesc.setText("Virtual Bridge Active (Accessibility Not Needed)");
+            }else if(!sysEnabled){
+                protectionDesc.setText(DeskTouchAccessibilityService.isPausedForBanking(this)
+                    ? "Accessibility Paused for Payment Apps"
+                    : "Accessibility Off • Tap Pay Safe or Setup to enable");
+            }else{
+                protectionDesc.setText(ShellInputClient.allowed(this)
+                    ? "Accessibility Active • Virtual Bridge Ready"
+                    : "Accessibility Active");
+            }
+        }
+
+        if(permissionState==null)return;
         String bridgeLine=shellReady
             ? "active (works with Accessibility OFF)"
             : (ShellInputClient.allowed(this)
@@ -826,68 +2028,122 @@ public final class MainActivity extends Activity {
                 ? "selected for focused-field typing."
                 : "not selected (optional when Accessibility is used)."));
     }
+
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
-    private void addCompactButton(LinearLayout parent,String label,Runnable action){
-        Button b=new Button(this);
-        b.setText(label);b.setAllCaps(false);b.setTextSize(12f);
-        b.setMinWidth(0);b.setMinimumWidth(0);
-        b.setPadding(dp(4),dp(6),dp(4),dp(6));
-        b.setOnClickListener(v->action.run());
-        LinearLayout.LayoutParams params=new LinearLayout.LayoutParams(
-            0,-2,1f);
-        params.setMargins(dp(2),0,dp(2),0);
-        parent.addView(b,params);
-    }
-    private void addButton(LinearLayout parent,String label,Runnable action){
-        Button b=new Button(this);
-        b.setText(label);b.setAllCaps(false);
-        b.setOnClickListener(v->action.run());
-        parent.addView(b,new LinearLayout.LayoutParams(-1,-2));
-    }
+
     private void refreshEnvironmentMembers(){
         if(environmentList==null)return;
         environmentList.removeAllViews();
         DeskTouchSession active=DeskTouchRuntime.session(this);
         List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
         if(targets.isEmpty()){
-            connectionSummary.setText(active.isConnected()
-                ?"Waiting for authenticated environment membership..."
-                :"No environment joined yet.");
+            if(connectionSummary!=null){
+                connectionSummary.setText(active.isConnected()
+                    ?"Waiting for authenticated environment membership..."
+                    :"Linked Devices (0 / 8)");
+            }
+            TextView empty=new TextView(this);
+            empty.setText(active.isConnected()
+                ?"Synchronizing environment devices..."
+                :"Tap Find Devices above to connect to a Windows hub on your Wi-Fi.");
+            empty.setTextSize(12f);
+            empty.setTextColor(palette.textSecondary);
+            empty.setPadding(dp(2),dp(4),dp(2),dp(4));
+            environmentList.addView(empty);
             return;
         }
-        connectionSummary.setText("One DeskTouch environment • "+
-            targets.size()+" device(s) online");
-        TextView heading=new TextView(this);
-        heading.setText("Connected devices — same environment");
-        heading.setTextColor(Color.WHITE);heading.setTextSize(18);
-        environmentList.addView(heading);
-        for(DeskTouchSession.EnvironmentTarget device:targets){
-            String label=(device.id==active.selectedEnvironmentTarget()?"● ":"")
-                +device.platform+" • "+device.name;
-            if(device.id==active.ownEnvironmentId() || !device.supportsInput){
-                TextView item=new TextView(this);
-                item.setText(label+(device.id==active.ownEnvironmentId()
-                    ?" • this phone":" • input permission required"));
-                item.setTextColor(Color.LTGRAY);
-                item.setPadding(0,dp(9),0,dp(9));
-                environmentList.addView(item);
-                continue;
+        if(connectionSummary!=null){
+            connectionSummary.setText("One DeskTouch environment • "+targets.size()+" device(s) online");
+        }
+        for(int i=0;i<targets.size();i++){
+            DeskTouchSession.EnvironmentTarget device=targets.get(i);
+            boolean isSelf=device.id==active.ownEnvironmentId();
+            boolean selectable=!isSelf && device.supportsInput;
+            boolean selected=device.id==active.selectedEnvironmentTarget();
+
+            LinearLayout row=new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(12),dp(10),dp(12),dp(10));
+            if(selected && selectable){
+                row.setBackground(PhoneUiKit.interactiveBg(
+                    palette.accentSoftBg,palette.accentSoftBg,palette.accentBorder,
+                    dp(12),Math.max(1,dp(1)),palette.rippleColor));
+            }else{
+                row.setBackground(selectable
+                    ? PhoneUiKit.interactiveBg(palette.subcardBg,palette.subtleBtnBg,
+                        palette.border,dp(12),Math.max(1,dp(1)),palette.rippleColor)
+                    : PhoneUiKit.roundedBox(palette.subcardBg,palette.border,
+                        dp(12),Math.max(1,dp(1))));
             }
-            addButton(environmentList,label,()->{
-                active.selectEnvironmentTarget(device.id);
-                active.claimControl();
-            });
+
+            LinearLayout textCol=new LinearLayout(this);
+            textCol.setOrientation(LinearLayout.VERTICAL);
+
+            TextView nameView=new TextView(this);
+            nameView.setText(device.name+(selected && selectable ? "  ● Active" : ""));
+            nameView.setTextSize(13f);
+            nameView.setTypeface(null,Typeface.BOLD);
+            nameView.setTextColor(palette.textPrimary);
+            textCol.addView(nameView);
+
+            TextView roleView=new TextView(this);
+            roleView.setText(isSelf ? device.platform+" • This phone" : device.platform);
+            roleView.setTextSize(11.5f);
+            roleView.setTextColor(palette.textSecondary);
+            roleView.setPadding(0,dp(1),0,0);
+            textCol.addView(roleView);
+
+            LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(0,-2,1f);
+            colLp.rightMargin=dp(8);
+            row.addView(textCol,colLp);
+
+            TextView actionTag=new TextView(this);
+            if(isSelf){
+                actionTag.setText("Local");
+                actionTag.setTextColor(palette.textMuted);
+            }else if(!device.supportsInput){
+                actionTag.setText("Permission Req.");
+                actionTag.setTextColor(palette.amberText);
+            }else if(selected){
+                actionTag.setText("Selected");
+                actionTag.setTextColor(palette.accentText);
+            }else{
+                actionTag.setText("Switch");
+                actionTag.setTextColor(palette.accentText);
+            }
+            actionTag.setTextSize(11.5f);
+            actionTag.setTypeface(null,Typeface.BOLD);
+            row.addView(actionTag);
+
+            if(selectable){
+                row.setClickable(true);
+                row.setFocusable(true);
+                row.setOnClickListener(v->{
+                    active.selectEnvironmentTarget(device.id);
+                    active.claimControl();
+                    refreshEnvironmentMembers();
+                    refreshLiveLinkAndKeyboard();
+                });
+            }
+
+            LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
+            if(i>0)rowLp.topMargin=dp(8);
+            environmentList.addView(row,rowLp);
         }
     }
+
     private void scan(){
         if(scanning)return;
         scanning=true;
         status.setText("Finding a DeskTouch environment hub on your private LAN...");
+        dynamicDeviceThemeUpdaters.clear();
         deviceList.removeAllViews();
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 runOnUiThread(()->{
+                    if(isFinishing()||isDestroyed())return;
                     java.util.LinkedHashMap<String,List<DesktopDiscovery.Device>> groups=
                         DesktopDiscovery.windowsGroups(list);
                     java.util.Set<String> connected=new java.util.HashSet<>();
@@ -907,10 +2163,44 @@ public final class MainActivity extends Activity {
                         if(gateway==null)continue;
                         String names=String.join(" + ",members.stream()
                             .map(m->m.name).toArray(String[]::new));
-                        String label="DeskTouch environment • "+names+
-                            (DeskTouchRuntime.isConnected(gateway.fingerprint)
-                                ?" • Joined":" • Join");
-                        addButton(deviceList,label,()->{
+                        boolean isJoined=DeskTouchRuntime.isConnected(gateway.fingerprint);
+
+                        LinearLayout hubRow=new LinearLayout(this);
+                        hubRow.setOrientation(LinearLayout.HORIZONTAL);
+                        hubRow.setGravity(Gravity.CENTER_VERTICAL);
+                        hubRow.setPadding(dp(12),dp(10),dp(12),dp(10));
+                        hubRow.setClickable(true);
+                        hubRow.setFocusable(true);
+
+                        TextView hubTitle=new TextView(this);
+                        hubTitle.setText("DeskTouch hub • "+names);
+                        hubTitle.setTextSize(12.5f);
+                        hubTitle.setTypeface(null,Typeface.BOLD);
+                        LinearLayout.LayoutParams htLp=new LinearLayout.LayoutParams(0,-2,1f);
+                        htLp.rightMargin=dp(8);
+                        hubRow.addView(hubTitle,htLp);
+
+                        TextView hubTag=new TextView(this);
+                        hubTag.setText(isJoined ? "Joined" : "Join");
+                        hubTag.setTextSize(11f);
+                        hubTag.setTypeface(null,Typeface.BOLD);
+                        hubTag.setPadding(dp(8),dp(3),dp(8),dp(3));
+                        hubRow.addView(hubTag);
+
+                        Runnable styleHubRow=()->{
+                            hubRow.setBackground(PhoneUiKit.interactiveBg(
+                                palette.subcardBg,palette.subtleBtnBg,palette.border,
+                                dp(12),Math.max(1,dp(1)),palette.rippleColor));
+                            hubTitle.setTextColor(palette.textPrimary);
+                            PhoneUiKit.stylePill(hubTag,
+                                isJoined ? palette.emeraldSoftBg : palette.accentSoftBg,
+                                Color.TRANSPARENT,
+                                isJoined ? palette.emeraldText : palette.accentText,this);
+                        };
+                        styleHubRow.run();
+                        dynamicDeviceThemeUpdaters.add(styleHubRow);
+
+                        hubRow.setOnClickListener(v->{
                             if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
                                 session=DeskTouchRuntime.select(this,gateway.fingerprint);
                                 refreshEnvironmentMembers();return;
@@ -942,13 +2232,21 @@ public final class MainActivity extends Activity {
                                         gateway.name+". Approve pairing on that Windows PC.");
                                 }).show();
                         });
+
+                        LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
+                        rowLp.topMargin=dp(6);
+                        deviceList.addView(hubRow,rowLp);
                     }
                 });
             }catch(Exception e){
-                runOnUiThread(()->status.setText("Environment discovery failed: "+e.getMessage()));
+                runOnUiThread(()->{
+                    if(!isFinishing()&&!isDestroyed())
+                        status.setText("Environment discovery failed: "+e.getMessage());
+                });
             }finally{scanning=false;}
         },"DeskTouch LAN environment discovery").start();
     }
+
     @Override public boolean dispatchKeyEvent(KeyEvent e){
         // The Android IME EditText handles composed Unicode text through
         // TextWatcher. Hardware keyboards control Windows when the touchpad
@@ -966,6 +2264,7 @@ public final class MainActivity extends Activity {
         }
         return super.dispatchKeyEvent(e);
     }
+
     static int toWindowsKey(int c){
         if(c>=KeyEvent.KEYCODE_A&&c<=KeyEvent.KEYCODE_Z)
             return 0x41+c-KeyEvent.KEYCODE_A;
@@ -1017,6 +2316,7 @@ public final class MainActivity extends Activity {
             default:return 0;
         }
     }
+
     @Override public void onWindowFocusChanged(boolean focus){
         super.onWindowFocusChanged(focus);
         // Opening an Android soft keyboard may temporarily change window
@@ -1024,6 +2324,7 @@ public final class MainActivity extends Activity {
         // lease before IME text is committed. Explicit Return / Disconnect
         // and physical Windows input still revoke that lease.
     }
+
     @Override protected void onDestroy(){
         stopLiveUiTicker();
         if(inputManager!=null && inputDeviceListener!=null){

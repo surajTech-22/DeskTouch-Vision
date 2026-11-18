@@ -1560,28 +1560,27 @@ public final class ProtocolSourceTest {
         assertNotNull(customMatched);
         assertEquals(fpMember, customMatched.fingerprint);
 
-        // Verify v0.3.78 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
-        String mainSource = readProjectSource("app/src/main/java/com/desktouch/vision/MainActivity.java");
+        // Verify v0.3.79 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
+        String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
         assertTrue(mainSource.contains("trackpadScreenScroll.setVisibility("));
         assertTrue(mainSource.replace("\r\n", "\n").contains("if(index==PhoneUiKit.TAB_TRACKPAD){\n            refreshTrackpadPcTaskbar();"));
         assertTrue(mainSource.contains("AndroidUpdater.checkInAppOnResume(this);"));
 
-        String updaterSource = readProjectSource("app/src/main/java/com/desktouch/vision/AndroidUpdater.java");
+        String updaterSource = readProjectSource("src/main/java/com/desktouch/vision/AndroidUpdater.java");
         assertTrue(updaterSource.contains("static void checkInAppOnResume(Activity activity)"));
         assertTrue(updaterSource.contains("promptInAppUpdate("));
     }
 
-    private static String readProjectSource(String relFromAndroidRoot) {
+    private static String readProjectSource(String relFromAppModule) {
         try {
-            java.nio.file.Path direct = java.nio.file.Paths.get(relFromAndroidRoot);
-            if (java.nio.file.Files.isRegularFile(direct)) {
-                return new String(java.nio.file.Files.readAllBytes(direct), java.nio.charset.StandardCharsets.UTF_8);
+            String[] prefixes = {"", "app/", "AndroidDeskTouch/app/"};
+            for (String prefix : prefixes) {
+                java.nio.file.Path candidate = java.nio.file.Paths.get(prefix + relFromAppModule);
+                if (java.nio.file.Files.isRegularFile(candidate)) {
+                    return new String(java.nio.file.Files.readAllBytes(candidate), java.nio.charset.StandardCharsets.UTF_8);
+                }
             }
-            java.nio.file.Path nested = java.nio.file.Paths.get("AndroidDeskTouch", relFromAndroidRoot);
-            if (java.nio.file.Files.isRegularFile(nested)) {
-                return new String(java.nio.file.Files.readAllBytes(nested), java.nio.charset.StandardCharsets.UTF_8);
-            }
-            throw new java.io.FileNotFoundException("Cannot locate " + relFromAndroidRoot);
+            throw new java.io.FileNotFoundException("Cannot locate " + relFromAppModule + " from " + java.nio.file.Paths.get("").toAbsolutePath());
         } catch (java.io.IOException e) {
             throw new RuntimeException(e);
         }

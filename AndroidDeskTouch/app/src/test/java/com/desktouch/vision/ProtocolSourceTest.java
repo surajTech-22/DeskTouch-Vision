@@ -1445,4 +1445,71 @@ public final class ProtocolSourceTest {
         DeskTouchNotificationListener.openSettings(null);
         assertNotNull(DeskTouchRuntime.connectedNotificationSummary(null));
     }
+
+    @Test
+    public void navTabsLinkedDisplayFormatAndPairingCodeHelpersWorkSafely() {
+        assertEquals(0, PhoneUiKit.TAB_HOME);
+        assertEquals(1, PhoneUiKit.TAB_FIND);
+        assertEquals(2, PhoneUiKit.TAB_TRACKPAD);
+        assertEquals(3, PhoneUiKit.TAB_SPEED);
+        assertEquals(4, PhoneUiKit.TAB_SETUP);
+
+        assertEquals("23", LinkedDisplayHelper.formatNotificationCount(23));
+        assertEquals("0", LinkedDisplayHelper.formatNotificationCount(0));
+        assertEquals("—", LinkedDisplayHelper.formatNotificationCount(-1));
+
+        String hubLayout = "[{\"Name\":\"\\\\\\\\.\\\\DISPLAY1\",\"X\":0,\"Y\":0,\"Width\":1920,\"Height\":1080,\"Primary\":true}]";
+        DeskTouchSession.EnvironmentTarget hub = new DeskTouchSession.EnvironmentTarget(
+            0, "DESKTOP-IQ1KSJ9", "Windows", hubLayout, true, 23);
+        LinkedDisplayHelper.DisplayTileModel hubTile = LinkedDisplayHelper.parseTileModel(hub, 0, 1);
+        assertTrue(hubTile.hub);
+        assertFalse(hubTile.self);
+        assertFalse(hubTile.portrait);
+        assertTrue(hubTile.selected);
+        assertTrue(hubTile.selectable);
+        assertEquals("Display 1", hubTile.displayLabel);
+        assertEquals("1920 × 1080", hubTile.resolutionSummary);
+        assertEquals(23, hubTile.notificationCount);
+
+        String multiLayout = "[{\"Name\":\"\\\\\\\\.\\\\DISPLAY1\",\"Width\":1920,\"Height\":1080,\"Primary\":true},"
+            + "{\"Name\":\"\\\\\\\\.\\\\DISPLAY2\",\"Width\":1280,\"Height\":1024,\"Primary\":false}]";
+        DeskTouchSession.EnvironmentTarget peer = new DeskTouchSession.EnvironmentTarget(
+            2, "SURAJ-WORKSTATION", "Windows", multiLayout, true, 3);
+        LinkedDisplayHelper.DisplayTileModel peerTile = LinkedDisplayHelper.parseTileModel(peer, 2, 1);
+        assertFalse(peerTile.hub);
+        assertEquals(2, peerTile.monitorCount);
+        assertEquals("2 Displays", peerTile.displayLabel);
+        assertEquals("2 screens • 1920 × 1080", peerTile.resolutionSummary);
+
+        String phoneLayout = "[{\"Name\":\"Android screen\",\"Width\":1080,\"Height\":2400,\"Primary\":true}]";
+        DeskTouchSession.EnvironmentTarget phone = new DeskTouchSession.EnvironmentTarget(
+            1, "Xiaomi 22041216I", "Android", phoneLayout, true, -1);
+        LinkedDisplayHelper.DisplayTileModel phoneTile = LinkedDisplayHelper.parseTileModel(phone, 0, 1);
+        assertTrue(phoneTile.self);
+        assertTrue(phoneTile.portrait);
+        assertFalse(phoneTile.selectable);
+        assertEquals("Android · 1", phoneTile.displayLabel);
+        assertEquals("1080 × 2400", phoneTile.resolutionSummary);
+
+        assertEquals("AABBCCDDEE11", LinkedDisplayHelper.normalizePairingCode("aa:bb cc-dd.ee 11"));
+        assertEquals("", LinkedDisplayHelper.normalizePairingCode("abc"));
+        assertEquals("", LinkedDisplayHelper.normalizePairingCode("ZZZZZZZZ"));
+
+        String fpHub = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        String fpMember = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        DesktopDiscovery.Device dHub = new DesktopDiscovery.Device("DESKTOP-IQ1KSJ9", "192.168.1.10", fpHub, true, false, false);
+        dHub.isHub = true;
+        dHub.hubMemberCount = 2;
+        DesktopDiscovery.Device dMember = new DesktopDiscovery.Device("SURAJ", "192.168.1.11", fpMember, true, false, false);
+        java.util.List<DesktopDiscovery.Device> found = java.util.Arrays.asList(dHub, dMember);
+        DesktopDiscovery.applyConnectedGroups(found, java.util.Collections.singletonList(new String[]{fpHub, fpMember}));
+
+        DesktopDiscovery.Device matched = LinkedDisplayHelper.findDeviceByPairingCode(found, "bbbbbbbb");
+        assertNotNull(matched);
+        assertEquals(fpMember, matched.fingerprint);
+        DesktopDiscovery.Device gateway = LinkedDisplayHelper.resolveGatewayForDevice(
+            found, matched, java.util.Collections.emptySet(), java.util.Collections.emptySet());
+        assertNotNull(gateway);
+        assertEquals(fpHub, gateway.fingerprint);
+    }
 }

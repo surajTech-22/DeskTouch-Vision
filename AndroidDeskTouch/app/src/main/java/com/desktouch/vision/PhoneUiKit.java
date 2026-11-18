@@ -44,9 +44,10 @@ final class PhoneUiKit {
     static final int BTN_DANGER = 7;
 
     static final int TAB_HOME = 0;
-    static final int TAB_TRACKPAD = 1;
-    static final int TAB_SPEED = 2;
-    static final int TAB_SETUP = 3;
+    static final int TAB_FIND = 1;
+    static final int TAB_TRACKPAD = 2;
+    static final int TAB_SPEED = 3;
+    static final int TAB_SETUP = 4;
 
     private PhoneUiKit() {}
 
@@ -635,6 +636,10 @@ final class PhoneUiKit {
                     path.lineTo(ox + 3f * s, oy + 20f * s);
                     path.close();
                     c.drawPath(path, strokePaint);
+                    break;
+                case TAB_FIND:
+                    c.drawCircle(ox + 10.5f * s, oy + 10.5f * s, 6f * s, strokePaint);
+                    c.drawLine(ox + 15f * s, oy + 15f * s, ox + 20f * s, oy + 20f * s, strokePaint);
                     break;
                 case TAB_TRACKPAD:
                     c.drawRoundRect(ox + 3.5f * s, oy + 4f * s, ox + 20.5f * s, oy + 20f * s,

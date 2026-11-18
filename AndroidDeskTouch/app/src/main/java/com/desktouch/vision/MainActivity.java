@@ -27,7 +27,7 @@ import java.util.function.Consumer;
 public final class MainActivity extends Activity {
     private static final String PREFS="desktouch_prefs";
     private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
-    private static final int TAB_COUNT=4;
+    private static final int TAB_COUNT=5;
 
     private PhoneUiKit.Palette palette;
     private final List<Consumer<PhoneUiKit.Palette>> themeUpdaters=new ArrayList<>();
@@ -42,9 +42,12 @@ public final class MainActivity extends Activity {
     private LinearLayout liveBadge,deviceList,environmentList;
     private View liveDot;
     private TextView liveBadgeText,mouseTag,mouseMetric,kbTag,kbMetric;
-    private Button scanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
+    private Button scanBtn,findScanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
     private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn,notifAccessBtn;
-    private TextView trackpadTargetTitle,trackpadReadout,sensReadout;
+    private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout;
+    private TextView findStatus,findCountTag;
+    private EditText pairingCodeInput;
+    private volatile List<DesktopDiscovery.Device> lastScannedDevices=new ArrayList<>();
     private TextView speedWifiRtt,speedWifiSub,wifiLossBadge,speedMobRtt,speedMobSub,mobLossBadge;
     private SeekBar pointerSensitivity;
     private EditText keyboardInput;
@@ -95,7 +98,7 @@ public final class MainActivity extends Activity {
         DeskTouchRuntime.setListener(message ->
             runOnUiThread(()->{
                 if(isFinishing()||isDestroyed())return;
-                if(status!=null)status.setText(message);
+                setDiscoveryStatus(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
                 refreshPermissionState();
                 refreshTrustSummary();
@@ -157,12 +160,14 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams frameParams=new LinearLayout.LayoutParams(-1,0,1f);
         rootLayout.addView(tabFrame,frameParams);
 
-        LinearLayout homePage=createTabPage(0);
-        LinearLayout trackpadPage=createTabPage(1);
-        LinearLayout speedPage=createTabPage(2);
-        LinearLayout setupPage=createTabPage(3);
+        LinearLayout homePage=createTabPage(PhoneUiKit.TAB_HOME);
+        LinearLayout findPage=createTabPage(PhoneUiKit.TAB_FIND);
+        LinearLayout trackpadPage=createTabPage(PhoneUiKit.TAB_TRACKPAD);
+        LinearLayout speedPage=createTabPage(PhoneUiKit.TAB_SPEED);
+        LinearLayout setupPage=createTabPage(PhoneUiKit.TAB_SETUP);
 
         buildHomeTab(homePage);
+        buildFindTab(findPage);
         buildTrackpadTab(trackpadPage,initialSensitivityProgress);
         buildSpeedTab(speedPage);
         buildSetupTab(setupPage);
@@ -307,15 +312,18 @@ public final class MainActivity extends Activity {
         badgeWrap.addView(liveBadge);
         heroTop.addView(badgeWrap,new LinearLayout.LayoutParams(0,-2,1f));
 
-        scanBtn=PhoneUiKit.createButton(this,"Find Devices",palette,PhoneUiKit.BTN_SUBTLE);
+        scanBtn=PhoneUiKit.createButton(this,"Find Hubs",palette,PhoneUiKit.BTN_SUBTLE);
         scanBtn.setTextSize(12f);
         scanBtn.setPadding(dp(12),dp(7),dp(12),dp(7));
-        scanBtn.setOnClickListener(v->scan());
+        scanBtn.setOnClickListener(v->{
+            selectTab(PhoneUiKit.TAB_FIND);
+            scan();
+        });
         heroTop.addView(scanBtn,new LinearLayout.LayoutParams(-2,-2));
         hero.addView(heroTop);
 
         status=new TextView(this);
-        status.setText("Scan for your Windows computer on the same private Wi-Fi.");
+        status.setText("Scan on the Find tab or plug in USB cable to connect.");
         status.setTextSize(14f);
         status.setTypeface(null,Typeface.BOLD);
         status.setPadding(0,dp(10),0,0);
@@ -353,7 +361,7 @@ public final class MainActivity extends Activity {
         mouseBox.addView(mTop);
 
         mouseMetric=new TextView(this);
-        mouseMetric.setText("Tap Find Devices");
+        mouseMetric.setText("Open Find tab");
         mouseMetric.setTextSize(12.5f);
         mouseMetric.setTypeface(null,Typeface.BOLD);
         mouseMetric.setPadding(0,dp(4),0,0);
@@ -388,38 +396,26 @@ public final class MainActivity extends Activity {
         kbMetric.setEllipsize(TextUtils.TruncateAt.END);
         kbBox.addView(kbMetric);
 
-        deviceList=new LinearLayout(this);
-        deviceList.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams devLp=new LinearLayout.LayoutParams(-1,-2);
-        devLp.topMargin=dp(6);
-        hero.addView(deviceList,devLp);
-
         LinearLayout heroActions=new LinearLayout(this);
         heroActions.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams actLp=new LinearLayout.LayoutParams(-1,-2);
         actLp.topMargin=dp(10);
         hero.addView(heroActions,actLp);
 
-        takeControlBtn=PhoneUiKit.createButton(this,"Control PC Screen",palette,PhoneUiKit.BTN_PRIMARY);
-        takeControlBtn.setOnClickListener(v->{
-            DeskTouchRuntime.releaseAll();
-            session=DeskTouchRuntime.session(this);
-            session.claimControl();
-            refreshLiveLinkAndKeyboard();
-        });
+        Button homeTrackpadBtn=PhoneUiKit.createButton(this,"Open Trackpad →",palette,PhoneUiKit.BTN_PRIMARY);
+        homeTrackpadBtn.setOnClickListener(v->selectTab(PhoneUiKit.TAB_TRACKPAD));
         LinearLayout.LayoutParams b1Lp=new LinearLayout.LayoutParams(0,-2,1f);
         b1Lp.rightMargin=dp(4);
-        heroActions.addView(takeControlBtn,b1Lp);
+        heroActions.addView(homeTrackpadBtn,b1Lp);
 
-        returnControlBtn=PhoneUiKit.createButton(this,"Return to Phone",palette,PhoneUiKit.BTN_SUBTLE);
-        returnControlBtn.setOnClickListener(v->{
-            DeskTouchRuntime.releaseAll();
-            setFeedback("Remote Windows input returned. Secure connections remain open.",false);
-            refreshLiveLinkAndKeyboard();
+        Button homeFindBtn=PhoneUiKit.createButton(this,"Hubs & Find →",palette,PhoneUiKit.BTN_SUBTLE);
+        homeFindBtn.setOnClickListener(v->{
+            selectTab(PhoneUiKit.TAB_FIND);
+            scan();
         });
         LinearLayout.LayoutParams b2Lp=new LinearLayout.LayoutParams(0,-2,1f);
         b2Lp.leftMargin=dp(4);
-        heroActions.addView(returnControlBtn,b2Lp);
+        heroActions.addView(homeFindBtn,b2Lp);
 
         LinearLayout envCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(envCard,cardParams(10));
@@ -429,8 +425,8 @@ public final class MainActivity extends Activity {
         envTop.setGravity(Gravity.CENTER_VERTICAL);
 
         connectionSummary=new TextView(this);
-        connectionSummary.setText("Connected devices: "+DeskTouchRuntime.connectedCount()+" / 8");
-        connectionSummary.setTextSize(11.5f);
+        connectionSummary.setText("Linked Displays ("+DeskTouchRuntime.connectedCount()+" / 8)");
+        connectionSummary.setTextSize(12f);
         connectionSummary.setTypeface(null,Typeface.BOLD);
         envTop.addView(connectionSummary,new LinearLayout.LayoutParams(0,-2,1f));
 
@@ -444,17 +440,39 @@ public final class MainActivity extends Activity {
                 current.requestTrust();
                 setFeedback("Requested trust approval on connected Windows PC.",true);
             }else{
-                selectTab(3);
+                selectTab(PhoneUiKit.TAB_SETUP);
             }
         });
         envTop.addView(trustBadgeBtn,new LinearLayout.LayoutParams(-2,-2));
         envCard.addView(envTop);
 
+        TextView envLegend=new TextView(this);
+        envLegend.setText("Windows format • Blue: Hub • Teal: Device • Above: Notifications");
+        envLegend.setTextSize(10.5f);
+        envLegend.setPadding(0,dp(4),0,dp(8));
+        envCard.addView(envLegend);
+
+        LinearLayout arrangementViewport=new LinearLayout(this);
+        arrangementViewport.setOrientation(LinearLayout.VERTICAL);
+        arrangementViewport.setBackground(PhoneUiKit.roundedBox(
+            0xFF1B1D22,0xFF2B313D,dp(12),Math.max(1,dp(1))));
+        arrangementViewport.setPadding(dp(10),dp(12),dp(10),dp(12));
+
+        HorizontalScrollView arrangementScroll=new HorizontalScrollView(this);
+        arrangementScroll.setHorizontalScrollBarEnabled(false);
+        arrangementScroll.setFillViewport(true);
         environmentList=new LinearLayout(this);
-        environmentList.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams envListLp=new LinearLayout.LayoutParams(-1,-2);
-        envListLp.topMargin=dp(8);
-        envCard.addView(environmentList,envListLp);
+        environmentList.setOrientation(LinearLayout.HORIZONTAL);
+        environmentList.setGravity(Gravity.CENTER);
+        arrangementScroll.addView(environmentList,new HorizontalScrollView.LayoutParams(-2,-2));
+        arrangementViewport.addView(arrangementScroll,new LinearLayout.LayoutParams(-1,-2));
+        envCard.addView(arrangementViewport,new LinearLayout.LayoutParams(-1,-2));
+
+        TextView envHint=new TextView(this);
+        envHint.setText("Tap any screen box to switch target, then open Trackpad to control.");
+        envHint.setTextSize(10.5f);
+        envHint.setPadding(0,dp(8),0,0);
+        envCard.addView(envHint);
 
         LinearLayout protCard=PhoneUiKit.createCard(this,palette,14);
         protCard.setOrientation(LinearLayout.HORIZONTAL);
@@ -479,10 +497,10 @@ public final class MainActivity extends Activity {
         protColLp.rightMargin=dp(10);
         protCard.addView(protTextCol,protColLp);
 
-        openPadBtn=PhoneUiKit.createButton(this,"Open Pad →",palette,PhoneUiKit.BTN_TINT_INDIGO);
+        openPadBtn=PhoneUiKit.createButton(this,"Trackpad →",palette,PhoneUiKit.BTN_TINT_INDIGO);
         openPadBtn.setTextSize(12f);
         openPadBtn.setPadding(dp(12),dp(8),dp(12),dp(8));
-        openPadBtn.setOnClickListener(v->selectTab(1));
+        openPadBtn.setOnClickListener(v->selectTab(PhoneUiKit.TAB_TRACKPAD));
         protCard.addView(openPadBtn,new LinearLayout.LayoutParams(-2,-2));
 
         onTheme(p->{
@@ -496,9 +514,12 @@ public final class MainActivity extends Activity {
             kLbl.setTextColor(p.textSecondary);
             mouseMetric.setTextColor(p.textPrimary);
             kbMetric.setTextColor(p.textPrimary);
-            PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(homeTrackpadBtn,p,PhoneUiKit.BTN_PRIMARY,this);
+            PhoneUiKit.styleButton(homeFindBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleCard(envCard,p,this);
-            connectionSummary.setTextColor(p.textSecondary);
+            connectionSummary.setTextColor(p.textPrimary);
+            envLegend.setTextColor(p.textSecondary);
+            envHint.setTextColor(p.textSecondary);
             PhoneUiKit.styleCard(protCard,p,this);
             protTitle.setTextColor(p.textPrimary);
             protectionDesc.setTextColor(p.textSecondary);
@@ -507,9 +528,202 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void buildFindTab(LinearLayout page){
+        LinearLayout findHero=PhoneUiKit.createCard(this,palette,14);
+        page.addView(findHero,cardParams(0));
+
+        LinearLayout heroTop=new LinearLayout(this);
+        heroTop.setOrientation(LinearLayout.HORIZONTAL);
+        heroTop.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView findTitle=new TextView(this);
+        findTitle.setText("Environments & Hubs");
+        findTitle.setTextSize(15f);
+        findTitle.setTypeface(null,Typeface.BOLD);
+        heroTop.addView(findTitle,new LinearLayout.LayoutParams(0,-2,1f));
+
+        findScanBtn=PhoneUiKit.createButton(this,"Scan Now",palette,PhoneUiKit.BTN_PRIMARY);
+        findScanBtn.setTextSize(12f);
+        findScanBtn.setPadding(dp(14),dp(8),dp(14),dp(8));
+        findScanBtn.setOnClickListener(v->scan());
+        heroTop.addView(findScanBtn,new LinearLayout.LayoutParams(-2,-2));
+        findHero.addView(heroTop);
+
+        findStatus=new TextView(this);
+        findStatus.setText("Tap Scan Now to discover DeskTouch Windows hubs on your Wi-Fi or USB cable.");
+        findStatus.setTextSize(12f);
+        findStatus.setPadding(0,dp(8),0,0);
+        findStatus.setLineSpacing(dp(2),1f);
+        findHero.addView(findStatus);
+
+        LinearLayout chipRow=new LinearLayout(this);
+        chipRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams chipRowLp=new LinearLayout.LayoutParams(-1,-2);
+        chipRowLp.topMargin=dp(10);
+        findHero.addView(chipRow,chipRowLp);
+
+        TextView chipHub=new TextView(this);
+        chipHub.setText("Shared Hub");
+        chipHub.setTextSize(10.5f);
+        chipHub.setTypeface(null,Typeface.BOLD);
+        chipHub.setPadding(dp(8),dp(4),dp(8),dp(4));
+        LinearLayout.LayoutParams c1Lp=new LinearLayout.LayoutParams(-2,-2);
+        c1Lp.rightMargin=dp(6);
+        chipRow.addView(chipHub,c1Lp);
+
+        TextView chipCable=new TextView(this);
+        chipCable.setText("Cable Auto");
+        chipCable.setTextSize(10.5f);
+        chipCable.setTypeface(null,Typeface.BOLD);
+        chipCable.setPadding(dp(8),dp(4),dp(8),dp(4));
+        LinearLayout.LayoutParams c2Lp=new LinearLayout.LayoutParams(-2,-2);
+        c2Lp.rightMargin=dp(6);
+        chipRow.addView(chipCable,c2Lp);
+
+        TextView chipTls=new TextView(this);
+        chipTls.setText("TLS Pinned");
+        chipTls.setTextSize(10.5f);
+        chipTls.setTypeface(null,Typeface.BOLD);
+        chipTls.setPadding(dp(8),dp(4),dp(8),dp(4));
+        chipRow.addView(chipTls,new LinearLayout.LayoutParams(-2,-2));
+
+        LinearLayout hubsCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(hubsCard,cardParams(10));
+
+        LinearLayout hubsTop=new LinearLayout(this);
+        hubsTop.setOrientation(LinearLayout.HORIZONTAL);
+        hubsTop.setGravity(Gravity.CENTER_VERTICAL);
+        TextView hubsSectionLbl=PhoneUiKit.createSectionLabel(this,"NEARBY HUBS & ENVIRONMENTS",palette);
+        hubsTop.addView(hubsSectionLbl,new LinearLayout.LayoutParams(0,-2,1f));
+
+        findCountTag=new TextView(this);
+        findCountTag.setText("Ready");
+        findCountTag.setTextSize(10.5f);
+        findCountTag.setTypeface(null,Typeface.BOLD);
+        findCountTag.setPadding(dp(8),dp(3),dp(8),dp(3));
+        hubsTop.addView(findCountTag,new LinearLayout.LayoutParams(-2,-2));
+        hubsCard.addView(hubsTop);
+
+        deviceList=new LinearLayout(this);
+        deviceList.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams devLp=new LinearLayout.LayoutParams(-1,-2);
+        devLp.topMargin=dp(10);
+        hubsCard.addView(deviceList,devLp);
+
+        LinearLayout pairCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(pairCard,cardParams(10));
+
+        TextView pairTitle=new TextView(this);
+        pairTitle.setText("Connect by Pairing Code");
+        pairTitle.setTextSize(13.5f);
+        pairTitle.setTypeface(null,Typeface.BOLD);
+        pairCard.addView(pairTitle);
+
+        TextView pairSub=new TextView(this);
+        pairSub.setText("Paste the identity code copied from DeskTouch on Windows to locate and join that hub directly.");
+        pairSub.setTextSize(11.5f);
+        pairSub.setPadding(0,dp(3),0,dp(10));
+        pairCard.addView(pairSub);
+
+        LinearLayout pairRow=new LinearLayout(this);
+        pairRow.setOrientation(LinearLayout.HORIZONTAL);
+        pairRow.setGravity(Gravity.CENTER_VERTICAL);
+        pairCard.addView(pairRow,new LinearLayout.LayoutParams(-1,-2));
+
+        pairingCodeInput=new EditText(this);
+        pairingCodeInput.setHint("Paste Windows pairing code");
+        pairingCodeInput.setSingleLine(true);
+        pairingCodeInput.setTextSize(12.5f);
+        pairingCodeInput.setPadding(dp(12),dp(10),dp(12),dp(10));
+        PhoneUiKit.styleSubcard(pairingCodeInput,palette,this);
+        LinearLayout.LayoutParams codeLp=new LinearLayout.LayoutParams(0,-2,1f);
+        codeLp.rightMargin=dp(8);
+        pairRow.addView(pairingCodeInput,codeLp);
+
+        Button pairCodeBtn=PhoneUiKit.createButton(this,"Find & Pair",palette,PhoneUiKit.BTN_TINT_ACCENT);
+        pairCodeBtn.setTextSize(12f);
+        pairCodeBtn.setPadding(dp(14),dp(10),dp(14),dp(10));
+        pairCodeBtn.setOnClickListener(v->pairByEnteredCode());
+        pairRow.addView(pairCodeBtn,new LinearLayout.LayoutParams(-2,-2));
+
+        onTheme(p->{
+            PhoneUiKit.styleCard(findHero,p,this);
+            findTitle.setTextColor(p.textPrimary);
+            PhoneUiKit.styleButton(findScanBtn,p,PhoneUiKit.BTN_PRIMARY,this);
+            findStatus.setTextColor(p.textSecondary);
+            PhoneUiKit.stylePill(chipHub,p.accentSoftBg,p.accentBorder,p.accentText,this);
+            PhoneUiKit.stylePill(chipCable,p.emeraldSoftBg,p.emeraldBorder,p.emeraldText,this);
+            PhoneUiKit.stylePill(chipTls,p.indigoSoftBg,p.indigoBorder,p.indigoText,this);
+            PhoneUiKit.styleCard(hubsCard,p,this);
+            hubsSectionLbl.setTextColor(p.textSecondary);
+            PhoneUiKit.stylePill(findCountTag,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            PhoneUiKit.styleCard(pairCard,p,this);
+            pairTitle.setTextColor(p.textPrimary);
+            pairSub.setTextColor(p.textSecondary);
+            PhoneUiKit.styleSubcard(pairingCodeInput,p,this);
+            pairingCodeInput.setTextColor(p.textPrimary);
+            pairingCodeInput.setHintTextColor(p.textMuted);
+            PhoneUiKit.styleButton(pairCodeBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
+        });
+    }
+
     private void buildTrackpadTab(LinearLayout page,int initialSensitivityProgress){
+        LinearLayout controlCard=PhoneUiKit.createCard(this,palette,14);
+        page.addView(controlCard,cardParams(0));
+
+        LinearLayout ctrlHeader=new LinearLayout(this);
+        ctrlHeader.setOrientation(LinearLayout.HORIZONTAL);
+        ctrlHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        trackpadTargetTitle=new TextView(this);
+        trackpadTargetTitle.setText("Touchpad Ready");
+        trackpadTargetTitle.setTextSize(14f);
+        trackpadTargetTitle.setTypeface(null,Typeface.BOLD);
+        LinearLayout.LayoutParams ttLp=new LinearLayout.LayoutParams(0,-2,1f);
+        ttLp.rightMargin=dp(8);
+        ctrlHeader.addView(trackpadTargetTitle,ttLp);
+
+        trackpadLinkPill=new TextView(this);
+        trackpadLinkPill.setText("Offline");
+        trackpadLinkPill.setTextSize(10.5f);
+        trackpadLinkPill.setTypeface(null,Typeface.BOLD);
+        trackpadLinkPill.setPadding(dp(8),dp(3),dp(8),dp(3));
+        ctrlHeader.addView(trackpadLinkPill,new LinearLayout.LayoutParams(-2,-2));
+        controlCard.addView(ctrlHeader);
+
+        LinearLayout ctrlActions=new LinearLayout(this);
+        ctrlActions.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams ctrlActLp=new LinearLayout.LayoutParams(-1,-2);
+        ctrlActLp.topMargin=dp(10);
+        controlCard.addView(ctrlActions,ctrlActLp);
+
+        takeControlBtn=PhoneUiKit.createButton(this,"Control PC Screen",palette,PhoneUiKit.BTN_PRIMARY);
+        takeControlBtn.setOnClickListener(v->{
+            DeskTouchRuntime.releaseAll();
+            session=DeskTouchRuntime.session(this);
+            session.claimControl();
+            DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+            if(snap==null || !snap.connected){
+                setFeedback("No hub connected yet. Open the Find tab to scan and connect.",true);
+            }
+            refreshLiveLinkAndKeyboard();
+        });
+        LinearLayout.LayoutParams tcLp=new LinearLayout.LayoutParams(0,-2,1f);
+        tcLp.rightMargin=dp(4);
+        ctrlActions.addView(takeControlBtn,tcLp);
+
+        returnControlBtn=PhoneUiKit.createButton(this,"Return to Phone",palette,PhoneUiKit.BTN_SUBTLE);
+        returnControlBtn.setOnClickListener(v->{
+            DeskTouchRuntime.releaseAll();
+            setFeedback("Remote Windows input returned. Secure connections remain open.",false);
+            refreshLiveLinkAndKeyboard();
+        });
+        LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(0,-2,1f);
+        rcLp.leftMargin=dp(4);
+        ctrlActions.addView(returnControlBtn,rcLp);
+
         LinearLayout padCard=PhoneUiKit.createCard(this,palette,14);
-        page.addView(padCard,cardParams(0));
+        page.addView(padCard,cardParams(10));
 
         LinearLayout padHeader=new LinearLayout(this);
         padHeader.setOrientation(LinearLayout.HORIZONTAL);
@@ -517,11 +731,11 @@ public final class MainActivity extends Activity {
 
         LinearLayout padTitleCol=new LinearLayout(this);
         padTitleCol.setOrientation(LinearLayout.VERTICAL);
-        trackpadTargetTitle=new TextView(this);
-        trackpadTargetTitle.setText("Touchpad Ready");
-        trackpadTargetTitle.setTextSize(14f);
-        trackpadTargetTitle.setTypeface(null,Typeface.BOLD);
-        padTitleCol.addView(trackpadTargetTitle);
+        TextView padSurfaceTitle=new TextView(this);
+        padSurfaceTitle.setText("Touchpad Surface");
+        padSurfaceTitle.setTextSize(13.5f);
+        padSurfaceTitle.setTypeface(null,Typeface.BOLD);
+        padTitleCol.addView(padSurfaceTitle);
 
         trackpadReadout=new TextView(this);
         trackpadReadout.setText("Drag to move • Tap to click • 2 fingers scroll");
@@ -834,9 +1048,12 @@ public final class MainActivity extends Activity {
         sensCard.addView(pointerSensitivity,seekLp);
 
         onTheme(p->{
+            PhoneUiKit.styleCard(controlCard,p,this);
             PhoneUiKit.styleCard(padCard,p,this);
             trackpadTargetTitle.setTextColor(p.textPrimary);
+            padSurfaceTitle.setTextColor(p.textPrimary);
             trackpadReadout.setTextColor(p.textSecondary);
+            PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(captureMouseBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             pointerPad.invalidate();
             PhoneUiKit.styleButton(leftBtn,p,PhoneUiKit.BTN_SUBTLE,this);
@@ -1406,25 +1623,33 @@ public final class MainActivity extends Activity {
     private void buildBottomNav(){
         bottomNav=new LinearLayout(this);
         bottomNav.setOrientation(LinearLayout.HORIZONTAL);
-        bottomNav.setPadding(dp(8),dp(6),dp(8),dp(6));
-        String[] titles={"Home","Trackpad","Speed","Setup"};
-        int[] icons={PhoneUiKit.TAB_HOME,PhoneUiKit.TAB_TRACKPAD,PhoneUiKit.TAB_SPEED,PhoneUiKit.TAB_SETUP};
+        bottomNav.setPadding(dp(6),dp(6),dp(6),dp(6));
+        String[] titles={"Home","Find","Trackpad","Speed","Setup"};
+        int[] icons={
+            PhoneUiKit.TAB_HOME,
+            PhoneUiKit.TAB_FIND,
+            PhoneUiKit.TAB_TRACKPAD,
+            PhoneUiKit.TAB_SPEED,
+            PhoneUiKit.TAB_SETUP
+        };
         for(int i=0;i<TAB_COUNT;i++){
             final int tabIdx=i;
             LinearLayout item=new LinearLayout(this);
             item.setOrientation(LinearLayout.VERTICAL);
             item.setGravity(Gravity.CENTER);
-            item.setPadding(dp(4),dp(6),dp(4),dp(6));
+            item.setPadding(dp(2),dp(6),dp(2),dp(6));
             item.setClickable(true);
             item.setFocusable(true);
             item.setOnClickListener(v->selectTab(tabIdx));
 
             PhoneUiKit.TabIconView icon=new PhoneUiKit.TabIconView(this,icons[i]);
-            item.addView(icon,new LinearLayout.LayoutParams(dp(20),dp(20)));
+            item.addView(icon,new LinearLayout.LayoutParams(dp(19),dp(19)));
 
             TextView label=new TextView(this);
             label.setText(titles[i]);
-            label.setTextSize(11f);
+            label.setTextSize(10.5f);
+            label.setSingleLine(true);
+            label.setEllipsize(TextUtils.TruncateAt.END);
             label.setGravity(Gravity.CENTER);
             label.setPadding(0,dp(3),0,0);
             item.addView(label);
@@ -1560,14 +1785,14 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.73";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.74";
         }catch(Exception ignored){
-            return "0.3.73";
+            return "0.3.74";
         }
     }
 
     private void setFeedback(String msg,boolean toast){
-        if(status!=null)status.setText(msg);
+        setDiscoveryStatus(msg);
         if(toast)showToast(msg);
     }
 
@@ -1675,8 +1900,8 @@ public final class MainActivity extends Activity {
 
         if(connectionSummary!=null){
             connectionSummary.setText(targets.isEmpty()
-                ? "Linked Devices ("+DeskTouchRuntime.connectedCount()+" / 8)"
-                : "Linked Devices ("+targets.size()+" / 8)");
+                ? "Linked Displays ("+DeskTouchRuntime.connectedCount()+" / 8)"
+                : "Linked Displays ("+targets.size()+" / 8)");
         }
         if(headerSub!=null){
             if(snap!=null && snap.connected){
@@ -1738,6 +1963,23 @@ public final class MainActivity extends Activity {
                 ? (controlling ? "Controlling "+targetName : "Target: "+targetName)
                 : "Touchpad (Not Connected)");
         }
+        if(trackpadLinkPill!=null){
+            if(!connected){
+                trackpadLinkPill.setText("Offline");
+                PhoneUiKit.stylePill(trackpadLinkPill,p.neutralBadgeBg,Color.TRANSPARENT,p.neutralBadgeText,this);
+            }else if(snap.cable){
+                trackpadLinkPill.setText("Data Cable");
+                PhoneUiKit.stylePill(trackpadLinkPill,p.emeraldSoftBg,Color.TRANSPARENT,p.emeraldText,this);
+            }else{
+                double bestMs=snap.mobConfirmed && snap.preferMobileMouse && snap.mobRttMs>0
+                    ? snap.mobRttMs : (snap.wifiRttMs>0 ? snap.wifiRttMs : snap.rttMs);
+                trackpadLinkPill.setText(bestMs>0 ? formatMs(bestMs) : "Connected");
+                PhoneUiKit.stylePill(trackpadLinkPill,
+                    controlling ? p.emeraldSoftBg : p.accentSoftBg,
+                    Color.TRANSPARENT,
+                    controlling ? p.emeraldText : p.accentText,this);
+            }
+        }
     }
 
     private void refreshTelemetryCards(DeskTouchSession.LiveStatusSnapshot snap,
@@ -1746,7 +1988,7 @@ public final class MainActivity extends Activity {
         if(snap==null || !snap.connected){
             setBadgeState(p.neutralBadgeBg,p.textSecondary,"Offline");
             if(mouseTag!=null){mouseTag.setText("Offline");mouseTag.setTextColor(p.textMuted);}
-            if(mouseMetric!=null)mouseMetric.setText("Tap Find Devices");
+            if(mouseMetric!=null)mouseMetric.setText("Open Find tab");
             if(kbTag!=null){kbTag.setText("Offline");kbTag.setTextColor(p.textMuted);}
             if(kbMetric!=null)kbMetric.setText("Auto-reconnect ready");
             if(speedWifiRtt!=null)speedWifiRtt.setText("—");
@@ -2079,228 +2321,501 @@ public final class MainActivity extends Activity {
         if(targets.isEmpty()){
             if(connectionSummary!=null){
                 connectionSummary.setText(active.isConnected()
-                    ?"Waiting for authenticated environment membership..."
-                    :"Linked Devices (0 / 8)");
+                    ? "Synchronizing displays..."
+                    : "Linked Displays (0 / 8)");
             }
-            TextView empty=new TextView(this);
-            empty.setText(active.isConnected()
-                ?"Synchronizing environment devices..."
-                :"Tap Find Devices above to connect to a Windows hub on your Wi-Fi.");
-            empty.setTextSize(12f);
-            empty.setTextColor(palette.textSecondary);
-            empty.setPadding(dp(2),dp(4),dp(2),dp(4));
-            environmentList.addView(empty);
+            LinearLayout placeholder=new LinearLayout(this);
+            placeholder.setOrientation(LinearLayout.VERTICAL);
+            placeholder.setGravity(Gravity.CENTER);
+            placeholder.setPadding(dp(16),dp(14),dp(16),dp(14));
+            placeholder.setBackground(PhoneUiKit.interactiveBg(
+                0xFF23262E,0xFF2D323E,0xFF475569,dp(8),Math.max(1,dp(1)),palette.rippleColor));
+            placeholder.setClickable(true);
+            placeholder.setFocusable(true);
+            placeholder.setOnClickListener(v->{
+                selectTab(PhoneUiKit.TAB_FIND);
+                scan();
+            });
+
+            TextView pTitle=new TextView(this);
+            pTitle.setText(active.isConnected() ? "Loading Windows Displays..." : "No Hub Linked");
+            pTitle.setTextSize(11.5f);
+            pTitle.setTypeface(null,Typeface.BOLD);
+            pTitle.setTextColor(0xFFE2E8F0);
+            pTitle.setGravity(Gravity.CENTER);
+            placeholder.addView(pTitle);
+
+            TextView pSub=new TextView(this);
+            pSub.setText(active.isConnected()
+                ? "Fetching shared screen arrangement"
+                : "Tap here to open Find & scan hubs");
+            pSub.setTextSize(10f);
+            pSub.setTextColor(0xFF94A3B8);
+            pSub.setGravity(Gravity.CENTER);
+            pSub.setPadding(0,dp(3),0,0);
+            placeholder.addView(pSub);
+
+            environmentList.addView(placeholder,new LinearLayout.LayoutParams(dp(196),dp(78)));
+            renderConnectedHubOnFindIfIdle();
             return;
         }
         if(connectionSummary!=null){
-            connectionSummary.setText("One DeskTouch environment • "+targets.size()+" device(s) online");
+            connectionSummary.setText("Linked Displays • "+targets.size()+" online");
         }
+        int ownId=active.ownEnvironmentId();
+        int selectedId=active.selectedEnvironmentTarget();
         for(int i=0;i<targets.size();i++){
             DeskTouchSession.EnvironmentTarget device=targets.get(i);
-            boolean isSelf=device.id==active.ownEnvironmentId();
-            boolean selectable=!isSelf && device.supportsInput;
-            boolean selected=device.id==active.selectedEnvironmentTarget();
-
-            LinearLayout row=new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(12),dp(10),dp(12),dp(10));
-            if(selected && selectable){
-                row.setBackground(PhoneUiKit.interactiveBg(
-                    palette.accentSoftBg,palette.accentSoftBg,palette.accentBorder,
-                    dp(12),Math.max(1,dp(1)),palette.rippleColor));
-            }else{
-                row.setBackground(selectable
-                    ? PhoneUiKit.interactiveBg(palette.subcardBg,palette.subtleBtnBg,
-                        palette.border,dp(12),Math.max(1,dp(1)),palette.rippleColor)
-                    : PhoneUiKit.roundedBox(palette.subcardBg,palette.border,
-                        dp(12),Math.max(1,dp(1))));
-            }
-
-            LinearLayout textCol=new LinearLayout(this);
-            textCol.setOrientation(LinearLayout.VERTICAL);
-
-            int notifCount=isSelf
+            LinkedDisplayHelper.DisplayTileModel model=LinkedDisplayHelper.parseTileModel(
+                device,selectedId,ownId);
+            int notifCount=model.self
                 ? DeskTouchNotificationListener.readActiveCount(this)
-                : device.notificationCount;
-            if(notifCount>=0){
-                TextView notifPill=new TextView(this);
-                notifPill.setText(String.valueOf(notifCount));
-                notifPill.setTextSize(10.5f);
-                notifPill.setTypeface(null,Typeface.BOLD);
-                notifPill.setPadding(dp(7),dp(2),dp(7),dp(2));
-                PhoneUiKit.stylePill(notifPill,
-                    notifCount>0 ? palette.accentSoftBg : palette.neutralBadgeBg,
-                    Color.TRANSPARENT,
-                    notifCount>0 ? palette.accentText : palette.neutralBadgeText,
-                    this);
-                LinearLayout.LayoutParams npLp=new LinearLayout.LayoutParams(-2,-2);
-                npLp.bottomMargin=dp(3);
-                textCol.addView(notifPill,npLp);
+                : model.notificationCount;
+
+            LinearLayout col=new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.setGravity(Gravity.CENTER_HORIZONTAL);
+
+            TextView notifPill=new TextView(this);
+            notifPill.setText(LinkedDisplayHelper.formatNotificationCount(notifCount));
+            notifPill.setTextSize(10.5f);
+            notifPill.setTypeface(null,Typeface.BOLD);
+            notifPill.setPadding(dp(8),dp(2),dp(8),dp(2));
+            notifPill.setGravity(Gravity.CENTER);
+            boolean hasCount=notifCount>=0;
+            PhoneUiKit.stylePill(notifPill,
+                hasCount ? 0xFF132B45 : 0xFF262B36,
+                hasCount ? 0xFF38BDF8 : 0xFF3F4756,
+                hasCount ? 0xFF7DD3FC : 0xFF94A3B8,this);
+            if(model.self && !hasCount){
+                notifPill.setClickable(true);
+                notifPill.setOnClickListener(v->{
+                    setFeedback("Enable Notification Count Badge in Setup to display this phone's count.",true);
+                    selectTab(PhoneUiKit.TAB_SETUP);
+                });
             }
+            col.addView(notifPill,new LinearLayout.LayoutParams(-2,-2));
+
+            int boxW=model.portrait ? dp(68) : dp(model.monitorCount>1 ? 132 : 118);
+            int boxH=model.portrait ? dp(90) : dp(72);
+            int fill=model.hub ? 0xFF4277CB : 0xFF368883;
+            int pressed=model.hub ? 0xFF4E86DF : 0xFF419D98;
+            boolean highlight=model.selected && model.selectable;
+            int strokeColor=highlight ? 0xFFE0F2FE : 0xFFAABECD;
+            int strokePx=highlight ? Math.max(2,dp(2)) : Math.max(1,dp(1));
+
+            LinearLayout box=new LinearLayout(this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setGravity(Gravity.CENTER);
+            box.setPadding(dp(6),dp(5),dp(6),dp(5));
+            box.setBackground(model.selectable
+                ? PhoneUiKit.interactiveBg(fill,pressed,strokeColor,dp(5),strokePx,0x33FFFFFF)
+                : PhoneUiKit.roundedBox(fill,strokeColor,dp(5),strokePx));
+
+            TextView roleChip=new TextView(this);
+            roleChip.setText(model.hub ? "HUB" : (model.self ? "PHONE" : (highlight ? "ACTIVE" : "PC")));
+            roleChip.setTextSize(8f);
+            roleChip.setTypeface(null,Typeface.BOLD);
+            roleChip.setTextColor(0xFFF8FAFC);
+            roleChip.setPadding(dp(5),dp(1),dp(5),dp(1));
+            roleChip.setBackground(PhoneUiKit.roundedBox(0x38000000,Color.TRANSPARENT,dp(4),0));
+            LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(-2,-2);
+            rcLp.bottomMargin=dp(2);
+            box.addView(roleChip,rcLp);
+
+            TextView labelView=new TextView(this);
+            labelView.setText(model.displayLabel);
+            labelView.setTextSize(10.5f);
+            labelView.setTypeface(null,Typeface.BOLD);
+            labelView.setTextColor(Color.WHITE);
+            labelView.setGravity(Gravity.CENTER);
+            labelView.setSingleLine(true);
+            labelView.setEllipsize(TextUtils.TruncateAt.END);
+            box.addView(labelView);
 
             TextView nameView=new TextView(this);
-            nameView.setText(device.name+(selected && selectable ? "  ● Active" : ""));
-            nameView.setTextSize(13f);
+            nameView.setText(model.shortName);
+            nameView.setTextSize(9.5f);
             nameView.setTypeface(null,Typeface.BOLD);
-            nameView.setTextColor(palette.textPrimary);
-            textCol.addView(nameView);
+            nameView.setTextColor(0xFFE8F3FF);
+            nameView.setGravity(Gravity.CENTER);
+            nameView.setSingleLine(true);
+            nameView.setEllipsize(TextUtils.TruncateAt.END);
+            box.addView(nameView);
 
-            TextView roleView=new TextView(this);
-            roleView.setText(isSelf ? device.platform+" • This phone" : device.platform);
-            roleView.setTextSize(11.5f);
-            roleView.setTextColor(palette.textSecondary);
-            roleView.setPadding(0,dp(1),0,0);
-            textCol.addView(roleView);
+            TextView resView=new TextView(this);
+            resView.setText((!model.self && !model.supportsInput) ? "Perm. req" : model.resolutionSummary);
+            resView.setTextSize(8.5f);
+            resView.setTextColor((!model.self && !model.supportsInput) ? 0xFFFDE68A : 0xFFD6E7F5);
+            resView.setGravity(Gravity.CENTER);
+            resView.setSingleLine(true);
+            resView.setEllipsize(TextUtils.TruncateAt.END);
+            box.addView(resView);
 
-            LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(0,-2,1f);
-            colLp.rightMargin=dp(8);
-            row.addView(textCol,colLp);
-
-            TextView actionTag=new TextView(this);
-            if(isSelf){
-                actionTag.setText("Local");
-                actionTag.setTextColor(palette.textMuted);
-            }else if(!device.supportsInput){
-                actionTag.setText("Permission Req.");
-                actionTag.setTextColor(palette.amberText);
-            }else if(selected){
-                actionTag.setText("Selected");
-                actionTag.setTextColor(palette.accentText);
-            }else{
-                actionTag.setText("Switch");
-                actionTag.setTextColor(palette.accentText);
-            }
-            actionTag.setTextSize(11.5f);
-            actionTag.setTypeface(null,Typeface.BOLD);
-            row.addView(actionTag);
-
-            if(selectable){
-                row.setClickable(true);
-                row.setFocusable(true);
-                row.setOnClickListener(v->{
+            if(model.selectable){
+                box.setClickable(true);
+                box.setFocusable(true);
+                box.setOnClickListener(v->{
                     active.selectEnvironmentTarget(device.id);
-                    active.claimControl();
                     refreshEnvironmentMembers();
                     refreshLiveLinkAndKeyboard();
+                    setFeedback("Target switched to "+model.fullName+". Use Trackpad to control.",false);
                 });
             }
 
-            LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
-            if(i>0)rowLp.topMargin=dp(8);
-            environmentList.addView(row,rowLp);
+            LinearLayout.LayoutParams boxLp=new LinearLayout.LayoutParams(boxW,boxH);
+            boxLp.topMargin=dp(5);
+            col.addView(box,boxLp);
+
+            LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(-2,-2);
+            colLp.gravity=Gravity.CENTER_VERTICAL;
+            if(i>0)colLp.leftMargin=dp(8);
+            environmentList.addView(col,colLp);
         }
+        renderConnectedHubOnFindIfIdle();
+    }
+
+    private void setDiscoveryStatus(String text){
+        if(status!=null)status.setText(text);
+        if(findStatus!=null)findStatus.setText(text);
+    }
+
+    private void renderConnectedHubOnFindIfIdle(){
+        if(deviceList==null || (lastScannedDevices!=null && !lastScannedDevices.isEmpty()))return;
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
+        if(targets.isEmpty() && DeskTouchRuntime.connectedCount()==0){
+            if(findCountTag!=null)findCountTag.setText("Ready");
+            deviceList.removeAllViews();
+            TextView empty=new TextView(this);
+            empty.setText("Tap Scan Now above to discover Windows hubs on Wi-Fi or Data Cable.");
+            empty.setTextSize(12f);
+            empty.setTextColor(palette.textSecondary);
+            empty.setPadding(dp(2),dp(4),dp(2),dp(4));
+            deviceList.addView(empty);
+            return;
+        }
+        deviceList.removeAllViews();
+        if(findCountTag!=null){
+            findCountTag.setText("1 active hub • "+Math.max(1,targets.size())+" devices");
+        }
+        LinearLayout card=PhoneUiKit.createSubcard(this,palette,12);
+        LinearLayout top=new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView title=new TextView(this);
+        DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+        String peerName=(snap!=null && snap.peerName!=null) ? snap.peerName : "";
+        title.setText((!peerName.isEmpty() ? peerName : "Connected Hub"));
+        title.setTextSize(13.5f);
+        title.setTypeface(null,Typeface.BOLD);
+        title.setTextColor(palette.textPrimary);
+        top.addView(title,new LinearLayout.LayoutParams(0,-2,1f));
+
+        TextView pill=new TextView(this);
+        pill.setText("Joined ●");
+        pill.setTextSize(10.5f);
+        pill.setTypeface(null,Typeface.BOLD);
+        pill.setPadding(dp(8),dp(3),dp(8),dp(3));
+        PhoneUiKit.stylePill(pill,palette.emeraldSoftBg,Color.TRANSPARENT,palette.emeraldText,this);
+        top.addView(pill);
+        card.addView(top);
+
+        int selId=active.selectedEnvironmentTarget();
+        int ownId=active.ownEnvironmentId();
+        for(DeskTouchSession.EnvironmentTarget t:targets){
+            LinkedDisplayHelper.DisplayTileModel tm=LinkedDisplayHelper.parseTileModel(t,selId,ownId);
+            LinearLayout row=new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(8),dp(7),dp(8),dp(7));
+            row.setBackground(PhoneUiKit.interactiveBg(
+                palette.cardBg,palette.subtleBtnBg,palette.border,dp(10),Math.max(1,dp(1)),palette.rippleColor));
+            LinearLayout.LayoutParams rLp=new LinearLayout.LayoutParams(-1,-2);
+            rLp.topMargin=dp(6);
+
+            TextView mName=new TextView(this);
+            mName.setText(tm.fullName+(tm.hub ? " (Hub)" : tm.self ? " (This phone)" : ""));
+            mName.setTextSize(12f);
+            mName.setTypeface(null,Typeface.BOLD);
+            mName.setTextColor(palette.textPrimary);
+            row.addView(mName,new LinearLayout.LayoutParams(0,-2,1f));
+
+            TextView badge=new TextView(this);
+            badge.setText("Notif: "+LinkedDisplayHelper.formatNotificationCount(tm.notificationCount));
+            badge.setTextSize(10.5f);
+            badge.setTypeface(null,Typeface.BOLD);
+            badge.setPadding(dp(7),dp(2),dp(7),dp(2));
+            PhoneUiKit.stylePill(badge,
+                tm.notificationCount>=0 ? palette.accentSoftBg : palette.neutralBadgeBg,
+                Color.TRANSPARENT,
+                tm.notificationCount>=0 ? palette.accentText : palette.neutralBadgeText,this);
+            row.addView(badge);
+
+            if(tm.selectable){
+                row.setClickable(true);
+                row.setFocusable(true);
+                row.setOnClickListener(v->{
+                    active.selectEnvironmentTarget(tm.id);
+                    refreshEnvironmentMembers();
+                    refreshLiveLinkAndKeyboard();
+                    selectTab(PhoneUiKit.TAB_TRACKPAD);
+                });
+            }
+            card.addView(row,rLp);
+        }
+        deviceList.addView(card);
+    }
+
+    private void renderScannedHubs(List<DesktopDiscovery.Device> list){
+        if(deviceList==null)return;
+        dynamicDeviceThemeUpdaters.clear();
+        deviceList.removeAllViews();
+        java.util.LinkedHashMap<String,List<DesktopDiscovery.Device>> groups=
+            DesktopDiscovery.windowsGroups(list);
+        java.util.Set<String> connected=new java.util.HashSet<>();
+        int windowsCount=0;
+        for(DesktopDiscovery.Device member:list){
+            if(!member.android){
+                windowsCount++;
+                if(DeskTouchRuntime.isConnected(member.fingerprint))
+                    connected.add(member.fingerprint);
+            }
+        }
+        java.util.Set<String> approved=new java.util.HashSet<>();
+        try {approved.addAll(new TrustedWindows(this).fingerprints());}
+        catch(Exception ignored){}
+
+        if(findCountTag!=null){
+            findCountTag.setText(groups.isEmpty() ? "0 hubs"
+                : groups.size()+" hub"+(groups.size()==1 ? "" : "s")+" • "+windowsCount+" PC");
+        }
+        if(groups.isEmpty()){
+            setDiscoveryStatus("No DeskTouch environment found. Start DeskTouch on a Windows hub or check Data Cable.");
+            renderConnectedHubOnFindIfIdle();
+            return;
+        }
+        setDiscoveryStatus("Choose a DeskTouch environment hub. Member devices join automatically through one hub.");
+
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        List<DeskTouchSession.EnvironmentTarget> liveTargets=active.environmentTargets();
+
+        int groupIdx=0;
+        for(List<DesktopDiscovery.Device> members:groups.values()){
+            DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(members,connected,approved);
+            if(gateway==null)continue;
+            boolean isJoined=DeskTouchRuntime.isConnected(gateway.fingerprint);
+
+            LinearLayout hubCard=new LinearLayout(this);
+            hubCard.setOrientation(LinearLayout.VERTICAL);
+            hubCard.setPadding(dp(12),dp(11),dp(12),dp(11));
+            hubCard.setClickable(true);
+            hubCard.setFocusable(true);
+
+            LinearLayout headerRow=new LinearLayout(this);
+            headerRow.setOrientation(LinearLayout.HORIZONTAL);
+            headerRow.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView hubRole=new TextView(this);
+            hubRole.setText(gateway.cable ? "CABLE HUB" : "HUB");
+            hubRole.setTextSize(9.5f);
+            hubRole.setTypeface(null,Typeface.BOLD);
+            hubRole.setPadding(dp(6),dp(2),dp(6),dp(2));
+            LinearLayout.LayoutParams hrLp=new LinearLayout.LayoutParams(-2,-2);
+            hrLp.rightMargin=dp(7);
+            headerRow.addView(hubRole,hrLp);
+
+            TextView hubTitle=new TextView(this);
+            hubTitle.setText(gateway.name+" ("+members.size()+")");
+            hubTitle.setTextSize(13.5f);
+            hubTitle.setTypeface(null,Typeface.BOLD);
+            hubTitle.setSingleLine(true);
+            hubTitle.setEllipsize(TextUtils.TruncateAt.END);
+            LinearLayout.LayoutParams htLp=new LinearLayout.LayoutParams(0,-2,1f);
+            htLp.rightMargin=dp(8);
+            headerRow.addView(hubTitle,htLp);
+
+            TextView hubTag=new TextView(this);
+            hubTag.setText(isJoined ? "Joined ●" : (!gateway.ready ? "Busy" : "Join Hub"));
+            hubTag.setTextSize(11f);
+            hubTag.setTypeface(null,Typeface.BOLD);
+            hubTag.setPadding(dp(9),dp(4),dp(9),dp(4));
+            headerRow.addView(hubTag);
+            hubCard.addView(headerRow);
+
+            List<TextView> memberTitles=new ArrayList<>();
+            List<TextView> memberSubs=new ArrayList<>();
+            for(DesktopDiscovery.Device m:members){
+                boolean isGw=m.fingerprint.equals(gateway.fingerprint);
+                LinearLayout mRow=new LinearLayout(this);
+                mRow.setOrientation(LinearLayout.HORIZONTAL);
+                mRow.setGravity(Gravity.CENTER_VERTICAL);
+                mRow.setPadding(dp(4),dp(6),dp(4),dp(2));
+
+                TextView mTitle=new TextView(this);
+                mTitle.setText("• "+m.name);
+                mTitle.setTextSize(12f);
+                mTitle.setTypeface(null,isGw ? Typeface.BOLD : Typeface.NORMAL);
+                LinearLayout.LayoutParams mtLp=new LinearLayout.LayoutParams(0,-2,1f);
+                mtLp.rightMargin=dp(6);
+                mRow.addView(mTitle,mtLp);
+                memberTitles.add(mTitle);
+
+                String roleLabel=isGw ? "Gateway" : "Member via Hub";
+                if(isJoined){
+                    for(DeskTouchSession.EnvironmentTarget et:liveTargets){
+                        if((isGw && et.id==0) || m.name.equalsIgnoreCase(et.name)){
+                            if(et.notificationCount>=0){
+                                roleLabel=roleLabel+" • Notif "+et.notificationCount;
+                            }
+                            break;
+                        }
+                    }
+                }
+                TextView mSub=new TextView(this);
+                mSub.setText(roleLabel);
+                mSub.setTextSize(10.5f);
+                mRow.addView(mSub);
+                memberSubs.add(mSub);
+                hubCard.addView(mRow);
+            }
+
+            Runnable styleHubRow=()->{
+                hubCard.setBackground(PhoneUiKit.interactiveBg(
+                    palette.subcardBg,palette.subtleBtnBg,
+                    isJoined ? palette.emeraldBorder : palette.border,
+                    dp(12),Math.max(1,dp(1)),palette.rippleColor));
+                PhoneUiKit.stylePill(hubRole,
+                    gateway.cable ? palette.emeraldSoftBg : palette.indigoSoftBg,
+                    Color.TRANSPARENT,
+                    gateway.cable ? palette.emeraldText : palette.indigoText,this);
+                hubTitle.setTextColor(palette.textPrimary);
+                PhoneUiKit.stylePill(hubTag,
+                    isJoined ? palette.emeraldSoftBg : (!gateway.ready ? palette.amberSoftBg : palette.accentSoftBg),
+                    Color.TRANSPARENT,
+                    isJoined ? palette.emeraldText : (!gateway.ready ? palette.amberText : palette.accentText),this);
+                for(TextView mt:memberTitles)mt.setTextColor(palette.textPrimary);
+                for(TextView ms:memberSubs)ms.setTextColor(palette.textSecondary);
+            };
+            styleHubRow.run();
+            dynamicDeviceThemeUpdaters.add(styleHubRow);
+
+            hubCard.setOnClickListener(v->onHubGatewaySelected(gateway));
+
+            LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
+            if(groupIdx++>0)rowLp.topMargin=dp(8);
+            deviceList.addView(hubCard,rowLp);
+        }
+    }
+
+    private void onHubGatewaySelected(DesktopDiscovery.Device gateway){
+        if(gateway==null)return;
+        if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
+            session=DeskTouchRuntime.select(this,gateway.fingerprint);
+            refreshEnvironmentMembers();
+            selectTab(PhoneUiKit.TAB_HOME);
+            return;
+        }
+        if(DeskTouchRuntime.connectedCount()>0){
+            setDiscoveryStatus("Already joined a DeskTouch environment. Leave it in Setup before switching hubs.");
+            return;
+        }
+        if(!gateway.ready){
+            setDiscoveryStatus("Environment gateway is at capacity or unavailable.");
+            return;
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Join DeskTouch environment")
+            .setMessage("Connect once to "+gateway.name+
+                ". Other Windows PCs and Android phones attached "+
+                "to that hub will appear inside the same environment. "+
+                "Each device joins through its own approved TLS "+
+                "connection to the hub; this phone does not need to "+
+                "pair separately with every member.")
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Join environment",(dialog,which)->{
+                android.graphics.Point size=PhoneScreenGeometry.read(this);
+                AutoConnectService.setReconnect(this,true);
+                AutoConnectService.resumePeer(this,gateway.fingerprint);
+                session=DeskTouchRuntime.select(this,gateway.fingerprint);
+                session.connect(gateway,size.x,size.y,true,null);
+                setDiscoveryStatus("Connecting to shared environment through "+
+                    gateway.name+". Approve pairing on that Windows PC.");
+            }).show();
+    }
+
+    private DesktopDiscovery.Device resolveGatewayForScan(
+            List<DesktopDiscovery.Device> list,DesktopDiscovery.Device matched){
+        java.util.Set<String> connected=new java.util.HashSet<>();
+        for(DesktopDiscovery.Device m:list)
+            if(!m.android && DeskTouchRuntime.isConnected(m.fingerprint))connected.add(m.fingerprint);
+        java.util.Set<String> approved=new java.util.HashSet<>();
+        try{approved.addAll(new TrustedWindows(this).fingerprints());}
+        catch(Exception ignored){}
+        return LinkedDisplayHelper.resolveGatewayForDevice(list,matched,connected,approved);
+    }
+
+    private void pairByEnteredCode(){
+        if(pairingCodeInput==null)return;
+        String normalized=LinkedDisplayHelper.normalizePairingCode(
+            pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString());
+        if(normalized.isEmpty()){
+            setFeedback("Enter at least 6 hex characters from the Windows Copy Pairing Code button.",true);
+            return;
+        }
+        List<DesktopDiscovery.Device> snapshot=lastScannedDevices;
+        DesktopDiscovery.Device cached=LinkedDisplayHelper.findDeviceByPairingCode(snapshot,normalized);
+        if(cached!=null){
+            onHubGatewaySelected(resolveGatewayForScan(snapshot,cached));
+            return;
+        }
+        setDiscoveryStatus("Searching Wi-Fi and cable for pairing code "+normalized+"...");
+        if(scanning)return;
+        scanning=true;
+        new Thread(()->{
+            try{
+                List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
+                lastScannedDevices=list;
+                runOnUiThread(()->{
+                    if(isFinishing()||isDestroyed())return;
+                    renderScannedHubs(list);
+                    DesktopDiscovery.Device matched=LinkedDisplayHelper.findDeviceByPairingCode(list,normalized);
+                    if(matched==null){
+                        setDiscoveryStatus("No reachable hub or PC matched that pairing code on your network.");
+                        return;
+                    }
+                    onHubGatewaySelected(resolveGatewayForScan(list,matched));
+                });
+            }catch(Exception e){
+                runOnUiThread(()->{
+                    if(!isFinishing()&&!isDestroyed())
+                        setDiscoveryStatus("Pairing lookup failed: "+e.getMessage());
+                });
+            }finally{scanning=false;}
+        },"DeskTouch pairing code lookup").start();
     }
 
     private void scan(){
         if(scanning)return;
         scanning=true;
-        status.setText("Finding a DeskTouch environment hub on your private LAN...");
-        dynamicDeviceThemeUpdaters.clear();
-        deviceList.removeAllViews();
+        setDiscoveryStatus("Finding a DeskTouch environment hub on your private Wi-Fi or cable...");
+        if(deviceList!=null){
+            dynamicDeviceThemeUpdaters.clear();
+            deviceList.removeAllViews();
+        }
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
+                lastScannedDevices=list;
                 runOnUiThread(()->{
                     if(isFinishing()||isDestroyed())return;
-                    java.util.LinkedHashMap<String,List<DesktopDiscovery.Device>> groups=
-                        DesktopDiscovery.windowsGroups(list);
-                    java.util.Set<String> connected=new java.util.HashSet<>();
-                    for(DesktopDiscovery.Device member:list)
-                        if(!member.android&&DeskTouchRuntime.isConnected(member.fingerprint))
-                            connected.add(member.fingerprint);
-                    java.util.Set<String> approved=new java.util.HashSet<>();
-                    try {approved.addAll(new TrustedWindows(this).fingerprints());}
-                    catch(Exception ignored){}
-                    if(groups.isEmpty())
-                        status.setText("No DeskTouch environment found. Start DeskTouch on a Windows hub.");
-                    else status.setText("Choose one environment. Connected members will "+
-                        "appear automatically after joining the hub.");
-                    for(List<DesktopDiscovery.Device> members:groups.values()){
-                        DesktopDiscovery.Device gateway=DesktopDiscovery.chooseGateway(
-                            members,connected,approved);
-                        if(gateway==null)continue;
-                        String names=String.join(" + ",members.stream()
-                            .map(m->m.name).toArray(String[]::new));
-                        boolean isJoined=DeskTouchRuntime.isConnected(gateway.fingerprint);
-
-                        LinearLayout hubRow=new LinearLayout(this);
-                        hubRow.setOrientation(LinearLayout.HORIZONTAL);
-                        hubRow.setGravity(Gravity.CENTER_VERTICAL);
-                        hubRow.setPadding(dp(12),dp(10),dp(12),dp(10));
-                        hubRow.setClickable(true);
-                        hubRow.setFocusable(true);
-
-                        TextView hubTitle=new TextView(this);
-                        hubTitle.setText("DeskTouch hub • "+names);
-                        hubTitle.setTextSize(12.5f);
-                        hubTitle.setTypeface(null,Typeface.BOLD);
-                        LinearLayout.LayoutParams htLp=new LinearLayout.LayoutParams(0,-2,1f);
-                        htLp.rightMargin=dp(8);
-                        hubRow.addView(hubTitle,htLp);
-
-                        TextView hubTag=new TextView(this);
-                        hubTag.setText(isJoined ? "Joined" : "Join");
-                        hubTag.setTextSize(11f);
-                        hubTag.setTypeface(null,Typeface.BOLD);
-                        hubTag.setPadding(dp(8),dp(3),dp(8),dp(3));
-                        hubRow.addView(hubTag);
-
-                        Runnable styleHubRow=()->{
-                            hubRow.setBackground(PhoneUiKit.interactiveBg(
-                                palette.subcardBg,palette.subtleBtnBg,palette.border,
-                                dp(12),Math.max(1,dp(1)),palette.rippleColor));
-                            hubTitle.setTextColor(palette.textPrimary);
-                            PhoneUiKit.stylePill(hubTag,
-                                isJoined ? palette.emeraldSoftBg : palette.accentSoftBg,
-                                Color.TRANSPARENT,
-                                isJoined ? palette.emeraldText : palette.accentText,this);
-                        };
-                        styleHubRow.run();
-                        dynamicDeviceThemeUpdaters.add(styleHubRow);
-
-                        hubRow.setOnClickListener(v->{
-                            if(DeskTouchRuntime.isConnected(gateway.fingerprint)){
-                                session=DeskTouchRuntime.select(this,gateway.fingerprint);
-                                refreshEnvironmentMembers();return;
-                            }
-                            if(DeskTouchRuntime.connectedCount()>0){
-                                status.setText("Already joined a DeskTouch environment. "+
-                                    "Leave it before switching hubs.");return;
-                            }
-                            if(!gateway.ready){
-                                status.setText("Environment gateway is at capacity or unavailable.");
-                                return;
-                            }
-                            new AlertDialog.Builder(this)
-                                .setTitle("Join DeskTouch environment")
-                                .setMessage("Connect once to "+gateway.name+
-                                    ". Other Windows PCs and Android phones attached "+
-                                    "to that hub will appear inside the same environment. "+
-                                    "Each device joins through its own approved TLS "+
-                                    "connection to the hub; this phone does not need to "+
-                                    "pair separately with every member.")
-                                .setNegativeButton("Cancel",null)
-                                .setPositiveButton("Join environment",(dialog,which)->{
-                                    android.graphics.Point size=PhoneScreenGeometry.read(this);
-                                    AutoConnectService.setReconnect(this,true);
-                                    AutoConnectService.resumePeer(this,gateway.fingerprint);
-                                    session=DeskTouchRuntime.select(this,gateway.fingerprint);
-                                    session.connect(gateway,size.x,size.y,true,null);
-                                    status.setText("Connecting to shared environment through "+
-                                        gateway.name+". Approve pairing on that Windows PC.");
-                                }).show();
-                        });
-
-                        LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
-                        rowLp.topMargin=dp(6);
-                        deviceList.addView(hubRow,rowLp);
-                    }
+                    renderScannedHubs(list);
                 });
             }catch(Exception e){
                 runOnUiThread(()->{
                     if(!isFinishing()&&!isDestroyed())
-                        status.setText("Environment discovery failed: "+e.getMessage());
+                        setDiscoveryStatus("Environment discovery failed: "+e.getMessage());
                 });
             }finally{scanning=false;}
         },"DeskTouch LAN environment discovery").start();

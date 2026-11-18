@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.74 — Android Trackpad Control, Windows-Format Linked Displays & Dedicated Find Hubs Panel
+
+- **Control PC Screen moved to Trackpad tab (`MainActivity`, `PhoneUiKit`):** Moves `Control PC Screen` and `Return to Phone` into a dedicated control banner at the top of the `Trackpad` tab alongside the live active-link status pill, keeping Home focused on connection health and display arrangement.
+- **Windows-format Linked Displays arrangement on Home (`MainActivity`, `LinkedDisplayHelper`):** Redesigns Home's Linked Displays card inside a dark Windows Display Settings-style arrangement canvas featuring proportional blue (`Hub`) and teal (`Connected PC` / portrait `Android`) monitor tiles (`Display 1` / `Android · 1`, resolution summary, active highlight) with each device's numeric notification badge centered directly above its screen box.
+- **Dedicated `Find` bottom navigation tab (`MainActivity`, `PhoneUiKit`):** Expands the bottom navigation bar to 5 tabs (`Home`, `Find`, `Trackpad`, `Speed`, `Setup`) with a dedicated Environments & Hubs panel (`Scan Now`, grouped hub cards showing gateway + members + live notification badges, and `Connect by Pairing Code` lookup).
+
+---
+
 # DeskTouch Vision v0.3.73 — Faster Phone Startup Auto-Connect & Xiaomi Restricted Notification Access Guide
 
 - **Faster initial phone startup & USB cable attach (`AutoConnectService`):** Extends the initial USB cable attach probe window up to 6.5 s so cold ADB reverse bridges connect immediately without waiting for the 10 s periodic sweep, and reduces cellular failover probe backoff from 60 s to 20 s for faster startup recovery when switching networks.

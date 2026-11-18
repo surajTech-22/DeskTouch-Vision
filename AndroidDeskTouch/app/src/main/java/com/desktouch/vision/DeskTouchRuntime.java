@@ -411,6 +411,45 @@ final class DeskTouchRuntime {
         return new java.util.HashSet<>(PEER_ENDPOINTS.keySet());
     }
 
+    static synchronized void notifyLocalNotificationCountChanged(int count){
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()) s.publishNotificationCount(count);
+        }
+        AutoConnectService.refreshNotification();
+        notifyLiveStatusChanged();
+    }
+
+    static synchronized String connectedNotificationSummary(Context context){
+        int devCount=0;
+        int totalNotifs=0;
+        boolean hasAnyNotifCount=false;
+        int localCount=DeskTouchNotificationListener.readActiveCount(context);
+        if(localCount>=0){
+            totalNotifs+=localCount;
+            hasAnyNotifCount=true;
+        }
+        for(DeskTouchSession s:sessions.values()){
+            if(s==null || !s.isConnected()) continue;
+            java.util.List<DeskTouchSession.EnvironmentTarget> list=s.environmentTargets();
+            if(!list.isEmpty()){
+                devCount=Math.max(devCount,list.size());
+                for(DeskTouchSession.EnvironmentTarget t:list){
+                    if(t.id==s.ownEnvironmentId()) continue;
+                    if(t.notificationCount>=0){
+                        totalNotifs+=t.notificationCount;
+                        hasAnyNotifCount=true;
+                    }
+                }
+            }else{
+                devCount++;
+            }
+        }
+        if(devCount<=0) return "";
+        return hasAnyNotifCount
+            ? devCount+" connected • "+totalNotifs+" notifications"
+            : devCount+" connected";
+    }
+
     static synchronized DeskTouchSession.LiveStatusSnapshot liveSnapshotForPeer(String fingerprint) {
         if (fingerprint == null || fingerprint.isEmpty()) return null;
         DeskTouchSession s = sessions.get(fingerprint.toUpperCase(java.util.Locale.ROOT));

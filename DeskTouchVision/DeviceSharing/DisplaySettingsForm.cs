@@ -151,12 +151,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly string _layoutPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "DeskTouchVision", "device-sharing-layout.json");
+    private readonly WindowsNotificationCounter _notificationCounter = new();
+    private readonly DeskSpaceDeckBridge _deckBridge;
+    private TrayDeviceFlyout? _trayFlyout;
 
     internal DisplaySettingsForm(bool startInTray = false)
     {
         _startInTray = startInTray;
         try { _trusted = new TrustedDeviceStore(); }
         catch (Exception ex) { _trustLoadError = ex.Message; }
+        _deckBridge = new DeskSpaceDeckBridge(
+            targetId => PostToUi(() => SwitchDirectlyToTarget(targetId)),
+            () => PostToUi(ReturnControlLocalFromExternal),
+            peerId => PostToUi(() => PausePhoneForPaymentsFromBridge(peerId)),
+            () => PostToUi(ShowFromTray));
+        _notificationCounter.CountChanged += count => PostToUi(() => OnLocalNotificationCountChanged(count));
         Text = "DeskTouch Vision — Displays";
         Font = new Font("Segoe UI", 10);
         BackColor = Color.FromArgb(31, 32, 36);
@@ -328,8 +337,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _ => PostToUi(() => _ = ScanTrustedAsync()),
                 TaskScheduler.Default);
             _liveLinkTimer = new System.Windows.Forms.Timer { Interval = 750 };
-            _liveLinkTimer.Tick += (_, _) => UpdateLiveLinkDisplay();
+            _liveLinkTimer.Tick += (_, _) =>
+            {
+                UpdateLiveLinkDisplay();
+                PublishDeckBridgeSnapshot();
+            };
             _liveLinkTimer.Start();
+            _deckBridge.Start();
+            PublishDeckBridgeSnapshot();
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
             if (_startInTray && !_showRequestedBeforeShown)
@@ -396,6 +411,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 
+        _trayMenu.Opening += OnTrayMenuOpening;
         _trayIcon = new NotifyIcon
         {
             Icon = Icon ?? LoadAppIcon(),
@@ -403,7 +419,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        _trayIcon.DoubleClick += (_, _) => ShowFromTray();
+        _trayIcon.MouseClick += OnTrayIconMouseClick;
+        _trayIcon.DoubleClick += (_, _) =>
+        {
+            _trayFlyout?.Hide();
+            ShowFromTray();
+        };
     }
 
     internal static Rectangle EnsureVisibleBounds(
@@ -845,6 +866,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _display.LocalDeviceName = Environment.MachineName;
             _display.LocalIsEnvironmentHub = _host == null;
             _display.Local = MonitorTopology.Capture();
+            _display.LocalNotificationCount = _notificationCounter.CurrentCount;
             // Device placement is an ENVIRONMENT property, not a transient
             // keyboard-authority selection. Selecting Android must never
             // move the Windows PC from the left side to another tile.
@@ -861,6 +883,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _display.RemotePlatform=hub?.Platform;
                 _display.RemoteScreenDetails=hub?.Platform == "Android"
                     ? baseTopology.DescribeSummary("Android") : null;
+                _display.RemoteNotificationCount = hub?.NotificationCount ?? -1;
                 foreach(var member in _host.EnvironmentMembers)
                 {
                     if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId)continue;
@@ -872,14 +895,17 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                         localDirect?.Peer.SupportsReverseInput ?? member.SupportsReverseInput,
                         member.StableIdentity,
                         localDirect?.Peer.Monitors ?? memberTopology,
-                        localDirect?.Peer.FormatScreenInfo() ?? memberTopology.DescribeSummary(member.Platform)));
+                        localDirect?.Peer.FormatScreenInfo() ?? memberTopology.DescribeSummary(member.Platform),
+                        localDirect is { } direct && direct.Peer.NotificationCount >= 0
+                            ? direct.Peer.NotificationCount
+                            : member.NotificationCount));
                 }
                 foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
                 {
                     tiles.Add(new EnvironmentDisplayTile(id, peer.Name,
                         peer.Platform, peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput, peer.DeviceFingerprint,
-                        peer.Monitors, peer.FormatScreenInfo()));
+                        peer.Monitors, peer.FormatScreenInfo(), peer.NotificationCount));
                 }
             }
             else
@@ -902,6 +928,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _display.RemotePlatform=main.Peer?.Platform;
                 _display.RemoteScreenDetails=main.Peer != null
                     ? main.Peer.FormatScreenInfo() : null;
+                _display.RemoteNotificationCount = main.Peer?.NotificationCount ?? -1;
                 var shownIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach(var (id,peer) in connected)
                 {
@@ -910,7 +937,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
                         peer.Platform,peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput,peer.DeviceFingerprint,
-                        peer.Monitors,peer.FormatScreenInfo()));
+                        peer.Monitors,peer.FormatScreenInfo(),peer.NotificationCount));
                 }
                 foreach(var (vid, peer, _) in bridged)
                 {
@@ -1257,6 +1284,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     _capture.BeginLinkedHandoff(edge,fraction);
             }
             RefreshDisplays();
+            PublishDeckBridgeSnapshot();
+            RefreshTrayFlyoutIfVisible();
             Status("Destination: "+(selectedPeer?.Name ??
                 _host?.RemoteSystemName ?? "shared environment")+
                 ". All connected devices remain online.");
@@ -1350,6 +1379,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 InputClaimLifecyclePolicy.CanGrant(_nativeInput?.IsRunning == true,
                     _capture?.RemoteActive == true, _capture?.IsClaimPending == true);
             _receiver.Start();
+            _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
             if (_adbBridge?.CurrentShellBridge is { } existingBridge)
                 _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret);
             try
@@ -1479,6 +1509,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             }
         }
         RefreshDisplays();
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
     });
 
     private void OnIncomingPeerConnected(ConnectedPeer peer)
@@ -1975,6 +2007,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.RemoteTopologyChanged += HandleRemoteTopology;
         session.RemoteNameChanged += HandleRemoteName;
         session.EnvironmentRosterChanged += HandleEnvironmentRoster;
+        session.PublishNotificationCount(_notificationCounter.CurrentCount);
         session.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
         session.SubRoutePacketReceived += OnHostSubRoutePacket;
         session.MutualTrustOfferRequested = ConfirmMutualTrustOfferAsync;
@@ -2287,6 +2320,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             case "busy": _capture.ReceiverBusy(packet.A); break;
             case "local-active": _capture.ReceiverNativePriority(packet.A); break;
         }
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
     }
 
     private void OnEnvironmentMemberMoved(string key,PointF point)
@@ -2321,6 +2356,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         SavePreferredEdge();
         // Applying a hub snapshot MUST NOT re-send it as a local drag.
         RefreshDisplays();
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
     });
 
     private void HandleEnvironmentRoster() => PostToUi(() =>
@@ -2333,6 +2370,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.OwnEnvironmentMemberId);
         UpdateTargetChoice();
         RefreshDisplays();
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
         Status($"Shared environment: {_host.EnvironmentMembers.Count} available devices.");
     });
 
@@ -2671,10 +2710,233 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _trayIcon.Dispose();
                 _trayIcon = null;
             }
+            _trayFlyout?.Hide();
+            _trayFlyout?.Dispose();
+            _trayFlyout = null;
             _trayMenu?.Dispose();
             _trayMenu = null;
+            _notificationCounter.Dispose();
+            _deckBridge.Dispose();
             _closing.Dispose();
         }
         base.Dispose(disposing);
+    }
+
+    private void OnLocalNotificationCountChanged(int count)
+    {
+        if (_closing.IsCancellationRequested || IsDisposed) return;
+        _display.LocalNotificationCount = count;
+        _receiver?.SetLocalNotificationCount(count);
+        _host?.PublishNotificationCount(count);
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
+    }
+
+    private void OnTrayIconMouseClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || _closing.IsCancellationRequested || IsDisposed)
+            return;
+        _trayFlyout ??= new TrayDeviceFlyout(
+            SwitchDirectlyToTarget,
+            ReturnControlLocalFromExternal,
+            PausePhoneForPaymentsFromBridge,
+            ShowFromTray);
+        _trayFlyout.ToggleNearCursor(BuildBridgeSnapshot());
+    }
+
+    private void OnTrayMenuOpening(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_trayMenu == null || _closing.IsCancellationRequested || IsDisposed) return;
+        for (int i = _trayMenu.Items.Count - 1; i >= 0; i--)
+        {
+            if (Equals(_trayMenu.Items[i].Tag, "dynamic-device"))
+                _trayMenu.Items.RemoveAt(i);
+        }
+
+        var snap = BuildBridgeSnapshot();
+        int insertAt = 0;
+        var header = new ToolStripMenuItem($"DeskTouch Devices ({snap.ConnectedCount} connected)")
+        {
+            Enabled = false,
+            Tag = "dynamic-device"
+        };
+        _trayMenu.Items.Insert(insertAt++, header);
+
+        foreach (var d in snap.Devices)
+        {
+            string badge = d.NotificationCount >= 0 ? $"  [{d.NotificationCount}]" : "";
+            string label = d.IsLocal
+                ? $"This Computer ({d.Name}){badge}"
+                : $"{d.Name} ({d.Platform}){badge}";
+            var item = new ToolStripMenuItem(label)
+            {
+                Checked = d.IsControlling || (d.IsSelected && d.IsLocal),
+                Enabled = d.SupportsInput,
+                Tag = "dynamic-device"
+            };
+            var captured = d;
+            item.Click += (_, _) =>
+            {
+                if (captured.IsLocal)
+                    ReturnControlLocalFromExternal();
+                else if (captured.SupportsInput)
+                    SwitchDirectlyToTarget(captured.Id);
+            };
+            _trayMenu.Items.Insert(insertAt++, item);
+        }
+
+        _trayMenu.Items.Insert(insertAt, new ToolStripSeparator { Tag = "dynamic-device" });
+    }
+
+    private void SwitchDirectlyToTarget(int targetId)
+    {
+        if (_closing.IsCancellationRequested || IsDisposed) return;
+        if (targetId == EnvironmentRouteOrder.Local)
+        {
+            ReturnControlLocalFromExternal();
+            return;
+        }
+        EnsureCaptureArmedIfConnected();
+        var actualEdge = _display.EdgeToward(EnvironmentRouteOrder.Local, targetId, CurrentBaseTargetId())
+            ?? _preferredEdge;
+        if (targetId == CurrentInputTargetId() && _capture?.IsArmed == true)
+        {
+            if (!_capture.RemoteActive)
+            {
+                _capture.SetEdge(actualEdge);
+                _capture.BeginDirectHandoff();
+            }
+        }
+        else
+        {
+            SelectConnectedTargetCore(targetId, actualEdge, 0.5, requestHandoff: true, directHandoff: true);
+        }
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
+    }
+
+    private void ReturnControlLocalFromExternal()
+    {
+        if (_closing.IsCancellationRequested || IsDisposed) return;
+        _capture?.ReturnLocal();
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
+    }
+
+    private void PausePhoneForPaymentsFromBridge(int peerId)
+    {
+        if (_receiver == null || _closing.IsCancellationRequested || IsDisposed) return;
+        int sent = _receiver.PauseConnectedAndroidForPayments(peerId > 0 ? peerId : null);
+        if (sent == 0 && peerId > 0)
+            sent = _receiver.PauseConnectedAndroidForPayments(null);
+        if (sent > 0)
+            Status("Sent payment-safe pause request to your phone so payment apps work normally.");
+        PublishDeckBridgeSnapshot();
+        RefreshTrayFlyoutIfVisible();
+    }
+
+    private void RefreshTrayFlyoutIfVisible()
+    {
+        if (_trayFlyout is { Visible: true, IsDisposed: false })
+            _trayFlyout.UpdateSnapshot(BuildBridgeSnapshot());
+    }
+
+    private void PublishDeckBridgeSnapshot()
+    {
+        if (_closing.IsCancellationRequested || IsDisposed) return;
+        _deckBridge.PublishSnapshot(BuildBridgeSnapshot());
+    }
+
+    private BridgeDeviceSnapshotDto BuildBridgeSnapshot()
+    {
+        int localNotif = _notificationCounter.CurrentCount;
+        int currentTarget = CurrentInputTargetId();
+        bool isRemoteActive = _capture?.RemoteActive == true;
+
+        var items = new List<BridgeDeviceItemDto>
+        {
+            new BridgeDeviceItemDto(
+                EnvironmentRouteOrder.Local,
+                Environment.MachineName,
+                "Windows",
+                IsLocal: true,
+                IsSelected: !isRemoteActive,
+                IsControlling: !isRemoteActive,
+                SupportsInput: true,
+                NotificationCount: localNotif,
+                StatusText: isRemoteActive ? "Click to return" : "Controlling")
+        };
+
+        var seenIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddRemote(int id, string name, string platform, bool supportsInput, int notifCount, string identity)
+        {
+            if (!string.IsNullOrWhiteSpace(identity) && !seenIdentities.Add(identity))
+                return;
+            bool selected = id == currentTarget;
+            bool controlling = isRemoteActive && selected;
+            string status = !supportsInput
+                ? (platform == "Android" ? "Paused" : "Unavailable")
+                : (controlling ? "Controlling" : (selected ? "Selected" : "Connected"));
+            items.Add(new BridgeDeviceItemDto(
+                id, name, platform, IsLocal: false,
+                IsSelected: selected, IsControlling: controlling,
+                SupportsInput: supportsInput,
+                NotificationCount: notifCount >= 0 ? notifCount : -1,
+                StatusText: status));
+        }
+
+        if (_host != null)
+        {
+            foreach (var member in _host.EnvironmentMembers)
+            {
+                if (member.Id == _host.OwnEnvironmentMemberId) continue;
+                var localDirect = FindLocalReceiverPeerByIdentity(member.StableIdentity);
+                int targetId = localDirect?.Id ?? -member.Id;
+                bool supportsInput = localDirect?.Peer.SupportsReverseInput ?? member.SupportsReverseInput;
+                int notif = localDirect is { } direct && direct.Peer.NotificationCount >= 0
+                    ? direct.Peer.NotificationCount
+                    : member.NotificationCount;
+                string identity = !string.IsNullOrWhiteSpace(member.StableIdentity)
+                    ? member.StableIdentity
+                    : member.Platform + "|" + member.Name;
+                AddRemote(targetId, member.Name, member.Platform, supportsInput, notif, identity);
+            }
+            foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
+            {
+                AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+            }
+        }
+        else if (_receiver != null)
+        {
+            foreach (var (id, peer) in _receiver.ConnectedPeers.OrderBy(p => p.Id))
+            {
+                AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+            }
+            foreach (var (vid, peer, _) in _receiver.BridgedPeers)
+            {
+                AddRemote(vid, peer.Name, peer.Platform, peer.SupportsReverseInput,
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+            }
+        }
+
+        int connectedCount = Math.Max(0, items.Count - 1);
+        bool hasKnown = items.Any(d => d.NotificationCount >= 0);
+        int totalNotif = items.Where(d => d.NotificationCount >= 0).Sum(d => d.NotificationCount);
+        string activeName = items.FirstOrDefault(d => d.IsControlling)?.Name ?? Environment.MachineName;
+
+        return new BridgeDeviceSnapshotDto(
+            Version: 1,
+            UpdatedUtcMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            LocalName: Environment.MachineName,
+            LocalNotificationCount: localNotif,
+            ActiveTargetId: isRemoteActive ? currentTarget : EnvironmentRouteOrder.Local,
+            IsRemoteActive: isRemoteActive,
+            ActiveDeviceName: activeName,
+            ConnectedCount: connectedCount,
+            TotalNotificationCount: totalNotif,
+            HasAnyKnownNotificationCount: hasKnown,
+            Devices: items);
     }
 }

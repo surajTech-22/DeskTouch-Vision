@@ -141,12 +141,18 @@ final class DeskTouchSession implements AutoCloseable {
         final int id;
         final String name,platform,layout;
         final boolean supportsInput;
+        final int notificationCount;
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled){
+            this(id,name,platform,layout,enabled,-1);
+        }
+        EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,int notificationCount){
             this.id=id;this.name=name;this.platform=platform;
             this.layout=layout;this.supportsInput=enabled;
+            this.notificationCount=notificationCount;
         }
         @Override public String toString(){
-            return platform+" • "+name+(supportsInput?"":" (view only)");
+            String base=platform+" • "+name+(supportsInput?"":" (view only)");
+            return notificationCount>=0 ? base+" ["+notificationCount+"]" : base;
         }
     }
     private final Events events;
@@ -310,6 +316,25 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile boolean connecting;
     private volatile boolean active;
     private volatile int claim;
+    private int forwardActionSeq;
+    private int nextForwardActionSeq(){
+        int next = ++forwardActionSeq;
+        if (next <= 0) next = forwardActionSeq = 1;
+        return next;
+    }
+    private FastUdpChannel activeForwardUdp(boolean isKey){
+        boolean mob = isKey ? preferMobileKeyboard : preferMobileMouse;
+        FastUdpChannel m = mobileUdpChannel;
+        if (mob && m != null && m.confirmed) return m;
+        FastUdpChannel w = udpChannel;
+        return (w != null && w.confirmed) ? w : ((m != null && m.confirmed) ? m : null);
+    }
+    private FastUdpChannel alternateForwardUdp(FastUdpChannel primary){
+        FastUdpChannel w = udpChannel;
+        FastUdpChannel m = mobileUdpChannel;
+        FastUdpChannel alt = (primary == m) ? w : m;
+        return (alt != null && alt.confirmed) ? alt : null;
+    }
     private volatile String fingerprint;
     private volatile String requestedToken;
     private final Object trustLock=new Object();
@@ -530,7 +555,8 @@ final class DeskTouchSession implements AutoCloseable {
                 // Parsing member monitor geometry is a validation step only.
                 if(new JSONArray(layout).length()==0)return;
                 members.add(new EnvironmentTarget(id,name,platform,layout,
-                    m.optBoolean("SupportsReverseInput",false)));
+                    m.optBoolean("SupportsReverseInput",false),
+                    m.optInt("NotificationCount",-1)));
             }
             if(!ids.contains(0))return;
             environmentOwnId=packet.a;
@@ -544,6 +570,8 @@ final class DeskTouchSession implements AutoCloseable {
                 selectedEnvironmentId=-1;
                 selectEnvironmentTarget(0);
             }
+            AutoConnectService.refreshNotification();
+            DeskTouchRuntime.notifyLiveStatusChanged();
             status("Shared DeskTouch environment: "+members.size()+" devices online.");
         }catch(Exception invalid){status("Invalid environment membership update.");}
     }
@@ -655,7 +683,8 @@ final class DeskTouchSession implements AutoCloseable {
                     .put("OsVersion",info.osVersion)
                     .put("DensityDpi",info.densityDpi)
                     .put("RefreshHz",info.refreshHz)
-                    .put("RotationDegrees",info.rotationDegrees);
+                    .put("RotationDegrees",info.rotationDegrees)
+                    .put("NotificationCount",DeskTouchNotificationListener.readActiveCount(application));
                 if(!info.appVersion.isEmpty())hello.put("AppVersion",info.appVersion);
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);
                 synchronized(monitors) {monitors.clear();monitors.addAll(parsed);}
@@ -1208,12 +1237,18 @@ final class DeskTouchSession implements AutoCloseable {
         if(reverseLease>0)clearReverseControl(true);
     }
 
+    void publishNotificationCount(int count){
+        if(!running)return;
+        send(new Packet("notify-count",count));
+    }
+
     void claimControl(){
         if(!running){status("Connect to a Windows PC first");return;}
         // Never start keyboard events until the target has confirmed that
         // the first remote cursor movement was actually applied.
         if(reverseLease>0)clearReverseControl(true);
         active=false;
+        forwardActionSeq=0;
         claim=RANDOM.nextInt(Integer.MAX_VALUE-1)+1;
         warmOrProbeUdp();
         send(new Packet("claim",claim));
@@ -1491,7 +1526,18 @@ final class DeskTouchSession implements AutoCloseable {
                 crossEnvironmentEdge(1))return;
             cursorX=nextX;cursorY+=Math.round(dy);
             clampToMonitor();
-            send(new Packet("move",cursorX,cursorY));
+            int lease=claim;
+            FastUdpChannel ch=activeForwardUdp(false);
+            if(ch!=null && lease>0){
+                int tx=cursorX, ty=cursorY;
+                if(!udpPacer.isShutdown()){
+                    udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,lease,(int)SystemClock.uptimeMillis()));
+                }else{
+                    ch.sendWithTag(FastUdpChannel.OP_MOVE,tx,ty,lease,(int)SystemClock.uptimeMillis());
+                }
+            }else{
+                send(new Packet("move",cursorX,cursorY));
+            }
         }
     }
     void click(int button){
@@ -1499,15 +1545,53 @@ final class DeskTouchSession implements AutoCloseable {
         button(button,true);button(button,false);
     }
     void button(int button,boolean down){
-        if(active && button>=1 && button<=3)
-            send(new Packet("button",button,down?1:0));
+        if(!active || button<1 || button>3)return;
+        int seq=nextForwardActionSeq();
+        int lease=claim;
+        FastUdpChannel ch=activeForwardUdp(false);
+        if(ch!=null && lease>0 && !udpPacer.isShutdown()){
+            boolean dual=readDualPathControls(application);
+            FastUdpChannel alt=dual ? alternateForwardUdp(ch) : null;
+            int d=down?1:0;
+            udpPacer.execute(()->{
+                ch.sendWithTag(FastUdpChannel.OP_FORWARD_BUTTON,button,d,lease,seq);
+                if(alt!=null)alt.sendWithTag(FastUdpChannel.OP_FORWARD_BUTTON,button,d,lease,seq);
+            });
+        }
+        send(new Packet("button",button,down?1:0,seq,0));
     }
     void wheel(int amount,boolean horizontal){
-        if(active&&amount!=0)send(new Packet("wheel",amount,horizontal?1:0));
+        if(!active || amount==0)return;
+        int seq=nextForwardActionSeq();
+        int lease=claim;
+        int h=horizontal?1:0;
+        FastUdpChannel ch=activeForwardUdp(false);
+        if(ch!=null && lease>0 && !udpPacer.isShutdown()){
+            boolean dual=readDualPathControls(application);
+            FastUdpChannel alt=dual ? alternateForwardUdp(ch) : null;
+            udpPacer.execute(()->{
+                ch.sendWithTag(FastUdpChannel.OP_FORWARD_WHEEL,amount,h,lease,seq);
+                if(alt!=null)alt.sendWithTag(FastUdpChannel.OP_FORWARD_WHEEL,amount,h,lease,seq);
+            });
+        }
+        send(new Packet("wheel",amount,h,seq,0));
     }
     void key(int vk,boolean down){
-        if(active&&vk>0&&vk<=255)
-            send(new Packet("key",0,0,down?1:0,vk));
+        if(!active || vk<=0 || vk>255)return;
+        int seq=nextForwardActionSeq();
+        int lease=claim;
+        int d=down?1:0;
+        FastUdpChannel ch=activeForwardUdp(true);
+        if(ch!=null && lease>0 && !udpPacer.isShutdown()){
+            boolean dual=readDualPathControls(application);
+            FastUdpChannel alt=dual ? alternateForwardUdp(ch) : null;
+            int packedVk=vk & 0xFF;
+            udpPacer.execute(()->{
+                ch.sendWithTag(FastUdpChannel.OP_FORWARD_KEY,packedVk,d,lease,seq);
+                if(alt!=null)alt.sendWithTag(FastUdpChannel.OP_FORWARD_KEY,packedVk,d,lease,seq);
+            });
+        }
+        send(new Packet("key",0,0,d,vk,Integer.toString(seq)));
     }
     void text(String value){
         if(!active || value==null || value.isEmpty())return;
@@ -2079,7 +2163,7 @@ final class DeskTouchSession implements AutoCloseable {
                     if (!running || mobileUdpChannel != ch || !ch.confirmed) return;
                     long t = SystemClock.uptimeMillis();
                     long gap = ch.linkTracker.computeProbeIntervalMs(
-                        (preferMobileMouse || preferMobileKeyboard) && isBusyInLease());
+                        (preferMobileMouse || preferMobileKeyboard) && (isBusyInLease() || active || hasClaim()));
                     if (t - lastMobileUdpLinkPingMs >= gap) {
                         lastMobileUdpLinkPingMs = t;
                         int pace = (int) Math.round(lastAdaptiveMoveIntervalMs * 10.0);
@@ -2124,8 +2208,8 @@ final class DeskTouchSession implements AutoCloseable {
                     if(!running || udpChannel!=ch || !ch.confirmed) return;
                     long now=SystemClock.uptimeMillis();
                     boolean screenInteractive=keepAlivePm==null || keepAlivePm.isInteractive();
-                    boolean activeSession=reverseLease>0 || hasClaim();
-                    boolean serviceReady=canAcceptRemoteInput();
+                    boolean activeSession=reverseLease>0 || hasClaim() || active;
+                    boolean serviceReady=reverseLease>0 ? canAcceptRemoteInput() : (hasClaim() || active);
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
                         if(readKeepChannelsWarm(application)

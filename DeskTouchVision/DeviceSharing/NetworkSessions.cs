@@ -16,7 +16,8 @@ internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     bool SupportsReverseInput = true, string? DeviceFingerprint = null,
     string Platform = "Windows", bool SupportsForwardInput = false,
     string? OsVersion = null, string? AppVersion = null,
-    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null)
+    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null,
+    int NotificationCount = -1)
 {
     internal string FormatScreenInfo()
     {
@@ -39,12 +40,14 @@ internal sealed record PeerHello(string Name, string Layout,
     bool? ReverseInputSupported = null, string? Fingerprint = null,
     string? Platform = null, bool? ForwardInputSupported = null,
     string? OsVersion = null, string? AppVersion = null,
-    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null);
+    int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null,
+    int? NotificationCount = null);
 
 // Issued exclusively by the authenticated hub over an existing TLS session.
 // Id is a connection-scoped route identifier, not a device identity or trust proof.
 internal sealed record EnvironmentMember(int Id, string Name, string Platform,
-    string Layout, bool SupportsReverseInput, string? StableIdentity=null);
+    string Layout, bool SupportsReverseInput, string? StableIdentity=null,
+    int NotificationCount = -1);
 internal sealed record EnvironmentPosition(string Key,float X,float Y)
 {
     internal static bool Valid(EnvironmentPosition? p) =>
@@ -54,7 +57,8 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
 }
 
 internal sealed record SubPeerDescriptor(int LocalId, string StableIdentity, string Name,
-    string Platform, string Layout, bool SupportsReverseInput, string? AppVersion = null);
+    string Platform, string Layout, bool SupportsReverseInput, string? AppVersion = null,
+    int NotificationCount = -1);
 
 internal sealed record SubRouteEnvelope(int LocalId, Packet Payload);
 
@@ -213,6 +217,88 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal string? PendingOfferedTrustResponse;
         internal int BridgedClaimLease;
         internal Func<Packet, Task>? BridgedReplyAsync;
+        internal readonly object ForwardDedupLock = new();
+        internal int ForwardHighestActionSeq;
+        internal long ForwardSeenActionMask;
+        internal int ForwardLastButtonSeq;
+        internal int ForwardHighestKeySeq;
+        internal long ForwardSeenKeyMask;
+
+        internal void ResetForwardDedup()
+        {
+            lock (ForwardDedupLock)
+            {
+                ForwardHighestActionSeq = 0;
+                ForwardSeenActionMask = 0;
+                ForwardLastButtonSeq = 0;
+                ForwardHighestKeySeq = 0;
+                ForwardSeenKeyMask = 0;
+            }
+        }
+
+        internal bool TryAcceptForwardAction(int seq, bool isButton)
+        {
+            if (seq <= 0) return true;
+            lock (ForwardDedupLock)
+            {
+                if (isButton && seq <= ForwardLastButtonSeq) return false;
+                if (ForwardHighestActionSeq == 0)
+                {
+                    ForwardHighestActionSeq = seq;
+                    ForwardSeenActionMask = 1L;
+                }
+                else
+                {
+                    int diff = seq - ForwardHighestActionSeq;
+                    if (diff > 0)
+                    {
+                        ForwardSeenActionMask = diff >= 64 ? 1L : ((ForwardSeenActionMask << diff) | 1L);
+                        ForwardHighestActionSeq = seq;
+                    }
+                    else
+                    {
+                        int back = -diff;
+                        if (back >= 64) return false;
+                        long bit = 1L << back;
+                        if ((ForwardSeenActionMask & bit) != 0L) return false;
+                        ForwardSeenActionMask |= bit;
+                    }
+                }
+                if (isButton) ForwardLastButtonSeq = seq;
+                return true;
+            }
+        }
+
+        internal bool TryAcceptForwardKeyAction(int seq)
+        {
+            if (seq <= 0) return true;
+            lock (ForwardDedupLock)
+            {
+                if (ForwardHighestKeySeq == 0)
+                {
+                    ForwardHighestKeySeq = seq;
+                    ForwardSeenKeyMask = 1L;
+                }
+                else
+                {
+                    int diff = seq - ForwardHighestKeySeq;
+                    if (diff > 0)
+                    {
+                        ForwardSeenKeyMask = diff >= 64 ? 1L : ((ForwardSeenKeyMask << diff) | 1L);
+                        ForwardHighestKeySeq = seq;
+                    }
+                    else
+                    {
+                        int back = -diff;
+                        if (back >= 64) return false;
+                        long bit = 1L << back;
+                        if ((ForwardSeenKeyMask & bit) != 0L) return false;
+                        ForwardSeenKeyMask |= bit;
+                    }
+                }
+                return true;
+            }
+        }
 
         internal int NextReverseActionSeq()
         {
@@ -419,7 +505,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             b.Descriptor.AppVersion ?? mon?.AppVersion,
             mon?.DensityDpi,
             mon?.RefreshHz,
-            mon?.RotationDegrees);
+            mon?.RotationDegrees,
+            b.Descriptor.NotificationCount);
     }
 
     internal IReadOnlyList<SubPeerDescriptor> GetSubPeersSnapshotForUpstream()
@@ -435,7 +522,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 s.Peer.Platform,
                 s.Peer.Monitors.ToWire(),
                 s.Peer.SupportsReverseInput,
-                s.Peer.AppVersion));
+                s.Peer.AppVersion,
+                s.Peer.NotificationCount));
         }
         return result;
     }
@@ -792,11 +880,28 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal bool HasReadyAndroidPeer =>
         _sessions.Values.Any(s => CanPauseAndroidForPayments(s.Peer));
 
-    internal int PauseConnectedAndroidForPayments()
+    private int _localNotificationCount = -1;
+    internal int LocalNotificationCount => Volatile.Read(ref _localNotificationCount);
+
+    internal void SetLocalNotificationCount(int count)
+    {
+        int normalized = count >= 0 ? count : -1;
+        if (Interlocked.Exchange(ref _localNotificationCount, normalized) == normalized)
+            return;
+        _ = Task.Run(async () =>
+        {
+            try { await PublishEnvironmentAsync(_cancel.Token); }
+            catch (Exception) { }
+        });
+        PeerListChanged?.Invoke();
+    }
+
+    internal int PauseConnectedAndroidForPayments(int? targetPeerId = null)
     {
         int sent = 0;
         foreach (var session in _sessions.Values)
         {
+            if (targetPeerId.HasValue && session.Id != targetPeerId.Value) continue;
             if (!CanPauseAndroidForPayments(session.Peer)) continue;
             TrySendReverseTo(session.Id, new Packet("reset"));
             if (TrySendReverseTo(session.Id, new Packet("pause-accessibility")))
@@ -1795,12 +1900,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         var members = new List<EnvironmentMember> {
             new(0, Environment.MachineName, "Windows",
                 MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
-                true, Fingerprint)
+                true, Fingerprint, Volatile.Read(ref _localNotificationCount))
         };
         foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
-                LayoutIdentity(peer.Peer)));
+                LayoutIdentity(peer.Peer), peer.Peer.NotificationCount));
         var knownIdentities = new HashSet<string>(
             members.Select(m => m.StableIdentity).OfType<string>().Where(s => !string.IsNullOrWhiteSpace(s)),
             StringComparer.OrdinalIgnoreCase);
@@ -1810,7 +1915,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             if (!knownIdentities.Add(identity)) continue;
             members.Add(new(bridged.VirtualId, bridged.Peer.Name, bridged.Peer.Platform,
                 bridged.Peer.Monitors.ToWire(), bridged.Peer.SupportsReverseInput,
-                identity));
+                identity, bridged.Peer.NotificationCount));
         }
         // Migrate names written by v0.3.16's local-only UI into stable
         // authenticated certificate identities whenever one is available.
@@ -1845,7 +1950,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     new(0, Environment.MachineName, "Windows",
                         MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
-                        true, Fingerprint)
+                        true, Fingerprint, Volatile.Read(ref _localNotificationCount))
                 };
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Fingerprint };
                 foreach (var p in _sessions.Values.OrderBy(s => s.Id))
@@ -1853,7 +1958,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     string id = LayoutIdentity(p.Peer);
                     if (seen.Add(id))
                         combined.Add(new(p.Id, p.Peer.Name, p.Peer.Platform,
-                            p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id));
+                            p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id, p.Peer.NotificationCount));
                 }
                 int extraId = 9900;
                 foreach (var up in overlay.Members)
@@ -2344,7 +2449,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             !string.IsNullOrWhiteSpace(hello.AppVersion) ? hello.AppVersion : primaryMon.AppVersion,
             hello.DensityDpi ?? primaryMon.DensityDpi,
             hello.RefreshHz ?? primaryMon.RefreshHz,
-            hello.RotationDegrees ?? primaryMon.RotationDegrees);
+            hello.RotationDegrees ?? primaryMon.RotationDegrees,
+            hello.NotificationCount is >= 0 and <= 9999 ? hello.NotificationCount.Value : -1);
     }
 
     internal static (string Band, int SpeedMbps) DetectInterfaceForLocalAddress(IPAddress? localAddress)
@@ -2958,6 +3064,17 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     continue;
                 }
+                if(p.Type=="notify-count")
+                {
+                    int nextCount = p.A is >= 0 and <= 9999 ? p.A : -1;
+                    if (session.Peer.NotificationCount != nextCount)
+                    {
+                        session.Peer = session.Peer with { NotificationCount = nextCount };
+                        await PublishEnvironmentAsync(token);
+                        PeerListChanged?.Invoke();
+                    }
+                    continue;
+                }
                 if(p.Type=="keyboard-info")
                 {
                     if (p.Text is { Length: > 1 and <= 8192 })
@@ -3134,6 +3251,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                             _owner=session;
                             session.Lease=p.A;
                             session.AppliedLease=0;
+                            session.ResetForwardDedup();
                             granted=true;
                         }
                     }
@@ -3270,6 +3388,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if(lease>0 && _priority.CanApplyRemote &&
                    p.Type is ("move" or "button" or "key" or "wheel" or "text"))
                 {
+                    if (p.Type is "button" or "wheel" &&
+                        !session.TryAcceptForwardAction(p.C, p.Type == "button"))
+                        continue;
+                    if (p.Type == "key" &&
+                        int.TryParse(p.Text, System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture, out int fwdKeySeq) &&
+                        !session.TryAcceptForwardKeyAction(fwdKeySeq))
+                        continue;
                     lock(session.InputLock)
                     {
                         lock(_authorityGate)
@@ -3548,7 +3674,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
             return;
         }
-        if (msg.Op is not (FastUdpOp.Move or FastUdpOp.Warm)) return;
+        if (msg.Op is not (FastUdpOp.Move or FastUdpOp.Warm or FastUdpOp.ForwardButton or FastUdpOp.ForwardWheel or FastUdpOp.ForwardKey)) return;
 
         (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;
         RelayLease? forward = null;
@@ -3559,6 +3685,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             else
                 _relayBySource.TryGetValue(session.Id, out forward);
         }
+        Packet? forwardPacket = msg.Op switch
+        {
+            FastUdpOp.Move => new Packet("move", msg.A, msg.B),
+            FastUdpOp.ForwardButton => new Packet("button", msg.A, msg.B, C: msg.TimestampMs),
+            FastUdpOp.ForwardWheel => new Packet("wheel", msg.A, msg.B, C: msg.TimestampMs),
+            FastUdpOp.ForwardKey => new Packet("key", (msg.A >> 8) & 0xFF, (msg.A >> 16) & 1, msg.B != 0 ? 1 : 0, msg.A & 0xFF,
+                Text: msg.TimestampMs > 0 ? msg.TimestampMs.ToString(System.Globalization.CultureInfo.InvariantCulture) : null),
+            _ => null
+        };
         if (virtualForward is { } vForward)
         {
             if (msg.Op == FastUdpOp.Warm)
@@ -3568,10 +3703,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _udpHub.Send(bridgeUdp, FastUdpOp.Warm, 0, 0, 0);
                 return;
             }
-            string env = JsonSerializer.Serialize(
-                new SubRouteEnvelope(vForward.LocalSubId, new Packet("move", msg.A, msg.B)));
-            vForward.BridgeSession.ReverseQueue.Writer.TryWrite(
-                new Packet("sub-route", vForward.VirtualTargetId, Text: env));
+            if (forwardPacket != null)
+            {
+                string env = JsonSerializer.Serialize(new SubRouteEnvelope(vForward.LocalSubId, forwardPacket));
+                vForward.BridgeSession.ReverseQueue.Writer.TryWrite(
+                    new Packet("sub-route", vForward.VirtualTargetId, Text: env));
+            }
             return;
         }
         if (forward != null)
@@ -3584,7 +3721,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     _udpHub.Send(targetUdp, FastUdpOp.Warm, 0, 0, 0);
                 return;
             }
-            QueueRoutedInput(forward, new Packet("move", msg.A, msg.B));
+            if (forwardPacket != null)
+                QueueRoutedInput(forward, forwardPacket);
             return;
         }
         if (msg.Op == FastUdpOp.Warm)
@@ -3613,13 +3751,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _udpHub.Send(peerUdp, FastUdpOp.Warm, 0, 0, 0);
             return;
         }
-        if (msg.Op != FastUdpOp.Move) return;
-        if (session.EnvironmentTargetId != 0) return;
+        if (forwardPacket == null || session.EnvironmentTargetId != 0) return;
 
         int lease;
         lock (_authorityGate)
             lease = ReferenceEquals(_owner, session) ? session.Lease : 0;
         if (lease <= 0 || lease != msg.Lease || !_priority.CanApplyRemote) return;
+
+        if (msg.Op is FastUdpOp.ForwardButton or FastUdpOp.ForwardWheel &&
+            !session.TryAcceptForwardAction(msg.TimestampMs, msg.Op == FastUdpOp.ForwardButton))
+            return;
+        if (msg.Op == FastUdpOp.ForwardKey &&
+            !session.TryAcceptForwardKeyAction(msg.TimestampMs))
+            return;
 
         bool applied = false;
         lock (session.InputLock)
@@ -3629,9 +3773,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 if (ReferenceEquals(_owner, session) && lease == session.Lease &&
                     _priority.CanApplyRemote)
                 {
-                    var (_, currX) = FastMovePacer.UnpackDualCoord(msg.A);
-                    var (_, currY) = FastMovePacer.UnpackDualCoord(msg.B);
-                    applied = session.Injector.Handle(new Packet("move", currX, currY));
+                    if (msg.Op == FastUdpOp.Move)
+                    {
+                        var (_, currX) = FastMovePacer.UnpackDualCoord(msg.A);
+                        var (_, currY) = FastMovePacer.UnpackDualCoord(msg.B);
+                        applied = session.Injector.Handle(new Packet("move", currX, currY));
+                    }
+                    else
+                    {
+                        applied = session.Injector.Handle(forwardPacket);
+                    }
                 }
             }
         }
@@ -4622,6 +4773,9 @@ internal sealed class HostSession : IInputSession, IDisposable
         _onFailure("Control queue overloaded; local control restored safely.");
         return false;
     }
+
+    internal void PublishNotificationCount(int count) =>
+        TrySend(new Packet("notify-count", count >= 0 ? count : -1));
 
     internal void PublishSourceTopology(MonitorTopology layout) =>
         TrySend(new Packet("topology", Text: layout.ToWire()));

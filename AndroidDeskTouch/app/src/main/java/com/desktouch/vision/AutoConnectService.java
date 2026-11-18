@@ -278,10 +278,13 @@ public final class AutoConnectService extends Service {
             : paused
                 ? "Payment-safe mode (Accessibility OFF) • Connections stay ready"
                 : "Accessibility OFF (payment apps work) • Connections stay ready";
+        String connSummary=DeskTouchRuntime.connectedNotificationSummary(this);
+        String fullText=connSummary.isEmpty() ? subtitle : (connSummary+" • "+subtitle);
         Notification.Builder builder=new Notification.Builder(this,CHANNEL)
             .setSmallIcon(com.desktouch.vision.R.drawable.ic_desktouch)
-            .setContentTitle("DeskTouch Vision")
-            .setContentText(subtitle)
+            .setContentTitle(connSummary.isEmpty() ? "DeskTouch Vision" : "DeskTouch • "+connSummary)
+            .setContentText(fullText)
+            .setStyle(new Notification.BigTextStyle().bigText(fullText))
             .setContentIntent(open)
             .setOngoing(true);
         if(sysEnabled) {

@@ -1,3 +1,12 @@
+# DeskTouch Vision v0.3.72 — Numeric Device Notification Badges, Tray Switcher Flyout, DeskSpace Bridge & Phone-to-System Fast Input
+
+- **Numeric notification counts across all connected devices (`DeskTouchNotificationListener`, `WindowsNotificationCounter`, `NetworkSessions`, `DisplayArrangementControl`):** Shares active notification counts (strictly numeric totals only — never notification titles, bodies, or app identities) across connected Windows and Android devices, displaying counts directly above each device in the Android app, ongoing phone notification, tray flyout, Displays diagram, and DeskSpace Deck.
+- **Taskbar tray switcher popup near the upward arrow (`TrayDeviceFlyout`, `DisplaySettingsForm`):** Left-clicking the DeskTouch tray icon opens a sleek Midnight Slate device switcher right above the taskbar chevron area with notification counts above every device card, 1-click switching back and forth, and phone payment-mode pause; right-clicking puts live device switching and notification counts right at the top of the tray menu.
+- **DeskSpace Deck & tray bridge (`DeskSpaceDeckBridge`):** Exposes live connected device counts, notification numbers, and 1-click switching over a local user-scoped Named Pipe and atomic snapshot file for DeskSpace widget integration.
+- **Phone-to-System fast input infrastructure (`FastUdpOp.ForwardButton`, `ForwardWheel`, `ForwardKey`):** Upgrades Android-to-Windows mouse clicks, scroll wheel, and keystrokes to travel over the same fast encrypted UDP channel, dual-path cellular/Wi-Fi fan-out, USB ADB bridge, and keep-warm radio lane alongside TCP backup with sequence deduplication.
+
+---
+
 # DeskTouch Vision v0.3.71 — Fix Multi-System Windows Keyboard Scan-Code Corruption (Spacebar / Video Controls)
 
 Fixes Windows-to-Windows ("multi-system") remote keyboard input where keys like Spacebar triggered wrong keys or stopped responding:

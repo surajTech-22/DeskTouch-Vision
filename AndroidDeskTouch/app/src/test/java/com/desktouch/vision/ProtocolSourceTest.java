@@ -1422,4 +1422,25 @@ public final class ProtocolSourceTest {
         assertEquals(PointerSmoother.FEEL_SMOOTH, PhoneUiKit.segmentToPointerFeel(2));
         assertEquals(PointerSmoother.FEEL_AUTO, PhoneUiKit.segmentToPointerFeel(7));
     }
+
+    @Test
+    public void forwardFastUdpAndNotificationCountsWorkSafely() {
+        assertEquals(15, FastUdpChannel.OP_FORWARD_BUTTON);
+        assertEquals(16, FastUdpChannel.OP_FORWARD_WHEEL);
+        assertEquals(17, FastUdpChannel.OP_FORWARD_KEY);
+        assertTrue(AdaptiveLinkTracker.isInteractiveOp(FastUdpChannel.OP_FORWARD_BUTTON));
+        assertTrue(AdaptiveLinkTracker.isInteractiveOp(FastUdpChannel.OP_FORWARD_WHEEL));
+        assertTrue(AdaptiveLinkTracker.isInteractiveOp(FastUdpChannel.OP_FORWARD_KEY));
+
+        DeskTouchSession.EnvironmentTarget targetWithNotifs = new DeskTouchSession.EnvironmentTarget(
+            2, "DESKTOP-IQ1KSJ9", "Windows", "1920x1080", true, 5);
+        DeskTouchSession.EnvironmentTarget targetDefault = new DeskTouchSession.EnvironmentTarget(
+            3, "SURAJ", "Windows", "1920x1080", true);
+        assertEquals(5, targetWithNotifs.notificationCount);
+        assertEquals(-1, targetDefault.notificationCount);
+
+        assertFalse(DeskTouchNotificationListener.isPermissionGranted(null));
+        assertEquals(-1, DeskTouchNotificationListener.readActiveCount(null));
+        assertNotNull(DeskTouchRuntime.connectedNotificationSummary(null));
+    }
 }

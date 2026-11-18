@@ -10,7 +10,8 @@ namespace DeskTouch.DeviceShare;
 /// </summary>
 internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
     int ScreenCount,bool SupportsInput,string? StableIdentity=null,
-    MonitorTopology? Topology=null,string? ScreenDetails=null)
+    MonitorTopology? Topology=null,string? ScreenDetails=null,
+    int NotificationCount=-1)
 {
     internal bool IsAndroid => Platform=="Android";
     // Prefer a persistent authenticated device identity. The hub roster only
@@ -87,6 +88,30 @@ internal sealed class DisplayArrangementControl : Control
     {
         get => _remoteScreenDetails;
         set { _remoteScreenDetails = value; Invalidate(); }
+    }
+    private int _localNotificationCount = -1;
+    internal int LocalNotificationCount
+    {
+        get => _localNotificationCount;
+        set
+        {
+            int next = value >= 0 ? value : -1;
+            if (_localNotificationCount == next) return;
+            _localNotificationCount = next;
+            Invalidate();
+        }
+    }
+    private int _remoteNotificationCount = -1;
+    internal int RemoteNotificationCount
+    {
+        get => _remoteNotificationCount;
+        set
+        {
+            int next = value >= 0 ? value : -1;
+            if (_remoteNotificationCount == next) return;
+            _remoteNotificationCount = next;
+            Invalidate();
+        }
     }
     internal static string CleanDeviceName(string? name, string fallback)
     {
@@ -786,11 +811,13 @@ internal sealed class DisplayArrangementControl : Control
                 DisplayNumber(m, ++localOrdinal), m.Primary, true,
                 resolution: m.Bounds.Size);
         }
+        DrawNotificationPillAbove(g, _localHit, _localNotificationCount);
 
         if (_remote is { } remote)
         {
             DrawTopologyMonitors(g, _remoteHit, remote, RemoteDeviceName,
                 _remotePlatform, _remoteScreenDetails);
+            DrawNotificationPillAbove(g, _remoteHit, _remoteNotificationCount);
         }
         else if (layout.Extras.Length == 0)
         {
@@ -823,6 +850,7 @@ internal sealed class DisplayArrangementControl : Control
                         details: index == 0 ? extra.Device.ScreenDetails : null);
                 }
             }
+            DrawNotificationPillAbove(g, group, extra.Device.NotificationCount);
         }
     }
 
@@ -850,6 +878,33 @@ internal sealed class DisplayArrangementControl : Control
             nextX=preview.Right+connectedGap;
         }
         return result;
+    }
+
+    private static void DrawNotificationPillAbove(Graphics g, RectangleF group, int count)
+    {
+        if (count < 0 || group.Width < 18 || group.Height < 18) return;
+        string label = count.ToString();
+        using var font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold);
+        var measured = g.MeasureString(label, font);
+        float pillW = Math.Max(26f, measured.Width + 14f);
+        float pillH = 18f;
+        float x = group.Left + (group.Width - pillW) / 2f;
+        float y = Math.Max(3f, group.Top - pillH - 4f);
+        var pillRect = new RectangleF(x, y, pillW, pillH);
+        using var path = Rounded(pillRect, 9f);
+        using var fill = new SolidBrush(count > 0
+            ? Color.FromArgb(56, 189, 248)
+            : Color.FromArgb(51, 65, 85));
+        using var textBrush = new SolidBrush(count > 0
+            ? Color.FromArgb(9, 17, 30)
+            : Color.FromArgb(226, 232, 240));
+        g.FillPath(fill, path);
+        using var format = new StringFormat
+        {
+            Alignment = StringAlignment.Center,
+            LineAlignment = StringAlignment.Center
+        };
+        g.DrawString(label, font, textBrush, pillRect, format);
     }
 
     private static void DrawPlaceholder(Graphics g, RectangleF r)

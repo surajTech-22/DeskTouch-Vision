@@ -2751,6 +2751,89 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               !ReceiverServer.SupportsWindowsUdpReverseKey("Windows", "0.3.70"),
             "SupportsWindowsUdpReverseKey must enable packed scan+vk UDP keys starting at v0.3.71");
     }
+
+    // Verify v0.3.72: ForwardButton/ForwardWheel/ForwardKey AEAD framing, NotificationCount propagation,
+    // EnvironmentDisplayTile NotificationCount, and DeskSpaceDeckBridge JSON/command dispatching.
+    Check(AdaptiveLinkTracker.IsInteractiveOp(FastUdpOp.ForwardButton) &&
+          AdaptiveLinkTracker.IsInteractiveOp(FastUdpOp.ForwardWheel) &&
+          AdaptiveLinkTracker.IsInteractiveOp(FastUdpOp.ForwardKey),
+          "ForwardButton/ForwardWheel/ForwardKey must be treated as interactive UDP ops");
+    byte[] fwdKey = Enumerable.Range(21, FastUdpCodec.KeySize).Select(i => (byte)i).ToArray();
+    using (var fwdCli = new FastUdpCodec(fwdKey, 0x0022, isServer: false))
+    using (var fwdSrv = new FastUdpCodec(fwdKey, 0x0022, isServer: true))
+    {
+        byte[] fBtn = new byte[FastUdpCodec.FrameSize];
+        byte[] fWhl = new byte[FastUdpCodec.FrameSize];
+        byte[] fKey = new byte[FastUdpCodec.FrameSize];
+        fwdCli.Seal(FastUdpOp.ForwardButton, 1, 1, 77, 10, fBtn);
+        fwdCli.Seal(FastUdpOp.ForwardWheel, -120, 0, 77, 11, fWhl);
+        fwdCli.Seal(FastUdpOp.ForwardKey, 32, 1, 77, 12, fKey);
+        Check(fwdSrv.TryOpen(fBtn, out var mBtn) && mBtn.Op == FastUdpOp.ForwardButton && mBtn.A == 1 && mBtn.B == 1 && mBtn.Lease == 77 && mBtn.TimestampMs == 10 &&
+              fwdSrv.TryOpen(fWhl, out var mWhl) && mWhl.Op == FastUdpOp.ForwardWheel && mWhl.A == -120 && mWhl.TimestampMs == 11 &&
+              fwdSrv.TryOpen(fKey, out var mKey) && mKey.Op == FastUdpOp.ForwardKey && mKey.A == 32 && mKey.B == 1 && mKey.TimestampMs == 12,
+              "FastUdpCodec must authenticate phone-to-system forward button/wheel/key frames cleanly");
+    }
+
+    var notifHelloJson = System.Text.Json.JsonSerializer.Serialize(new PeerHello(
+        "Xiaomi 22041216I", testDisplay.ToWire(), ReverseInputSupported: true,
+        Platform: "Android", ForwardInputSupported: true, NotificationCount: 7));
+    var parsedNotifHello = ReceiverServer.ReadHello(notifHelloJson);
+    Check(parsedNotifHello.NotificationCount == 7,
+          "PeerHello must preserve numeric NotificationCount across JSON serialization");
+
+    var memberDto = new EnvironmentMember(2, "SURAJ", "Windows", testDisplay.ToWire(), true, fpOne, 4);
+    var memberRoundtrip = System.Text.Json.JsonSerializer.Deserialize<EnvironmentMember>(
+        System.Text.Json.JsonSerializer.Serialize(memberDto));
+    Check(memberRoundtrip != null && memberRoundtrip.NotificationCount == 4,
+          "EnvironmentMember must preserve numeric NotificationCount cleanly");
+
+    var badgeTile = new EnvironmentDisplayTile(1, "Xiaomi", "Android", 1, true, fpMobile, testDisplay, null, 9);
+    Check(badgeTile.NotificationCount == 9 &&
+          new EnvironmentDisplayTile(2, "SURAJ", "Windows", 1, true).NotificationCount == -1,
+          "EnvironmentDisplayTile must store count-only notification badges with -1 unknown default");
+
+    int bridgeSwitched = 0;
+    bool bridgeReturned = false;
+    int bridgePayPeer = -999;
+    bool bridgeShown = false;
+    using (var bridge = new DeskSpaceDeckBridge(
+        id => bridgeSwitched = id,
+        () => bridgeReturned = true,
+        p => bridgePayPeer = p,
+        () => bridgeShown = true))
+    {
+        var snap = new BridgeDeviceSnapshotDto(
+            Version: 1,
+            UpdatedUtcMs: 123456789,
+            LocalName: "DESKTOP-IQ1KSJ9",
+            LocalNotificationCount: 3,
+            ActiveTargetId: 5,
+            IsRemoteActive: true,
+            ActiveDeviceName: "Xiaomi",
+            ConnectedCount: 1,
+            TotalNotificationCount: 10,
+            HasAnyKnownNotificationCount: true,
+            Devices: new[]
+            {
+                new BridgeDeviceItemDto(EnvironmentRouteOrder.Local, "DESKTOP-IQ1KSJ9", "Windows", true, false, false, true, 3, "Click to return"),
+                new BridgeDeviceItemDto(5, "Xiaomi", "Android", false, true, true, true, 7, "Controlling")
+            });
+        string snapJson = DeskSpaceDeckBridge.SerializeSnapshot(snap);
+        var back = System.Text.Json.JsonSerializer.Deserialize<BridgeDeviceSnapshotDto>(snapJson,
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        Check(back != null && back.ConnectedCount == 1 && back.TotalNotificationCount == 10 &&
+              back.Devices.Count == 2 && back.Devices[1].NotificationCount == 7,
+              "DeskSpaceDeckBridge JSON snapshot must serialize and roundtrip cleanly");
+
+        bridge.DispatchCommand("GET");
+        bridge.DispatchCommand("SWITCH:-2");
+        bridge.DispatchCommand("RETURN");
+        bridge.DispatchCommand("TOGGLE_PAY:5");
+        bridge.DispatchCommand("SHOW");
+        Check(bridgeSwitched == -2 && bridgeReturned && bridgePayPeer == 5 && bridgeShown,
+              "DeskSpaceDeckBridge must dispatch SWITCH, RETURN, TOGGLE_PAY, and SHOW commands accurately");
+    }
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

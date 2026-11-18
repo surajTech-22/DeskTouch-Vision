@@ -43,7 +43,7 @@ public final class MainActivity extends Activity {
     private View liveDot;
     private TextView liveBadgeText,mouseTag,mouseMetric,kbTag,kbMetric;
     private Button scanBtn,takeControlBtn,returnControlBtn,trustBadgeBtn,openPadBtn;
-    private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn;
+    private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn,notifAccessBtn;
     private TextView trackpadTargetTitle,trackpadReadout,sensReadout;
     private TextView speedWifiRtt,speedWifiSub,wifiLossBadge,speedMobRtt,speedMobSub,mobLossBadge;
     private SeekBar pointerSensitivity;
@@ -135,6 +135,8 @@ public final class MainActivity extends Activity {
         refreshPermissionState();
         refreshTrustSummary();
         refreshStreamOptionControls();
+        DeskTouchRuntime.notifyLocalNotificationCountChanged(
+            DeskTouchNotificationListener.readActiveCount(this));
         refreshLiveLinkAndKeyboard();
 
         // Only checks official GitHub metadata; never downloads or silently
@@ -1172,6 +1174,15 @@ public final class MainActivity extends Activity {
         stopLp.topMargin=dp(8);
         safetyCard.addView(stopCtrlBtn,stopLp);
 
+        notifAccessBtn=PhoneUiKit.createButton(this,"Notification Count: Off",palette,PhoneUiKit.BTN_SUBTLE);
+        notifAccessBtn.setOnClickListener(v->{
+            DeskTouchNotificationListener.openSettings(this);
+            setFeedback("Allow DeskTouch Notification Badge to share your notification count across connected devices.",true);
+        });
+        LinearLayout.LayoutParams nLp=new LinearLayout.LayoutParams(-1,-2);
+        nLp.topMargin=dp(8);
+        safetyCard.addView(notifAccessBtn,nLp);
+
         LinearLayout kbXiaomiCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(kbXiaomiCard,cardParams(10));
 
@@ -1366,6 +1377,7 @@ public final class MainActivity extends Activity {
             PhoneUiKit.styleButton(accBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(pinWidgetBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(stopCtrlBtn,p,PhoneUiKit.BTN_DANGER,this);
+            refreshNotificationAccessButton();
 
             PhoneUiKit.styleCard(kbXiaomiCard,p,this);
             kxTitle.setTextColor(p.textSecondary);
@@ -1551,9 +1563,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.71";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.72";
         }catch(Exception ignored){
-            return "0.3.71";
+            return "0.3.72";
         }
     }
 
@@ -1589,6 +1601,8 @@ public final class MainActivity extends Activity {
         refreshPermissionState();
         refreshTrustSummary();
         refreshStreamOptionControls();
+        DeskTouchRuntime.notifyLocalNotificationCountChanged(
+            DeskTouchNotificationListener.readActiveCount(this));
         refreshLiveLinkAndKeyboard();
         startLiveUiTicker();
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
@@ -1984,6 +1998,7 @@ public final class MainActivity extends Activity {
             PhoneUiKit.styleButton(pauseBankingButton,palette,
                 sysEnabled ? PhoneUiKit.BTN_TINT_EMERALD : PhoneUiKit.BTN_TINT_AMBER,this);
         }
+        refreshNotificationAccessButton();
 
         if(safetyBadge!=null){
             if(shellReady){
@@ -2027,6 +2042,18 @@ public final class MainActivity extends Activity {
             (DeskTouchInputMethod.isSelected(this)
                 ? "selected for focused-field typing."
                 : "not selected (optional when Accessibility is used)."));
+    }
+
+    private void refreshNotificationAccessButton(){
+        if(notifAccessBtn==null || palette==null)return;
+        int nCount=DeskTouchNotificationListener.readActiveCount(this);
+        if(nCount>=0){
+            notifAccessBtn.setText("Notification Count: Active ("+nCount+")");
+            PhoneUiKit.styleButton(notifAccessBtn,palette,PhoneUiKit.BTN_TINT_EMERALD,this);
+        }else{
+            notifAccessBtn.setText("Enable Notification Count Badge");
+            PhoneUiKit.styleButton(notifAccessBtn,palette,PhoneUiKit.BTN_SUBTLE,this);
+        }
     }
 
     private int dp(int size){return Math.round(getResources().getDisplayMetrics().density*size);}
@@ -2079,6 +2106,25 @@ public final class MainActivity extends Activity {
 
             LinearLayout textCol=new LinearLayout(this);
             textCol.setOrientation(LinearLayout.VERTICAL);
+
+            int notifCount=isSelf
+                ? DeskTouchNotificationListener.readActiveCount(this)
+                : device.notificationCount;
+            if(notifCount>=0){
+                TextView notifPill=new TextView(this);
+                notifPill.setText(String.valueOf(notifCount));
+                notifPill.setTextSize(10.5f);
+                notifPill.setTypeface(null,Typeface.BOLD);
+                notifPill.setPadding(dp(7),dp(2),dp(7),dp(2));
+                PhoneUiKit.stylePill(notifPill,
+                    notifCount>0 ? palette.accentSoftBg : palette.neutralBadgeBg,
+                    Color.TRANSPARENT,
+                    notifCount>0 ? palette.accentText : palette.neutralBadgeText,
+                    this);
+                LinearLayout.LayoutParams npLp=new LinearLayout.LayoutParams(-2,-2);
+                npLp.bottomMargin=dp(3);
+                textCol.addView(notifPill,npLp);
+            }
 
             TextView nameView=new TextView(this);
             nameView.setText(device.name+(selected && selectable ? "  ● Active" : ""));

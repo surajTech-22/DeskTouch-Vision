@@ -38,6 +38,9 @@ final class FastUdpChannel implements Closeable {
     static final byte OP_LINK_FEEDBACK = 12;
     static final byte OP_REVERSE_EDGE_PUSH = 13;
     static final byte OP_REVERSE_KEY = 14;
+    static final byte OP_FORWARD_BUTTON = 15;
+    static final byte OP_FORWARD_WHEEL = 16;
+    static final byte OP_FORWARD_KEY = 17;
 
     static int unpackCurr(int packed) {
         int hi = (packed >>> 16) & 0xFFFF;

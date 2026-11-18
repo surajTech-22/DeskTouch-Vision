@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.66 — Always-On Wi-Fi Link + Simultaneous Local Mobile Receiver & Stronger-Path Switching
+
+Replaces cellular-over-Wi-Fi session replacement with a purely local dual-stream architecture that keeps the PC and phone connected Wi-Fi-to-Wi-Fi continuously:
+
+- **Wi-Fi connection stays open (`AutoConnectService`, `DeskTouchSession`, `DeskTouchRuntime`):** Removes session replacement when `"sreevatsa_5GHz"` or local Wi-Fi is connected, keeping pairing, control, and system Wi-Fi completely untouched while evaluating mobile network strength alongside it.
+- **Auxiliary local Mobile UDP stream with simultaneous two-way firewall opening (`FastUdpChannel`, `FastUdpHub`, `NetworkSessions`, `CellularLinkHelper`):** Windows allocates a dedicated auxiliary encrypted UDP peer (`MobileUdpPeer`) alongside the primary Wi-Fi peer; Android binds a secondary `FastUdpChannel` onto `TRANSPORT_CELLULAR` and exchanges global cellular IPv6 candidates over the existing Wi-Fi TLS channel (`"mobile-udp-punch"` / `"mobile-udp-channel"`), causing both sides to probe outward simultaneously across multiple candidate endpoints.
+- **Stronger-path receive switching (`DeskTouchSession`, `NetworkSessions`, `FastMovePacer`):** Android continuously benchmarks real packet loss, jitter, and RTT across both active receivers (`Wi-Fi` vs `Mobile network`), signals `"stream-prefer"` over Wi-Fi to select whichever receive stream is stronger, mirrors a 250 ms transition overlap so zero cursor frames drop during handoff, and automatically falls back to Wi-Fi if mobile delivery stalls or degrades.
+
+---
+
 # DeskTouch Vision v0.3.65 — Non-Blocking Mobile Network Switcher, Multi-Sample Probe & Burst-Loss Memory
 
 Fixes the Android monitor deadlock that prevented cellular path probing on dual-path networks, adds recent burst-loss retention, and upgrades path benchmarking:

@@ -774,6 +774,8 @@ internal sealed class FastUdpHub : IDisposable
         internal readonly AdaptiveLinkTracker LinkTracker;
         private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
         private IPEndPoint? _remoteEndPoint;
+        private IPEndPoint[]? _candidateEndPoints;
+        internal readonly bool IsAuxiliary;
         internal volatile bool Confirmed;
         private int _confirmedLogged;
         internal long LastMoveSentTicks;
@@ -787,10 +789,12 @@ internal sealed class FastUdpHub : IDisposable
 
         internal IPAddress ExpectedAddress => Volatile.Read(ref _expectedAddress);
 
-        internal Peer(int sessionId, IPAddress expectedAddress, string initialBand = "wireless", int initialSpeedMbps = 0)
+        internal Peer(int sessionId, IPAddress expectedAddress, string initialBand = "wireless",
+            int initialSpeedMbps = 0, ushort? overrideWirePeerId = null, bool isAuxiliary = false)
         {
             SessionId = sessionId;
-            WirePeerId = unchecked((ushort)sessionId);
+            WirePeerId = overrideWirePeerId ?? unchecked((ushort)sessionId);
+            IsAuxiliary = isAuxiliary;
             _expectedAddress = FastUdpSocketOptions.NormalizeAddress(expectedAddress);
             Key = RandomNumberGenerator.GetBytes(FastUdpCodec.KeySize);
             Codec = new FastUdpCodec(Key, WirePeerId, isServer: true);
@@ -807,6 +811,8 @@ internal sealed class FastUdpHub : IDisposable
             var currentEp = Volatile.Read(ref _remoteEndPoint);
             if (currentEp == null || !currentEp.Address.Equals(normalized) || currentEp.Port != port)
                 Volatile.Write(ref _remoteEndPoint, new IPEndPoint(normalized, port));
+            if (Volatile.Read(ref _candidateEndPoints) != null)
+                Volatile.Write(ref _candidateEndPoints, null);
         }
 
         internal IPEndPoint? RemoteEndPoint
@@ -814,6 +820,9 @@ internal sealed class FastUdpHub : IDisposable
             get => Volatile.Read(ref _remoteEndPoint);
             set => Volatile.Write(ref _remoteEndPoint, value);
         }
+
+        internal void SetCandidateEndPoints(IPEndPoint[]? candidates) =>
+            Volatile.Write(ref _candidateEndPoints, candidates is { Length: > 0 } ? candidates : null);
 
         internal bool HasEndpoint => Volatile.Read(ref _remoteEndPoint) != null;
 
@@ -824,10 +833,9 @@ internal sealed class FastUdpHub : IDisposable
             return Codec.Seal(op, a, b, lease, Environment.TickCount, scratchOut);
         }
 
-        internal bool Send(Socket socket, FastUdpOp op, int a, int b, int lease, int? payloadTag = null)
+        internal bool SendToEndPoint(Socket socket, IPEndPoint target, FastUdpOp op, int a, int b, int lease,
+            int? payloadTag = null)
         {
-            IPEndPoint? target = Volatile.Read(ref _remoteEndPoint);
-            if (target == null) return false;
             lock (_sendBuffer)
             {
                 int len = Codec.Seal(op, a, b, lease, payloadTag ?? Environment.TickCount, _sendBuffer);
@@ -845,6 +853,26 @@ internal sealed class FastUdpHub : IDisposable
                     return false;
                 }
             }
+        }
+
+        internal bool Send(Socket socket, FastUdpOp op, int a, int b, int lease, int? payloadTag = null)
+        {
+            IPEndPoint? target = Volatile.Read(ref _remoteEndPoint);
+            IPEndPoint[]? candidates = !Confirmed ? Volatile.Read(ref _candidateEndPoints) : null;
+            if (op == FastUdpOp.Probe && candidates != null)
+            {
+                bool any = false;
+                if (target != null)
+                    any |= SendToEndPoint(socket, target, op, a, b, lease, payloadTag);
+                foreach (var c in candidates)
+                {
+                    if (target == null || !c.Equals(target))
+                        any |= SendToEndPoint(socket, c, op, a, b, lease, payloadTag);
+                }
+                return any;
+            }
+            if (target == null) return false;
+            return SendToEndPoint(socket, target, op, a, b, lease, payloadTag);
         }
 
         public void Dispose()
@@ -897,12 +925,32 @@ internal sealed class FastUdpHub : IDisposable
         return peer;
     }
 
+    internal Peer? AddAuxiliaryPeer(int sessionId, IPAddress placeholderAddress, string initialBand = "cellular")
+    {
+        // High-bit namespace avoids any collision with primary session WirePeerIds (1..MaxPeers).
+        ushort auxId = unchecked((ushort)(0x8000 | (sessionId & 0x7FFF)));
+        var peer = new Peer(sessionId, placeholderAddress, initialBand, 0, auxId, isAuxiliary: true);
+        _peers[peer.WirePeerId] = peer;
+        return peer;
+    }
+
     internal void ConfigurePeerPort(Peer peer, int port)
     {
         if (port is <= 0 or > 65535) return;
+        peer.SetCandidateEndPoints(null);
         peer.RemoteEndPoint = new IPEndPoint(peer.ExpectedAddress, port);
         // Send two quick UDP probes from Windows immediately so Windows Defender
         // Firewall opens a stateful return path without needing elevated rules.
+        peer.Send(_socket, FastUdpOp.Probe, Port, 0, 0);
+        peer.Send(_socket, FastUdpOp.Probe, Port, 0, 0);
+    }
+
+    internal void ConfigurePeerEndPoints(Peer peer, IPEndPoint[] endpoints)
+    {
+        if (endpoints == null || endpoints.Length == 0) return;
+        peer.Confirmed = false;
+        peer.RemoteEndPoint = endpoints[0];
+        peer.SetCandidateEndPoints(endpoints);
         peer.Send(_socket, FastUdpOp.Probe, Port, 0, 0);
         peer.Send(_socket, FastUdpOp.Probe, Port, 0, 0);
     }

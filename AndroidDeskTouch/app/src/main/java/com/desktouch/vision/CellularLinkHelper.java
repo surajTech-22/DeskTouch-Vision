@@ -2,6 +2,8 @@ package com.desktouch.vision;
 
 import android.content.Context;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
@@ -9,9 +11,12 @@ import android.util.Log;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -182,6 +187,10 @@ final class CellularLinkHelper {
         }
     }
 
+    ConnectivityManager connectivityManager() {
+        return connectivityManager;
+    }
+
     void releaseCellularNetwork() {
         ConnectivityManager.NetworkCallback toUnregister;
         synchronized (lock) {
@@ -193,6 +202,34 @@ final class CellularLinkHelper {
             try {
                 connectivityManager.unregisterNetworkCallback(toUnregister);
             } catch (Throwable ignored) {}
+        }
+    }
+
+    static List<String> getGlobalCellularIpv6Addresses(ConnectivityManager cm, Network cellNet) {
+        if (cm == null || cellNet == null) return Collections.emptyList();
+        try {
+            LinkProperties lp = cm.getLinkProperties(cellNet);
+            if (lp == null) return Collections.emptyList();
+            ArrayList<String> out = new ArrayList<>();
+            for (LinkAddress la : lp.getLinkAddresses()) {
+                InetAddress addr = la.getAddress();
+                if (!(addr instanceof Inet6Address)) continue;
+                if (addr.isLinkLocalAddress() || addr.isLoopbackAddress()
+                    || addr.isSiteLocalAddress() || addr.isMulticastAddress()) {
+                    continue;
+                }
+                byte[] b = addr.getAddress();
+                if (b.length == 16 && (b[0] & 0xFE) == 0xFC) continue; // skip ULA fc00::/7
+                String host = addr.getHostAddress();
+                if (host != null) {
+                    int pct = host.indexOf('%');
+                    if (pct > 0) host = host.substring(0, pct);
+                    if (!host.isEmpty() && !out.contains(host)) out.add(host);
+                }
+            }
+            return out;
+        } catch (Throwable ex) {
+            return Collections.emptyList();
         }
     }
 

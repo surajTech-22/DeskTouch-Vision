@@ -147,6 +147,21 @@ final class DeskTouchRuntime {
         for(DeskTouchSession s:sessions.values())if(s.isCellularSession())return true;
         return false;
     }
+    static synchronized boolean hasActiveMobileUdpStream(){
+        for(DeskTouchSession s:sessions.values())if(s.hasActiveMobileUdpStream())return true;
+        return false;
+    }
+    static void evaluateLocalMobileReceiver(Context context, CellularLinkHelper helper){
+        java.util.ArrayList<DeskTouchSession> snapshot;
+        synchronized(DeskTouchRuntime.class){
+            snapshot=new java.util.ArrayList<>(sessions.values());
+        }
+        for(DeskTouchSession s:snapshot){
+            if(s.isConnected() && !s.isCableSession()){
+                s.evaluateLocalMobileReceiver(context,helper);
+            }
+        }
+    }
     static synchronized String connectedCellularFingerprint(){
         for(DeskTouchSession s:sessions.values()){
             if(s.isCellularSession()) return s.connectedFingerprint();

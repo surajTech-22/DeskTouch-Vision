@@ -2642,6 +2642,36 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         var probeResp = new Packet("probe-echo", 1);
         Check(probeResp.Type == "probe-echo" && probeResp.A == 1,
             "Multi-sample cellular probe-echo packet contract must preserve sequence index");
+
+        // Verify v0.3.66: Auxiliary mobile UDP peer alongside primary peer, strict global IPv6 filtering, and dual-end UDP confirmation.
+        using (var auxHub = new FastUdpHub())
+        {
+            var primaryPeer = auxHub.AddPeer(1, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 12345), "2.4GHz");
+            var auxPeer = auxHub.AddAuxiliaryPeer(1, System.Net.IPAddress.IPv6Loopback, "cellular");
+            Check(primaryPeer != null && auxPeer != null &&
+                  auxPeer.IsAuxiliary && !primaryPeer.IsAuxiliary &&
+                  auxPeer.SessionId == 1 && auxPeer.WirePeerId != primaryPeer.WirePeerId,
+                "Auxiliary mobile peer must share SessionId while using an isolated WirePeerId and key");
+
+            var parsedCandidates = ReceiverServer.ParseMobileCandidateEndPoints(
+                "[\"2401:4900:62fe:2095:bd0a:7f11:e821:39a\",\"fe80::1\",\"fd00::1\",\"127.0.0.1\"]", 41234);
+            Check(parsedCandidates.Length == 1 &&
+                  parsedCandidates[0].Address.ToString() == "2401:4900:62fe:2095:bd0a:7f11:e821:39a" &&
+                  parsedCandidates[0].Port == 41234,
+                "ParseMobileCandidateEndPoints must accept only global unicast candidates and reject link-local/ULA/loopback");
+
+            using var mobClient = new FastUdpClient(
+                System.Net.IPAddress.IPv6Loopback, auxHub.Port, auxPeer!.WirePeerId, auxPeer.Key, "cellular", 0);
+            auxHub.ConfigurePeerEndPoints(auxPeer, new[] { new System.Net.IPEndPoint(System.Net.IPAddress.IPv6Loopback, mobClient.LocalPort) });
+            mobClient.SendProbe();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 1500 && (!mobClient.Confirmed || !auxPeer.Confirmed))
+                System.Threading.Thread.Sleep(10);
+            Check(mobClient.Confirmed && auxPeer.Confirmed,
+                "Two-way loopback UDP probe must confirm auxiliary mobile stream without dropping primary Wi-Fi");
+            auxHub.RemovePeer(auxPeer);
+            auxHub.RemovePeer(primaryPeer);
+        }
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

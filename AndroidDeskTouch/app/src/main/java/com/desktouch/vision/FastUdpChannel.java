@@ -229,6 +229,7 @@ final class FastUdpChannel implements Closeable {
     private final DatagramSocket socket;
     private volatile InetAddress serverAddress;
     private volatile int serverPort;
+    private volatile java.util.List<InetAddress> extraCandidates = java.util.Collections.emptyList();
     private final Codec codec;
     private final Listener listener;
     final AdaptiveLinkTracker linkTracker = new AdaptiveLinkTracker();
@@ -246,15 +247,29 @@ final class FastUdpChannel implements Closeable {
 
     FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener)
             throws Exception {
-        this(serverAddress, serverPort, peerId, key, listener, null);
+        this(serverAddress, serverPort, peerId, key, listener, null, null);
     }
 
     FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener,
             android.net.Network boundNetwork) throws Exception {
+        this(serverAddress, serverPort, peerId, key, listener, boundNetwork, null);
+    }
+
+    FastUdpChannel(InetAddress serverAddress, int serverPort, int peerId, byte[] key, Listener listener,
+            android.net.Network boundNetwork, java.util.List<InetAddress> candidateAddresses) throws Exception {
         this.serverAddress = serverAddress;
         this.serverPort = serverPort;
         this.listener = listener;
         this.codec = new Codec(key, peerId, false);
+        if (candidateAddresses != null && !candidateAddresses.isEmpty()) {
+            java.util.ArrayList<InetAddress> extras = new java.util.ArrayList<>();
+            for (InetAddress c : candidateAddresses) {
+                if (c != null && !c.equals(serverAddress)) extras.add(c);
+            }
+            if (!extras.isEmpty()) {
+                this.extraCandidates = java.util.Collections.unmodifiableList(extras);
+            }
+        }
         if (boundNetwork != null) {
             this.socket = new DatagramSocket(null);
             boundNetwork.bindSocket(this.socket);
@@ -289,6 +304,27 @@ final class FastUdpChannel implements Closeable {
         int port = localPort();
         send(OP_PROBE, port, 0, 0);
         send(OP_PROBE, port, 0, 0);
+        java.util.List<InetAddress> extras = extraCandidates;
+        if (!confirmed && extras != null && !extras.isEmpty()) {
+            for (InetAddress cand : extras) {
+                sendToAddress(cand, serverPort, OP_PROBE, port, 0, 0);
+            }
+        }
+    }
+
+    private void sendToAddress(InetAddress target, int port, byte op, int a, int b, int lease) {
+        if (closed || target == null) return;
+        synchronized (sendBuffer) {
+            if (closed) return;
+            try {
+                int len = codec.seal(op, a, b, lease, (int) SystemClock.uptimeMillis(), sendBuffer);
+                if (len <= 0) return;
+                DatagramPacket pkt = new DatagramPacket(sendBuffer, len, target, port);
+                socket.send(pkt);
+                lastSentMs = SystemClock.uptimeMillis();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
     void sendWarm() {
@@ -368,7 +404,10 @@ final class FastUdpChannel implements Closeable {
                         serverPort = srcPort;
                         sendPacket.setAddress(srcAddr);
                         sendPacket.setPort(srcPort);
+                        extraCandidates = java.util.Collections.emptyList();
                     }
+                } else if (!extraCandidates.isEmpty()) {
+                    extraCandidates = java.util.Collections.emptyList();
                 }
                 long nowMs = SystemClock.uptimeMillis();
                 boolean hasSenderTimestamp = msg.op == OP_MOVE;

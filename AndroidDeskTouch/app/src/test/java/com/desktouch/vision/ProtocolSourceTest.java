@@ -1122,7 +1122,7 @@ public final class ProtocolSourceTest {
     }
 
     @Test
-    public void cachedLeafDoesNotBypassHubAndWirelessMigratesToRealHub() {
+    public void cachedLeafDoesNotBypassHubAndWirelessMigratesToRealHub() throws Exception {
         String hubFp = "B".repeat(64);
         String leafFp = "A".repeat(64);
         assertEquals(hubFp, DesktopDiscovery.parseHubHintFingerprint("DT1-HUB|" + hubFp.toLowerCase()));
@@ -1268,5 +1268,42 @@ public final class ProtocolSourceTest {
             CellularLinkHelper.shouldPreferCellular(
                 peakSnap.rttMs, peakSnap.recentPeakJitterMs, peakSnap.recentPeakLossPermille,
                 15.0, 2.0, 0.0, 70_000L, 0L));
+
+        // Verify v0.3.66: Auxiliary WirePeerId AEAD probe/ack UDP frame exchange over real DatagramSockets.
+        try (java.net.DatagramSocket echoServer = new java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress());
+             java.net.DatagramSocket clientSock = new java.net.DatagramSocket(0, java.net.InetAddress.getLoopbackAddress())) {
+            int srvPort = echoServer.getLocalPort();
+            byte[] key = new byte[FastUdpChannel.KEY_SIZE];
+            for (int i = 0; i < key.length; i++) key[i] = (byte) (i + 1);
+            int auxPeerId = 0x8001;
+            FastUdpChannel.Codec serverCodec = new FastUdpChannel.Codec(key, auxPeerId, true);
+            FastUdpChannel.Codec clientCodec = new FastUdpChannel.Codec(key, auxPeerId, false);
+            byte[] txCli = new byte[FastUdpChannel.FRAME_SIZE];
+            int nCli = clientCodec.seal(FastUdpChannel.OP_PROBE, clientSock.getLocalPort(), 0, 0, 1, txCli);
+            clientSock.send(new java.net.DatagramPacket(txCli, nCli, java.net.InetAddress.getLoopbackAddress(), srvPort));
+
+            byte[] rxSrv = new byte[128];
+            java.net.DatagramPacket pSrv = new java.net.DatagramPacket(rxSrv, rxSrv.length);
+            echoServer.setSoTimeout(1500);
+            echoServer.receive(pSrv);
+            FastUdpChannel.Message srvMsg = serverCodec.tryOpen(rxSrv, pSrv.getLength(), null);
+            assertNotNull(srvMsg);
+            assertEquals(FastUdpChannel.OP_PROBE, srvMsg.op);
+
+            byte[] txSrv = new byte[FastUdpChannel.FRAME_SIZE];
+            int nSrv = serverCodec.seal(FastUdpChannel.OP_PROBE_ACK, srvPort, 0, 0, 2, txSrv);
+            echoServer.send(new java.net.DatagramPacket(txSrv, nSrv, pSrv.getAddress(), pSrv.getPort()));
+
+            byte[] rxCli = new byte[128];
+            java.net.DatagramPacket pCli = new java.net.DatagramPacket(rxCli, rxCli.length);
+            clientSock.setSoTimeout(1500);
+            clientSock.receive(pCli);
+            FastUdpChannel.Message cliMsg = clientCodec.tryOpen(rxCli, pCli.getLength(), null);
+            assertNotNull(cliMsg);
+            assertEquals(FastUdpChannel.OP_PROBE_ACK, cliMsg.op);
+            assertEquals(srvPort, cliMsg.a);
+            clientCodec.close();
+            serverCodec.close();
+        }
     }
 }

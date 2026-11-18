@@ -778,12 +778,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             : (snap.LinkSpeedMbps > 0 ? $" ({snap.LinkSpeedMbps} Mbps)" : "");
         string pingText = snap.RttMs > 0 ? $"{snap.RttMs:F1} ms ping" : "measuring ping...";
         string lossText = snap.LossPermille >= 1.0 ? $"  •  loss {snap.LossPermille / 10.0:F1}%" : "";
+        string splitText = !string.IsNullOrWhiteSpace(snap.SplitPathsSummary) ? $"  •  {snap.SplitPathsSummary}" : "";
         Color color = snap.RttMs is > 0 and <= 20
             ? Color.FromArgb(136, 224, 168)
             : (snap.RttMs > 60 ? Color.FromArgb(245, 200, 120) : Color.FromArgb(170, 212, 245));
         return (
             color,
-            $"Live link [{snap.PeerName}]: {bandText}{speedText}  •  {pingText}  •  jitter {snap.JitterMs:F1} ms{lossText}{kbText}"
+            $"Live link [{snap.PeerName}]: {bandText}{speedText}  •  {pingText}  •  jitter {snap.JitterMs:F1} ms{lossText}{splitText}{kbText}"
         );
     }
 
@@ -1030,11 +1031,31 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 m.SupportsReverseInput);
     }
 
+    private bool CurrentDestinationSupportsFastReverseKey()
+    {
+        if(_captureUsesInbound || _host==null)
+        {
+            int id=_receiver?.SelectedPeerId??0;
+            if(id<=0)return false;
+            var peer=_receiver?.ConnectedPeers.FirstOrDefault(p=>p.Id==id).Peer
+                ?? _receiver?.BridgedPeers.FirstOrDefault(b=>b.VirtualId==id).Peer;
+            return peer!=null && ReceiverServer.SupportsFastReverseKey(peer.Platform, peer.AppVersion);
+        }
+        int target=_host.SelectedEnvironmentTargetId;
+        var member=_host.EnvironmentMembers.FirstOrDefault(m=>m.Id==target);
+        if(member==null || member.Platform!="Android")return false;
+        string? ver=null;
+        try { ver=MonitorTopology.FromWire(member.Layout).Monitors.FirstOrDefault()?.AppVersion; }
+        catch { }
+        return ReceiverServer.SupportsFastReverseKey(member.Platform, ver);
+    }
+
     private void AttachCaptureHandlers(SourceCapture capture)
     {
         capture.SetPointerSensitivity(_pointerSensitivity);
         capture.NavigateEnvironment=NavigateEnvironmentFromCapture;
         capture.DestinationIsAndroid=CurrentDestinationIsAndroid;
+        capture.DestinationSupportsFastReverseKey=CurrentDestinationSupportsFastReverseKey;
         capture.ToggleMobileRequested+=JumpToMobileOrReturn;
     }
 

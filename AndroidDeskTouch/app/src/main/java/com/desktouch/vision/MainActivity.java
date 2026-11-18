@@ -39,6 +39,8 @@ public final class MainActivity extends Activity {
     private CheckBox autoStartCheck;
     private CheckBox allowWindowsCheck,allowShellBridgeCheck,autoPausePaymentsCheck,autoPauseDisconnectCheck;
     private Button pauseBankingButton;
+    private Button mouseModeBtn,keyboardModeBtn,pointerFeelBtn,resetPathsBtn;
+    private CheckBox dualPathControlsCheck,keepChannelsWarmCheck;
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
@@ -121,6 +123,104 @@ public final class MainActivity extends Activity {
         liveLinkView.setPadding(0,0,0,dp(8));
         liveLinkView.setText("Live link: waiting for connection");
         page.addView(liveLinkView);
+        TextView streamControlsTitle=new TextView(this);
+        streamControlsTitle.setText("Input Channels & Speed");
+        streamControlsTitle.setTextColor(Color.WHITE);
+        streamControlsTitle.setTextSize(14f);
+        streamControlsTitle.setPadding(0,0,0,dp(4));
+        page.addView(streamControlsTitle);
+        LinearLayout streamRow=new LinearLayout(this);
+        streamRow.setOrientation(LinearLayout.HORIZONTAL);
+        streamRow.setPadding(0,0,0,dp(4));
+        page.addView(streamRow,new LinearLayout.LayoutParams(-1,-2));
+        mouseModeBtn=new Button(this);
+        mouseModeBtn.setAllCaps(false);mouseModeBtn.setTextSize(11.5f);
+        mouseModeBtn.setMinWidth(0);mouseModeBtn.setMinimumWidth(0);
+        mouseModeBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
+        mouseModeBtn.setOnClickListener(v->{
+            int cur=DeskTouchSession.readMouseMode(this);
+            int next=cur==DeskTouchSession.STREAM_MODE_AUTO
+                ? DeskTouchSession.STREAM_MODE_FORCE_MOBILE
+                : (cur==DeskTouchSession.STREAM_MODE_FORCE_MOBILE
+                    ? DeskTouchSession.STREAM_MODE_FORCE_WIFI
+                    : DeskTouchSession.STREAM_MODE_AUTO);
+            DeskTouchSession.writeMouseMode(this,next);
+            DeskTouchRuntime.applyStreamOptions(this);
+            refreshStreamOptionControls();
+            refreshLiveLinkAndKeyboard();
+        });
+        LinearLayout.LayoutParams srp1=new LinearLayout.LayoutParams(0,-2,1f);
+        srp1.setMargins(0,0,dp(2),0);
+        streamRow.addView(mouseModeBtn,srp1);
+        keyboardModeBtn=new Button(this);
+        keyboardModeBtn.setAllCaps(false);keyboardModeBtn.setTextSize(11.5f);
+        keyboardModeBtn.setMinWidth(0);keyboardModeBtn.setMinimumWidth(0);
+        keyboardModeBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
+        keyboardModeBtn.setOnClickListener(v->{
+            int cur=DeskTouchSession.readKeyboardMode(this);
+            int next=cur==DeskTouchSession.STREAM_MODE_AUTO
+                ? DeskTouchSession.STREAM_MODE_FORCE_WIFI
+                : (cur==DeskTouchSession.STREAM_MODE_FORCE_WIFI
+                    ? DeskTouchSession.STREAM_MODE_FORCE_MOBILE
+                    : DeskTouchSession.STREAM_MODE_AUTO);
+            DeskTouchSession.writeKeyboardMode(this,next);
+            DeskTouchRuntime.applyStreamOptions(this);
+            refreshStreamOptionControls();
+            refreshLiveLinkAndKeyboard();
+        });
+        LinearLayout.LayoutParams srp2=new LinearLayout.LayoutParams(0,-2,1f);
+        srp2.setMargins(dp(2),0,dp(2),0);
+        streamRow.addView(keyboardModeBtn,srp2);
+        pointerFeelBtn=new Button(this);
+        pointerFeelBtn.setAllCaps(false);pointerFeelBtn.setTextSize(11.5f);
+        pointerFeelBtn.setMinWidth(0);pointerFeelBtn.setMinimumWidth(0);
+        pointerFeelBtn.setPadding(dp(4),dp(6),dp(4),dp(6));
+        pointerFeelBtn.setOnClickListener(v->{
+            int cur=DeskTouchSession.readPointerFeelMode(this);
+            int next=cur==PointerSmoother.FEEL_AUTO
+                ? PointerSmoother.FEEL_RAW_DIRECT
+                : (cur==PointerSmoother.FEEL_RAW_DIRECT
+                    ? PointerSmoother.FEEL_SMOOTH
+                    : PointerSmoother.FEEL_AUTO);
+            DeskTouchSession.writePointerFeelMode(this,next);
+            DeskTouchRuntime.applyStreamOptions(this);
+            refreshStreamOptionControls();
+        });
+        LinearLayout.LayoutParams srp3=new LinearLayout.LayoutParams(0,-2,1f);
+        srp3.setMargins(dp(2),0,0,0);
+        streamRow.addView(pointerFeelBtn,srp3);
+        dualPathControlsCheck=new CheckBox(this);
+        dualPathControlsCheck.setText("Dual-path keys & clicks (anti-lag boost)");
+        dualPathControlsCheck.setTextColor(Color.WHITE);
+        dualPathControlsCheck.setChecked(DeskTouchSession.readDualPathControls(this));
+        dualPathControlsCheck.setOnClickListener(v->{
+            DeskTouchSession.writeDualPathControls(this,dualPathControlsCheck.isChecked());
+            DeskTouchRuntime.applyStreamOptions(this);
+            refreshStreamOptionControls();
+            refreshLiveLinkAndKeyboard();
+        });
+        page.addView(dualPathControlsCheck);
+        keepChannelsWarmCheck=new CheckBox(this);
+        keepChannelsWarmCheck.setText("Keep wireless radio awake during control");
+        keepChannelsWarmCheck.setTextColor(Color.WHITE);
+        keepChannelsWarmCheck.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
+        keepChannelsWarmCheck.setOnClickListener(v->{
+            DeskTouchSession.writeKeepChannelsWarm(this,keepChannelsWarmCheck.isChecked());
+            DeskTouchRuntime.applyStreamOptions(this);
+            refreshStreamOptionControls();
+        });
+        page.addView(keepChannelsWarmCheck);
+        resetPathsBtn=new Button(this);
+        resetPathsBtn.setText("Reset Saved Paths");
+        resetPathsBtn.setAllCaps(false);resetPathsBtn.setTextSize(12f);
+        resetPathsBtn.setOnClickListener(v->{
+            DeskTouchRuntime.resetRememberedStreams(this);
+            refreshStreamOptionControls();
+            refreshLiveLinkAndKeyboard();
+            Toast.makeText(this,"Cleared remembered network paths.",Toast.LENGTH_SHORT).show();
+        });
+        page.addView(resetPathsBtn,new LinearLayout.LayoutParams(-1,-2));
+        refreshStreamOptionControls();
         deviceList=new LinearLayout(this);
         deviceList.setOrientation(LinearLayout.VERTICAL);
         page.addView(deviceList);
@@ -525,10 +625,37 @@ public final class MainActivity extends Activity {
         updateVisibleScreenAwake();
         refreshPermissionState();
         refreshTrustSummary();
+        refreshStreamOptionControls();
         refreshLiveLinkAndKeyboard();
         startLiveUiTicker();
         if(autoStartCheck!=null)autoStartCheck.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+    }
+    private void refreshStreamOptionControls(){
+        if(mouseModeBtn!=null){
+            int m=DeskTouchSession.readMouseMode(this);
+            String label=m==DeskTouchSession.STREAM_MODE_FORCE_MOBILE ? "Mobile"
+                : (m==DeskTouchSession.STREAM_MODE_FORCE_WIFI ? "Wireless" : "Auto");
+            mouseModeBtn.setText("Mouse: "+label);
+        }
+        if(keyboardModeBtn!=null){
+            int k=DeskTouchSession.readKeyboardMode(this);
+            String label=k==DeskTouchSession.STREAM_MODE_FORCE_WIFI ? "Wireless"
+                : (k==DeskTouchSession.STREAM_MODE_FORCE_MOBILE ? "Mobile" : "Fastest");
+            keyboardModeBtn.setText("Keys: "+label);
+        }
+        if(pointerFeelBtn!=null){
+            int f=DeskTouchSession.readPointerFeelMode(this);
+            String label=f==PointerSmoother.FEEL_RAW_DIRECT ? "Raw 0ms"
+                : (f==PointerSmoother.FEEL_SMOOTH ? "Smooth" : "Auto");
+            pointerFeelBtn.setText("Feel: "+label);
+        }
+        if(dualPathControlsCheck!=null){
+            dualPathControlsCheck.setChecked(DeskTouchSession.readDualPathControls(this));
+        }
+        if(keepChannelsWarmCheck!=null){
+            keepChannelsWarmCheck.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
+        }
     }
     @Override protected void onPause(){
         stopLiveUiTicker();
@@ -606,7 +733,18 @@ public final class MainActivity extends Activity {
         if(snap.lossPermille>=1.0){
             extra+=String.format(java.util.Locale.US," • loss %.1f%%",snap.lossPermille/10.0);
         }
-        return "Live link: "+snap.peerName+" via "+path+" • "+ping+extra;
+        String base="Live link: "+snap.peerName+" via "+path+" • "+ping+extra;
+        if(snap.mobConfirmed || snap.preferMobileMouse || snap.preferMobileKeyboard){
+            String mousePath=snap.preferMobileMouse
+                ? ("Mobile"+(snap.mobRttMs>0.0 ? String.format(java.util.Locale.US," (%.1f ms)",snap.mobRttMs) : ""))
+                : ("Wireless"+(snap.wifiRttMs>0.0 ? String.format(java.util.Locale.US," (%.1f ms)",snap.wifiRttMs) : ""));
+            String kbPath=snap.preferMobileKeyboard
+                ? ("Mobile"+(snap.mobRttMs>0.0 ? String.format(java.util.Locale.US," (%.1f ms)",snap.mobRttMs) : ""))
+                : ("Wireless"+(snap.wifiRttMs>0.0 ? String.format(java.util.Locale.US," (%.1f ms)",snap.wifiRttMs) : ""));
+            String dualTag=snap.dualPathControls ? " [Dual-path]" : "";
+            return base+"\nMouse: "+mousePath+" • Keys: "+kbPath+dualTag;
+        }
+        return base;
     }
     private static String formatBandPlain(String band, int speedMbps){
         String base;
@@ -679,7 +817,7 @@ public final class MainActivity extends Activity {
         String bridgeLine=shellReady
             ? "active (works with Accessibility OFF)"
             : (ShellInputClient.allowed(this)
-                ? "standby (starts automatically when data cable is connected to Windows)"
+                ? "standby (starts automatically when cable or Wireless Debugging is connected to Windows)"
                 : "disabled in DeskTouch");
         permissionState.setText(PermissionContinuity.state(this) +
             "\nVirtual Bridge: " + bridgeLine +

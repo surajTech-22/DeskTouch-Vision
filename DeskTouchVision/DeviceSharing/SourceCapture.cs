@@ -62,7 +62,15 @@ internal sealed class SourceCapture : IDisposable
     // crossing its actual screen boundary. Never connects another socket.
     internal Func<MonitorEdge,double,bool>? NavigateEnvironment { get; set; }
     internal Func<bool>? DestinationIsAndroid { get; set; }
+    internal Func<bool>? DestinationSupportsFastReverseKey { get; set; }
     internal event Action? ToggleMobileRequested;
+
+    internal static int ResolveAndroidHardwareKeyVk(int vk, bool shift, bool ctrl, bool alt, bool win)
+    {
+        if (!shift && !ctrl && !alt && !win && vk is >= 0x60 and <= 0x69)
+            return 0x30 + (vk - 0x60);
+        return vk;
+    }
 
     internal static string? AndroidPrintableKey(int vk,bool shift)
     {
@@ -812,9 +820,10 @@ internal sealed class SourceCapture : IDisposable
             bool winNow = (_remoteModifierDownMask & (8 | 16)) != 0
                 || (Win.GetAsyncKeyState(0x5B) & 0x8000) != 0
                 || (Win.GetAsyncKeyState(0x5C) & 0x8000) != 0;
-            // Forward modifier shortcuts (Ctrl, Alt, Win) and navigation/system
-            // keys as hardware reverse-key events so Android handles real shortcuts.
-            if (targetIsAndroid && !ctrlNow && !altNow && !winNow)
+            bool fastReverseKey = targetIsAndroid && DestinationSupportsFastReverseKey?.Invoke() == true;
+            // Forward printable characters as hardware reverse-key packets to modern Android
+            // peers so they ride the dual-path UDP ReverseKey channel instead of TCP-only text.
+            if (targetIsAndroid && !fastReverseKey && !ctrlNow && !altNow && !winNow)
             {
                 var printable = AndroidPrintableKey((int)key.vkCode, _shiftPressed);
                 if (printable != null)
@@ -824,9 +833,12 @@ internal sealed class SourceCapture : IDisposable
                     return (IntPtr)1;
                 }
             }
+            int wireVk = fastReverseKey
+                ? ResolveAndroidHardwareKeyVk((int)key.vkCode, _shiftPressed, ctrlNow, altNow, winNow)
+                : (int)key.vkCode;
             bool extended = (key.flags & 1) != 0;
             if(!_session.TrySend(new Packet("key",(int)key.scanCode,
-                extended?1:0,down?1:0,(int)key.vkCode)))
+                extended?1:0,down?1:0,wireVk)))
                 Post(ReturnLocal);
             return (IntPtr)1;
         }

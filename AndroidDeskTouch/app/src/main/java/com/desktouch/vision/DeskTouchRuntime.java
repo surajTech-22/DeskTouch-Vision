@@ -417,6 +417,23 @@ final class DeskTouchRuntime {
         return s != null && s.isConnected() ? s.getLiveSnapshot() : null;
     }
 
+    static synchronized void applyStreamOptions(Context context) {
+        if (context == null) return;
+        for (DeskTouchSession s : sessions.values()) {
+            if (s != null && s.isConnected()) s.applyStreamOptions();
+        }
+        notifyLiveStatusChanged();
+    }
+
+    static synchronized void resetRememberedStreams(Context context) {
+        if (context == null) return;
+        DeskTouchSession.clearStreamMemory(context);
+        for (DeskTouchSession s : sessions.values()) {
+            if (s != null && s.isConnected()) s.resetStreamStateAndReapply();
+        }
+        notifyLiveStatusChanged();
+    }
+
     static synchronized void clear(){
         PEER_ENDPOINTS.clear();
         for(DeskTouchSession s:pendingMakeBeforeBreak.values())s.close();

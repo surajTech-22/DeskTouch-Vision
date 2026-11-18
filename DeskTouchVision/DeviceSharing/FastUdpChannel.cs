@@ -780,6 +780,7 @@ internal sealed class FastUdpHub : IDisposable
         internal volatile bool Confirmed;
         private int _confirmedLogged;
         internal long LastMoveSentTicks;
+        internal long LastAnySendMs;
         internal long LastLinkPingMs;
         internal int PendingWakePing;
         internal long LastWakePrimerMs;
@@ -845,8 +846,12 @@ internal sealed class FastUdpHub : IDisposable
                 {
                     var dest = FastUdpSocketOptions.MapForSocket(socket, target);
                     bool sent = socket.SendTo(_sendBuffer, 0, len, SocketFlags.None, dest) == len;
-                    if (sent && op is FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush or FastUdpOp.Move)
-                        Volatile.Write(ref LastMoveSentTicks, Stopwatch.GetTimestamp());
+                    if (sent)
+                    {
+                        Volatile.Write(ref LastAnySendMs, Environment.TickCount64);
+                        if (op is FastUdpOp.ReverseMove or FastUdpOp.ReverseEdgePush or FastUdpOp.Move)
+                            Volatile.Write(ref LastMoveSentTicks, Stopwatch.GetTimestamp());
+                    }
                     return sent;
                 }
                 catch (Exception)

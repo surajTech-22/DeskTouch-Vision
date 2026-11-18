@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.69 — Zero-Lag Hardware ReverseKey Keyboard, Dual-Path Key/Click Redundancy & Input Channel Controls
+
+Eliminates intermittent Wi-Fi keyboard latency and gives direct Android UI control over Mouse/Keyboard channels, Cursor Feel, Dual-Path Boost, and Radio Wake:
+
+- **Direct UDP hardware ReverseKey forwarding (`SourceCapture`, `NetworkSessions`, `DisplaySettingsForm`):** Sends unshifted and modified keystrokes as real hardware `"key"` packets over fast UDP `OP_REVERSE_KEY` for Android `>= 0.3.67` peers instead of queuing printable characters down TCP-only `"text"` frames, while cleanly normalizing unshifted Numpad digits (`0x60..0x69`) and keeping TCP backup compatibility for legacy peers.
+- **Always-on Dual-Path protection & Wireless Radio Keep-Warm (`NetworkSessions`, `FastUdpHub`, `DeskTouchSession`):** Duplicates interactive `key`, `button`, and `wheel` UDP frames simultaneously over both confirmed Wi-Fi and Mobile UDP peers (with Android-side `actionSeq` deduplication) and pulses lightweight `OP_WARM` frames every `85 ms` when Wi-Fi is idle during an active lease so Xiaomi's 2.4 GHz radio never naps between keystrokes.
+- **Interactive Input Channels & Speed Controls + Live Split Display (`MainActivity`, `DeskTouchSession`, `DeskTouchRuntime`, `PointerSmoother`, `DeskTouchAccessibilityService`):** Adds per-device toggles directly in the Android app for Mouse path (`Auto` / `Mobile` / `Wireless`), Keyboard path (`Fastest` / `Wireless` / `Mobile`), Cursor feel (`Auto` / `Raw 0ms` / `Smooth`), Dual-path keys & clicks (`OP_REVERSE_KEY` / button mirror), Wireless radio keep-warm, Saved-Path Reset, and live split Mouse/Keyboard latency telemetry across both Android and Windows status views.
+
+---
+
 # DeskTouch Vision v0.3.68 — Auto Wireless Debugging, Instant Mobile Stream Sync, Low-Delay Cellular Pacing & Faster Keyboard Path
 
 Fixes the stream-preference confirmation race after cable/Wi-Fi handoffs, removes artificial mobile pacing delay, auto-connects Wireless Debugging, and puts Keyboard cleanly onto the fastest `0%`-loss path:

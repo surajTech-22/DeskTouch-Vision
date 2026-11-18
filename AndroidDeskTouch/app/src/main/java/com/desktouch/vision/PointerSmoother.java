@@ -23,6 +23,11 @@ public final class PointerSmoother {
     private float targetX;
     private float targetY;
 
+    public static final int FEEL_AUTO = 0;
+    public static final int FEEL_RAW_DIRECT = 1;
+    public static final int FEEL_SMOOTH = 2;
+
+    private int feelMode = FEEL_AUTO;
     private int displayRefreshHz = 60;
     private int measuredFrameHz;
     private int frameSampleCount;
@@ -45,6 +50,18 @@ public final class PointerSmoother {
     public synchronized void setLinkMetrics(double jitterMs, double lossPermille) {
         this.networkJitterMs = Math.max(0.0, Math.min(250.0, jitterMs));
         this.lossPermille = Math.max(0.0, Math.min(1000.0, lossPermille));
+    }
+
+    public synchronized void setFeelMode(int mode) {
+        if (mode == FEEL_RAW_DIRECT || mode == FEEL_SMOOTH) {
+            this.feelMode = mode;
+        } else {
+            this.feelMode = FEEL_AUTO;
+        }
+    }
+
+    public synchronized int getFeelMode() {
+        return feelMode;
     }
 
     public synchronized void reset(float x, float y, long nowNs) {
@@ -285,7 +302,14 @@ public final class PointerSmoother {
     }
 
     private double computeTauMsLocked(double nominalFrameMs) {
+        if (feelMode == FEEL_RAW_DIRECT) {
+            return 0.0;
+        }
         double jitter = Math.max(networkJitterMs, localArrivalJitterMs);
+        if (feelMode == FEEL_SMOOTH) {
+            double effectiveJitter = Math.max(jitter, 12.0);
+            return Math.min(28.0, Math.max(8.0, effectiveJitter * 0.75 + nominalFrameMs * 0.35));
+        }
         if (jitter <= 6.5 && lossPermille <= 4.0) {
             return 0.0;
         }

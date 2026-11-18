@@ -607,6 +607,11 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(service!=null)service.smoother.setLinkMetrics(jitterMs,lossPermille);
     }
 
+    static void setPointerFeelMode(int feelMode){
+        DeskTouchAccessibilityService service=instance;
+        if(service!=null)service.smoother.setFeelMode(feelMode);
+    }
+
     static void setDisplayRefreshHz(int refreshHz){
         DeskTouchAccessibilityService service=instance;
         if(service!=null && refreshHz>0)service.smoother.setDisplayRefreshHz(refreshHz);

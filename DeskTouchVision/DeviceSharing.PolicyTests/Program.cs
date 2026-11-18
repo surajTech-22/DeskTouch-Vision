@@ -2713,6 +2713,31 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         double cleanCellLive144 = ReceiverServer.ComputeAdaptiveUdpIntervalMs("Android", 144, 21.0, 19.0, 1.8, 0.0, "cellular");
         Check(cleanCellLive144 is >= 6.4 and <= 7.2,
             "Clean 0%-loss cellular at 144 Hz must unlock crisp ~6.8ms cadence instead of holding at 9.7ms");
+
+        // Verify v0.3.69: hardware ReverseKey forwarding, Numpad mapping, DualPath/KeepWarm stream-prefer, and split-path formatting.
+        Check(SourceCapture.ResolveAndroidHardwareKeyVk(0x65, false, false, false, false) == 0x35 &&
+              SourceCapture.ResolveAndroidHardwareKeyVk(0x65, true, false, false, false) == 0x65 &&
+              SourceCapture.ResolveAndroidHardwareKeyVk(0x41, false, false, false, false) == 0x41,
+            "ResolveAndroidHardwareKeyVk must map unshifted Numpad digits to standard digit VKs while preserving shifted/other keys");
+        Check(ReceiverServer.SupportsFastReverseKey("Android", "0.3.67") &&
+              ReceiverServer.SupportsFastReverseKey("Android", "0.3.69") &&
+              !ReceiverServer.SupportsFastReverseKey("Android", "0.3.66") &&
+              !ReceiverServer.SupportsFastReverseKey("Windows", "0.3.69") &&
+              !ReceiverServer.SupportsFastReverseKey("Android", null),
+            "SupportsFastReverseKey must require Android >= 0.3.67");
+        var dualPref = new Packet("stream-prefer", 1, 0, 1, 2, "cellular");
+        Check(dualPref.C == 1 && dualPref.D == 2,
+            "stream-prefer packet must carry C=DualPathControls and D=KeepChannelsWarm");
+        var splitSnap = new ReceiverServer.ActiveLinkSnapshot(
+            true, "Xiaomi", "cellular", 0, 19.5, 1.4, 0.0, null, "Mouse: Mobile  •  Keys: Wireless + dual keys");
+        var (_, splitFormatted) = DisplaySettingsForm.FormatLiveLinkDisplay(splitSnap, "English (US)");
+        Check(splitFormatted.Contains("Mouse: Mobile  •  Keys: Wireless + dual keys"),
+            "FormatLiveLinkDisplay must show SplitPathsSummary when active");
+        var singleSnap = new ReceiverServer.ActiveLinkSnapshot(
+            true, "Xiaomi", "5GHz", 866, 4.1, 0.6, 0.0, null);
+        var (_, singleFormatted) = DisplaySettingsForm.FormatLiveLinkDisplay(singleSnap, "English (US)");
+        Check(!singleFormatted.Contains("Mouse:") && singleFormatted.Contains("5 GHz wireless"),
+            "FormatLiveLinkDisplay must stay concise on single-path connections");
     }
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

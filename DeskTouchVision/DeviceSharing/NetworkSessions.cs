@@ -169,6 +169,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int PreferMobileKeyboard;
         internal int DesiredPreferMobileMouse;
         internal int DesiredPreferMobileKeyboard;
+        internal int DualPathControls = 1;
+        internal int KeepChannelsWarm = 1;
         internal long DualMouseMirrorUntilTicks;
         internal long DualKeyboardMirrorUntilTicks;
         internal FastMovePacer? MovePacer;
@@ -608,7 +610,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         double RttMs,
         double JitterMs,
         double LossPermille,
-        string? KeyboardInfoJson);
+        string? KeyboardInfoJson,
+        string? SplitPathsSummary = null);
+
+    private static string? FormatSplitPathsSummary(Session session)
+    {
+        if (session.IsCableSession || session.MobileUdpPeer is not { Confirmed: true } mob)
+            return null;
+        string mouseName = ReferenceEquals(ActiveMouseUdpPeer(session), mob) ? "Mobile" : "Wireless";
+        string kbName = ReferenceEquals(ActiveKeyboardUdpPeer(session), mob) ? "Mobile" : "Wireless";
+        string dualTag = Volatile.Read(ref session.DualPathControls) != 0 ? " + dual keys" : "";
+        return $"Mouse: {mouseName}  •  Keys: {kbName}{dualTag}";
+    }
 
     internal ActiveLinkSnapshot GetActiveLinkSummary()
     {
@@ -658,7 +671,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             peer?.LinkTracker.SmoothedRttMs ?? 0,
             peer?.LinkTracker.EffectiveJitterMs ?? 0,
             peer?.LinkTracker.CombinedLossPermille ?? 0,
-            Volatile.Read(ref session.KeyboardInfoJson));
+            Volatile.Read(ref session.KeyboardInfoJson),
+            FormatSplitPathsSummary(session));
     }
 
     internal void SetShellBridgeAuth(int port, string secret)
@@ -1133,8 +1147,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         return session.UdpPeer;
     }
 
-    private void ApplyStreamPreference(Session session, bool desiredMouse, bool desiredKeyboard)
+    private void ApplyStreamPreference(
+        Session session, bool desiredMouse, bool desiredKeyboard,
+        int dualPathCode = 0, int keepWarmCode = 0)
     {
+        if (dualPathCode is 1 or 2)
+            Volatile.Write(ref session.DualPathControls, dualPathCode == 1 ? 1 : 0);
+        if (keepWarmCode is 1 or 2)
+            Volatile.Write(ref session.KeepChannelsWarm, keepWarmCode == 1 ? 1 : 0);
         Volatile.Write(ref session.DesiredPreferMobileMouse, desiredMouse ? 1 : 0);
         Volatile.Write(ref session.DesiredPreferMobileKeyboard, desiredKeyboard ? 1 : 0);
         bool mobileConfirmed = session.MobileUdpPeer is { Confirmed: true };
@@ -1385,8 +1405,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         bool isAndroidPeer = string.Equals(session.Peer.Platform, "Android", StringComparison.Ordinal);
                         SendPeriodicUdpPingIfNeeded(session, peer, nowMs, controlActive, isAndroidPeer);
+                        if (controlActive && Volatile.Read(ref session.KeepChannelsWarm) != 0
+                            && peer is { Confirmed: true }
+                            && nowMs - Volatile.Read(ref peer.LastAnySendMs) >= 85)
+                        {
+                            _udpHub.Send(peer, FastUdpOp.Warm, 0, 0, 0);
+                        }
                         if (session.MobileUdpPeer is { Confirmed: true } mobPeer)
+                        {
                             SendPeriodicUdpPingIfNeeded(session, mobPeer, nowMs, controlActive, isAndroidPeer);
+                        }
                     }
 
                     if ((tick % 150) != 149) continue;
@@ -1673,8 +1701,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         int udpA = isKey ? packet.D : packet.A;
         int udpB = isKey ? (packet.C != 0 ? 1 : 0) : packet.B;
         _udpHub.Send(activeUdp, op, udpA, udpB, lease, actionSeq);
+        bool dualControls = Volatile.Read(ref target.DualPathControls) != 0;
         long mirrorUntil = Volatile.Read(ref isKey ? ref target.DualKeyboardMirrorUntilTicks : ref target.DualMouseMirrorUntilTicks);
-        if (mirrorUntil > Stopwatch.GetTimestamp())
+        if (dualControls || mirrorUntil > Stopwatch.GetTimestamp())
         {
             var backup = ReferenceEquals(activeUdp, target.MobileUdpPeer) ? target.UdpPeer : target.MobileUdpPeer;
             if (backup is { Confirmed: true })
@@ -2720,7 +2749,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     bool wantMobileMouse = p.A != 0 || string.Equals(p.Text, "cellular", StringComparison.OrdinalIgnoreCase);
                     bool wantMobileKb = p.B != 0;
-                    ApplyStreamPreference(session, wantMobileMouse, wantMobileKb);
+                    ApplyStreamPreference(session, wantMobileMouse, wantMobileKb, p.C, p.D);
                     continue;
                 }
                 if(p.Type=="trust-request")
@@ -3735,6 +3764,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal static bool SupportsDualMovePacket(string? appVersion) =>
         SupportsDualMovePacket("Android", appVersion);
+    internal static bool SupportsFastReverseKey(string? platform, string? appVersion) =>
+        string.Equals(platform, "Android", StringComparison.Ordinal) &&
+        Version.TryParse(appVersion, out var parsed) && parsed >= new Version(0, 3, 67);
 
     /// <summary>Encodes a reliable (wired / fallback) move carrying both (-) and (+) positions.</summary>
     private static Packet EncodeMoveForWire(Session session, Packet move)

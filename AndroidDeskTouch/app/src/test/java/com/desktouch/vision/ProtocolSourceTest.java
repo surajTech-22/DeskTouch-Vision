@@ -1345,5 +1345,31 @@ public final class ProtocolSourceTest {
             CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(4.2, 0.0, 20.5, 0.0, 50_000L, 10_000L, 15_000L));
         assertFalse("Keyboard must NEVER switch to a lossy alternate path even if lower RTT",
             CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(20.5, 0.0, 4.2, 5.0, 50_000L, 10_000L, 15_000L));
+
+        // Verify v0.3.69: PointerSmoother feel modes, DeskTouchSession null-safe defaults, and split live link display.
+        PointerSmoother feelSmoother = new PointerSmoother();
+        feelSmoother.setDisplayRefreshHz(120);
+        feelSmoother.setLinkMetrics(28.0, 45.0);
+        feelSmoother.setFeelMode(PointerSmoother.FEEL_RAW_DIRECT);
+        assertEquals("Raw 0ms feel mode must keep tau at 0.0 even under jitter/loss",
+            0.0, feelSmoother.getCurrentTauMs(), 0.001);
+        feelSmoother.setLinkMetrics(2.0, 0.0);
+        feelSmoother.setFeelMode(PointerSmoother.FEEL_SMOOTH);
+        assertTrue("Smooth feel mode must apply positive smoothing even on quiet link",
+            feelSmoother.getCurrentTauMs() >= 8.0);
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, DeskTouchSession.readMouseMode(null));
+        assertEquals(DeskTouchSession.STREAM_MODE_AUTO, DeskTouchSession.readKeyboardMode(null));
+        assertTrue(DeskTouchSession.readDualPathControls(null));
+        assertTrue(DeskTouchSession.readKeepChannelsWarm(null));
+        assertEquals(PointerSmoother.FEEL_AUTO, DeskTouchSession.readPointerFeelMode(null));
+
+        DeskTouchSession.LiveStatusSnapshot splitUiSnap = new DeskTouchSession.LiveStatusSnapshot(
+            true, "DESKTOP-IQ1KSJ9", "FP1", false, WifiLinkMonitor.BAND_CELLULAR, 0,
+            19.8, 1.5, 0.0, 0.0, 1.5, "", null,
+            true, false, 4.2, 0.0, 19.8, 0.0, true, true);
+        String splitUiText = MainActivity.formatLiveLinkText(splitUiSnap, "Wireless");
+        assertTrue(splitUiText.contains("Mouse: Mobile (19.8 ms)"));
+        assertTrue(splitUiText.contains("Keys: Wireless (4.2 ms)"));
+        assertTrue(splitUiText.contains("[Dual-path]"));
     }
 }

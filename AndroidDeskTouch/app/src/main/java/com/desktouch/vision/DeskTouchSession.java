@@ -208,6 +208,14 @@ final class DeskTouchSession implements AutoCloseable {
         final double recentPeakJitterMs;
         final String pcLayout;
         final KeyboardBindingInspector.KeyboardReport keyboardReport;
+        final boolean preferMobileMouse;
+        final boolean preferMobileKeyboard;
+        final double wifiRttMs;
+        final double wifiLossPermille;
+        final double mobRttMs;
+        final double mobLossPermille;
+        final boolean mobConfirmed;
+        final boolean dualPathControls;
         LiveStatusSnapshot(boolean connected, String peerName, String fingerprint, boolean cable,
                 String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
                 String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport) {
@@ -218,6 +226,18 @@ final class DeskTouchSession implements AutoCloseable {
                 String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
                 double recentPeakLossPermille, double recentPeakJitterMs,
                 String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport) {
+            this(connected, peerName, fingerprint, cable, band, speedMbps, rttMs, jitterMs,
+                lossPermille, recentPeakLossPermille, recentPeakJitterMs, pcLayout, keyboardReport,
+                false, false, rttMs, lossPermille, 0.0, 0.0, false, true);
+        }
+        LiveStatusSnapshot(boolean connected, String peerName, String fingerprint, boolean cable,
+                String band, int speedMbps, double rttMs, double jitterMs, double lossPermille,
+                double recentPeakLossPermille, double recentPeakJitterMs,
+                String pcLayout, KeyboardBindingInspector.KeyboardReport keyboardReport,
+                boolean preferMobileMouse, boolean preferMobileKeyboard,
+                double wifiRttMs, double wifiLossPermille,
+                double mobRttMs, double mobLossPermille,
+                boolean mobConfirmed, boolean dualPathControls) {
             this.connected = connected;
             this.peerName = peerName != null ? peerName : "";
             this.fingerprint = fingerprint;
@@ -231,9 +251,25 @@ final class DeskTouchSession implements AutoCloseable {
             this.recentPeakJitterMs = recentPeakJitterMs;
             this.pcLayout = pcLayout != null ? pcLayout : "";
             this.keyboardReport = keyboardReport;
+            this.preferMobileMouse = preferMobileMouse;
+            this.preferMobileKeyboard = preferMobileKeyboard;
+            this.wifiRttMs = wifiRttMs;
+            this.wifiLossPermille = wifiLossPermille;
+            this.mobRttMs = mobRttMs;
+            this.mobLossPermille = mobLossPermille;
+            this.mobConfirmed = mobConfirmed;
+            this.dualPathControls = dualPathControls;
         }
     }
+    static final int STREAM_MODE_AUTO = 0;
+    static final int STREAM_MODE_FORCE_WIFI = 1;
+    static final int STREAM_MODE_FORCE_MOBILE = 2;
     private static final String STREAM_MEMORY_PREFS = "desktouch_stream_memory";
+    private static final String PREF_MOUSE_MODE = "opt_mouse_mode";
+    private static final String PREF_KB_MODE = "opt_kb_mode";
+    private static final String PREF_DUAL_PATH_CONTROLS = "opt_dual_path_controls";
+    private static final String PREF_KEEP_CHANNELS_WARM = "opt_keep_channels_warm";
+    private static final String PREF_POINTER_FEEL = "opt_pointer_feel";
     private static final long STREAM_SWITCH_COOLDOWN_MS = 8_000L;
     private static final long STREAM_SAVE_CLEAN_DELAY_MS = 3_000L;
     private static final long MOUSE_UNLOAD_GRACE_MS = 6_000L;
@@ -345,28 +381,41 @@ final class DeskTouchSession implements AutoCloseable {
         double peakLoss = 0.0;
         double peakJitter = 0.0;
         double rtt = cableSession ? 0.0 : liveRttMs;
-        if (!cableSession && preferMobileMouse && mobCh != null && mobCh.confirmed) {
+        boolean mobOk = !cableSession && mobCh != null && mobCh.confirmed;
+        double wifiRtt = cableSession ? 0.0 : liveRttMs;
+        double wifiLoss = 0.0;
+        if (!cableSession && ch != null) {
+            if (ch.linkTracker.getSmoothedRttMs() > 0) wifiRtt = ch.linkTracker.getSmoothedRttMs();
+            wifiLoss = ch.linkTracker.getInboundLossPermille();
+        }
+        double mobRtt = (mobOk && mobCh.linkTracker.getSmoothedRttMs() > 0)
+            ? mobCh.linkTracker.getSmoothedRttMs() : 0.0;
+        double mobLoss = mobOk ? mobCh.linkTracker.getInboundLossPermille() : 0.0;
+        if (preferMobileMouse && mobOk) {
             long nowMs = SystemClock.uptimeMillis();
-            if (mobCh.linkTracker.getSmoothedRttMs() > 0) rtt = mobCh.linkTracker.getSmoothedRttMs();
+            if (mobRtt > 0) rtt = mobRtt;
             jitter = mobCh.linkTracker.getEffectiveJitterMs();
-            loss = mobCh.linkTracker.getInboundLossPermille();
+            loss = mobLoss;
             peakLoss = Math.max(loss, mobCh.linkTracker.getRecentPeakLossPermille(nowMs));
             peakJitter = Math.max(jitter, mobCh.linkTracker.getRecentPeakJitterMs(nowMs));
             band = WifiLinkMonitor.BAND_CELLULAR;
         } else if (!cableSession && ch != null) {
             long nowMs = SystemClock.uptimeMillis();
-            if (ch.linkTracker.getSmoothedRttMs() > 0) rtt = ch.linkTracker.getSmoothedRttMs();
+            rtt = wifiRtt;
             jitter = ch.linkTracker.getEffectiveJitterMs();
-            loss = ch.linkTracker.getInboundLossPermille();
+            loss = wifiLoss;
             peakLoss = Math.max(loss, ch.linkTracker.getRecentPeakLossPermille(nowMs));
             peakJitter = Math.max(jitter, ch.linkTracker.getRecentPeakJitterMs(nowMs));
             String trackerBand = ch.linkTracker.getBand();
             if (trackerBand != null && !trackerBand.isEmpty()) band = trackerBand;
         }
+        boolean dualPath = readDualPathControls(application);
         return new LiveStatusSnapshot(running, peerName, fingerprint, cableSession,
-            band, (!cableSession && preferMobileMouse && mobCh != null && mobCh.confirmed) ? 0 : (cableSession ? 0 : liveLinkSpeedMbps),
+            band, (preferMobileMouse && mobOk) ? 0 : (cableSession ? 0 : liveLinkSpeedMbps),
             rtt, jitter, loss, peakLoss, peakJitter,
-            pcKeyboardLayout, lastKeyboardReport);
+            pcKeyboardLayout, lastKeyboardReport,
+            preferMobileMouse && mobOk, preferMobileKeyboard && mobOk,
+            wifiRtt, wifiLoss, mobRtt, mobLoss, mobOk, dualPath);
     }
     static boolean allowedInputType(String type) {
         return "move".equals(type)||"button".equals(type)||"key".equals(type)||
@@ -1024,6 +1073,7 @@ final class DeskTouchSession implements AutoCloseable {
             if(!preparedShell) ShellInputClient.beginRemote(application,ptrSpeed,hz);
             DeskTouchAccessibilityService.setNativeCursorRefreshVote(true);
         }
+        DeskTouchAccessibilityService.setPointerFeelMode(readPointerFeelMode(application));
         send(new Packet("reverse-granted",claim));
         if(!fromUdp) warmOrProbeUdp();
         RemoteInputPower.begin(application);
@@ -1482,31 +1532,33 @@ final class DeskTouchSession implements AutoCloseable {
                     long now = SystemClock.uptimeMillis();
                     boolean changed = false;
                     synchronized (streamPrefLock) {
+                        int mouseMode = readMouseMode(application);
+                        int kbMode = readKeyboardMode(application);
                         String savedMouse = readRememberedStream("mouse");
                         String savedKb = readRememberedStream("keyboard");
-                        if ("cellular".equals(savedMouse) && !preferMobileMouse) {
-                            preferMobileMouse = true;
+                        boolean wantMobMouse = mouseMode == STREAM_MODE_FORCE_MOBILE
+                            || (mouseMode == STREAM_MODE_AUTO && "cellular".equals(savedMouse));
+                        boolean wantMobKb = kbMode == STREAM_MODE_FORCE_MOBILE
+                            || (kbMode == STREAM_MODE_AUTO && "cellular".equals(savedKb));
+                        if (wantMobMouse != preferMobileMouse) {
+                            preferMobileMouse = wantMobMouse;
                             lastMouseSwitchAtMs = now;
-                            wifiPostMouseOffloadAtMs = now;
+                            wifiPostMouseOffloadAtMs = preferMobileMouse ? now : 0L;
                             wifiPostOffloadLostAnchor = -1L;
-                            lastSavedMouseStream = "cellular";
                             changed = true;
-                        } else if ("wifi".equals(savedMouse)) {
-                            lastSavedMouseStream = "wifi";
                         }
-                        if ("cellular".equals(savedKb) && !preferMobileKeyboard) {
-                            preferMobileKeyboard = true;
+                        if (preferMobileMouse && "cellular".equals(savedMouse)) lastSavedMouseStream = "cellular";
+                        else if (!preferMobileMouse && "wifi".equals(savedMouse)) lastSavedMouseStream = "wifi";
+                        if (wantMobKb != preferMobileKeyboard) {
+                            preferMobileKeyboard = wantMobKb;
                             lastKeyboardSwitchAtMs = now;
-                            lastSavedKeyboardStream = "cellular";
                             changed = true;
-                        } else if ("wifi".equals(savedKb)) {
-                            lastSavedKeyboardStream = "wifi";
                         }
+                        if (preferMobileKeyboard && "cellular".equals(savedKb)) lastSavedKeyboardStream = "cellular";
+                        else if (!preferMobileKeyboard && "wifi".equals(savedKb)) lastSavedKeyboardStream = "wifi";
                         if (connectedStreamSinceMs <= 0L) connectedStreamSinceMs = now;
                     }
-                    if (changed) {
-                        sendStreamPreference();
-                    }
+                    sendStreamPreference();
                     FastUdpChannel ch = mobileUdpChannel;
                     if (running && ch != null && !udpPacer.isShutdown()) {
                         udpPacer.execute(() -> {
@@ -1526,7 +1578,10 @@ final class DeskTouchSession implements AutoCloseable {
                 } else {
                     ScheduledFuture<?> retry = udpProbeRetryFuture;
                     if (retry != null) retry.cancel(false);
-                    if (running) send(new Packet("udp-ack"));
+                    if (running) {
+                        send(new Packet("udp-ack"));
+                        sendStreamPreference();
+                    }
                 }
             }
             @Override public void onReverseMove(int x, int y, int lease, int moveSeq) {
@@ -1622,12 +1677,149 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
 
+    static int readMouseMode(Context context) {
+        if (context == null) return STREAM_MODE_AUTO;
+        int v = context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .getInt(PREF_MOUSE_MODE, STREAM_MODE_AUTO);
+        return (v == STREAM_MODE_FORCE_WIFI || v == STREAM_MODE_FORCE_MOBILE) ? v : STREAM_MODE_AUTO;
+    }
+
+    static void writeMouseMode(Context context, int mode) {
+        if (context == null) return;
+        int clamped = (mode == STREAM_MODE_FORCE_WIFI || mode == STREAM_MODE_FORCE_MOBILE) ? mode : STREAM_MODE_AUTO;
+        context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .edit().putInt(PREF_MOUSE_MODE, clamped).apply();
+    }
+
+    static int readKeyboardMode(Context context) {
+        if (context == null) return STREAM_MODE_AUTO;
+        int v = context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .getInt(PREF_KB_MODE, STREAM_MODE_AUTO);
+        return (v == STREAM_MODE_FORCE_WIFI || v == STREAM_MODE_FORCE_MOBILE) ? v : STREAM_MODE_AUTO;
+    }
+
+    static void writeKeyboardMode(Context context, int mode) {
+        if (context == null) return;
+        int clamped = (mode == STREAM_MODE_FORCE_WIFI || mode == STREAM_MODE_FORCE_MOBILE) ? mode : STREAM_MODE_AUTO;
+        context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .edit().putInt(PREF_KB_MODE, clamped).apply();
+    }
+
+    static boolean readDualPathControls(Context context) {
+        return context == null || context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_DUAL_PATH_CONTROLS, true);
+    }
+
+    static void writeDualPathControls(Context context, boolean enabled) {
+        if (context == null) return;
+        context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(PREF_DUAL_PATH_CONTROLS, enabled).apply();
+    }
+
+    static boolean readKeepChannelsWarm(Context context) {
+        return context == null || context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_KEEP_CHANNELS_WARM, true);
+    }
+
+    static void writeKeepChannelsWarm(Context context, boolean enabled) {
+        if (context == null) return;
+        context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(PREF_KEEP_CHANNELS_WARM, enabled).apply();
+    }
+
+    static int readPointerFeelMode(Context context) {
+        if (context == null) return PointerSmoother.FEEL_AUTO;
+        int v = context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .getInt(PREF_POINTER_FEEL, PointerSmoother.FEEL_AUTO);
+        return (v == PointerSmoother.FEEL_RAW_DIRECT || v == PointerSmoother.FEEL_SMOOTH)
+            ? v : PointerSmoother.FEEL_AUTO;
+    }
+
+    static void writePointerFeelMode(Context context, int mode) {
+        if (context == null) return;
+        int clamped = (mode == PointerSmoother.FEEL_RAW_DIRECT || mode == PointerSmoother.FEEL_SMOOTH)
+            ? mode : PointerSmoother.FEEL_AUTO;
+        context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE)
+            .edit().putInt(PREF_POINTER_FEEL, clamped).apply();
+    }
+
+    static void clearStreamMemory(Context context) {
+        if (context == null) return;
+        try {
+            android.content.SharedPreferences prefs = context.getSharedPreferences(STREAM_MEMORY_PREFS, Context.MODE_PRIVATE);
+            android.content.SharedPreferences.Editor ed = prefs.edit();
+            for (String k : prefs.getAll().keySet()) {
+                if (k != null && (k.contains("|mouse|") || k.contains("|keyboard|"))) {
+                    ed.remove(k);
+                }
+            }
+            ed.apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    void resetStreamStateAndReapply() {
+        synchronized (streamPrefLock) {
+            lastSavedMouseStream = "";
+            lastSavedKeyboardStream = "";
+            preferMobileMouse = false;
+            preferMobileKeyboard = false;
+            wifiPostMouseOffloadAtMs = 0L;
+            wifiPostOffloadLostAnchor = -1L;
+            lastMouseSwitchAtMs = 0L;
+            lastKeyboardSwitchAtMs = 0L;
+        }
+        applyStreamOptions();
+    }
+
+    void applyStreamOptions() {
+        DeskTouchAccessibilityService.setPointerFeelMode(readPointerFeelMode(application));
+        if (!running || cableSession || cellularSession) return;
+        int mouseMode = readMouseMode(application);
+        int kbMode = readKeyboardMode(application);
+        boolean wantPunch = false;
+        synchronized (streamPrefLock) {
+            FastUdpChannel mobCh = mobileUdpChannel;
+            boolean mobOk = mobCh != null && mobCh.confirmed;
+            if (mouseMode == STREAM_MODE_FORCE_WIFI) {
+                preferMobileMouse = false;
+                wifiPostMouseOffloadAtMs = 0L;
+                wifiPostOffloadLostAnchor = -1L;
+            } else if (mouseMode == STREAM_MODE_FORCE_MOBILE) {
+                if (mobOk) {
+                    preferMobileMouse = true;
+                    wifiPostMouseOffloadAtMs = SystemClock.uptimeMillis();
+                    wifiPostOffloadLostAnchor = -1L;
+                } else {
+                    wantPunch = true;
+                }
+            }
+            if (kbMode == STREAM_MODE_FORCE_WIFI) {
+                preferMobileKeyboard = false;
+            } else if (kbMode == STREAM_MODE_FORCE_MOBILE) {
+                if (mobOk) preferMobileKeyboard = true;
+                else wantPunch = true;
+            }
+        }
+        sendStreamPreference();
+        if (wantPunch) {
+            mobilePunchAttemptedOnce = false;
+            mobilePunchBackoffUntilMs = 0L;
+            AutoConnectService.onMobileUdpCredentialsReady(application);
+        }
+        evaluateLossTriggeredStreams();
+        DeskTouchRuntime.notifyLiveStatusChanged();
+    }
+
     private void sendStreamPreference() {
         if (!running) return;
         boolean mobMouse = preferMobileMouse;
         boolean mobKb = preferMobileKeyboard;
+        boolean dualPath = readDualPathControls(application);
+        boolean keepWarm = readKeepChannelsWarm(application);
         String label = (mobMouse || mobKb) ? "cellular" : "wifi";
-        send(new Packet("stream-prefer", mobMouse ? 1 : 0, mobKb ? 1 : 0, 0, 0, label));
+        send(new Packet("stream-prefer", mobMouse ? 1 : 0, mobKb ? 1 : 0,
+            dualPath ? 1 : 2, keepWarm ? 1 : 2, label));
     }
 
     private void evaluateLossTriggeredStreams() {
@@ -1670,10 +1862,28 @@ final class DeskTouchSession implements AutoCloseable {
             double mobLoss = Math.max(mobCh.linkTracker.getInboundLossPermille(),
                 mobCh.linkTracker.getPeerLossPermille());
             boolean changed = false;
+            int mouseMode = readMouseMode(application);
+            int kbMode = readKeyboardMode(application);
 
             double activeMouseLoss = preferMobileMouse ? mobLoss : wifiLoss;
             double candMouseLoss = preferMobileMouse ? wifiLoss : mobLoss;
-            if (CellularLinkHelper.shouldSwitchStreamOnLoss(
+            if (mouseMode == STREAM_MODE_FORCE_WIFI) {
+                if (preferMobileMouse) {
+                    preferMobileMouse = false;
+                    lastMouseSwitchAtMs = now;
+                    wifiPostMouseOffloadAtMs = 0L;
+                    wifiPostOffloadLostAnchor = -1L;
+                    changed = true;
+                }
+            } else if (mouseMode == STREAM_MODE_FORCE_MOBILE) {
+                if (!preferMobileMouse) {
+                    preferMobileMouse = true;
+                    lastMouseSwitchAtMs = now;
+                    wifiPostMouseOffloadAtMs = now;
+                    wifiPostOffloadLostAnchor = -1L;
+                    changed = true;
+                }
+            } else if (CellularLinkHelper.shouldSwitchStreamOnLoss(
                 activeMouseLoss, candMouseLoss, now, lastMouseSwitchAtMs, STREAM_SWITCH_COOLDOWN_MS)) {
                 preferMobileMouse = !preferMobileMouse;
                 lastMouseSwitchAtMs = now;
@@ -1722,22 +1932,36 @@ final class DeskTouchSession implements AutoCloseable {
             double activeKbRtt = preferMobileKeyboard ? mobRtt : wifiRtt;
             double candKbRtt = preferMobileKeyboard ? wifiRtt : mobRtt;
 
-            boolean kbLossSwitch = !kbHoldForMouseUnload && CellularLinkHelper.shouldSwitchStreamOnLoss(
-                activeKbLoss, candKbLoss, now, lastKeyboardSwitchAtMs, STREAM_SWITCH_COOLDOWN_MS);
-            boolean kbFasterZeroLossSwitch = !kbHoldForMouseUnload && !kbLossSwitch
-                && CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(
-                    activeKbRtt, activeKbLoss, candKbRtt, candKbLoss,
-                    now, lastKeyboardSwitchAtMs, KEYBOARD_FAST_SWITCH_COOLDOWN_MS);
-            if (kbLossSwitch || kbFasterZeroLossSwitch) {
-                preferMobileKeyboard = !preferMobileKeyboard;
-                lastKeyboardSwitchAtMs = now;
-                lastSavedKeyboardStream = "";
-                changed = true;
+            if (kbMode == STREAM_MODE_FORCE_WIFI) {
+                if (preferMobileKeyboard) {
+                    preferMobileKeyboard = false;
+                    lastKeyboardSwitchAtMs = now;
+                    changed = true;
+                }
+            } else if (kbMode == STREAM_MODE_FORCE_MOBILE) {
+                if (!preferMobileKeyboard) {
+                    preferMobileKeyboard = true;
+                    lastKeyboardSwitchAtMs = now;
+                    changed = true;
+                }
             } else {
-                long kbStableSince = lastKeyboardSwitchAtMs > 0L ? lastKeyboardSwitchAtMs : connectedStreamSinceMs;
-                if (kbStableSince > 0L && now - kbStableSince >= STREAM_SAVE_CLEAN_DELAY_MS
-                    && activeKbLoss == 0.0) {
-                    rememberCleanStreamIfNeeded("keyboard", preferMobileKeyboard ? "cellular" : "wifi");
+                boolean kbLossSwitch = !kbHoldForMouseUnload && CellularLinkHelper.shouldSwitchStreamOnLoss(
+                    activeKbLoss, candKbLoss, now, lastKeyboardSwitchAtMs, STREAM_SWITCH_COOLDOWN_MS);
+                boolean kbFasterZeroLossSwitch = !kbHoldForMouseUnload && !kbLossSwitch
+                    && CellularLinkHelper.shouldSwitchKeyboardToFasterZeroLoss(
+                        activeKbRtt, activeKbLoss, candKbRtt, candKbLoss,
+                        now, lastKeyboardSwitchAtMs, KEYBOARD_FAST_SWITCH_COOLDOWN_MS);
+                if (kbLossSwitch || kbFasterZeroLossSwitch) {
+                    preferMobileKeyboard = !preferMobileKeyboard;
+                    lastKeyboardSwitchAtMs = now;
+                    lastSavedKeyboardStream = "";
+                    changed = true;
+                } else {
+                    long kbStableSince = lastKeyboardSwitchAtMs > 0L ? lastKeyboardSwitchAtMs : connectedStreamSinceMs;
+                    if (kbStableSince > 0L && now - kbStableSince >= STREAM_SAVE_CLEAN_DELAY_MS
+                        && activeKbLoss == 0.0) {
+                        rememberCleanStreamIfNeeded("keyboard", preferMobileKeyboard ? "cellular" : "wifi");
+                    }
                 }
             }
 
@@ -1790,10 +2014,12 @@ final class DeskTouchSession implements AutoCloseable {
             wifiLoss = Math.max(wifiCh.linkTracker.getInboundLossPermille(),
                 wifiCh.linkTracker.getPeerLossPermille());
         }
+        boolean forceMobile = readMouseMode(application) == STREAM_MODE_FORCE_MOBILE
+            || readKeyboardMode(application) == STREAM_MODE_FORCE_MOBILE;
         boolean rememberCell = "cellular".equals(readRememberedStream("mouse"))
             || "cellular".equals(readRememberedStream("keyboard"));
         boolean wifiLossTriggered = wifiLoss >= 10.0;
-        if (mobilePunchAttemptedOnce && !wifiLossTriggered && !rememberCell) return;
+        if (mobilePunchAttemptedOnce && !wifiLossTriggered && !rememberCell && !forceMobile) return;
         if (now < mobilePunchBackoffUntilMs) return;
 
         android.net.Network cellNet = helper.acquireCellularNetwork(4500L);
@@ -1902,7 +2128,8 @@ final class DeskTouchSession implements AutoCloseable {
                     boolean serviceReady=canAcceptRemoteInput();
                     if(activeSession && shouldSendInteractiveKeepalive(
                         running,true,true,serviceReady,screenInteractive,true)){
-                        if(now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS
+                        if(readKeepChannelsWarm(application)
+                            && now-lastWarmSentMs>=INTERACTIVE_KEEPALIVE_MS
                             && now-lastUdpReverseMoveAtMs>=30L
                             && now-ch.getLastSentMs()>=INTERACTIVE_KEEPALIVE_MS){
                             lastWarmSentMs=now;

@@ -3005,6 +3005,28 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         Check(wHigh >= wLow && wHigh > 0, "Fullscreen highRes preview mode must preserve >= resolution than inline preview");
     }
 
+    Check(!DeskTouchVision.SingleInstanceActivation.HasPathMismatchWithRunningPeers(
+              @"C:\Users\tester\AppData\Local\Programs\DeskTouchVision\DeviceSharing\DeskTouch.DeviceShare.exe",
+              new[] { @"C:\Users\tester\AppData\Local\Programs\DeskTouchVision\DeviceSharing\DeskTouch.DeviceShare.exe", null }),
+          "Same installed path peers must wake cleanly without mismatch recovery");
+    Check(DeskTouchVision.SingleInstanceActivation.HasPathMismatchWithRunningPeers(
+              @"C:\Users\tester\AppData\Local\Programs\DeskTouchVision\DeviceSharing\DeskTouch.DeviceShare.exe",
+              new[] { @"C:\Users\tester\Downloads\DeskTouch\app\DeviceSharing\DeskTouch.DeviceShare.exe" }),
+          "Running peers from another folder must trigger mismatch recovery");
+
+    string? issPath = null;
+    for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir != null; dir = dir.Parent)
+    {
+        string candidate = Path.Combine(dir.FullName, "DeskTouchVision", "DeskTouchVision.iss");
+        if (File.Exists(candidate)) { issPath = candidate; break; }
+    }
+    Check(issPath != null, "DeskTouchVision.iss Inno Setup script must exist in the repository");
+    string issText = File.ReadAllText(issPath!);
+    Check(issText.Contains("OutputBaseFilename=DeskTouchVision-Install", StringComparison.Ordinal) &&
+          issText.Contains("PrepareToInstall", StringComparison.Ordinal) &&
+          issText.Contains("Local\\DeskTouchVision.WindowsDisplays.ExitEvent.2026", StringComparison.Ordinal),
+          "Single-EXE Inno Setup installer must output DeskTouchVision-Install.exe and clean up running processes pre-install");
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

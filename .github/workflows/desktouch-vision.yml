@@ -115,10 +115,20 @@ jobs:
             ([pscustomobject]@{schema=1;files=@($entries)} |
               ConvertTo-Json -Depth 5), [Text.Encoding]::UTF8)
           & 'DeskTouchVision/VERIFY_DESKTOUCH_PAYLOAD.ps1' -Root $app
-      - name: Package installer + SHA-256
+      - name: Install Inno Setup
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          choco install innosetup --yes --no-progress
+
+      - name: Package ZIP + single EXE installer + SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [xml]$proj = Get-Content "DeskTouchVision/DeskTouchVision.csproj"
+          $appVersion = ([string]$proj.Project.PropertyGroup.Version).Split("-")[0]
+          if ([string]::IsNullOrWhiteSpace($appVersion)) { throw "App version not set" }
+
           Copy-Item DeskTouchVision/Install-DeskTouch.ps1 DeskTouchVision/dist/
           Copy-Item DeskTouchVision/INSTALL_DESKTOUCH.cmd DeskTouchVision/dist/
           Copy-Item DeskTouchVision/CHECK_DESKTOUCH.ps1 DeskTouchVision/dist/
@@ -132,6 +142,24 @@ jobs:
           Compress-Archive -Path DeskTouchVision/dist/* -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText("$zip.sha256", "$hash  DeskTouchVision-win-x64.zip" + [Environment]::NewLine, [Text.Encoding]::ASCII)
+
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after Inno Setup installation" }
+
+          $sourceFull = (Resolve-Path "DeskTouchVision/dist/app").Path
+          $outFull = (Resolve-Path "DeskTouchVision/published").Path
+          & $iscc "/DAppVersion=$appVersion" "/DSourceDir=$sourceFull" "/DOutputDir=$outFull" "DeskTouchVision/DeskTouchVision.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
+
+          $exe = "DeskTouchVision/published/DeskTouchVision-Install.exe"
+          if (-not (Test-Path $exe)) { throw "DeskTouchVision-Install.exe missing after compilation" }
+          $exeHash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$exe.sha256", "$exeHash  DeskTouchVision-Install.exe" + [Environment]::NewLine, [Text.Encoding]::ASCII)
+
           if (-not (Test-Path "DeskTouchVision/dist/app/DeskTouchVision.exe")) { throw "App executable missing" }
           if (-not (Test-Path "DeskTouchVision/dist/app/DeviceSharing/DeskTouch.DeviceShare.exe")) { throw "Input-sharing executable missing" }
           if (-not (Test-Path "DeskTouchVision/dist/app/Update-DeskTouch.ps1")) { throw "Installed updater script missing" }
@@ -141,7 +169,7 @@ jobs:
           if (-not (Test-Path "DeskTouchVision/dist/RECOVER_DESKTOUCH.ps1")) { throw "Recovery script missing" }
           if (-not (Test-Path "DeskTouchVision/dist/app/payload-integrity.json")) { throw "Integrity manifest missing" }
           if (-not (Test-Path "DeskTouchVision/dist/CHECK_SECURITY_STATUS.ps1")) { throw "Antivirus diagnostic missing" }
-      - name: Upload installable ZIP
+      - name: Upload installable EXE and ZIP
         uses: actions/upload-artifact@v4
         with:
           name: DeskTouchVision-Installer-win-x64
@@ -164,13 +192,20 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "$tag already published; not altering the release"
           } else {
-            gh release create $tag DeskTouchVision/published/DeskTouchVision-win-x64.zip DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes-file "DeskTouchVision/RELEASE_NOTES.md"
+            gh release create $tag `
+              DeskTouchVision/published/DeskTouchVision-Install.exe `
+              DeskTouchVision/published/DeskTouchVision-Install.exe.sha256 `
+              DeskTouchVision/published/DeskTouchVision-win-x64.zip `
+              DeskTouchVision/published/DeskTouchVision-win-x64.zip.sha256 `
+              --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DeskTouch Vision $tag - Preview" --notes-file "DeskTouchVision/RELEASE_NOTES.md"
             if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }
             $assets = @(gh release view $tag --json assets --jq '.assets[].name' --repo "${{ github.repository }}")
             if ($LASTEXITCODE -ne 0) { throw "Cannot verify Windows-only release assets" }
-            if (!($assets -contains 'DeskTouchVision-win-x64.zip') -or
+            if (!($assets -contains 'DeskTouchVision-Install.exe') -or
+                !($assets -contains 'DeskTouchVision-Install.exe.sha256') -or
+                !($assets -contains 'DeskTouchVision-win-x64.zip') -or
                 !($assets -contains 'DeskTouchVision-win-x64.zip.sha256')) {
-              throw "Windows release is missing the installer or its SHA-256"
+              throw "Windows release is missing the single EXE installer, ZIP archive, or SHA-256"
             }
             Write-Host "Windows release assets verified for $tag. Coordinated announcement runs after signed Android APK attaches."
           }

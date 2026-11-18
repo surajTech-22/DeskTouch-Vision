@@ -110,14 +110,38 @@ internal static class SingleInstanceActivation
         try { gate.Dispose(); } catch { }
     }
 
+    internal static bool HasPathMismatchWithRunningPeers(
+        string? expectedShareExecutablePath,
+        IReadOnlyCollection<string?> peerPaths)
+    {
+        if (string.IsNullOrWhiteSpace(expectedShareExecutablePath)) return false;
+        string expected = Path.GetFullPath(expectedShareExecutablePath);
+        foreach (string? p in peerPaths)
+        {
+            if (string.IsNullOrWhiteSpace(p)) continue;
+            try
+            {
+                if (!string.Equals(Path.GetFullPath(p), expected, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// <summary>
     /// Wakes an already-running DeskTouch instance on the caller's desktop and
     /// verifies its Displays window actually appears. If a background/different-
-    /// desktop/hung instance is blocking startup without surfacing a visible
-    /// window, shuts that instance down cleanly so the caller can launch fresh.
+    /// desktop/different-path/hung instance is blocking startup without surfacing
+    /// a visible window, shuts that instance down cleanly so the caller can launch fresh.
     /// Returns true if an existing window surfaced on the caller's desktop.
     /// </summary>
-    internal static bool WakeOrRecoverExistingForInteractiveLaunch(int currentPid)
+    internal static bool WakeOrRecoverExistingForInteractiveLaunch(
+        int currentPid,
+        string? expectedShareExecutablePath = null)
     {
         List<Process> peers = GetSameSessionShareProcesses(currentPid);
         try
@@ -125,6 +149,16 @@ internal static class SingleInstanceActivation
             bool kernelObjectsExist = HasExistingLifecycleHandles();
             if (peers.Count == 0 && !kernelObjectsExist)
                 return false;
+
+            if (!string.IsNullOrWhiteSpace(expectedShareExecutablePath))
+            {
+                var runningPaths = peers.Select(TryGetProcessPath).ToArray();
+                if (HasPathMismatchWithRunningPeers(expectedShareExecutablePath, runningPaths))
+                {
+                    RecoverBlockedInstances(currentPid, peers);
+                    return false;
+                }
+            }
 
             SignalShow(peers, FindDeskTouchWindowsOnCurrentDesktop(ToPidSet(peers)));
 
@@ -285,6 +319,22 @@ internal static class SingleInstanceActivation
             DisposeProcesses(stuck);
         }
 
+        // Also clear stale DeskTouchVision launcher processes holding the startup gate if any.
+        int currentSession = Process.GetCurrentProcess().SessionId;
+        foreach (Process launcher in Process.GetProcessesByName("DeskTouchVision"))
+        {
+            try
+            {
+                if (launcher.Id != currentPid && launcher.SessionId == currentSession && !launcher.HasExited)
+                {
+                    launcher.Kill(entireProcessTree: false);
+                    launcher.WaitForExit(1000);
+                }
+            }
+            catch { }
+            finally { launcher.Dispose(); }
+        }
+
         var cleanupSw = Stopwatch.StartNew();
         while (cleanupSw.ElapsedMilliseconds < 1000 && HasExistingSingleInstanceMutex())
         {
@@ -418,6 +468,12 @@ internal static class SingleInstanceActivation
             catch { }
         }
         return newest;
+    }
+
+    private static string? TryGetProcessPath(Process p)
+    {
+        try { return p.MainModule?.FileName; }
+        catch { return null; }
     }
 
     private static bool IsAliveSafe(Process p)

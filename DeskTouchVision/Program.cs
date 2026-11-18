@@ -8,8 +8,8 @@ using System.Windows.Forms;
 namespace DeskTouchVision;
 internal static class Program
 {
-    private static bool TryWakeRunningDisplays() =>
-        SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(Environment.ProcessId);
+    private static bool TryWakeRunningDisplays(string shareExePath) =>
+        SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(Environment.ProcessId, shareExePath);
 
     [STAThread]
     private static void Main(string[] args)
@@ -51,7 +51,7 @@ internal static class Program
         Mutex? gate = SingleInstanceActivation.AcquireActivationGate(TimeSpan.FromSeconds(5));
         try
         {
-            if (!startInTray && TryWakeRunningDisplays())
+            if (!startInTray && TryWakeRunningDisplays(share))
                 return;
             try
             {

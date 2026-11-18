@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.84 — Single Click-to-Run Windows Installer (`DeskTouchVision-Install.exe`) & Cross-Path Process Conflict Recovery
+
+- **Direct Single-File Windows Installer (`DeskTouchVision.iss`, `.github/workflows/desktouch-vision.yml`):** Publishes `DeskTouchVision-Install.exe` (with matching `.sha256`) alongside the ZIP and Android APK so testers can install directly by running a single `.exe` installer without extracting archives or encountering script execution policy blocks.
+- **Automatic Stale / Conflicting Background Process Cleanup (`SingleInstanceActivation`, `Program`, `Install-DeskTouch.ps1`, `Update-DeskTouch.ps1`):** Detects and cleanly recovers when an older or different-folder `DeskTouchVision.exe` / `DeskTouch.DeviceShare.exe` process is already holding the single-instance lock or network ports, preventing silent launch failures across reinstalls and upgrades.
+
+---
+
 # DeskTouch Vision v0.3.83 — Full-Screen Monitor Preview on Android & Reliable Post-Update Window Activation on Windows
 
 - **Proper Full-Screen Live Screen Preview on Android (`MainActivity`, `EcosystemFeatures`, `DeskTouchSession`, `ScreenPreviewHelper`, `NetworkSessions`):** Adds an interactive `⛶ Full Screen` viewer in `Trackpad` (plus double-tap on the inline preview) with edge-to-edge immersive display, automatic landscape rotation with manual rotate toggle, aspect-ratio-accurate touch-to-screen coordinate mapping (`mapTouchToBitmapNormalized`), multi-monitor cycling, inline quick typing bar, right-click / two-finger scroll support, and high-resolution (~3.5 FPS) streaming when viewing full screen.

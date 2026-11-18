@@ -41,7 +41,8 @@ internal static class Program
             bool acquired = false;
             try
             {
-                if (SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(Environment.ProcessId))
+                if (SingleInstanceActivation.WakeOrRecoverExistingForInteractiveLaunch(
+                        Environment.ProcessId, Application.ExecutablePath))
                     return;
 
                 singleInstance = new Mutex(false, SingleInstanceMutexName);

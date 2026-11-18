@@ -12,28 +12,22 @@ function Log([string]$message) {
 
 function Stop-DeskTouchGracefully([string]$root) {
   foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
-    $expected = if ($exeName -eq 'DeskTouchVision.exe') {
-      Join-Path $root $exeName
-    } else {
-      Join-Path $root "DeviceSharing\$exeName"
-    }
-    $installed = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop)
+    $installed = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction SilentlyContinue)
     foreach ($info in $installed) {
-      if (-not $info -or -not $info.ExecutablePath -or
-        -not [string]::Equals($info.ExecutablePath, $expected,
-          [StringComparison]::OrdinalIgnoreCase)) { continue }
-      $process = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
-      if (!$process) { continue }
-      Log "Closing installed $exeName PID=$($process.Id) gracefully"
+      $p = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
+      if (!$p -or $p.Id -eq $PID) { continue }
+      Log "Closing running $exeName PID=$($p.Id) ($($info.ExecutablePath)) gracefully"
       if ($exeName -eq 'DeskTouch.DeviceShare.exe') {
         $exitHandle = $null
         if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
           try { [void]$exitHandle.Set() } finally { $exitHandle.Dispose() }
         }
       }
-      [void]$process.CloseMainWindow()
-      if (-not $process.WaitForExit(15000)) {
-        throw "$exeName did not stop normally. Installation was cancelled without terminating native input hooks."
+      [void]$p.CloseMainWindow()
+      if (-not $p.WaitForExit(8000)) {
+        Log "Force closing unresponsive $exeName PID=$($p.Id) after graceful timeout."
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        $null = $p.WaitForExit(3000)
       }
     }
   }

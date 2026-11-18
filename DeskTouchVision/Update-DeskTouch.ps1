@@ -58,15 +58,9 @@ function Stop-InstalledApplications([string]$installDir) {
   foreach ($exeName in @('DeskTouchVision.exe', 'DeskTouch.DeviceShare.exe')) {
     $processes = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop)
     foreach ($info in $processes) {
-      $expected = if ($exeName -eq 'DeskTouchVision.exe') {
-        Join-Path $installDir $exeName
-      } else {
-        Join-Path $installDir "DeviceSharing\$exeName"
-      }
-      if (-not [string]::Equals($info.ExecutablePath, $expected, [StringComparison]::OrdinalIgnoreCase)) { continue }
       $p = Get-Process -Id $info.ProcessId -ErrorAction SilentlyContinue
-      if (-not $p) { continue }
-      Log "Requesting graceful close: $exeName PID=$($p.Id)"
+      if (-not $p -or $p.Id -eq $PID) { continue }
+      Log "Requesting graceful close: $exeName PID=$($p.Id) ($($info.ExecutablePath))"
       if ($exeName -eq 'DeskTouch.DeviceShare.exe') {
         $exitHandle = $null
         if ([System.Threading.EventWaitHandle]::TryOpenExisting('Local\DeskTouchVision.WindowsDisplays.ExitEvent.2026', [ref]$exitHandle)) {
@@ -74,8 +68,15 @@ function Stop-InstalledApplications([string]$installDir) {
         }
       }
       [void]$p.CloseMainWindow()
-      if (-not $p.WaitForExit(12000)) {
-        throw "Active $exeName did not close safely; update deferred to avoid leaving input hooks/held keys behind."
+      if (-not $p.WaitForExit(8000)) {
+        $isInstalledPath = $info.ExecutablePath -and
+          $info.ExecutablePath.StartsWith($installDir + '\', [StringComparison]::OrdinalIgnoreCase)
+        if ($isInstalledPath) {
+          throw "Active $exeName did not close safely; update deferred to avoid leaving input hooks/held keys behind."
+        }
+        Log "Stopping leftover external $exeName PID=$($p.Id) so updated instance owns the lock cleanly."
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        $null = $p.WaitForExit(3000)
       }
     }
   }

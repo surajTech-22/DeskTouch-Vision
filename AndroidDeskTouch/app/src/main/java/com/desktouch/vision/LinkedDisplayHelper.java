@@ -60,6 +60,8 @@ final class LinkedDisplayHelper {
         final boolean supportsInput;
         final int notificationCount;
         final List<MonitorBox> monitors;
+        final int batteryPercent;
+        final boolean charging;
 
         DisplayTileModel(int id, String fullName, String shortName, String platform,
                 String displayLabel, String resolutionSummary,
@@ -67,6 +69,17 @@ final class LinkedDisplayHelper {
                 boolean portrait, boolean hub, boolean self, boolean selected,
                 boolean selectable, boolean supportsInput, int notificationCount,
                 List<MonitorBox> monitors) {
+            this(id, fullName, shortName, platform, displayLabel, resolutionSummary,
+                primaryWidth, primaryHeight, monitorCount, portrait, hub, self, selected,
+                selectable, supportsInput, notificationCount, monitors, -1, false);
+        }
+
+        DisplayTileModel(int id, String fullName, String shortName, String platform,
+                String displayLabel, String resolutionSummary,
+                int primaryWidth, int primaryHeight, int monitorCount,
+                boolean portrait, boolean hub, boolean self, boolean selected,
+                boolean selectable, boolean supportsInput, int notificationCount,
+                List<MonitorBox> monitors, int batteryPercent, boolean charging) {
             this.id = id;
             this.fullName = fullName;
             this.shortName = shortName;
@@ -84,6 +97,8 @@ final class LinkedDisplayHelper {
             this.supportsInput = supportsInput;
             this.notificationCount = notificationCount;
             this.monitors = monitors;
+            this.batteryPercent = batteryPercent;
+            this.charging = charging;
         }
     }
 
@@ -177,7 +192,7 @@ final class LinkedDisplayHelper {
             target.platform != null ? target.platform : "Windows",
             displayLabel, resSummary, pw, ph, count,
             portrait, isHub, isSelf, selected, selectable, target.supportsInput,
-            target.notificationCount, monitors);
+            target.notificationCount, monitors, target.batteryPercent, target.charging);
     }
 
     static List<DeskTouchSession.EnvironmentTarget> sortTargetsSpatially(

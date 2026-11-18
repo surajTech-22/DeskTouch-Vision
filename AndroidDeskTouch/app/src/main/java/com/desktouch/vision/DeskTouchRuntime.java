@@ -419,6 +419,33 @@ final class DeskTouchRuntime {
         notifyLiveStatusChanged();
     }
 
+    static synchronized void notifyLocalNotificationDetailsChanged(
+            java.util.List<EcosystemFeatures.NotificationItem> items){
+        String json=EcosystemFeatures.serializeNotificationList(items);
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()) s.publishNotificationPreviews(json);
+        }
+    }
+
+    static synchronized void notifyLocalOtpDetected(String app, String code, String title){
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()) s.publishOtpOffer(app,code,title);
+        }
+    }
+
+    static synchronized void publishBatteryState(int percent, boolean charging, String signalLabel){
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()) s.publishBatteryState(percent,charging,signalLabel);
+        }
+        notifyLiveStatusChanged();
+    }
+
+    static synchronized void broadcastClipboardText(String hash, String text){
+        for(DeskTouchSession s:sessions.values()){
+            if(s!=null && s.isConnected()) s.sendClipboardText(hash,text);
+        }
+    }
+
     static synchronized String connectedNotificationSummary(Context context){
         int devCount=0;
         int totalNotifs=0;

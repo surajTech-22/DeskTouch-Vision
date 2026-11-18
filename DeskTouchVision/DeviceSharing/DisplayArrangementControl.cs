@@ -11,7 +11,10 @@ namespace DeskTouch.DeviceShare;
 internal sealed record EnvironmentDisplayTile(int TargetId,string Name,string Platform,
     int ScreenCount,bool SupportsInput,string? StableIdentity=null,
     MonitorTopology? Topology=null,string? ScreenDetails=null,
-    int NotificationCount=-1)
+    int NotificationCount=-1,
+    int BatteryPercent=-1,
+    bool IsCharging=false,
+    string SignalLabel="")
 {
     internal bool IsAndroid => Platform=="Android";
     // Prefer a persistent authenticated device identity. The hub roster only
@@ -113,6 +116,34 @@ internal sealed class DisplayArrangementControl : Control
             Invalidate();
         }
     }
+    internal int RemoteTargetId { get; set; }
+    private int _remoteBatteryPercent = -1;
+    internal int RemoteBatteryPercent
+    {
+        get => _remoteBatteryPercent;
+        set
+        {
+            int next = value is >= 0 and <= 100 ? value : -1;
+            if (_remoteBatteryPercent == next) return;
+            _remoteBatteryPercent = next;
+            Invalidate();
+        }
+    }
+    private bool _remoteIsCharging;
+    internal bool RemoteIsCharging
+    {
+        get => _remoteIsCharging;
+        set
+        {
+            if (_remoteIsCharging == value) return;
+            _remoteIsCharging = value;
+            Invalidate();
+        }
+    }
+    private int _dragDropHoverTargetId = int.MinValue;
+    private readonly List<(RectangleF Rect, int TargetId, string DeviceName)> _notificationPillHits = new();
+    internal event Action<int, string, Point>? NotificationPillClicked;
+    internal event Action<int, string[]>? FileDroppedOnDevice;
     internal static string CleanDeviceName(string? name, string fallback)
     {
         string clean = (name ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
@@ -538,6 +569,7 @@ internal sealed class DisplayArrangementControl : Control
         BackColor = Color.FromArgb(20, 28, 42);
         ForeColor = Color.White;
         DoubleBuffered = true;
+        AllowDrop = true;
         Cursor = Cursors.Default;
         MinimumSize = new Size(300, 160);
         TabStop = true;
@@ -869,6 +901,7 @@ internal sealed class DisplayArrangementControl : Control
             return;
         }
 
+        _notificationPillHits.Clear();
         int localOrdinal = 0;
         foreach (var m in _local.Monitors.OrderBy(m => m.Primary ? 0 : 1))
         {
@@ -877,13 +910,19 @@ internal sealed class DisplayArrangementControl : Control
                 DisplayNumber(m, ++localOrdinal), m.Primary, true,
                 resolution: m.Bounds.Size);
         }
-        DrawNotificationPillAbove(g, _localHit, _localNotificationCount);
+        var localPill = DrawNotificationPillAbove(g, _localHit, _localNotificationCount);
+        if (localPill is { } lp) _notificationPillHits.Add((lp, EnvironmentRouteOrder.Local, LocalDeviceName));
 
         if (_remote is { } remote)
         {
             DrawTopologyMonitors(g, _remoteHit, remote, RemoteDeviceName,
                 _remotePlatform, _remoteScreenDetails);
-            DrawNotificationPillAbove(g, _remoteHit, _remoteNotificationCount);
+            var remPill = DrawNotificationPillAbove(g, _remoteHit, _remoteNotificationCount);
+            if (remPill is { } rp) _notificationPillHits.Add((rp, RemoteTargetId, RemoteDeviceName));
+            if (_remotePlatform == "Android" && _remoteBatteryPercent >= 0)
+                DrawBatteryPillBelow(g, _remoteHit, _remoteBatteryPercent, _remoteIsCharging);
+            if (_dragDropHoverTargetId == RemoteTargetId && _remoteHit.Width > 0)
+                DrawDropHighlight(g, _remoteHit);
         }
         else if (layout.Extras.Length == 0)
         {
@@ -916,7 +955,12 @@ internal sealed class DisplayArrangementControl : Control
                         details: index == 0 ? extra.Device.ScreenDetails : null);
                 }
             }
-            DrawNotificationPillAbove(g, group, extra.Device.NotificationCount);
+            var extraPill = DrawNotificationPillAbove(g, group, extra.Device.NotificationCount);
+            if (extraPill is { } ep) _notificationPillHits.Add((ep, extra.Device.TargetId, extra.Device.Name));
+            if (extra.Device.BatteryPercent >= 0)
+                DrawBatteryPillBelow(g, group, extra.Device.BatteryPercent, extra.Device.IsCharging);
+            if (_dragDropHoverTargetId == extra.Device.TargetId && group.Width > 0)
+                DrawDropHighlight(g, group);
         }
     }
 
@@ -946,9 +990,9 @@ internal sealed class DisplayArrangementControl : Control
         return result;
     }
 
-    private static void DrawNotificationPillAbove(Graphics g, RectangleF group, int count)
+    private static RectangleF? DrawNotificationPillAbove(Graphics g, RectangleF group, int count)
     {
-        if (count < 0 || group.Width < 18 || group.Height < 18) return;
+        if (count < 0 || group.Width < 18 || group.Height < 18) return null;
         string label = count.ToString();
         using var font = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold);
         var measured = g.MeasureString(label, font);
@@ -971,6 +1015,43 @@ internal sealed class DisplayArrangementControl : Control
             LineAlignment = StringAlignment.Center
         };
         g.DrawString(label, font, textBrush, pillRect, format);
+        return pillRect;
+    }
+
+    private static void DrawBatteryPillBelow(Graphics g, RectangleF group, int percent, bool charging)
+    {
+        if (percent < 0 || group.Width < 24 || group.Height < 20) return;
+        string label = charging ? $"⚡ {percent}%" : $"{percent}%";
+        Color fg = percent <= 15 && !charging
+            ? Color.FromArgb(252, 165, 165)
+            : (charging ? Color.FromArgb(110, 231, 183) : Color.FromArgb(203, 213, 225));
+        Color bg = percent <= 15 && !charging
+            ? Color.FromArgb(69, 26, 36)
+            : Color.FromArgb(24, 34, 52);
+        using var font = new Font("Segoe UI Semibold", 7.8f, FontStyle.Bold);
+        var measured = g.MeasureString(label, font);
+        float w = Math.Max(34f, measured.Width + 10f);
+        float h = 16f;
+        float x = group.Left + (group.Width - w) / 2f;
+        float y = group.Bottom + 4f;
+        if (y + h > g.VisibleClipBounds.Bottom) return;
+        var rect = new RectangleF(x, y, w, h);
+        using var path = Rounded(rect, 8f);
+        using var fill = new SolidBrush(bg);
+        using var pen = new Pen(percent <= 15 && !charging ? Color.FromArgb(239, 68, 68) : Color.FromArgb(51, 65, 85), 1f);
+        using var textBrush = new SolidBrush(fg);
+        using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        g.FillPath(fill, path);
+        g.DrawPath(pen, path);
+        g.DrawString(label, font, textBrush, rect, format);
+    }
+
+    private static void DrawDropHighlight(Graphics g, RectangleF group)
+    {
+        var expanded = new RectangleF(group.Left - 3f, group.Top - 3f, group.Width + 6f, group.Height + 6f);
+        using var path = Rounded(expanded, 12f);
+        using var pen = new Pen(Color.FromArgb(56, 189, 248), 2.4f) { DashStyle = DashStyle.Dash };
+        g.DrawPath(pen, path);
     }
 
     private static void DrawPlaceholder(Graphics g, RectangleF r)
@@ -1121,6 +1202,14 @@ internal sealed class DisplayArrangementControl : Control
     {
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
+        foreach (var pill in _notificationPillHits)
+        {
+            if (pill.Rect.Contains(e.Location))
+            {
+                NotificationPillClicked?.Invoke(pill.TargetId, pill.DeviceName, PointToScreen(e.Location));
+                return;
+            }
+        }
         foreach(var item in _environmentHits)
         {
             if(item.Hit.Contains(e.Location))
@@ -1162,12 +1251,69 @@ internal sealed class DisplayArrangementControl : Control
             _dragCurrent = ClampedDragPoint(e.Location);
             Invalidate();
         }
-        else Cursor = _environmentHits.Any(item=>item.Hit.Contains(e.Location))
+        else Cursor = _notificationPillHits.Any(p => p.Rect.Contains(e.Location))
+            ? Cursors.Hand
+            : _environmentHits.Any(item=>item.Hit.Contains(e.Location))
             ? Cursors.SizeAll
             : _remote != null && _remoteHit.Contains(e.Location)
                 ? Cursors.SizeAll
                 : _remote == null && _placeholderHit.Contains(e.Location)
                     ? Cursors.Hand : Cursors.Default;
+    }
+
+    private int FindTargetAtClientPoint(Point clientPoint)
+    {
+        foreach (var item in _environmentHits)
+            if (item.Hit.Contains(clientPoint))
+                return item.TargetId;
+        if (_remote != null && _remoteHit.Contains(clientPoint))
+            return RemoteTargetId;
+        return int.MinValue;
+    }
+
+    protected override void OnDragEnter(DragEventArgs e)
+    {
+        base.OnDragEnter(e);
+        if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
+            e.Effect = DragDropEffects.Copy;
+    }
+
+    protected override void OnDragOver(DragEventArgs e)
+    {
+        base.OnDragOver(e);
+        if (e.Data?.GetDataPresent(DataFormats.FileDrop) != true)
+        {
+            e.Effect = DragDropEffects.None;
+            return;
+        }
+        int target = FindTargetAtClientPoint(PointToClient(new Point(e.X, e.Y)));
+        e.Effect = target != int.MinValue ? DragDropEffects.Copy : DragDropEffects.None;
+        if (_dragDropHoverTargetId != target)
+        {
+            _dragDropHoverTargetId = target;
+            Invalidate();
+        }
+    }
+
+    protected override void OnDragLeave(EventArgs e)
+    {
+        base.OnDragLeave(e);
+        if (_dragDropHoverTargetId != int.MinValue)
+        {
+            _dragDropHoverTargetId = int.MinValue;
+            Invalidate();
+        }
+    }
+
+    protected override void OnDragDrop(DragEventArgs e)
+    {
+        base.OnDragDrop(e);
+        int target = _dragDropHoverTargetId;
+        _dragDropHoverTargetId = int.MinValue;
+        Invalidate();
+        if (target == int.MinValue || e.Data?.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0)
+            return;
+        FileDroppedOnDevice?.Invoke(target, files);
     }
 
     protected override void OnMouseUp(MouseEventArgs e)

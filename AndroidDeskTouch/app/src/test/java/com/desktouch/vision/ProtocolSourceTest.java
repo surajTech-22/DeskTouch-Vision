@@ -1593,6 +1593,53 @@ public final class ProtocolSourceTest {
         assertTrue(sessionSource.contains("TASKBAR_ICON_CACHE"));
         assertTrue(sessionSource.contains("new Packet(\"taskbar-need-icons\",reqTarget)"));
         assertTrue(mainSource.contains("active.switchTargetAndClaim(pc.id,0);"));
+
+        // Verify v0.3.82 Ecosystem helpers: OTP extraction, notification serialization, chunk assembly,
+        // battery telemetry propagation, live preview watch, 3-finger & pinch gestures, and media/profile controls.
+        assertEquals("819204", EcosystemFeatures.extractVerificationCode("Login", "Use OTP 819204 to verify"));
+        assertEquals("", EcosystemFeatures.extractVerificationCode("Summary", "Order total 1250 items"));
+        assertEquals("report_2026_.pdf", EcosystemFeatures.sanitizeFileName("../dir/report:2026?.pdf"));
+
+        byte[] previewBytes = "DeskTouchPreviewFrameBytes".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String p1 = java.util.Base64.getEncoder().encodeToString(java.util.Arrays.copyOfRange(previewBytes, 0, 10));
+        String p2 = java.util.Base64.getEncoder().encodeToString(java.util.Arrays.copyOfRange(previewBytes, 10, previewBytes.length));
+        EcosystemFeatures.ChunkAssembler assembler = new EcosystemFeatures.ChunkAssembler();
+        assertNull(assembler.addChunk(7, 0, 2, 320, 180, p1, "tag"));
+        EcosystemFeatures.ChunkAssembler.Result assembled = assembler.addChunk(7, 1, 2, 320, 180, p2, "tag");
+        assertNotNull(assembled);
+        assertArrayEquals(previewBytes, assembled.data);
+        assertEquals(320, assembled.width);
+
+        java.util.List<EcosystemFeatures.NotificationItem> sampleNotifs = java.util.Collections.singletonList(
+            new EcosystemFeatures.NotificationItem("k1", "Messages", "OTP", "Code 442211", 1000L, true, "442211"));
+        String notifsJson = EcosystemFeatures.serializeNotificationList(sampleNotifs);
+        java.util.List<EcosystemFeatures.NotificationItem> parsedNotifs = EcosystemFeatures.parseNotificationList(notifsJson);
+        assertEquals(1, parsedNotifs.size());
+        assertEquals("k1", parsedNotifs.get(0).key);
+        assertTrue(parsedNotifs.get(0).canReply);
+        assertEquals("442211", parsedNotifs.get(0).otpCode);
+
+        EcosystemFeatures.ProfileSummary parsedProf = EcosystemFeatures.parseProfileState(
+            "{\"activeProfile\":\"Presentation\",\"clipboardSync\":false,\"notifPreviews\":false,\"otpHelper\":true,\"shortcutPreset\":\"Presentation\",\"profiles\":[\"Work\",\"Presentation\",\"Away\"]}");
+        assertEquals("Presentation", parsedProf.activeProfile);
+        assertFalse(parsedProf.clipboardSync);
+        assertEquals(3, parsedProf.profiles.size());
+        assertFalse(EcosystemFeatures.shortcutsForPresetOrCustom(null, "Presentation").isEmpty());
+
+        DeskTouchSession.EnvironmentTarget battTarget = new DeskTouchSession.EnvironmentTarget(
+            4, "Phone", "Android", "[]", false, 2, 0, 0.8, 0.2, 0.1, 0.3, 84, true);
+        LinkedDisplayHelper.DisplayTileModel battTile = LinkedDisplayHelper.parseTileModel(battTarget, 0, 4);
+        assertEquals(84, battTile.batteryPercent);
+        assertTrue(battTile.charging);
+
+        assertTrue(mainSource.contains("setScreenPreviewWatch("));
+        assertTrue(mainSource.contains("showNotificationsDialog("));
+        assertTrue(mainSource.contains("handleShareIntent("));
+        assertTrue(mainSource.contains("switch-window"));
+        assertTrue(mainSource.contains("task-view"));
+        assertTrue(mainSource.contains("REQ_SEND_FILE"));
+        assertTrue(sessionSource.contains("screen-preview-chunk"));
+        assertTrue(sessionSource.contains("sendFileUriAsync"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

@@ -2939,11 +2939,62 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               "ReceiverServer must temporarily rate-limit custom pairing code attempts after repeated failures");
     }
 
-    var orderedMemberDto = new EnvironmentMember(2, "SURAJ", "Windows", testDisplay.ToWire(), true, fpOne, 4, 0, 0.0, 0.1, 0.3, 0.4);
+    var orderedMemberDto = new EnvironmentMember(2, "SURAJ", "Windows", testDisplay.ToWire(), true, fpOne, 4, 0, 0.0, 0.1, 0.3, 0.4, 87, true);
     var orderedRoundtrip = System.Text.Json.JsonSerializer.Deserialize<EnvironmentMember>(
         System.Text.Json.JsonSerializer.Serialize(orderedMemberDto));
-    Check(orderedRoundtrip != null && orderedRoundtrip.ArrangementOrder == 0 && Math.Abs(orderedRoundtrip.LayoutW - 0.3) < 0.001,
-          "EnvironmentMember must preserve optional spatial arrangement order and bounds");
+    Check(orderedRoundtrip != null && orderedRoundtrip.ArrangementOrder == 0 && Math.Abs(orderedRoundtrip.LayoutW - 0.3) < 0.001
+          && orderedRoundtrip.BatteryPercent == 87 && orderedRoundtrip.IsCharging,
+          "EnvironmentMember must preserve optional spatial arrangement order, bounds, and battery telemetry");
+
+    // v0.3.82 Ecosystem features: shared clipboard hash/packet, OTP extraction, file drop bounds & chunks, media/power allowlists, and rules.
+    string clipJson = SharedClipboardHelper.SerializeClipboardTextPacket("ABCDEF0123456789", "Hello DeskTouch");
+    Check(clipJson.Contains("Hello DeskTouch", StringComparison.Ordinal) &&
+          SharedClipboardHelper.ComputeHash("text", System.Text.Encoding.UTF8.GetBytes("Hello DeskTouch")).Length == 16,
+          "SharedClipboardHelper must serialize clipboard packets and compute 16-hex hashes");
+
+    Check(DeviceTelemetryAndNotifModel.ExtractVerificationCode("Sign in", "Your OTP code is 492817 for login") == "492817" &&
+          DeviceTelemetryAndNotifModel.ExtractVerificationCode("Balance update", "You spent Rs 450 today") == null,
+          "ExtractVerificationCode must detect keyword-gated OTPs and ignore ordinary numbers");
+
+    string sanitized = FileDropHelper.SanitizeFileName("..\\secret/report:2026?.pdf");
+    Check(!sanitized.Contains("..", StringComparison.Ordinal) && !sanitized.Contains('/', StringComparison.Ordinal) &&
+          sanitized.EndsWith(".pdf", StringComparison.Ordinal),
+          "FileDropHelper.SanitizeFileName must strip traversal and invalid filename characters");
+
+    var chunkAsm = new FileDropHelper.BufferedChunkAssembler();
+    byte[] rawSample = System.Text.Encoding.UTF8.GetBytes("DeskTouchChunkPayload");
+    string b64Part1 = Convert.ToBase64String(rawSample, 0, 9);
+    string b64Part2 = Convert.ToBase64String(rawSample, 9, rawSample.Length - 9);
+    var c1 = chunkAsm.AddChunk(55, 0, 2, b64Part1, "doc");
+    var c2 = chunkAsm.AddChunk(55, 1, 2, b64Part2, "doc");
+    Check(!c1.Complete && c2.Complete &&
+          System.Text.Encoding.UTF8.GetString(c2.Data) == "DeskTouchChunkPayload",
+          "BufferedChunkAssembler must reassemble multi-part payloads in order");
+
+    Check(SystemMediaPowerHelper.IsValidMediaAction("play-pause") &&
+          SystemMediaPowerHelper.IsValidMediaAction("switch-window") &&
+          !SystemMediaPowerHelper.IsValidMediaAction("rm-rf") &&
+          SystemMediaPowerHelper.IsValidPowerAction("lock") &&
+          SystemMediaPowerHelper.IsValidPowerAction("wake") &&
+          !SystemMediaPowerHelper.IsValidPowerAction("format-disk"),
+          "SystemMediaPowerHelper must strictly validate media and power actions");
+
+    var rulesCfg = AutomationAndProfilesStore.CreateDefault();
+    var matchedVlc = AutomationAndProfilesStore.MatchRule(rulesCfg, "vlc.exe", "Movie.mkv");
+    var matchedTally = AutomationAndProfilesStore.MatchRule(rulesCfg, "tallyprime.exe", "Tally");
+    Check(matchedVlc?.ShortcutPreset == "Media" && matchedTally?.ShortcutPreset == "Accounting" &&
+          AutomationAndProfilesStore.MatchRule(rulesCfg, "notepad.exe", "notes.txt") == null,
+          "AutomationAndProfilesStore.MatchRule must map app process/title patterns to presets");
+
+    var bridgeSnap = new BridgeDeviceSnapshotDto(
+        1, 123456L, "DESKTOP", 2, EnvironmentRouteOrder.Local, false, "DESKTOP", 2, 2, true,
+        new[] { new BridgeDeviceItemDto(EnvironmentRouteOrder.Local, "DESKTOP", "Windows", true, false, false, true, 2, "Hub", 0, 0, 0.4, 0.3, 0, 92, true, "AC") },
+        ActiveProfile: "Work", ClipboardSyncEnabled: true, ActiveForegroundApp: "vlc.exe", ActiveShortcutPreset: "Media");
+    string bridgeSnapJson = DeskSpaceDeckBridge.SerializeSnapshot(bridgeSnap);
+    Check(bridgeSnapJson.Contains("\"activeProfile\":\"Work\"", StringComparison.Ordinal) &&
+          bridgeSnapJson.Contains("\"batteryPercent\":92", StringComparison.Ordinal) &&
+          bridgeSnapJson.Contains("\"activeForegroundApp\":\"vlc.exe\"", StringComparison.Ordinal),
+          "DeskSpaceDeckBridge snapshot and ecosystem metadata must serialize cleanly");
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }

@@ -17,7 +17,10 @@ internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     string Platform = "Windows", bool SupportsForwardInput = false,
     string? OsVersion = null, string? AppVersion = null,
     int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null,
-    int NotificationCount = -1)
+    int NotificationCount = -1,
+    int BatteryPercent = -1,
+    bool IsCharging = false,
+    string SignalLabel = "")
 {
     internal string FormatScreenInfo()
     {
@@ -52,7 +55,9 @@ internal sealed record EnvironmentMember(int Id, string Name, string Platform,
     double LayoutX = 0,
     double LayoutY = 0,
     double LayoutW = 0,
-    double LayoutH = 0);
+    double LayoutH = 0,
+    int BatteryPercent = -1,
+    bool IsCharging = false);
 internal sealed record EnvironmentPosition(string Key,float X,float Y)
 {
     internal static bool Valid(EnvironmentPosition? p) =>
@@ -63,7 +68,9 @@ internal sealed record EnvironmentPosition(string Key,float X,float Y)
 
 internal sealed record SubPeerDescriptor(int LocalId, string StableIdentity, string Name,
     string Platform, string Layout, bool SupportsReverseInput, string? AppVersion = null,
-    int NotificationCount = -1);
+    int NotificationCount = -1,
+    int BatteryPercent = -1,
+    bool IsCharging = false);
 
 internal sealed record SubRouteEnvelope(int LocalId, Packet Payload);
 
@@ -233,6 +240,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal string LastSentTaskbarSig = "";
         internal int LastSentTaskbarTarget = -1;
         internal bool TaskbarWatchSent;
+        internal int ScreenPreviewTarget = -1;
+        internal int ScreenPreviewMonitor = -1;
+        internal int LowBatteryAlertSent;
 
         internal void ResetForwardDedup()
         {
@@ -502,6 +512,205 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly object _taskbarGate = new();
     private readonly Dictionary<int, PeerTaskbarCache> _peerTaskbars = new();
     private int _localTaskbarNudge;
+    private readonly FileDropHelper _fileDrop = new();
+    private readonly Dictionary<int, NotificationPreviewItem[]> _peerNotifications = new();
+    private readonly object _notifGate = new();
+    private readonly ConcurrentDictionary<string, string[]> _macsByFingerprint = new(StringComparer.OrdinalIgnoreCase);
+    private string _lastBroadcastForeground = "";
+    private string _latestProfileStateJson = "";
+
+    internal event Action<string, string>? ClipboardTextReceived;
+    internal event Action<string, byte[]>? ClipboardImageReceived;
+    internal event Action<string, string>? FileReceived;
+    internal event Action<int, NotificationPreviewItem[]>? PeerNotificationsUpdated;
+    internal event Action<string, string, string>? OtpOfferReceived;
+    internal event Action<string, int, bool>? LowBatteryDetected;
+    internal event Action<string>? RemoteProfileApplyRequested;
+    internal event Action<string, string>? ForegroundAppChanged;
+
+    internal NotificationPreviewItem[] GetNotificationsForPeer(int peerId)
+    {
+        lock (_notifGate)
+            return _peerNotifications.TryGetValue(peerId, out var items) ? items : Array.Empty<NotificationPreviewItem>();
+    }
+
+    internal IReadOnlyList<string> GetRememberedMacs(string? fingerprint) =>
+        !string.IsNullOrWhiteSpace(fingerprint) && _macsByFingerprint.TryGetValue(fingerprint, out var macs)
+            ? macs : Array.Empty<string>();
+
+    internal void BroadcastClipboardTextAsync(string hash, string text, int excludeSessionId = -1)
+    {
+        string json = SharedClipboardHelper.SerializeClipboardTextPacket(hash, text);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > 7800) return;
+        foreach (var s in _sessions.Values)
+        {
+            if (s.Id == excludeSessionId) continue;
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("clipboard-text", Text: json), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void BroadcastClipboardImageAsync(string hash, byte[] png, int excludeSessionId = -1)
+    {
+        var chunks = FileDropHelper.BuildImageClipboardChunks(hash, png);
+        foreach (var s in _sessions.Values)
+        {
+            if (s.Id == excludeSessionId) continue;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    foreach (var pkt in chunks)
+                        await SendToAsync(s, pkt, _cancel.Token);
+                }
+                catch { }
+            });
+        }
+    }
+
+    internal async Task<bool> SendFileToTargetAsync(int targetId, string filePath)
+    {
+        try
+        {
+            var info = new FileInfo(filePath);
+            if (!info.Exists || info.Length <= 0 || info.Length > FileDropHelper.MaxFileSizeBytes)
+                return false;
+            if (!_sessions.TryGetValue(targetId, out var target))
+                return false;
+            int txId = FileDropHelper.NextTransferId();
+            string safeName = FileDropHelper.SanitizeFileName(info.Name);
+            await SendToAsync(target, new Packet("file-offer", txId, (int)info.Length, 0, 0, safeName), _cancel.Token);
+            byte[] buf = new byte[FileDropHelper.ChunkRawBytes];
+            await using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192, useAsync: true);
+            int seq = 0;
+            int read;
+            while ((read = await fs.ReadAsync(buf, _cancel.Token)) > 0)
+            {
+                string b64 = Convert.ToBase64String(buf, 0, read);
+                await SendToAsync(target, new Packet("file-chunk", txId, seq++, 0, 0, b64), _cancel.Token);
+            }
+            await SendToAsync(target, new Packet("file-done", txId, seq), _cancel.Token);
+            _status($"Sent '{safeName}' to {target.Peer.Name}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _status($"File transfer failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    internal void SendMediaAction(int targetId, string action, int value = 0)
+    {
+        if (!SystemMediaPowerHelper.IsValidMediaAction(action)) return;
+        if (targetId <= 0)
+        {
+            SystemMediaPowerHelper.ExecuteMediaAction(action, value);
+            return;
+        }
+        if (_sessions.TryGetValue(targetId, out var target))
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(target, new Packet("media-action", 0, value, 0, 0, action), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void SendPowerAction(int targetId, string action)
+    {
+        if (!SystemMediaPowerHelper.IsValidPowerAction(action)) return;
+        if (string.Equals(action, "lock-all", StringComparison.Ordinal))
+        {
+            foreach (var s in _sessions.Values)
+            {
+                if (s.Peer.Platform == "Windows")
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await SendToAsync(s, new Packet("power-action", 0, 0, 0, 0, "lock"), _cancel.Token); }
+                        catch { }
+                    });
+                }
+            }
+            _ = Task.Run(() =>
+            {
+                Thread.Sleep(220);
+                SystemMediaPowerHelper.ExecutePowerAction("lock");
+            });
+            return;
+        }
+        if (targetId <= 0)
+        {
+            SystemMediaPowerHelper.ExecutePowerAction(action);
+            return;
+        }
+        if (_sessions.TryGetValue(targetId, out var target))
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(target, new Packet("power-action", 0, 0, 0, 0, action), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void SendNotificationDismiss(int targetId, string key)
+    {
+        if (_sessions.TryGetValue(targetId, out var s))
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("notif-dismiss", targetId, Text: key), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void SendNotificationReply(int targetId, string key, string reply)
+    {
+        if (_sessions.TryGetValue(targetId, out var s))
+        {
+            string payload = JsonSerializer.Serialize(new { k = key, r = reply });
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("notif-reply", targetId, Text: payload), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void BroadcastProfileState(string summaryJson)
+    {
+        _latestProfileStateJson = summaryJson;
+        if (System.Text.Encoding.UTF8.GetByteCount(summaryJson) > 7800) return;
+        foreach (var s in _sessions.Values)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("profile-state", Text: summaryJson), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
+
+    internal void PublishLocalNotifications(NotificationPreviewItem[] items)
+    {
+        string json = DeviceTelemetryAndNotifModel.SerializeNotificationList(items);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > 7800) return;
+        foreach (var s in _sessions.Values)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await SendToAsync(s, new Packet("notif-preview-state", 0, Text: json), _cancel.Token); }
+                catch { }
+            });
+        }
+    }
 
     internal void SetCustomPairingCode(string? code) =>
         _customPairingCode = PairingCodeHelper.NormalizeCustomCode(code);
@@ -1468,6 +1677,43 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                 }
 
+                // Active screen preview frames (only when Android expands Screen Preview on this hub).
+                foreach (var android in androidSessions)
+                {
+                    int monIdx = Volatile.Read(ref android.ScreenPreviewMonitor);
+                    int previewTarget = Volatile.Read(ref android.ScreenPreviewTarget);
+                    if (monIdx >= 0 && previewTarget == 0 && Volatile.Read(ref android.UrgentControlWaiters) == 0)
+                    {
+                        var shot = ScreenPreviewHelper.CaptureMonitorPreview(monIdx);
+                        if (shot.Chunks != null && shot.Chunks.Count > 0)
+                        {
+                            foreach (var chunk in shot.Chunks)
+                            {
+                                if (Volatile.Read(ref android.ScreenPreviewMonitor) < 0) break;
+                                try { await SendToAsync(android, chunk, token); }
+                                catch { break; }
+                            }
+                        }
+                    }
+                }
+
+                // Foreground active window tracking for per-app switching rules.
+                var (fgProc, fgTitle) = SystemMediaPowerHelper.GetForegroundAppInfo();
+                string fgSig = fgProc + "|" + (fgTitle.Length > 60 ? fgTitle[..60] : fgTitle);
+                if (!string.IsNullOrEmpty(fgProc) && !string.Equals(fgSig, _lastBroadcastForeground, StringComparison.Ordinal))
+                {
+                    _lastBroadcastForeground = fgSig;
+                    ForegroundAppChanged?.Invoke(fgProc, fgTitle);
+                    foreach (var android in androidSessions)
+                    {
+                        if (android.EnvironmentTargetId == 0)
+                        {
+                            try { await SendToAsync(android, new Packet("foreground-app", 0, Text: fgSig), token); }
+                            catch { }
+                        }
+                    }
+                }
+
                 for (int step = 0; step < 5 && !token.IsCancellationRequested; step++)
                 {
                     if (Interlocked.Exchange(ref _localTaskbarNudge, 0) != 0)
@@ -2167,7 +2413,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
-                LayoutIdentity(peer.Peer), peer.Peer.NotificationCount));
+                LayoutIdentity(peer.Peer), peer.Peer.NotificationCount,
+                BatteryPercent: peer.Peer.BatteryPercent, IsCharging: peer.Peer.IsCharging));
         var knownIdentities = new HashSet<string>(
             members.Select(m => m.StableIdentity).OfType<string>().Where(s => !string.IsNullOrWhiteSpace(s)),
             StringComparer.OrdinalIgnoreCase);
@@ -2195,7 +2442,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             }
         }
         members = ApplyAndOrderSpatialMembers(members);
-        string payload = JsonSerializer.Serialize(members);
+        string payload = SerializeCompactRoster(members);
         if (System.Text.Encoding.UTF8.GetByteCount(payload) > 7800)
         {
             _status("Environment roster too large; refusing to advertise incomplete routes.");
@@ -2221,7 +2468,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     string id = LayoutIdentity(p.Peer);
                     if (seen.Add(id))
                         combined.Add(new(p.Id, p.Peer.Name, p.Peer.Platform,
-                            p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id, p.Peer.NotificationCount));
+                            p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id, p.Peer.NotificationCount,
+                            BatteryPercent: p.Peer.BatteryPercent, IsCharging: p.Peer.IsCharging));
                 }
                 int extraId = 9900;
                 foreach (var up in overlay.Members)
@@ -2231,7 +2479,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     combined.Add(up with { Id = ++extraId, SupportsReverseInput = false });
                 }
                 combined = ApplyAndOrderSpatialMembers(combined);
-                string candidate = JsonSerializer.Serialize(combined);
+                string candidate = SerializeCompactRoster(combined);
                 if (System.Text.Encoding.UTF8.GetByteCount(candidate) <= 7800)
                     sendPayload = candidate;
             }
@@ -2240,6 +2488,39 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             catch (Exception) { /* peer may have disconnected */ }
         }
         await PublishEnvironmentLayoutAsync(token);
+    }
+
+    private static string SerializeCompactRoster(IReadOnlyList<EnvironmentMember> members)
+    {
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartArray();
+            foreach (var m in members)
+            {
+                w.WriteStartObject();
+                w.WriteNumber("Id", m.Id);
+                w.WriteString("Name", m.Name);
+                w.WriteString("Platform", m.Platform);
+                w.WriteString("Layout", m.Layout);
+                w.WriteBoolean("SupportsReverseInput", m.SupportsReverseInput);
+                if (m.StableIdentity != null) w.WriteString("StableIdentity", m.StableIdentity);
+                if (m.NotificationCount >= 0) w.WriteNumber("NotificationCount", m.NotificationCount);
+                if (m.ArrangementOrder >= 0) w.WriteNumber("ArrangementOrder", m.ArrangementOrder);
+                if (m.LayoutW > 0 || m.LayoutH > 0)
+                {
+                    w.WriteNumber("LayoutX", Math.Round(m.LayoutX, 3));
+                    w.WriteNumber("LayoutY", Math.Round(m.LayoutY, 3));
+                    w.WriteNumber("LayoutW", Math.Round(m.LayoutW, 3));
+                    w.WriteNumber("LayoutH", Math.Round(m.LayoutH, 3));
+                }
+                if (m.BatteryPercent >= 0) w.WriteNumber("BatteryPercent", m.BatteryPercent);
+                if (m.IsCharging) w.WriteBoolean("IsCharging", true);
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+        }
+        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private void NotifySelection(Session? previous, Session? next)
@@ -3053,6 +3334,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 await SendToAsync(session,
                     new Packet("keyboard-layout", Text: KeyboardLayoutHelper.DescribeCurrentWindowsLayout()),
                     token);
+                if (!string.IsNullOrEmpty(_latestProfileStateJson))
+                    await SendToAsync(session, new Packet("profile-state", Text: _latestProfileStateJson), token);
+            }
+            if (peer.Platform == "Windows")
+            {
+                string[] macs = SystemMediaPowerHelper.CollectLocalMacAddresses();
+                if (macs.Length > 0)
+                    await SendToAsync(session, new Packet("mac-addresses", Text: string.Join(",", macs)), token);
             }
             await PublishEnvironmentAsync(token);
             while(!token.IsCancellationRequested)
@@ -3817,6 +4106,216 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     continue;
                 }
+                if (p.Type == "device-battery")
+                {
+                    int pct = p.A is >= -1 and <= 100 ? p.A : -1;
+                    bool charging = p.B != 0;
+                    string sig = (p.Text ?? "").Trim();
+                    session.Peer = session.Peer with { BatteryPercent = pct, IsCharging = charging, SignalLabel = sig };
+                    if (pct is >= 1 and <= 15 && !charging &&
+                        Interlocked.CompareExchange(ref session.LowBatteryAlertSent, 1, 0) == 0)
+                    {
+                        LowBatteryDetected?.Invoke(session.Peer.Name, pct, charging);
+                    }
+                    else if (pct > 20 || charging)
+                    {
+                        Interlocked.Exchange(ref session.LowBatteryAlertSent, 0);
+                    }
+                    await PublishEnvironmentAsync(token);
+                    PeerListChanged?.Invoke();
+                    continue;
+                }
+                if (p.Type == "mac-addresses" && !string.IsNullOrWhiteSpace(session.Peer.DeviceFingerprint) &&
+                    !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    var parsedMacs = p.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Where(m => m.Length <= 20).Take(4).ToArray();
+                    if (parsedMacs.Length > 0)
+                        _macsByFingerprint[session.Peer.DeviceFingerprint!] = parsedMacs;
+                    continue;
+                }
+                if (p.Type == "clipboard-text" && p.Text is { Length: > 2 and <= 7800 } cbJson)
+                {
+                    var parsedCb = SharedClipboardHelper.ParseClipboardTextPacket(cbJson);
+                    if (parsedCb is { } cb)
+                    {
+                        ClipboardTextReceived?.Invoke(cb.Hash, cb.Text);
+                        BroadcastClipboardTextAsync(cb.Hash, cb.Text, excludeSessionId: session.Id);
+                    }
+                    continue;
+                }
+                if (p.Type == "clipboard-img-chunk" && p.Text is { Length: > 2 and <= 7800 })
+                {
+                    var imgDone = _fileDrop.AcceptClipboardImgChunk(p.A, p.B, p.C, p.Text);
+                    if (imgDone is { } img)
+                        ClipboardImageReceived?.Invoke(img.Hash, img.Png);
+                    foreach (var other in _sessions.Values)
+                    {
+                        if (other.Id == session.Id) continue;
+                        try { await SendToAsync(other, p, token); } catch { }
+                    }
+                    continue;
+                }
+                if (p.Type == "file-offer")
+                {
+                    int targetRoute = p.C;
+                    if (targetRoute > 0 && _sessions.TryGetValue(targetRoute, out var fwdTarget))
+                    {
+                        try { await SendToAsync(fwdTarget, p with { D = session.Id }, token); } catch { }
+                    }
+                    else
+                    {
+                        if (!_fileDrop.BeginInbound(session.Id, p.A, p.B, p.Text, out string? err))
+                        {
+                            try { await SendToAsync(session, new Packet("file-reject", p.A, Text: err ?? "Rejected"), token); }
+                            catch { }
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "file-chunk")
+                {
+                    int targetRoute = p.C;
+                    if (targetRoute > 0 && _sessions.TryGetValue(targetRoute, out var fwdTarget))
+                    {
+                        try { await SendToAsync(fwdTarget, p with { D = session.Id }, token); } catch { }
+                    }
+                    else
+                    {
+                        _ = _fileDrop.AppendInboundChunk(session.Id, p.A, p.Text);
+                    }
+                    continue;
+                }
+                if (p.Type == "file-done")
+                {
+                    int targetRoute = p.C;
+                    if (targetRoute > 0 && _sessions.TryGetValue(targetRoute, out var fwdTarget))
+                    {
+                        try { await SendToAsync(fwdTarget, p with { D = session.Id }, token); } catch { }
+                    }
+                    else
+                    {
+                        string? saved = _fileDrop.CompleteInbound(session.Id, p.A);
+                        if (!string.IsNullOrEmpty(saved))
+                        {
+                            _status($"Received file from {session.Peer.Name}: {Path.GetFileName(saved)}");
+                            FileReceived?.Invoke(session.Peer.Name, saved);
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "media-action" && AllowsForwardInput(session.Peer) &&
+                    SystemMediaPowerHelper.IsValidMediaAction(p.Text))
+                {
+                    int targetRoute = p.A == 0 && session.EnvironmentTargetId > 0 ? session.EnvironmentTargetId : p.A;
+                    if (targetRoute <= 0)
+                        _ = Task.Run(() => SystemMediaPowerHelper.ExecuteMediaAction(p.Text, p.B));
+                    else if (_sessions.TryGetValue(targetRoute, out var mTarget))
+                        try { await SendToAsync(mTarget, new Packet("media-action", 0, p.B, 0, 0, p.Text), token); } catch { }
+                    continue;
+                }
+                if (p.Type == "power-action" && AllowsForwardInput(session.Peer) &&
+                    SystemMediaPowerHelper.IsValidPowerAction(p.Text))
+                {
+                    if (string.Equals(p.Text, "lock-all", StringComparison.Ordinal))
+                    {
+                        SendPowerAction(0, "lock-all");
+                    }
+                    else
+                    {
+                        int targetRoute = p.A == 0 && session.EnvironmentTargetId > 0 ? session.EnvironmentTargetId : p.A;
+                        SendPowerAction(targetRoute, p.Text!);
+                    }
+                    continue;
+                }
+                if (p.Type == "screen-preview-watch" && session.Peer.Platform == "Android")
+                {
+                    int targetRoute = p.A;
+                    int mon = p.B;
+                    int prevTarget = Volatile.Read(ref session.ScreenPreviewTarget);
+                    if (prevTarget > 0 && prevTarget != targetRoute && _sessions.TryGetValue(prevTarget, out var oldWin))
+                    {
+                        try { await SendToAsync(oldWin, new Packet("screen-preview-watch", 0, -1), token); } catch { }
+                    }
+                    Volatile.Write(ref session.ScreenPreviewTarget, targetRoute);
+                    Volatile.Write(ref session.ScreenPreviewMonitor, mon);
+                    if (targetRoute > 0 && _sessions.TryGetValue(targetRoute, out var newWin))
+                    {
+                        try { await SendToAsync(newWin, new Packet("screen-preview-watch", 0, mon), token); } catch { }
+                    }
+                    continue;
+                }
+                if (p.Type == "screen-preview-chunk" && session.Peer.Platform == "Windows")
+                {
+                    foreach (var android in _sessions.Values)
+                    {
+                        if (android.Peer.Platform == "Android" &&
+                            Volatile.Read(ref android.ScreenPreviewTarget) == session.Id &&
+                            Volatile.Read(ref android.ScreenPreviewMonitor) >= 0 &&
+                            Volatile.Read(ref android.UrgentControlWaiters) == 0)
+                        {
+                            try { await SendToAsync(android, p, token); } catch { }
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "foreground-app" && session.Peer.Platform == "Windows" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    foreach (var android in _sessions.Values)
+                    {
+                        if (android.Peer.Platform == "Android" && android.EnvironmentTargetId == session.Id)
+                        {
+                            try { await SendToAsync(android, new Packet("foreground-app", session.Id, Text: p.Text), token); } catch { }
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "notif-preview-state" && p.Text is { Length: >= 2 and <= 7800 })
+                {
+                    var list = DeviceTelemetryAndNotifModel.ParseNotificationList(p.Text);
+                    lock (_notifGate)
+                        _peerNotifications[session.Id] = list;
+                    PeerNotificationsUpdated?.Invoke(session.Id, list);
+                    if (session.Peer.Platform == "Android")
+                    {
+                        foreach (var winPeer in _sessions.Values)
+                        {
+                            if (winPeer.Peer.Platform == "Windows")
+                                try { await SendToAsync(winPeer, p with { A = session.Id }, token); } catch { }
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "notif-dismiss" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    if (p.A == 0)
+                        WindowsNotificationCounter.DismissLocalNotification(p.Text);
+                    else if (_sessions.TryGetValue(p.A, out var nTarget))
+                        try { await SendToAsync(nTarget, p, token); } catch { }
+                    continue;
+                }
+                if (p.Type == "notif-reply" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    if (_sessions.TryGetValue(p.A, out var nTarget))
+                        try { await SendToAsync(nTarget, p, token); } catch { }
+                    continue;
+                }
+                if (p.Type == "otp-offer" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    try
+                    {
+                        var offer = JsonSerializer.Deserialize<OtpOfferPayload>(p.Text);
+                        if (offer != null && !string.IsNullOrWhiteSpace(offer.Code))
+                            OtpOfferReceived?.Invoke(offer.App, offer.Code, offer.Title);
+                    }
+                    catch { }
+                    continue;
+                }
+                if (p.Type == "profile-apply" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    RemoteProfileApplyRequested?.Invoke(p.Text.Trim());
+                    continue;
+                }
                 (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;
                 RelayLease? forward=null;
                 lock(_authorityGate)
@@ -3902,6 +4401,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             linked.Cancel();
             ClearSessionSubPeers(session);
+            _fileDrop.CancelAllForPeer(id);
+            lock (_notifGate)
+                _peerNotifications.Remove(id);
             lock (_taskbarGate)
                 _peerTaskbars.Remove(id);
             session.ReverseQueue.Writer.TryComplete();
@@ -4670,6 +5172,73 @@ internal sealed class HostSession : IInputSession, IDisposable
     private volatile bool _taskbarWatched;
     private string _lastHostTaskbarSig = "";
     private readonly HashSet<string> _sentHostTaskbarIcons = new(StringComparer.Ordinal);
+    private int _hostScreenPreviewMonitor = -1;
+    private string _lastHostForegroundSig = "";
+    private readonly FileDropHelper _hostFileDrop = new();
+    private readonly Dictionary<int, NotificationPreviewItem[]> _hostPeerNotifications = new();
+    private readonly object _hostNotifGate = new();
+
+    internal event Action<string, string>? ClipboardTextReceived;
+    internal event Action<string, byte[]>? ClipboardImageReceived;
+    internal event Action<string, string>? FileReceived;
+    internal event Action<int, NotificationPreviewItem[]>? PeerNotificationsUpdated;
+    internal event Action<string, string, string>? OtpOfferReceived;
+
+    internal NotificationPreviewItem[] GetNotificationsForTarget(int memberId)
+    {
+        lock (_hostNotifGate)
+            return _hostPeerNotifications.TryGetValue(memberId, out var arr) ? arr : Array.Empty<NotificationPreviewItem>();
+    }
+
+    internal void SendClipboardText(string hash, string text)
+    {
+        string json = SharedClipboardHelper.SerializeClipboardTextPacket(hash, text);
+        if (System.Text.Encoding.UTF8.GetByteCount(json) <= 7800)
+            TrySend(new Packet("clipboard-text", Text: json));
+    }
+
+    internal void SendClipboardImage(string hash, byte[] png)
+    {
+        foreach (var pkt in FileDropHelper.BuildImageClipboardChunks(hash, png))
+            TrySend(pkt);
+    }
+
+    internal async Task<bool> SendFileToMemberAsync(int memberId, string filePath)
+    {
+        try
+        {
+            var info = new FileInfo(filePath);
+            if (!info.Exists || info.Length <= 0 || info.Length > FileDropHelper.MaxFileSizeBytes)
+                return false;
+            int txId = FileDropHelper.NextTransferId();
+            string safeName = FileDropHelper.SanitizeFileName(info.Name);
+            TrySend(new Packet("file-offer", txId, (int)info.Length, memberId, 0, safeName));
+            byte[] buf = new byte[FileDropHelper.ChunkRawBytes];
+            await using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 8192, useAsync: true);
+            int seq = 0;
+            int read;
+            while ((read = await fs.ReadAsync(buf, _cancel.Token)) > 0)
+            {
+                TrySend(new Packet("file-chunk", txId, seq++, memberId, 0, Convert.ToBase64String(buf, 0, read)));
+                await Task.Delay(2, _cancel.Token);
+            }
+            TrySend(new Packet("file-done", txId, seq, memberId));
+            return true;
+        }
+        catch { return false; }
+    }
+
+    internal void SendPowerAction(int targetMemberId, string action) =>
+        TrySend(new Packet("power-action", targetMemberId, Text: action));
+
+    internal void SendMediaAction(int targetMemberId, string action, int value = 0) =>
+        TrySend(new Packet("media-action", targetMemberId, value, 0, 0, action));
+
+    internal void SendNotificationDismiss(int targetMemberId, string key) =>
+        TrySend(new Packet("notif-dismiss", targetMemberId, Text: key));
+
+    internal void SendNotificationReply(int targetMemberId, string key, string reply) =>
+        TrySend(new Packet("notif-reply", targetMemberId, Text: JsonSerializer.Serialize(new { k = key, r = reply })));
 
     private void ReleaseReverseAuthority()
     {
@@ -5167,6 +5736,11 @@ internal sealed class HostSession : IInputSession, IDisposable
             {
                 await Wire.WriteAsync(ssl, new Packet("link-info", Text: outBand, A: outSpeed), acceptedLimit.Token);
             }
+            string[] hostMacs = SystemMediaPowerHelper.CollectLocalMacAddresses();
+            if (hostMacs.Length > 0)
+            {
+                await Wire.WriteAsync(ssl, new Packet("mac-addresses", Text: string.Join(",", hostMacs)), acceptedLimit.Token);
+            }
             return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure, outBand, outSpeed);
         }
         catch (Exception ex)
@@ -5433,6 +6007,66 @@ internal sealed class HostSession : IInputSession, IDisposable
                         Interlocked.Exchange(ref _hostTaskbarNudge, 1);
                     });
                 }
+                else if (p.Type == "clipboard-text" && p.Text is { Length: > 2 and <= 7800 })
+                {
+                    var parsedCb = SharedClipboardHelper.ParseClipboardTextPacket(p.Text);
+                    if (parsedCb is { } cb)
+                        ClipboardTextReceived?.Invoke(cb.Hash, cb.Text);
+                }
+                else if (p.Type == "clipboard-img-chunk" && p.Text is { Length: > 2 and <= 7800 })
+                {
+                    var imgDone = _hostFileDrop.AcceptClipboardImgChunk(p.A, p.B, p.C, p.Text);
+                    if (imgDone is { } img)
+                        ClipboardImageReceived?.Invoke(img.Hash, img.Png);
+                }
+                else if (p.Type == "file-offer")
+                {
+                    if (!_hostFileDrop.BeginInbound(p.D, p.A, p.B, p.Text, out string? err))
+                        TrySend(new Packet("file-reject", p.A, Text: err ?? "Rejected"));
+                }
+                else if (p.Type == "file-chunk")
+                {
+                    _ = _hostFileDrop.AppendInboundChunk(p.D, p.A, p.Text);
+                }
+                else if (p.Type == "file-done")
+                {
+                    string? saved = _hostFileDrop.CompleteInbound(p.D, p.A);
+                    if (!string.IsNullOrEmpty(saved))
+                        FileReceived?.Invoke(_remoteSystemName ?? "Connected device", saved);
+                }
+                else if (p.Type == "media-action" && SystemMediaPowerHelper.IsValidMediaAction(p.Text))
+                {
+                    _ = Task.Run(() => SystemMediaPowerHelper.ExecuteMediaAction(p.Text, p.B));
+                }
+                else if (p.Type == "power-action" && SystemMediaPowerHelper.IsValidPowerAction(p.Text))
+                {
+                    _ = Task.Run(() => SystemMediaPowerHelper.ExecutePowerAction(p.Text));
+                }
+                else if (p.Type == "screen-preview-watch")
+                {
+                    Volatile.Write(ref _hostScreenPreviewMonitor, p.B);
+                }
+                else if (p.Type == "notif-preview-state" && p.Text is { Length: >= 2 and <= 7800 })
+                {
+                    var list = DeviceTelemetryAndNotifModel.ParseNotificationList(p.Text);
+                    lock (_hostNotifGate)
+                        _hostPeerNotifications[p.A] = list;
+                    PeerNotificationsUpdated?.Invoke(p.A, list);
+                }
+                else if (p.Type == "notif-dismiss" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    WindowsNotificationCounter.DismissLocalNotification(p.Text);
+                }
+                else if (p.Type == "otp-offer" && !string.IsNullOrWhiteSpace(p.Text))
+                {
+                    try
+                    {
+                        var offer = JsonSerializer.Deserialize<OtpOfferPayload>(p.Text);
+                        if (offer != null && !string.IsNullOrWhiteSpace(offer.Code))
+                            OtpOfferReceived?.Invoke(offer.App, offer.Code, offer.Title);
+                    }
+                    catch { }
+                }
                 else if (ReverseInputProtocol.TryDecode(p, out _))
                     ProcessReverseInput(p);
             }
@@ -5557,6 +6191,26 @@ internal sealed class HostSession : IInputSession, IDisposable
                             TrySend(new Packet("taskbar-state", 0, Text: capture.StateJson));
                             _lastHostTaskbarSig = capture.Signature;
                         }
+                    }
+                }
+                int previewMon = Volatile.Read(ref _hostScreenPreviewMonitor);
+                if (previewMon >= 0 && (tick % 4) == 0)
+                {
+                    var shot = ScreenPreviewHelper.CaptureMonitorPreview(previewMon);
+                    if (shot.Chunks != null)
+                    {
+                        foreach (var c in shot.Chunks)
+                            TrySend(c);
+                    }
+                }
+                if ((tick % 8) == 0)
+                {
+                    var (fgProc, fgTitle) = SystemMediaPowerHelper.GetForegroundAppInfo();
+                    string fgSig = fgProc + "|" + (fgTitle.Length > 60 ? fgTitle[..60] : fgTitle);
+                    if (!string.IsNullOrEmpty(fgProc) && !string.Equals(fgSig, _lastHostForegroundSig, StringComparison.Ordinal))
+                    {
+                        _lastHostForegroundSig = fgSig;
+                        TrySend(new Packet("foreground-app", 0, Text: fgSig));
                     }
                 }
             }

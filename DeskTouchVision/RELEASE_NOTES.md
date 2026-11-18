@@ -1,3 +1,13 @@
+# DeskTouch Vision v0.3.82 — Shared Clipboard, File Drop, OTP Helper, Live Trackpad Screen Preview, Gestures, Power, Media & Profiles
+
+- **Automatic Shared Clipboard (`EcosystemHelpers`, `DisplaySettingsForm`, `NetworkSessions`, `MainActivity`):** Syncs text and PNG clipboard images automatically across all linked Windows computers and Android devices with loop-safe hash deduplication and a one-click pause toggle.
+- **Instant File & Photo Drop (`FileDropHelper`, `DisplayArrangementControl`, `MainActivity`, `DeskSpaceDeckBridge`):** Drag files directly onto any display tile in Windows `Displays` or `DeskSpace Deck`, pick files on Windows or Android, or use Android's System Share sheet; files arrive cleanly under `Downloads\DeskTouch Received` (Windows) or `Downloads/DeskTouch` (Android).
+- **One-Time Verification Code (OTP) Helper & Privacy Controls (`DeskTouchNotificationListener`, `OtpBannerForm`, `MainActivity`):** Detects non-banking verification codes when opted in, displays a 1-click Copy popup banner on the active computer, and automatically excludes payment/UPI/banking apps via `PaymentAppDetector`.
+- **Live Screen Preview, Media/Volume/Brightness Strip, Custom Shortcuts & Gestures (`ScreenPreviewHelper`, `SystemMediaPowerHelper`, `MainActivity`):** Collapsible live monitor preview inside Android `Trackpad` for tap-to-aim clicking, collapsible media/playback/volume/brightness/slide strip, 2-finger pinch zoom, 3-finger window/Task View/Desktop gestures, and customizable trackpad shortcut chips.
+- **Click-to-View Notification Previews, Quick Reply, Device Battery Telemetry, Power/Wake & Profiles (`WindowsNotificationCounter`, `TrayDeviceFlyout`, `AutomationAndProfilesStore`):** Click notification badges on Windows, DeskSpace Deck, or Android to read/reply/dismiss; view live battery percentage and charging status; lock individual/all computers, turn off displays, or send Wake-on-LAN; and switch `Work`, `Presentation`, `Away`, or automatic per-app shortcut profiles.
+
+---
+
 # DeskTouch Vision v0.3.81 — Crisp Native Taskbar Icons, Instant Zero-Lag Trackpad System Switching & Modern Windows 11 App Revamp
 
 - **Crisp Native Windows Taskbar Icons on Android (`WindowsTaskbarHelper`, `NetworkSessions`, `DeskTouchSession`, `MainActivity`):** Extracts direct shortcut `.ico`/`.exe` targets without shortcut overlay arrows, unwraps `ApplicationFrameHost` UWP child windows and MSIX `AppxManifest` PNG assets (Terminal, Calculator, Store, WhatsApp, Settings), caches icons persistently across wireless and cable transitions, and self-heals missing icon hashes on demand.

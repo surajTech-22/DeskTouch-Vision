@@ -169,6 +169,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly WindowsNotificationCounter _notificationCounter = new();
     private readonly DeskSpaceDeckBridge _deckBridge;
     private TrayDeviceFlyout? _trayFlyout;
+    private ProfilesAndRulesConfig _ecosystemConfig = AutomationAndProfilesStore.Load();
+    private NotificationPreviewFlyout? _notifFlyout;
+    private OtpBannerForm? _otpBanner;
+    private readonly Button _profileButton = Button("Profile: Work");
+    private readonly Button _clipboardToggleButton = Button("Clipboard: On");
+    private readonly Button _sendFileButton = Button("Send file");
+    private readonly Button _lockAllButton = Button("Lock all");
+    private readonly Button _wakeAllButton = Button("Wake PCs");
+    private readonly Button _rulesButton = Button("Profiles & rules");
+    private System.Windows.Forms.Timer? _otpClipboardClearTimer;
+    private string _activeForegroundApp = "";
+    private string _activeShortcutPreset = "Default";
+    private bool _clipboardListenerAttached;
+    private const int WM_CLIPBOARDUPDATE = 0x031D;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AddClipboardFormatListener(IntPtr hwnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
 
     internal DisplaySettingsForm(bool startInTray = false)
     {
@@ -179,14 +201,27 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             targetId => PostToUi(() => SwitchDirectlyToTarget(targetId)),
             () => PostToUi(ReturnControlLocalFromExternal),
             peerId => PostToUi(() => PausePhoneForPaymentsFromBridge(peerId)),
-            () => PostToUi(ShowFromTray));
+            () => PostToUi(ShowFromTray),
+            onOpenNotifications: id => PostToUi(() => OpenNotificationsFlyoutForTarget(id, null, Cursor.Position)),
+            onToggleClipboard: () => PostToUi(ToggleClipboardSync),
+            onDropFile: (id, path) => PostToUi(() => HandleDeckFileDrop(id, path)),
+            onPowerAction: (id, action) => PostToUi(() => ExecutePowerActionFromUi(id, action)),
+            onMediaAction: (id, action) => PostToUi(() => ExecuteMediaActionFromUi(id, action)),
+            onSwitchProfile: name => PostToUi(() => ApplyScreenProfile(name)));
+        _notificationCounter.EnablePreviewCapture = _ecosystemConfig.NotificationPreviewsEnabled;
         _notificationCounter.CountChanged += count => PostToUi(() => OnLocalNotificationCountChanged(count));
+        _notificationCounter.ItemsChanged += items => PostToUi(() =>
+        {
+            if (_ecosystemConfig.NotificationPreviewsEnabled)
+                _receiver?.PublishLocalNotifications(items);
+        });
+        _activeShortcutPreset = _ecosystemConfig.ActiveShortcutPreset;
         Text = "DeskTouch Vision — Displays";
         Font = new Font("Segoe UI", 10);
         BackColor = Color.FromArgb(17, 23, 34);
         ForeColor = Color.FromArgb(241, 245, 249);
-        ClientSize = new Size(1000, 690);
-        MinimumSize = new Size(780, 600);
+        ClientSize = new Size(1060, 728);
+        MinimumSize = new Size(820, 640);
         StartPosition = FormStartPosition.CenterScreen;
         AutoScaleMode = AutoScaleMode.Dpi;
         DoubleBuffered = true;
@@ -220,7 +255,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         // one-to-one links and was coupled to destructive input-hook switching.
         header.Controls.Add(_environmentHeader);
 
-        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 304,
+        var bottom = new Panel { Dock = DockStyle.Bottom, Height = 342,
             Padding = new Padding(24, 8, 24, 7), BackColor = BackColor };
         var pairingBar = new Panel { Dock = DockStyle.Top, Height = 38,
             Padding = new Padding(10, 4, 10, 4), BackColor = Color.FromArgb(24, 33, 49) };
@@ -268,6 +303,36 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         pairingFlow.Controls.Add(_copyFullLink);
         pairingFlow.Controls.Add(pairingHint);
         pairingBar.Controls.Add(pairingFlow);
+
+        var ecosystemBar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 38,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            AutoScroll = true,
+            Padding = new Padding(0, 4, 0, 2),
+            BackColor = BackColor
+        };
+        _profileButton.Width = 148;
+        _clipboardToggleButton.Width = 128;
+        _sendFileButton.Width = 104;
+        _lockAllButton.Width = 96;
+        _wakeAllButton.Width = 102;
+        _rulesButton.Width = 140;
+        foreach (var eb in new[] { _profileButton, _clipboardToggleButton, _sendFileButton, _lockAllButton, _wakeAllButton, _rulesButton })
+        {
+            eb.Height = 29;
+            eb.Margin = new Padding(0, 0, 8, 0);
+            ecosystemBar.Controls.Add(eb);
+        }
+        _profileButton.Click += (_, _) => CycleScreenProfile();
+        _clipboardToggleButton.Click += (_, _) => ToggleClipboardSync();
+        _sendFileButton.Click += (_, _) => PromptAndSendFile(CurrentInputTargetId());
+        _lockAllButton.Click += (_, _) => ExecutePowerActionFromUi(0, "lock-all");
+        _wakeAllButton.Click += (_, _) => WakeRememberedComputers();
+        _rulesButton.Click += (_, _) => OpenProfilesRulesDialog();
+        RefreshEcosystemButtonsUi();
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 48,
             Name = "ConnectionActions",
@@ -337,6 +402,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
         bottom.Controls.Add(deviceInfo);
         bottom.Controls.Add(sensitivityRow);
+        bottom.Controls.Add(ecosystemBar);
         bottom.Controls.Add(pairingBar);
         bottom.Controls.Add(actions);
         bottom.Controls.Add(_status);
@@ -388,6 +454,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         _display.EnvironmentMemberMoved += OnEnvironmentMemberMoved;
         _display.RemoteEdgeChanged += OnRemoteEdgeChanged;
+        _display.NotificationPillClicked += OpenNotificationsFlyoutForTarget;
+        _display.FileDroppedOnDevice += SendFilesToTargetFromDiagram;
 
         LoadPreferredEdge();
         _display.RemoteEdge = _preferredEdge;
@@ -493,6 +561,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         _trayMenu.Items.Add(_startupMenu);
         _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add("Profiles & Automation Rules...", null, (_, _) =>
+        {
+            ShowFromTray();
+            OpenProfilesRulesDialog();
+        });
+        _trayMenu.Items.Add("Toggle Shared Clipboard", null, (_, _) => ToggleClipboardSync());
+        _trayMenu.Items.Add("Lock All Connected Computers", null, (_, _) => ExecutePowerActionFromUi(0, "lock-all"));
+        _trayMenu.Items.Add(new ToolStripSeparator());
         _trayMenu.Items.Add("Exit DeskTouch", null, (_, _) => ExitDeskTouch());
 
         _trayMenu.Opening += OnTrayMenuOpening;
@@ -565,6 +641,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _ = DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
             int round = 2;
             _ = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+        }
+        catch { }
+        try
+        {
+            _clipboardListenerAttached = AddClipboardFormatListener(Handle);
         }
         catch { }
         if (_exitRequested && !IsDisposed) PostToUi(ExitDeskTouch);
@@ -988,6 +1069,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _display.RemoteScreenDetails=hub?.Platform == "Android"
                     ? baseTopology.DescribeSummary("Android") : null;
                 _display.RemoteNotificationCount = hub?.NotificationCount ?? -1;
+                _display.RemoteTargetId = 0;
+                _display.RemoteBatteryPercent = hub?.BatteryPercent ?? -1;
+                _display.RemoteIsCharging = hub?.IsCharging ?? false;
                 foreach(var member in _host.EnvironmentMembers)
                 {
                     if(member.Id==0 || member.Id==_host.OwnEnvironmentMemberId)continue;
@@ -1002,14 +1086,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                         localDirect?.Peer.FormatScreenInfo() ?? memberTopology.DescribeSummary(member.Platform),
                         localDirect is { } direct && direct.Peer.NotificationCount >= 0
                             ? direct.Peer.NotificationCount
-                            : member.NotificationCount));
+                            : member.NotificationCount,
+                        localDirect is { } dBatt && dBatt.Peer.BatteryPercent >= 0 ? dBatt.Peer.BatteryPercent : member.BatteryPercent,
+                        localDirect is { } dChg ? dChg.Peer.IsCharging : member.IsCharging,
+                        localDirect is { } dSig ? dSig.Peer.SignalLabel : ""));
                 }
                 foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
                 {
                     tiles.Add(new EnvironmentDisplayTile(id, peer.Name,
                         peer.Platform, peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput, peer.DeviceFingerprint,
-                        peer.Monitors, peer.FormatScreenInfo(), peer.NotificationCount));
+                        peer.Monitors, peer.FormatScreenInfo(), peer.NotificationCount,
+                        peer.BatteryPercent, peer.IsCharging, peer.SignalLabel));
                 }
             }
             else
@@ -1033,6 +1121,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _display.RemoteScreenDetails=main.Peer != null
                     ? main.Peer.FormatScreenInfo() : null;
                 _display.RemoteNotificationCount = main.Peer?.NotificationCount ?? -1;
+                _display.RemoteTargetId = baseTargetId;
+                _display.RemoteBatteryPercent = main.Peer?.BatteryPercent ?? -1;
+                _display.RemoteIsCharging = main.Peer?.IsCharging ?? false;
                 var shownIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach(var (id,peer) in connected)
                 {
@@ -1041,7 +1132,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     tiles.Add(new EnvironmentDisplayTile(id,peer.Name,
                         peer.Platform,peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput,peer.DeviceFingerprint,
-                        peer.Monitors,peer.FormatScreenInfo(),peer.NotificationCount));
+                        peer.Monitors,peer.FormatScreenInfo(),peer.NotificationCount,
+                        peer.BatteryPercent,peer.IsCharging,peer.SignalLabel));
                 }
                 foreach(var (vid, peer, _) in bridged)
                 {
@@ -1050,7 +1142,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     tiles.Add(new EnvironmentDisplayTile(vid, peer.Name,
                         peer.Platform, peer.Monitors.Monitors.Count,
                         peer.SupportsReverseInput, peer.DeviceFingerprint,
-                        peer.Monitors, peer.FormatScreenInfo()));
+                        peer.Monitors, peer.FormatScreenInfo(),
+                        NotificationCount: peer.NotificationCount,
+                        BatteryPercent: peer.BatteryPercent, IsCharging: peer.IsCharging));
                 }
             }
             _display.EnvironmentDevices =
@@ -1488,6 +1582,26 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 if (_nativeInput?.Priority.CanApplyRemote == true && _capture?.RemoteActive == true)
                     ReturnControlLocalFromExternal();
             });
+            _receiver.ClipboardTextReceived += (h, t) => PostToUi(() =>
+            {
+                if (_ecosystemConfig.ClipboardSyncEnabled)
+                    SharedClipboardHelper.TryApplyTextOnStaThread(t, h);
+            });
+            _receiver.ClipboardImageReceived += (h, png) => PostToUi(() =>
+            {
+                if (_ecosystemConfig.ClipboardSyncEnabled)
+                    SharedClipboardHelper.TryApplyImageOnStaThread(png, h);
+            });
+            _receiver.FileReceived += (fromDev, savedPath) => PostToUi(() => OnIncomingFileSaved(fromDev, savedPath));
+            _receiver.OtpOfferReceived += (app, code, title) => PostToUi(() => ShowOtpOfferToast(app, code, title));
+            _receiver.LowBatteryDetected += (devName, pct, _) => PostToUi(() =>
+            {
+                if (_ecosystemConfig.LowBatteryAlertEnabled)
+                    _trayIcon?.ShowBalloonTip(5000, "Low Phone Battery", $"{devName} battery is at {pct}% (unplugged).", ToolTipIcon.Warning);
+            });
+            _receiver.RemoteProfileApplyRequested += profileName => PostToUi(() => ApplyScreenProfile(profileName));
+            _receiver.ForegroundAppChanged += (proc, title) => PostToUi(() => EvaluateForegroundAutomationRule(proc, title));
+            _receiver.BroadcastProfileState(AutomationAndProfilesStore.SerializeSummaryForAndroid(_ecosystemConfig));
             _receiver.Start();
             _receiver.SetCustomPairingCode(_customPairingCode);
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
@@ -2161,6 +2275,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         session.PublishNotificationCount(_notificationCounter.CurrentCount);
         session.EnvironmentLayoutChanged += HandleSharedEnvironmentLayout;
         session.SubRoutePacketReceived += OnHostSubRoutePacket;
+        session.ClipboardTextReceived += (h, t) => PostToUi(() =>
+        {
+            if (_ecosystemConfig.ClipboardSyncEnabled)
+                SharedClipboardHelper.TryApplyTextOnStaThread(t, h);
+        });
+        session.ClipboardImageReceived += (h, png) => PostToUi(() =>
+        {
+            if (_ecosystemConfig.ClipboardSyncEnabled)
+                SharedClipboardHelper.TryApplyImageOnStaThread(png, h);
+        });
+        session.FileReceived += (fromDev, savedPath) => PostToUi(() => OnIncomingFileSaved(fromDev, savedPath));
+        session.OtpOfferReceived += (app, code, title) => PostToUi(() => ShowOtpOfferToast(app, code, title));
         session.MutualTrustOfferRequested = ConfirmMutualTrustOfferAsync;
         if (_receiver != null)
         {
@@ -2756,6 +2882,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         {
             _adbBridge?.TriggerRefresh();
         }
+        if (message.Msg == WM_CLIPBOARDUPDATE && !_closing.IsCancellationRequested && _ecosystemConfig.ClipboardSyncEnabled)
+        {
+            HandleLocalClipboardUpdated();
+        }
         if (message.Msg == 0x0051 && !_closing.IsCancellationRequested)
         {
             _receiver?.BroadcastKeyboardLayoutAsync();
@@ -2867,6 +2997,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trayFlyout?.Hide();
             _trayFlyout?.Dispose();
             _trayFlyout = null;
+            _notifFlyout?.Hide();
+            _notifFlyout?.Dispose();
+            _notifFlyout = null;
+            _otpBanner?.Hide();
+            _otpBanner?.Dispose();
+            _otpBanner = null;
+            _otpClipboardClearTimer?.Stop();
+            _otpClipboardClearTimer?.Dispose();
+            _otpClipboardClearTimer = null;
+            if (_clipboardListenerAttached && IsHandleCreated)
+            {
+                try { RemoveClipboardFormatListener(Handle); } catch { }
+                _clipboardListenerAttached = false;
+            }
             _trayMenu?.Dispose();
             _trayMenu = null;
             _notificationCounter.Dispose();
@@ -2894,7 +3038,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             SwitchDirectlyToTarget,
             ReturnControlLocalFromExternal,
             PausePhoneForPaymentsFromBridge,
-            ShowFromTray);
+            ShowFromTray,
+            (id, name, pt) => OpenNotificationsFlyoutForTarget(id, name, pt));
         _trayFlyout.ToggleNearCursor(BuildBridgeSnapshot());
     }
 
@@ -3076,7 +3221,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
 
         var seenIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        void AddRemote(int id, string name, string platform, bool supportsInput, int notifCount, string identity)
+        void AddRemote(int id, string name, string platform, bool supportsInput, int notifCount, string identity, int battPct = -1, bool chg = false, string sig = "")
         {
             if (!string.IsNullOrWhiteSpace(identity) && !seenIdentities.Add(identity))
                 return;
@@ -3090,7 +3235,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 IsSelected: selected, IsControlling: controlling,
                 SupportsInput: supportsInput,
                 NotificationCount: notifCount >= 0 ? notifCount : -1,
-                StatusText: status));
+                StatusText: status,
+                BatteryPercent: battPct,
+                IsCharging: chg,
+                SignalLabel: sig));
         }
 
         if (_host != null)
@@ -3104,15 +3252,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 int notif = localDirect is { } direct && direct.Peer.NotificationCount >= 0
                     ? direct.Peer.NotificationCount
                     : member.NotificationCount;
+                int batt = localDirect is { } dB && dB.Peer.BatteryPercent >= 0 ? dB.Peer.BatteryPercent : member.BatteryPercent;
+                bool chg = localDirect is { } dC ? dC.Peer.IsCharging : member.IsCharging;
                 string identity = !string.IsNullOrWhiteSpace(member.StableIdentity)
                     ? member.StableIdentity
                     : member.Platform + "|" + member.Name;
-                AddRemote(targetId, member.Name, member.Platform, supportsInput, notif, identity);
+                AddRemote(targetId, member.Name, member.Platform, supportsInput, notif, identity, batt, chg);
             }
             foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
             {
                 AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
-                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer),
+                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel);
             }
         }
         else if (_receiver != null)
@@ -3120,12 +3271,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             foreach (var (id, peer) in _receiver.ConnectedPeers.OrderBy(p => p.Id))
             {
                 AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
-                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer),
+                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel);
             }
             foreach (var (vid, peer, _) in _receiver.BridgedPeers)
             {
                 AddRemote(vid, peer.Name, peer.Platform, peer.SupportsReverseInput,
-                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer));
+                    peer.NotificationCount, ReceiverServer.LayoutIdentity(peer),
+                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel);
             }
         }
 
@@ -3149,6 +3302,297 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ConnectedCount: connectedCount,
             TotalNotificationCount: totalNotif,
             HasAnyKnownNotificationCount: hasKnown,
-            Devices: orderedItems);
+            Devices: orderedItems,
+            ActiveProfile: _ecosystemConfig.ActiveProfile,
+            ClipboardSyncEnabled: _ecosystemConfig.ClipboardSyncEnabled,
+            ActiveForegroundApp: _activeForegroundApp,
+            ActiveShortcutPreset: _activeShortcutPreset);
+    }
+
+    private void RefreshEcosystemButtonsUi()
+    {
+        _profileButton.Text = $"Profile: {_ecosystemConfig.ActiveProfile}";
+        _clipboardToggleButton.Text = _ecosystemConfig.ClipboardSyncEnabled ? "Clipboard: On" : "Clipboard: Off";
+    }
+
+    private void HandleLocalClipboardUpdated()
+    {
+        var cap = SharedClipboardHelper.TryCaptureOnStaThread();
+        if (!cap.Changed) return;
+        if (cap.Kind == "text")
+        {
+            _receiver?.BroadcastClipboardTextAsync(cap.Hash, cap.PayloadText);
+            _host?.SendClipboardText(cap.Hash, cap.PayloadText);
+        }
+        else if (cap.Kind == "image" && cap.ImagePng != null)
+        {
+            _receiver?.BroadcastClipboardImageAsync(cap.Hash, cap.ImagePng);
+            _host?.SendClipboardImage(cap.Hash, cap.ImagePng);
+        }
+    }
+
+    private void ToggleClipboardSync()
+    {
+        _ecosystemConfig.ClipboardSyncEnabled = !_ecosystemConfig.ClipboardSyncEnabled;
+        AutomationAndProfilesStore.Save(_ecosystemConfig);
+        RefreshEcosystemButtonsUi();
+        _receiver?.BroadcastProfileState(AutomationAndProfilesStore.SerializeSummaryForAndroid(_ecosystemConfig));
+        PublishDeckBridgeSnapshot();
+        Status(_ecosystemConfig.ClipboardSyncEnabled
+            ? "Shared clipboard enabled across connected devices."
+            : "Shared clipboard paused.");
+    }
+
+    private void CycleScreenProfile()
+    {
+        var list = _ecosystemConfig.Profiles;
+        if (list.Count == 0) return;
+        int cur = list.FindIndex(p => string.Equals(p.Name, _ecosystemConfig.ActiveProfile, StringComparison.OrdinalIgnoreCase));
+        int next = (cur + 1) % list.Count;
+        ApplyScreenProfile(list[next].Name);
+    }
+
+    private void ApplyScreenProfile(string profileName)
+    {
+        var preset = _ecosystemConfig.Profiles.FirstOrDefault(p =>
+            string.Equals(p.Name, profileName, StringComparison.OrdinalIgnoreCase));
+        if (preset == null) return;
+        _ecosystemConfig.ActiveProfile = preset.Name;
+        _ecosystemConfig.ClipboardSyncEnabled = preset.ClipboardSync;
+        _ecosystemConfig.NotificationPreviewsEnabled = preset.NotificationPreviews;
+        _ecosystemConfig.ActiveShortcutPreset = preset.ShortcutPreset;
+        _activeShortcutPreset = preset.ShortcutPreset;
+        _notificationCounter.EnablePreviewCapture = preset.NotificationPreviews;
+
+        if (Enum.TryParse<MonitorEdge>(preset.Edge, true, out var edge))
+        {
+            _preferredEdge = edge;
+            _display.RemoteEdge = edge;
+            _capture?.SetEdge(edge);
+        }
+        int pct = Math.Clamp((int)Math.Round(preset.Sensitivity * 100.0),
+            _sensitivityBar.Minimum, _sensitivityBar.Maximum);
+        _pointerSensitivity = pct / 100.0;
+        _updatingSensitivityUi = true;
+        try
+        {
+            _sensitivityBar.Value = pct;
+            _sensitivityValue.Text = pct + "%";
+        }
+        finally { _updatingSensitivityUi = false; }
+        _capture?.SetPointerSensitivity(_pointerSensitivity);
+
+        AutomationAndProfilesStore.Save(_ecosystemConfig);
+        SavePreferredEdge();
+        RefreshEcosystemButtonsUi();
+        _receiver?.BroadcastProfileState(AutomationAndProfilesStore.SerializeSummaryForAndroid(_ecosystemConfig));
+        PublishDeckBridgeSnapshot();
+        Status($"Activated '{preset.Name}' profile.");
+    }
+
+    private void OpenProfilesRulesDialog()
+    {
+        using var dlg = new ProfilesRulesDialog(
+            _ecosystemConfig,
+            name => ApplyScreenProfile(name),
+            cfg =>
+            {
+                _ecosystemConfig = cfg;
+                _notificationCounter.EnablePreviewCapture = cfg.NotificationPreviewsEnabled;
+                AutomationAndProfilesStore.Save(cfg);
+                RefreshEcosystemButtonsUi();
+                _receiver?.BroadcastProfileState(AutomationAndProfilesStore.SerializeSummaryForAndroid(cfg));
+                PublishDeckBridgeSnapshot();
+            });
+        dlg.ShowDialog(this);
+    }
+
+    private void EvaluateForegroundAutomationRule(string proc, string title)
+    {
+        _activeForegroundApp = proc;
+        var match = AutomationAndProfilesStore.MatchRule(_ecosystemConfig, proc, title);
+        string nextPreset = match != null ? match.ShortcutPreset : _ecosystemConfig.ActiveShortcutPreset;
+        if (!string.Equals(_activeShortcutPreset, nextPreset, StringComparison.OrdinalIgnoreCase))
+        {
+            _activeShortcutPreset = nextPreset;
+            PublishDeckBridgeSnapshot();
+        }
+    }
+
+    private void OpenNotificationsFlyoutForTarget(int targetId, string? fallbackName, Point screenAnchor)
+    {
+        string devName = fallbackName ?? (targetId == EnvironmentRouteOrder.Local ? Environment.MachineName : "Device");
+        NotificationPreviewItem[] items;
+        if (targetId == EnvironmentRouteOrder.Local)
+        {
+            _notificationCounter.EnablePreviewCapture = true;
+            items = _notificationCounter.CurrentItems;
+        }
+        else if (targetId > 0 && _receiver != null)
+        {
+            items = _receiver.GetNotificationsForPeer(targetId);
+        }
+        else if (_host != null)
+        {
+            items = _host.GetNotificationsForTarget(-targetId);
+        }
+        else
+        {
+            items = Array.Empty<NotificationPreviewItem>();
+        }
+
+        _notifFlyout ??= new NotificationPreviewFlyout(
+            onDismiss: (id, key) =>
+            {
+                if (id == EnvironmentRouteOrder.Local)
+                    WindowsNotificationCounter.DismissLocalNotification(key);
+                else if (id > 0)
+                    _receiver?.SendNotificationDismiss(id, key);
+                else
+                    _host?.SendNotificationDismiss(-id, key);
+            },
+            onReply: (id, key, reply) =>
+            {
+                if (id > 0) _receiver?.SendNotificationReply(id, key, reply);
+                else _host?.SendNotificationReply(-id, key, reply);
+                Status($"Sent reply to notification on {devName}.");
+            },
+            onCopyOtp: CopyOneTimeCodeWithAutoClear);
+
+        _notifFlyout.ShowForDevice(targetId, devName, items, screenAnchor);
+    }
+
+    private void ShowOtpOfferToast(string app, string code, string title)
+    {
+        if (!_ecosystemConfig.OtpHelperEnabled || string.IsNullOrWhiteSpace(code)) return;
+        _otpBanner ??= new OtpBannerForm(CopyOneTimeCodeWithAutoClear);
+        _otpBanner.ShowCode(app, code);
+        Status($"Verification code received from {app}.");
+    }
+
+    private void CopyOneTimeCodeWithAutoClear(string code)
+    {
+        try
+        {
+            SharedClipboardHelper.TryApplyTextOnStaThread(code);
+            Status("Verification code copied cleanly. Clipboard will clear automatically in 45 seconds.");
+            _otpClipboardClearTimer?.Stop();
+            _otpClipboardClearTimer ??= new System.Windows.Forms.Timer { Interval = 45000 };
+            _otpClipboardClearTimer.Tick += (_, _) =>
+            {
+                _otpClipboardClearTimer?.Stop();
+                try
+                {
+                    if (Clipboard.ContainsText() && Clipboard.GetText() == code)
+                        Clipboard.Clear();
+                }
+                catch { }
+            };
+            _otpClipboardClearTimer.Start();
+        }
+        catch { }
+    }
+
+    private void HandleDeckFileDrop(int targetId, string? filePath)
+    {
+        int resolvedTarget = targetId == EnvironmentRouteOrder.Local ? PickFirstFileDropTargetId() : targetId;
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            PromptAndSendFile(resolvedTarget);
+            return;
+        }
+        if (resolvedTarget != int.MinValue && resolvedTarget != EnvironmentRouteOrder.Local && File.Exists(filePath))
+            SendFilesToTargetFromDiagram(resolvedTarget, new[] { filePath });
+    }
+
+    private int PickFirstFileDropTargetId()
+    {
+        if (_receiver != null)
+        {
+            int sel = _receiver.SelectedPeerId;
+            if (sel > 0) return sel;
+            var first = _receiver.ConnectedPeers.FirstOrDefault();
+            if (first.Id > 0) return first.Id;
+        }
+        if (_host != null)
+        {
+            int sel = _host.SelectedEnvironmentTargetId;
+            return sel > 0 ? -sel : 0;
+        }
+        return int.MinValue;
+    }
+
+    private void PromptAndSendFile(int preferredTargetId)
+    {
+        int target = preferredTargetId is EnvironmentRouteOrder.Local or 0 && _receiver != null
+            ? PickFirstFileDropTargetId()
+            : preferredTargetId;
+        if (target == int.MinValue)
+        {
+            Status("Connect a computer or phone first to send a file.");
+            return;
+        }
+        using var ofd = new OpenFileDialog
+        {
+            Title = "Select a file or photo to send across DeskTouch",
+            Multiselect = true
+        };
+        if (ofd.ShowDialog(this) == DialogResult.OK && ofd.FileNames.Length > 0)
+            SendFilesToTargetFromDiagram(target, ofd.FileNames);
+    }
+
+    private void SendFilesToTargetFromDiagram(int targetId, string[] files)
+    {
+        if (files == null || files.Length == 0) return;
+        _ = Task.Run(async () =>
+        {
+            foreach (string path in files)
+            {
+                if (!File.Exists(path)) continue;
+                bool ok = targetId > 0 && _receiver != null
+                    ? await _receiver.SendFileToTargetAsync(targetId, path)
+                    : (_host != null && await _host.SendFileToMemberAsync(targetId < 0 ? -targetId : 0, path));
+                PostToUi(() => Status(ok
+                    ? $"Sent '{Path.GetFileName(path)}' cleanly."
+                    : $"Could not send '{Path.GetFileName(path)}' (max 25 MB)."));
+            }
+        });
+    }
+
+    private void OnIncomingFileSaved(string fromDevice, string savedPath)
+    {
+        string name = Path.GetFileName(savedPath);
+        Status($"Received '{name}' from {fromDevice} in Downloads\\DeskTouch Received.");
+        _trayIcon?.ShowBalloonTip(4000, $"File from {fromDevice}", $"Saved '{name}' to Downloads\\DeskTouch Received.", ToolTipIcon.Info);
+    }
+
+    private void ExecutePowerActionFromUi(int targetId, string action)
+    {
+        if (_receiver != null) _receiver.SendPowerAction(targetId, action);
+        else if (_host != null) _host.SendPowerAction(targetId <= 0 ? 0 : -targetId, action);
+        else SystemMediaPowerHelper.ExecutePowerAction(action);
+        Status($"Executed power command ({action}).");
+    }
+
+    private void ExecuteMediaActionFromUi(int targetId, string action)
+    {
+        if (_receiver != null) _receiver.SendMediaAction(targetId, action);
+        else if (_host != null) _host.SendMediaAction(targetId <= 0 ? 0 : -targetId, action);
+        else SystemMediaPowerHelper.ExecuteMediaAction(action);
+    }
+
+    private void WakeRememberedComputers()
+    {
+        if (_receiver != null) _receiver.SendPowerAction(0, "wake");
+        var macs = new List<string>();
+        if (_trusted != null && _receiver != null)
+        {
+            foreach (var d in _trusted.Outgoing)
+                macs.AddRange(_receiver.GetRememberedMacs(d.Fingerprint));
+        }
+        int woken = macs.Count > 0 ? SystemMediaPowerHelper.SendWakeOnLan(macs.Distinct()) : 0;
+        Status(woken > 0
+            ? $"Sent Wake-on-LAN signal to {woken} trusted network adapter(s)."
+            : "Screen wake signal sent to connected devices.");
     }
 }

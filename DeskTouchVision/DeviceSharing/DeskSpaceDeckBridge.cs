@@ -26,7 +26,10 @@ internal sealed record BridgeDeviceItemDto(
     double LayoutY = 0,
     double LayoutW = 0,
     double LayoutH = 0,
-    int ArrangementOrder = 0);
+    int ArrangementOrder = 0,
+    int BatteryPercent = -1,
+    bool IsCharging = false,
+    string SignalLabel = "");
 
 internal sealed record BridgeDeviceSnapshotDto(
     int Version,
@@ -39,12 +42,15 @@ internal sealed record BridgeDeviceSnapshotDto(
     int ConnectedCount,
     int TotalNotificationCount,
     bool HasAnyKnownNotificationCount,
-    IReadOnlyList<BridgeDeviceItemDto> Devices);
+    IReadOnlyList<BridgeDeviceItemDto> Devices,
+    string ActiveProfile = "Work",
+    bool ClipboardSyncEnabled = true,
+    string ActiveForegroundApp = "",
+    string ActiveShortcutPreset = "Default");
 
 /// <summary>
-/// Exposes live connected devices, count-only notification badges, and 1-click
-/// device switching over a local user-only Named Pipe + atomic JSON file for DeskSpace.
-/// Never reads or transmits notification titles, bodies, or app names.
+/// Exposes live connected devices, notification badges, battery, profile/clipboard state,
+/// and 1-click commands over a local user-only Named Pipe + atomic JSON file for DeskSpace.
 /// </summary>
 internal sealed class DeskSpaceDeckBridge : IDisposable
 {
@@ -64,6 +70,12 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
     private readonly Action _onReturnLocal;
     private readonly Action<int> _onTogglePay;
     private readonly Action _onShowWindow;
+    private readonly Action<int>? _onOpenNotifications;
+    private readonly Action? _onToggleClipboard;
+    private readonly Action<int, string?>? _onDropFile;
+    private readonly Action<int, string>? _onPowerAction;
+    private readonly Action<int, string>? _onMediaAction;
+    private readonly Action<string>? _onSwitchProfile;
     private readonly CancellationTokenSource _cancel = new();
     private readonly object _stateLock = new();
     private readonly object _fileLock = new();
@@ -79,12 +91,24 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
         Action<int> onSwitchTarget,
         Action onReturnLocal,
         Action<int> onTogglePay,
-        Action onShowWindow)
+        Action onShowWindow,
+        Action<int>? onOpenNotifications = null,
+        Action? onToggleClipboard = null,
+        Action<int, string?>? onDropFile = null,
+        Action<int, string>? onPowerAction = null,
+        Action<int, string>? onMediaAction = null,
+        Action<string>? onSwitchProfile = null)
     {
         _onSwitchTarget = onSwitchTarget;
         _onReturnLocal = onReturnLocal;
         _onTogglePay = onTogglePay;
         _onShowWindow = onShowWindow;
+        _onOpenNotifications = onOpenNotifications;
+        _onToggleClipboard = onToggleClipboard;
+        _onDropFile = onDropFile;
+        _onPowerAction = onPowerAction;
+        _onMediaAction = onMediaAction;
+        _onSwitchProfile = onSwitchProfile;
         _snapshot = CreateEmptySnapshot(Environment.MachineName, -1);
         _snapshotJson = SerializeSnapshot(_snapshot);
     }
@@ -128,7 +152,11 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
             .Append(snapshot.ActiveTargetId).Append('|')
             .Append(snapshot.IsRemoteActive ? '1' : '0').Append('|')
             .Append(snapshot.ConnectedCount).Append('|')
-            .Append(snapshot.TotalNotificationCount);
+            .Append(snapshot.TotalNotificationCount).Append('|')
+            .Append(snapshot.ActiveProfile).Append('|')
+            .Append(snapshot.ClipboardSyncEnabled ? '1' : '0').Append('|')
+            .Append(snapshot.ActiveForegroundApp).Append('|')
+            .Append(snapshot.ActiveShortcutPreset);
         foreach (var d in snapshot.Devices)
         {
             sb.Append(';').Append(d.Id).Append(':')
@@ -138,6 +166,7 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
                 .Append(d.IsControlling ? '1' : '0')
                 .Append(d.SupportsInput ? '1' : '0').Append(':')
                 .Append(d.NotificationCount).Append(':')
+                .Append(d.BatteryPercent).Append(d.IsCharging ? '1' : '0').Append(':')
                 .Append(d.ArrangementOrder).Append(':')
                 .Append(Math.Round(d.LayoutX, 3)).Append(',')
                 .Append(Math.Round(d.LayoutY, 3)).Append(',')
@@ -366,6 +395,52 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
                 _onTogglePay(peerId);
             else
                 _onTogglePay(0);
+            return;
+        }
+        if (trimmed.StartsWith("OPEN_NOTIFS:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (int.TryParse(trimmed["OPEN_NOTIFS:".Length..].Trim(), out int nid))
+                _onOpenNotifications?.Invoke(nid);
+            return;
+        }
+        if (string.Equals(trimmed, "TOGGLE_CLIPBOARD", StringComparison.OrdinalIgnoreCase))
+        {
+            _onToggleClipboard?.Invoke();
+            return;
+        }
+        if (trimmed.StartsWith("DROP_FILE:", StringComparison.OrdinalIgnoreCase))
+        {
+            if (int.TryParse(trimmed["DROP_FILE:".Length..].Trim(), out int fid))
+                _onDropFile?.Invoke(fid, null);
+            return;
+        }
+        if (trimmed.StartsWith("DROP_FILE_PATH:", StringComparison.OrdinalIgnoreCase))
+        {
+            string rest = trimmed["DROP_FILE_PATH:".Length..];
+            int sep = rest.IndexOf('|');
+            if (sep > 0 && int.TryParse(rest[..sep], out int tid))
+                _onDropFile?.Invoke(tid, rest[(sep + 1)..]);
+            return;
+        }
+        if (trimmed.StartsWith("POWER:", StringComparison.OrdinalIgnoreCase))
+        {
+            string rest = trimmed["POWER:".Length..];
+            int sep = rest.IndexOf(':');
+            if (sep > 0 && int.TryParse(rest[..sep], out int pid))
+                _onPowerAction?.Invoke(pid, rest[(sep + 1)..].Trim());
+            return;
+        }
+        if (trimmed.StartsWith("MEDIA:", StringComparison.OrdinalIgnoreCase))
+        {
+            string rest = trimmed["MEDIA:".Length..];
+            int sep = rest.IndexOf(':');
+            if (sep > 0 && int.TryParse(rest[..sep], out int mid))
+                _onMediaAction?.Invoke(mid, rest[(sep + 1)..].Trim());
+            return;
+        }
+        if (trimmed.StartsWith("PROFILE:", StringComparison.OrdinalIgnoreCase))
+        {
+            _onSwitchProfile?.Invoke(trimmed["PROFILE:".Length..].Trim());
         }
     }
 

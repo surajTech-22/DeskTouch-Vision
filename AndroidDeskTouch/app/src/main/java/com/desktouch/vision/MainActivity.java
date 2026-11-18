@@ -2,6 +2,7 @@ package com.desktouch.vision;
 
 import android.app.*;
 import android.content.*;
+import android.content.ClipboardManager;
 import android.content.res.ColorStateList;
 import android.graphics.*;
 import android.graphics.drawable.GradientDrawable;
@@ -28,6 +29,7 @@ public final class MainActivity extends Activity {
     private static final String PREFS="desktouch_prefs";
     private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
     private static final int TAB_COUNT=5;
+    private static final int REQ_SEND_FILE=38201;
 
     private PhoneUiKit.Palette palette;
     private final List<Consumer<PhoneUiKit.Palette>> themeUpdaters=new ArrayList<>();
@@ -84,6 +86,8 @@ public final class MainActivity extends Activity {
     private DeskTouchSession session;
     private View pointerPad;
     private float prevX,prevY,downX,downY,twoFingerPrevY,twoFingerScrollCarry;
+    private float pinchPrevSpan,pinchZoomCarry,threeFingerStartX,threeFingerStartY;
+    private boolean threeFingerHandled;
     private float touchGlowX,touchGlowY;
     private boolean touchGlowActive;
     private boolean dragged,twoFingerMoved;
@@ -91,6 +95,20 @@ public final class MainActivity extends Activity {
     private volatile boolean scanning;
     private float pointerSpeed=2.8f;
     private boolean suppressTypedText;
+
+    private TextView profilePillBtn,fgAppBanner,trackpadPresetPill,previewEmptyHint;
+    private Button homeSendFileBtn,homePowerBtn,previewToggleBtn;
+    private LinearLayout previewWrap,shortcutStripRow,mediaBar;
+    private ImageView previewImageView;
+    private PhoneUiKit.SwitchRow clipSyncSwitch,notifPreviewSwitch,otpHelperSwitch;
+    private final List<Runnable> dynamicEcoButtonThemeUpdaters=new ArrayList<>();
+    private String lastShortcutSig="";
+    private boolean previewExpanded;
+    private boolean suppressClipboardPush;
+    private String lastLocalClipHash="";
+    private android.graphics.Bitmap lastRenderedPreviewBmp;
+    private ClipboardManager.OnPrimaryClipChangedListener clipboardListener;
+    private BroadcastReceiver batteryReceiver;
 
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
@@ -143,6 +161,7 @@ public final class MainActivity extends Activity {
                 refreshLiveLinkAndKeyboard();
             }
         }));
+        setupEcosystemHooks();
         registerKeyboardDeviceListener();
         refreshEnvironmentMembers();
         refreshTrackpadPcTaskbar();
@@ -152,10 +171,24 @@ public final class MainActivity extends Activity {
         DeskTouchRuntime.notifyLocalNotificationCountChanged(
             DeskTouchNotificationListener.readActiveCount(this));
         refreshLiveLinkAndKeyboard();
+        handleShareIntent(getIntent());
 
         // Only checks official GitHub metadata; never downloads or silently
         // installs an executable without explicit user action.
         AndroidUpdater.checkForUpdates(this,false);
+    }
+
+    @Override protected void onNewIntent(Intent intent){
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleShareIntent(intent);
+    }
+
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+        super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode==REQ_SEND_FILE && resultCode==RESULT_OK && data!=null && data.getData()!=null){
+            sendSelectedUriToActiveComputer(data.getData());
+        }
     }
 
     private void buildRootLayout(int initialSensitivityProgress){
@@ -428,6 +461,43 @@ public final class MainActivity extends Activity {
         b2Lp.leftMargin=dp(4);
         heroActions.addView(homeFindBtn,b2Lp);
 
+        LinearLayout ecoActions=new LinearLayout(this);
+        ecoActions.setOrientation(LinearLayout.HORIZONTAL);
+        ecoActions.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams ecoLp=new LinearLayout.LayoutParams(-1,-2);
+        ecoLp.topMargin=dp(8);
+        hero.addView(ecoActions,ecoLp);
+
+        profilePillBtn=new TextView(this);
+        profilePillBtn.setText("Profile: Work ▾");
+        profilePillBtn.setTextSize(11f);
+        profilePillBtn.setTypeface(null,Typeface.BOLD);
+        profilePillBtn.setPadding(dp(10),dp(7),dp(10),dp(7));
+        profilePillBtn.setGravity(Gravity.CENTER);
+        PhoneUiKit.stylePill(profilePillBtn,palette.accentSoftBg,palette.border,palette.accentText,this);
+        profilePillBtn.setClickable(true);
+        profilePillBtn.setFocusable(true);
+        profilePillBtn.setOnClickListener(v->showProfilePickerDialog());
+        LinearLayout.LayoutParams pPillLp=new LinearLayout.LayoutParams(-2,-2);
+        pPillLp.rightMargin=dp(6);
+        ecoActions.addView(profilePillBtn,pPillLp);
+
+        homeSendFileBtn=PhoneUiKit.createButton(this,"Send File",palette,PhoneUiKit.BTN_SUBTLE);
+        homeSendFileBtn.setTextSize(11f);
+        homeSendFileBtn.setPadding(dp(10),dp(6),dp(10),dp(6));
+        homeSendFileBtn.setOnClickListener(v->launchFilePicker());
+        LinearLayout.LayoutParams sfLp=new LinearLayout.LayoutParams(0,-2,1f);
+        sfLp.rightMargin=dp(4);
+        ecoActions.addView(homeSendFileBtn,sfLp);
+
+        homePowerBtn=PhoneUiKit.createButton(this,"Power / Wake",palette,PhoneUiKit.BTN_SUBTLE);
+        homePowerBtn.setTextSize(11f);
+        homePowerBtn.setPadding(dp(10),dp(6),dp(10),dp(6));
+        homePowerBtn.setOnClickListener(v->showPowerMenuDialog());
+        LinearLayout.LayoutParams pwLp=new LinearLayout.LayoutParams(0,-2,1f);
+        pwLp.leftMargin=dp(2);
+        ecoActions.addView(homePowerBtn,pwLp);
+
         LinearLayout envCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(envCard,cardParams(10));
 
@@ -480,10 +550,16 @@ public final class MainActivity extends Activity {
         envCard.addView(arrangementViewport,new LinearLayout.LayoutParams(-1,-2));
 
         TextView envHint=new TextView(this);
-        envHint.setText("Tap any screen box to switch target, then open Trackpad to control.");
+        envHint.setText("Tap screen box to select • Tap badge above box for notifications");
         envHint.setTextSize(10.5f);
         envHint.setPadding(0,dp(8),0,0);
         envCard.addView(envHint);
+
+        fgAppBanner=new TextView(this);
+        fgAppBanner.setText("Auto-rules: Ready • Shared clipboard & battery sync active");
+        fgAppBanner.setTextSize(10.5f);
+        fgAppBanner.setPadding(0,dp(4),0,0);
+        envCard.addView(fgAppBanner);
 
         LinearLayout protCard=PhoneUiKit.createCard(this,palette,14);
         protCard.setOrientation(LinearLayout.HORIZONTAL);
@@ -527,10 +603,14 @@ public final class MainActivity extends Activity {
             kbMetric.setTextColor(p.textPrimary);
             PhoneUiKit.styleButton(homeTrackpadBtn,p,PhoneUiKit.BTN_PRIMARY,this);
             PhoneUiKit.styleButton(homeFindBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.stylePill(profilePillBtn,p.accentSoftBg,p.border,p.accentText,this);
+            PhoneUiKit.styleButton(homeSendFileBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(homePowerBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleCard(envCard,p,this);
             connectionSummary.setTextColor(p.textPrimary);
             envLegend.setTextColor(p.textSecondary);
             envHint.setTextColor(p.textSecondary);
+            fgAppBanner.setTextColor(p.accentText);
             PhoneUiKit.styleCard(protCard,p,this);
             protTitle.setTextColor(p.textPrimary);
             protectionDesc.setTextColor(p.textSecondary);
@@ -794,6 +874,14 @@ public final class MainActivity extends Activity {
         padColLp.rightMargin=dp(8);
         padHeader.addView(padTitleCol,padColLp);
 
+        previewToggleBtn=PhoneUiKit.createButton(this,"Preview",palette,PhoneUiKit.BTN_SUBTLE);
+        previewToggleBtn.setTextSize(11f);
+        previewToggleBtn.setPadding(dp(9),dp(7),dp(9),dp(7));
+        previewToggleBtn.setOnClickListener(v->toggleTrackpadScreenPreview());
+        LinearLayout.LayoutParams pvBtnLp=new LinearLayout.LayoutParams(-2,-2);
+        pvBtnLp.rightMargin=dp(6);
+        padHeader.addView(previewToggleBtn,pvBtnLp);
+
         captureMouseBtn=PhoneUiKit.createButton(this,"Capture Mouse",palette,PhoneUiKit.BTN_SUBTLE);
         captureMouseBtn.setTextSize(11.5f);
         captureMouseBtn.setPadding(dp(10),dp(7),dp(10),dp(7));
@@ -804,6 +892,73 @@ public final class MainActivity extends Activity {
         });
         padHeader.addView(captureMouseBtn,new LinearLayout.LayoutParams(-2,-2));
         padCard.addView(padHeader);
+
+        previewWrap=new LinearLayout(this);
+        previewWrap.setOrientation(LinearLayout.VERTICAL);
+        previewWrap.setPadding(dp(6),dp(6),dp(6),dp(6));
+        previewWrap.setVisibility(View.GONE);
+        PhoneUiKit.styleSubcard(previewWrap,palette,this);
+        LinearLayout.LayoutParams pvWrapLp=new LinearLayout.LayoutParams(-1,-2);
+        pvWrapLp.topMargin=dp(8);
+        padCard.addView(previewWrap,pvWrapLp);
+
+        previewImageView=new ImageView(this);
+        previewImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        previewImageView.setAdjustViewBounds(true);
+        previewImageView.setBackgroundColor(0xFF0F172A);
+        previewImageView.setOnTouchListener((iv,ev)->{
+            if(iv.getWidth()<=0 || iv.getHeight()<=0)return true;
+            if(ev.getActionMasked()==MotionEvent.ACTION_DOWN || ev.getActionMasked()==MotionEvent.ACTION_MOVE){
+                if(iv.getParent()!=null)iv.getParent().requestDisallowInterceptTouchEvent(true);
+                float nx=Math.max(0f,Math.min(1f,ev.getX()/(float)iv.getWidth()));
+                float ny=Math.max(0f,Math.min(1f,ev.getY()/(float)iv.getHeight()));
+                DeskTouchRuntime.session(MainActivity.this).moveToNormalizedInActiveMonitor(nx,ny);
+            }else if(ev.getActionMasked()==MotionEvent.ACTION_UP){
+                if(iv.getParent()!=null)iv.getParent().requestDisallowInterceptTouchEvent(false);
+                float nx=Math.max(0f,Math.min(1f,ev.getX()/(float)iv.getWidth()));
+                float ny=Math.max(0f,Math.min(1f,ev.getY()/(float)iv.getHeight()));
+                DeskTouchSession ps=DeskTouchRuntime.session(MainActivity.this);
+                ps.moveToNormalizedInActiveMonitor(nx,ny);
+                ps.click(1);
+            }
+            return true;
+        });
+        previewWrap.addView(previewImageView,new LinearLayout.LayoutParams(-1,dp(136)));
+
+        previewEmptyHint=new TextView(this);
+        previewEmptyHint.setText("Tap screen preview to aim and click accurately");
+        previewEmptyHint.setTextSize(10f);
+        previewEmptyHint.setGravity(Gravity.CENTER);
+        previewEmptyHint.setPadding(0,dp(4),0,0);
+        previewWrap.addView(previewEmptyHint);
+
+        LinearLayout shortcutHeaderRow=new LinearLayout(this);
+        shortcutHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
+        shortcutHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams shLp=new LinearLayout.LayoutParams(-1,-2);
+        shLp.topMargin=dp(8);
+        padCard.addView(shortcutHeaderRow,shLp);
+
+        HorizontalScrollView shortcutScroll=new HorizontalScrollView(this);
+        shortcutScroll.setHorizontalScrollBarEnabled(false);
+        shortcutStripRow=new LinearLayout(this);
+        shortcutStripRow.setOrientation(LinearLayout.HORIZONTAL);
+        shortcutStripRow.setGravity(Gravity.CENTER_VERTICAL);
+        shortcutScroll.addView(shortcutStripRow,new HorizontalScrollView.LayoutParams(-2,-2));
+        shortcutHeaderRow.addView(shortcutScroll,new LinearLayout.LayoutParams(0,-2,1f));
+
+        trackpadPresetPill=new TextView(this);
+        trackpadPresetPill.setText("⚙ Edit");
+        trackpadPresetPill.setTextSize(10.5f);
+        trackpadPresetPill.setTypeface(null,Typeface.BOLD);
+        trackpadPresetPill.setPadding(dp(8),dp(5),dp(8),dp(5));
+        PhoneUiKit.stylePill(trackpadPresetPill,palette.subtleBtnBg,palette.border,palette.textPrimary,this);
+        trackpadPresetPill.setClickable(true);
+        trackpadPresetPill.setFocusable(true);
+        trackpadPresetPill.setOnClickListener(v->showCustomizeShortcutsDialog());
+        LinearLayout.LayoutParams tpLp=new LinearLayout.LayoutParams(-2,-2);
+        tpLp.leftMargin=dp(6);
+        shortcutHeaderRow.addView(trackpadPresetPill,tpLp);
 
         pointerPad=new View(this){
             final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -884,20 +1039,58 @@ public final class MainActivity extends Activity {
                     touchGlowX=event.getX();touchGlowY=event.getY();touchGlowActive=true;
                     v.invalidate();
                     dragged=false;twoFingerMoved=false;maxPointerCount=1;
-                    twoFingerScrollCarry=0f;
+                    twoFingerScrollCarry=0f;pinchZoomCarry=0f;pinchPrevSpan=0f;threeFingerHandled=false;
                     v.requestFocus();return true;
                 case MotionEvent.ACTION_POINTER_DOWN:
                     maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
-                    if(event.getPointerCount()>=2){
+                    if(event.getPointerCount()>=3){
+                        threeFingerStartX=avgPointerX(event,3);
+                        threeFingerStartY=avgPointerY(event,3);
+                        threeFingerHandled=false;
+                    }else if(event.getPointerCount()==2){
                         twoFingerPrevY=(event.getY(0)+event.getY(1))*0.5f;
+                        pinchPrevSpan=pointerSpan(event);
                         twoFingerScrollCarry=0f;
+                        pinchZoomCarry=0f;
                     }
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     touchGlowX=event.getX();touchGlowY=event.getY();touchGlowActive=true;
                     v.invalidate();
-                    if(event.getPointerCount()>=2){
+                    if(event.getPointerCount()>=3){
                         maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
+                        if(!threeFingerHandled){
+                            float dx3=avgPointerX(event,3)-threeFingerStartX;
+                            float dy3=avgPointerY(event,3)-threeFingerStartY;
+                            DeskTouchSession ts3=DeskTouchRuntime.session(MainActivity.this);
+                            int tid3=ts3.selectedEnvironmentTarget()>0 ? ts3.selectedEnvironmentTarget() : 0;
+                            if(Math.abs(dx3)>dp(42) && Math.abs(dx3)>Math.abs(dy3)){
+                                ts3.sendMediaAction(tid3,"switch-window",dx3>0 ? 1 : -1);
+                                threeFingerHandled=true;
+                            }else if(dy3<-dp(42) && Math.abs(dy3)>Math.abs(dx3)){
+                                ts3.sendMediaAction(tid3,"task-view",0);
+                                threeFingerHandled=true;
+                            }else if(dy3>dp(42) && Math.abs(dy3)>Math.abs(dx3)){
+                                ts3.sendMediaAction(tid3,"desktop",0);
+                                threeFingerHandled=true;
+                            }
+                        }
+                        return true;
+                    }
+                    if(event.getPointerCount()==2){
+                        maxPointerCount=Math.max(maxPointerCount,event.getPointerCount());
+                        float span=pointerSpan(event);
+                        float dSpan=span-pinchPrevSpan;
+                        if(Math.abs(dSpan)>dp(20)){
+                            DeskTouchSession zs=DeskTouchRuntime.session(MainActivity.this);
+                            zs.key(0x11,true);
+                            zs.wheel(dSpan>0 ? 120 : -120,false);
+                            zs.key(0x11,false);
+                            pinchPrevSpan=span;
+                            twoFingerMoved=true;
+                            twoFingerPrevY=(event.getY(0)+event.getY(1))*0.5f;
+                            return true;
+                        }
                         float avgY=(event.getY(0)+event.getY(1))*0.5f;
                         float sdy=avgY-twoFingerPrevY;
                         twoFingerPrevY=avgY;
@@ -1022,6 +1215,17 @@ public final class MainActivity extends Activity {
             if(imm!=null)imm.showSoftInput(keyboardInput,InputMethodManager.SHOW_IMPLICIT);
         });
 
+        HorizontalScrollView mediaScroll=new HorizontalScrollView(this);
+        mediaScroll.setHorizontalScrollBarEnabled(false);
+        mediaBar=new LinearLayout(this);
+        mediaBar.setOrientation(LinearLayout.HORIZONTAL);
+        mediaBar.setGravity(Gravity.CENTER_VERTICAL);
+        mediaScroll.addView(mediaBar,new HorizontalScrollView.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams mbLp=new LinearLayout.LayoutParams(-1,-2);
+        mbLp.topMargin=dp(8);
+        padCard.addView(mediaScroll,mbLp);
+        populateMediaAndPowerBar();
+
         LinearLayout kbCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(kbCard,cardParams(10));
 
@@ -1135,6 +1339,13 @@ public final class MainActivity extends Activity {
             padSurfaceTitle.setTextColor(p.textPrimary);
             trackpadReadout.setTextColor(p.textSecondary);
             PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(previewToggleBtn,p,previewExpanded ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleSubcard(previewWrap,p,this);
+            previewEmptyHint.setTextColor(p.textSecondary);
+            PhoneUiKit.stylePill(trackpadPresetPill,p.subtleBtnBg,p.border,p.textPrimary,this);
+            lastShortcutSig="";
+            refreshShortcutStrip();
+            for(Runnable ecoUpd:dynamicEcoButtonThemeUpdaters)ecoUpd.run();
             PhoneUiKit.styleButton(captureMouseBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             pointerPad.invalidate();
             PhoneUiKit.styleButton(leftBtn,p,PhoneUiKit.BTN_SUBTLE,this);
@@ -1429,6 +1640,46 @@ public final class MainActivity extends Activity {
             });
         safetyCard.addView(autoPauseDisconnectSwitch.getView());
 
+        View sd4=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd4);
+
+        clipSyncSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Shared clipboard sync",
+            "Sync copied text across linked computers and phone",
+            EcosystemFeatures.isClipboardSyncEnabled(this),
+            checked->{
+                EcosystemFeatures.setClipboardSyncEnabled(this,checked);
+                if(checked)pushCurrentClipboardIfChanged();
+                setFeedback(checked ? "Shared clipboard sync enabled." : "Shared clipboard paused.",true);
+            });
+        safetyCard.addView(clipSyncSwitch.getView());
+
+        View sd5=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd5);
+
+        notifPreviewSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "Notification previews & quick reply",
+            "Skips banking/UPI apps automatically",
+            EcosystemFeatures.isNotifPreviewsEnabled(this),
+            checked->{
+                EcosystemFeatures.setNotifPreviewsEnabled(this,checked);
+                setFeedback(checked ? "Notification preview sharing enabled." : "Only notification counts will be shown.",true);
+            });
+        safetyCard.addView(notifPreviewSwitch.getView());
+
+        View sd6=PhoneUiKit.createDivider(this,palette);
+        safetyCard.addView(sd6);
+
+        otpHelperSwitch=new PhoneUiKit.SwitchRow(this,palette,
+            "One-time code (OTP) helper",
+            "Shows copy prompt on active PC for non-banking verification codes",
+            EcosystemFeatures.isOtpHelperEnabled(this),
+            checked->{
+                EcosystemFeatures.setOtpHelperEnabled(this,checked);
+                setFeedback(checked ? "One-time code helper enabled." : "One-time code helper disabled.",true);
+            });
+        safetyCard.addView(otpHelperSwitch.getView());
+
         LinearLayout permBox=PhoneUiKit.createSubcard(this,palette,10);
         LinearLayout.LayoutParams permBoxLp=new LinearLayout.LayoutParams(-1,-2);
         permBoxLp.topMargin=dp(10);
@@ -1667,6 +1918,12 @@ public final class MainActivity extends Activity {
             autoPausePaymentsSwitch.applyPalette(p);
             sd3.setBackgroundColor(p.divider);
             autoPauseDisconnectSwitch.applyPalette(p);
+            sd4.setBackgroundColor(p.divider);
+            clipSyncSwitch.applyPalette(p);
+            sd5.setBackgroundColor(p.divider);
+            notifPreviewSwitch.applyPalette(p);
+            sd6.setBackgroundColor(p.divider);
+            otpHelperSwitch.applyPalette(p);
             PhoneUiKit.styleSubcard(permBox,p,this);
             permissionState.setTextColor(p.amberText);
             PhoneUiKit.styleButton(accBtn,p,PhoneUiKit.BTN_SUBTLE,this);
@@ -1772,6 +2029,13 @@ public final class MainActivity extends Activity {
         if(index==PhoneUiKit.TAB_TRACKPAD){
             refreshTrackpadPcTaskbar();
             refreshLiveLinkAndKeyboard();
+            if(previewExpanded){
+                DeskTouchSession s=DeskTouchRuntime.session(this);
+                int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+                s.setScreenPreviewWatch(tid,s.activeMonitorIndex());
+            }
+        }else{
+            DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
         }
         refreshTabBarStyles();
     }
@@ -1871,9 +2135,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.81";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.82";
         }catch(Exception ignored){
-            return "0.3.81";
+            return "0.3.82";
         }
     }
 
@@ -1936,10 +2200,20 @@ public final class MainActivity extends Activity {
         if(keepChannelsWarmSwitch!=null){
             keepChannelsWarmSwitch.setChecked(DeskTouchSession.readKeepChannelsWarm(this));
         }
+        if(clipSyncSwitch!=null){
+            clipSyncSwitch.setChecked(EcosystemFeatures.isClipboardSyncEnabled(this));
+        }
+        if(notifPreviewSwitch!=null){
+            notifPreviewSwitch.setChecked(EcosystemFeatures.isNotifPreviewsEnabled(this));
+        }
+        if(otpHelperSwitch!=null){
+            otpHelperSwitch.setChecked(EcosystemFeatures.isOtpHelperEnabled(this));
+        }
     }
 
     @Override protected void onPause(){
         stopLiveUiTicker();
+        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
         super.onPause();
     }
 
@@ -2070,6 +2344,7 @@ public final class MainActivity extends Activity {
             }
         }
         refreshWindowsTaskbar();
+        refreshEcosystemLiveUi();
     }
 
     private void refreshTelemetryCards(DeskTouchSession.LiveStatusSnapshot snap,
@@ -2485,13 +2760,16 @@ public final class MainActivity extends Activity {
                     hasCount ? 0xFF132B45 : 0xFF262B36,
                     hasCount ? 0xFF38BDF8 : 0xFF3F4756,
                     hasCount ? 0xFF7DD3FC : 0xFF94A3B8,this);
-                if(model.self && !hasCount){
-                    notifPill.setClickable(true);
-                    notifPill.setOnClickListener(v->{
-                        setFeedback("Enable Notification Count Badge in Setup to display this phone's count.",true);
+                notifPill.setClickable(true);
+                notifPill.setFocusable(true);
+                notifPill.setOnClickListener(v->{
+                    if(model.self && !hasCount){
+                        setFeedback("Enable Notification Count Badge in Setup to view & share notifications.",true);
                         selectTab(PhoneUiKit.TAB_SETUP);
-                    });
-                }
+                    }else{
+                        showNotificationsDialog(device.id,model.fullName,model.self);
+                    }
+                });
                 col.addView(notifPill,new LinearLayout.LayoutParams(-2,-2));
 
                 int boxW=model.portrait ? dp(68) : dp(model.monitorCount>1 ? 132 : 118);
@@ -2569,6 +2847,21 @@ public final class MainActivity extends Activity {
                 boxLp.topMargin=dp(5);
                 col.addView(box,boxLp);
 
+                int battPct=model.self ? readLocalBatteryPercent() : model.batteryPercent;
+                boolean battChg=model.self ? readLocalBatteryCharging() : model.charging;
+                if(battPct>=0){
+                    TextView battView=new TextView(this);
+                    battView.setText((battChg ? "⚡ " : "")+battPct+"%");
+                    battView.setTextSize(9f);
+                    battView.setTypeface(null,Typeface.BOLD);
+                    int battFg=battChg ? 0xFF38BDF8 : (battPct<=20 ? 0xFFFCA5A5 : 0xFF86EFAC);
+                    battView.setTextColor(battFg);
+                    battView.setGravity(Gravity.CENTER);
+                    LinearLayout.LayoutParams bvLp=new LinearLayout.LayoutParams(-2,-2);
+                    bvLp.topMargin=dp(2);
+                    col.addView(battView,bvLp);
+                }
+
                 LinearLayout.LayoutParams colLp=new LinearLayout.LayoutParams(-2,-2);
                 colLp.gravity=Gravity.CENTER_VERTICAL;
                 if(i>0)colLp.leftMargin=dp(8);
@@ -2644,6 +2937,9 @@ public final class MainActivity extends Activity {
                             active.switchTargetAndClaim(screenPc.id,0);
                         }
                         active.focusMonitor(monIdx);
+                        if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD){
+                            active.setScreenPreviewWatch(screenPc.id,monIdx);
+                        }
                         refreshTrackpadPcTaskbar();
                         setFeedback("Moved cursor to Display "+mb.displayNumber+".",false);
                     });
@@ -2667,6 +2963,7 @@ public final class MainActivity extends Activity {
                 }));
         }
         refreshWindowsTaskbar();
+        refreshEcosystemLiveUi();
     }
 
     private void refreshWindowsTaskbar(){
@@ -3400,6 +3697,20 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy(){
         stopLiveUiTicker();
+        DeskTouchSession.setRemoteClipboardTextApplier(null);
+        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
+        if(clipboardListener!=null){
+            try{
+                ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+                if(cm!=null)cm.removePrimaryClipChangedListener(clipboardListener);
+            }catch(RuntimeException ignored){}
+            clipboardListener=null;
+        }
+        if(batteryReceiver!=null){
+            try{unregisterReceiver(batteryReceiver);}
+            catch(RuntimeException ignored){}
+            batteryReceiver=null;
+        }
         if(inputManager!=null && inputDeviceListener!=null){
             try{inputManager.unregisterInputDeviceListener(inputDeviceListener);}
             catch(RuntimeException ignored){}
@@ -3410,5 +3721,530 @@ public final class MainActivity extends Activity {
         // The foreground reconnect service owns the authenticated TLS sessions.
         // Closing this setup screen must not disconnect the selected phone.
         super.onDestroy();
+    }
+
+    private void setupEcosystemHooks(){
+        DeskTouchSession.setRemoteClipboardTextApplier(text ->
+            runOnUiThread(()->{
+                if(!isFinishing() && !isDestroyed())applyRemoteClipboardText(text);
+            }));
+        ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+        if(cm!=null){
+            clipboardListener=()->{
+                if(!suppressClipboardPush && EcosystemFeatures.isClipboardSyncEnabled(this)){
+                    pushCurrentClipboardIfChanged();
+                }
+            };
+            try{cm.addPrimaryClipChangedListener(clipboardListener);}
+            catch(RuntimeException ignored){}
+        }
+        batteryReceiver=new BroadcastReceiver(){
+            @Override public void onReceive(Context context,Intent intent){
+                if(intent==null)return;
+                int level=intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL,-1);
+                int scale=intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE,-1);
+                if(level<0 || scale<=0)return;
+                int pct=Math.max(0,Math.min(100,(level*100)/scale));
+                int st=intent.getIntExtra(android.os.BatteryManager.EXTRA_STATUS,-1);
+                boolean chg=st==android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    st==android.os.BatteryManager.BATTERY_STATUS_FULL;
+                WifiLinkMonitor.LinkSnapshot link=WifiLinkMonitor.inspect(MainActivity.this,false,0);
+                DeskTouchRuntime.publishBatteryState(pct,chg,link!=null ? link.band : "");
+            }
+        };
+        try{
+            Intent sticky=registerReceiver(batteryReceiver,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if(sticky!=null)batteryReceiver.onReceive(this,sticky);
+        }catch(RuntimeException ignored){}
+    }
+
+    private void applyRemoteClipboardText(String text){
+        if(text==null || text.isEmpty() || !EcosystemFeatures.isClipboardSyncEnabled(this))return;
+        String h=EcosystemFeatures.computeShortHash("text",text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        if(h.equals(lastLocalClipHash))return;
+        lastLocalClipHash=h;
+        ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+        if(cm==null)return;
+        suppressClipboardPush=true;
+        try{
+            cm.setPrimaryClip(ClipData.newPlainText("DeskTouch",text));
+        }catch(RuntimeException ignored){
+        }finally{
+            suppressClipboardPush=false;
+        }
+    }
+
+    private void pushCurrentClipboardIfChanged(){
+        ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+        if(cm==null || !cm.hasPrimaryClip())return;
+        try{
+            ClipData clip=cm.getPrimaryClip();
+            if(clip==null || clip.getItemCount()==0)return;
+            CharSequence seq=clip.getItemAt(0).coerceToText(this);
+            if(seq==null)return;
+            String text=seq.toString();
+            if(text.isEmpty() || text.length()>2800)return;
+            String h=EcosystemFeatures.computeShortHash("text",text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            if(h.equals(lastLocalClipHash) || DeskTouchRuntime.session(this).isLastReceivedClipboardHash(h))return;
+            lastLocalClipHash=h;
+            DeskTouchRuntime.broadcastClipboardText(h,text);
+        }catch(RuntimeException ignored){}
+    }
+
+    private int readLocalBatteryPercent(){
+        try{
+            Intent i=registerReceiver(null,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if(i==null)return -1;
+            int level=i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL,-1);
+            int scale=i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE,-1);
+            return (level>=0 && scale>0) ? Math.max(0,Math.min(100,(level*100)/scale)) : -1;
+        }catch(RuntimeException ignored){
+            return -1;
+        }
+    }
+
+    private boolean readLocalBatteryCharging(){
+        try{
+            Intent i=registerReceiver(null,new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            if(i==null)return false;
+            int st=i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS,-1);
+            return st==android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                st==android.os.BatteryManager.BATTERY_STATUS_FULL;
+        }catch(RuntimeException ignored){
+            return false;
+        }
+    }
+
+    private void handleShareIntent(Intent intent){
+        if(intent==null || !Intent.ACTION_SEND.equals(intent.getAction()))return;
+        intent.setAction("");
+        @SuppressWarnings("deprecation")
+        android.net.Uri stream=intent.getParcelableExtra(Intent.EXTRA_STREAM);
+        if(stream!=null){
+            sendSelectedUriToActiveComputer(stream);
+            return;
+        }
+        CharSequence txt=intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
+        if(txt!=null && txt.length()>0){
+            String s=txt.toString();
+            String clipped=s.length()>2800 ? s.substring(0,2800) : s;
+            String h=EcosystemFeatures.computeShortHash("text",clipped.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            lastLocalClipHash=h;
+            DeskTouchRuntime.broadcastClipboardText(h,clipped);
+            setFeedback("Sent shared text to linked computer clipboard.",true);
+        }
+    }
+
+    private void launchFilePicker(){
+        if(!DeskTouchRuntime.session(this).isConnected()){
+            setFeedback("Connect to a computer in Find before sending files.",true);
+            return;
+        }
+        Intent picker=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        try{
+            startActivityForResult(picker,REQ_SEND_FILE);
+        }catch(RuntimeException err){
+            setFeedback("File picker unavailable on this device.",true);
+        }
+    }
+
+    private void sendSelectedUriToActiveComputer(android.net.Uri uri){
+        if(uri==null)return;
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        if(!s.isConnected()){
+            setFeedback("Connect to a computer first before sending files.",true);
+            return;
+        }
+        int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+        setFeedback("Sending file...",false);
+        s.sendFileUriAsync(tid,uri,msg->runOnUiThread(()->{
+            if(!isFinishing() && !isDestroyed())setFeedback(msg,true);
+        }));
+    }
+
+    private static float avgPointerX(MotionEvent e,int count){
+        int n=Math.min(count,e.getPointerCount());
+        float sum=0f;
+        for(int i=0;i<n;i++)sum+=e.getX(i);
+        return n>0 ? sum/n : 0f;
+    }
+
+    private static float avgPointerY(MotionEvent e,int count){
+        int n=Math.min(count,e.getPointerCount());
+        float sum=0f;
+        for(int i=0;i<n;i++)sum+=e.getY(i);
+        return n>0 ? sum/n : 0f;
+    }
+
+    private static float pointerSpan(MotionEvent e){
+        if(e.getPointerCount()<2)return 0f;
+        float dx=e.getX(0)-e.getX(1);
+        float dy=e.getY(0)-e.getY(1);
+        return (float)Math.hypot(dx,dy);
+    }
+
+    private void toggleTrackpadScreenPreview(){
+        previewExpanded=!previewExpanded;
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        if(previewWrap!=null){
+            previewWrap.setVisibility(previewExpanded ? View.VISIBLE : View.GONE);
+        }
+        if(previewToggleBtn!=null){
+            previewToggleBtn.setText(previewExpanded ? "Hide View" : "Preview");
+            PhoneUiKit.styleButton(previewToggleBtn,palette,
+                previewExpanded ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE,this);
+        }
+        if(previewExpanded){
+            int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+            s.setScreenPreviewWatch(tid,s.activeMonitorIndex());
+            if(previewEmptyHint!=null)previewEmptyHint.setText("Requesting live monitor snapshot...");
+            refreshEcosystemLiveUi();
+        }else{
+            s.setScreenPreviewWatch(-1,-1);
+            lastRenderedPreviewBmp=null;
+            if(previewImageView!=null)previewImageView.setImageDrawable(null);
+        }
+    }
+
+    private void populateMediaAndPowerBar(){
+        if(mediaBar==null)return;
+        mediaBar.removeAllViews();
+        dynamicEcoButtonThemeUpdaters.clear();
+        String[][] actions={
+            {"⏮","prev","Previous track"},
+            {"⏯","play-pause","Play / Pause"},
+            {"⏭","next","Next track"},
+            {"🔇","mute","Mute / Unmute"},
+            {"🔊−","vol-down","Volume down"},
+            {"🔊+","vol-up","Volume up"},
+            {"☀−","brightness-down","Brightness down"},
+            {"☀+","brightness-up","Brightness up"},
+            {"◀Slide","slide-prev","Previous slide"},
+            {"▶Slide","slide-next","Next slide"}
+        };
+        for(int i=0;i<actions.length;i++){
+            final String label=actions[i][0];
+            final String act=actions[i][1];
+            final String desc=actions[i][2];
+            addEcoMediaPill(label,()->{
+                DeskTouchSession s=DeskTouchRuntime.session(this);
+                int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+                s.sendMediaAction(tid,act,0);
+                setFeedback(desc,false);
+            },i>0);
+        }
+        addEcoMediaPill("🔒Lock",()->{
+            DeskTouchSession s=DeskTouchRuntime.session(this);
+            int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+            s.sendPowerAction(tid,"lock");
+            setFeedback("Sent Lock command.",true);
+        },true);
+        addEcoMediaPill("📁Send",this::launchFilePicker,true);
+    }
+
+    private void addEcoMediaPill(String label,Runnable action,boolean addLeftMargin){
+        TextView pill=new TextView(this);
+        pill.setText(label);
+        pill.setTextSize(10.5f);
+        pill.setTypeface(null,Typeface.BOLD);
+        pill.setPadding(dp(10),dp(6),dp(10),dp(6));
+        Runnable styler=()->PhoneUiKit.stylePill(pill,palette.subtleBtnBg,palette.border,palette.textPrimary,this);
+        styler.run();
+        dynamicEcoButtonThemeUpdaters.add(styler);
+        pill.setClickable(true);
+        pill.setFocusable(true);
+        pill.setOnClickListener(v->action.run());
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,-2);
+        if(addLeftMargin)lp.leftMargin=dp(6);
+        mediaBar.addView(pill,lp);
+    }
+
+    private void refreshShortcutStrip(){
+        if(shortcutStripRow==null)return;
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        EcosystemFeatures.ProfileSummary prof=s.profileSummary();
+        android.content.SharedPreferences sp=EcosystemFeatures.prefs(this);
+        String customIds=sp!=null ? sp.getString(EcosystemFeatures.KEY_CUSTOM_SHORTCUTS,"") : "";
+        String sig=palette.themeId+"|"+prof.shortcutPreset+"|"+s.activeForegroundProc()+"|"+customIds;
+        if(sig.equals(lastShortcutSig))return;
+        lastShortcutSig=sig;
+
+        shortcutStripRow.removeAllViews();
+        List<EcosystemFeatures.ShortcutDef> defs=EcosystemFeatures.shortcutsForPresetOrCustom(
+            this,prof.shortcutPreset);
+        for(int i=0;i<defs.size();i++){
+            final EcosystemFeatures.ShortcutDef def=defs.get(i);
+            TextView chip=new TextView(this);
+            chip.setText(def.label);
+            chip.setTextSize(11f);
+            chip.setTypeface(null,Typeface.BOLD);
+            chip.setPadding(dp(10),dp(5),dp(10),dp(5));
+            PhoneUiKit.stylePill(chip,palette.accentSoftBg,palette.border,palette.accentText,this);
+            chip.setClickable(true);
+            chip.setFocusable(true);
+            chip.setOnClickListener(v->{
+                int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+                if("lock".equals(def.action)){
+                    s.sendPowerAction(tid,"lock");
+                }else{
+                    s.sendMediaAction(tid,def.action,0);
+                }
+                setFeedback("Sent "+def.label,false);
+            });
+            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,-2);
+            if(i>0)lp.leftMargin=dp(6);
+            shortcutStripRow.addView(chip,lp);
+        }
+    }
+
+    private void refreshEcosystemLiveUi(){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        EcosystemFeatures.ProfileSummary prof=s.profileSummary();
+        if(profilePillBtn!=null){
+            profilePillBtn.setText("Profile: "+prof.activeProfile+" ▾");
+        }
+        if(fgAppBanner!=null){
+            String fg=s.activeForegroundProc();
+            String clip=EcosystemFeatures.isClipboardSyncEnabled(this) ? "Clipboard On" : "Clipboard Paused";
+            String base="Profile: "+prof.activeProfile+" • "+clip+" • Preset: "+prof.shortcutPreset;
+            if(fg!=null && !fg.isEmpty()){
+                base="Active App: "+fg+" ("+prof.shortcutPreset+" keys) • "+clip;
+            }
+            fgAppBanner.setText(base);
+        }
+        refreshShortcutStrip();
+        if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && previewImageView!=null){
+            android.graphics.Bitmap bmp=s.currentScreenPreview();
+            if(bmp!=null && !bmp.isRecycled()){
+                if(bmp!=lastRenderedPreviewBmp){
+                    previewImageView.setImageBitmap(bmp);
+                    lastRenderedPreviewBmp=bmp;
+                }
+                if(previewEmptyHint!=null){
+                    previewEmptyHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Tap anywhere to move & click");
+                }
+            }
+        }
+    }
+
+    private void showProfilePickerDialog(){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        EcosystemFeatures.ProfileSummary prof=s.profileSummary();
+        List<String> list=prof.profiles;
+        String[] items=list.toArray(new String[0]);
+        int checked=0;
+        for(int i=0;i<items.length;i++){
+            if(items[i].equalsIgnoreCase(prof.activeProfile)){
+                checked=i;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Switch DeskTouch Profile")
+            .setSingleChoiceItems(items,checked,(dlg,which)->{
+                String chosen=items[which];
+                s.applyProfile(chosen);
+                setFeedback("Requested profile switch to "+chosen+".",true);
+                dlg.dismiss();
+            })
+            .setNegativeButton("Close",null)
+            .show();
+    }
+
+    private void showPowerMenuDialog(){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        if(!s.isConnected()){
+            setFeedback("Connect to a computer first.",true);
+            return;
+        }
+        int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+        String[] labels={
+            "Lock Active Computer",
+            "Lock All Linked Computers",
+            "Turn Off Active Monitor",
+            "Wake Remembered Computers"
+        };
+        String[] actions={"lock","lock-all","screen-off","wake"};
+        new AlertDialog.Builder(this)
+            .setTitle("Remote Power & Wake")
+            .setItems(labels,(dlg,which)->{
+                s.sendPowerAction(tid,actions[which]);
+                setFeedback("Sent command: "+labels[which],true);
+            })
+            .setNegativeButton("Cancel",null)
+            .show();
+    }
+
+    private void showCustomizeShortcutsDialog(){
+        android.content.SharedPreferences sp=EcosystemFeatures.prefs(this);
+        String saved=sp!=null ? sp.getString(EcosystemFeatures.KEY_CUSTOM_SHORTCUTS,"copy,paste,undo,snip,task-view,lock") : "";
+        java.util.HashSet<String> activeSet=new java.util.HashSet<>();
+        for(String tok:saved.split(",")){
+            String c=tok.trim();
+            if(!c.isEmpty())activeSet.add(c);
+        }
+        int count=EcosystemFeatures.ALL_SHORTCUTS.size();
+        String[] names=new String[count];
+        boolean[] checked=new boolean[count];
+        for(int i=0;i<count;i++){
+            EcosystemFeatures.ShortcutDef d=EcosystemFeatures.ALL_SHORTCUTS.get(i);
+            names[i]=d.label;
+            checked[i]=activeSet.contains(d.id);
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("Customize Trackpad Shortcuts")
+            .setMultiChoiceItems(names,checked,(dlg,which,isChecked)->checked[which]=isChecked)
+            .setPositiveButton("Save",(dlg,which)->{
+                ArrayList<String> selectedIds=new ArrayList<>();
+                for(int i=0;i<count;i++){
+                    if(checked[i])selectedIds.add(EcosystemFeatures.ALL_SHORTCUTS.get(i).id);
+                }
+                if(selectedIds.isEmpty())selectedIds.add("copy");
+                EcosystemFeatures.saveCustomShortcutIds(this,selectedIds);
+                lastShortcutSig="";
+                refreshShortcutStrip();
+                setFeedback("Saved trackpad shortcuts.",true);
+            })
+            .setNegativeButton("Cancel",null)
+            .show();
+    }
+
+    private void showNotificationsDialog(int targetId,String deviceName,boolean isSelf){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        List<EcosystemFeatures.NotificationItem> items=isSelf
+            ? DeskTouchNotificationListener.readRecentItems(this)
+            : s.peerNotifications(targetId);
+
+        LinearLayout container=new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(16),dp(10),dp(16),dp(6));
+
+        if(!EcosystemFeatures.isNotifPreviewsEnabled(this)){
+            TextView disabledNote=new TextView(this);
+            disabledNote.setText("Notification previews are currently turned off in Setup. Only counts are shared.");
+            disabledNote.setTextSize(12.5f);
+            container.addView(disabledNote);
+        }else if(items==null || items.isEmpty()){
+            TextView emptyNote=new TextView(this);
+            emptyNote.setText("No active previewable notifications right now (banking & payment alerts stay hidden).");
+            emptyNote.setTextSize(12.5f);
+            container.addView(emptyNote);
+        }else{
+            for(final EcosystemFeatures.NotificationItem item:items){
+                LinearLayout row=new LinearLayout(this);
+                row.setOrientation(LinearLayout.VERTICAL);
+                row.setPadding(dp(10),dp(8),dp(10),dp(8));
+                row.setBackground(PhoneUiKit.roundedBox(palette.subcardBg,palette.border,dp(10),Math.max(1,dp(1))));
+
+                TextView appLbl=new TextView(this);
+                appLbl.setText((item.app.isEmpty() ? deviceName : item.app)
+                    +(item.otpCode.isEmpty() ? "" : " • Code: "+item.otpCode));
+                appLbl.setTextSize(10.5f);
+                appLbl.setTypeface(null,Typeface.BOLD);
+                appLbl.setTextColor(palette.accentText);
+                row.addView(appLbl);
+
+                if(!item.title.isEmpty()){
+                    TextView tLbl=new TextView(this);
+                    tLbl.setText(item.title);
+                    tLbl.setTextSize(12.5f);
+                    tLbl.setTypeface(null,Typeface.BOLD);
+                    tLbl.setTextColor(palette.textPrimary);
+                    row.addView(tLbl);
+                }
+                if(!item.text.isEmpty()){
+                    TextView bLbl=new TextView(this);
+                    bLbl.setText(item.text);
+                    bLbl.setTextSize(11.5f);
+                    bLbl.setTextColor(palette.textSecondary);
+                    row.addView(bLbl);
+                }
+
+                LinearLayout btnRow=new LinearLayout(this);
+                btnRow.setOrientation(LinearLayout.HORIZONTAL);
+                btnRow.setPadding(0,dp(6),0,0);
+
+                if(!item.otpCode.isEmpty()){
+                    TextView copyOtp=new TextView(this);
+                    copyOtp.setText("Copy "+item.otpCode);
+                    copyOtp.setTextSize(11f);
+                    copyOtp.setTypeface(null,Typeface.BOLD);
+                    copyOtp.setPadding(dp(9),dp(5),dp(9),dp(5));
+                    PhoneUiKit.stylePill(copyOtp,palette.emeraldSoftBg,palette.border,palette.emeraldText,this);
+                    copyOtp.setOnClickListener(v->{
+                        applyRemoteClipboardText(item.otpCode);
+                        String h=EcosystemFeatures.computeShortHash("text",item.otpCode.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        DeskTouchRuntime.broadcastClipboardText(h,item.otpCode);
+                        setFeedback("Copied code "+item.otpCode,true);
+                    });
+                    LinearLayout.LayoutParams cLp=new LinearLayout.LayoutParams(-2,-2);
+                    cLp.rightMargin=dp(6);
+                    btnRow.addView(copyOtp,cLp);
+                }
+
+                if(item.canReply && !item.key.isEmpty()){
+                    TextView replyBtn=new TextView(this);
+                    replyBtn.setText("Reply");
+                    replyBtn.setTextSize(11f);
+                    replyBtn.setTypeface(null,Typeface.BOLD);
+                    replyBtn.setPadding(dp(9),dp(5),dp(9),dp(5));
+                    PhoneUiKit.stylePill(replyBtn,palette.accentSoftBg,palette.border,palette.accentText,this);
+                    replyBtn.setOnClickListener(v->promptNotificationReply(targetId,item.key,item.title,isSelf));
+                    LinearLayout.LayoutParams rLp=new LinearLayout.LayoutParams(-2,-2);
+                    rLp.rightMargin=dp(6);
+                    btnRow.addView(replyBtn,rLp);
+                }
+
+                if(!item.key.isEmpty()){
+                    TextView dismissBtn=new TextView(this);
+                    dismissBtn.setText("Dismiss");
+                    dismissBtn.setTextSize(11f);
+                    dismissBtn.setTypeface(null,Typeface.BOLD);
+                    dismissBtn.setPadding(dp(9),dp(5),dp(9),dp(5));
+                    PhoneUiKit.stylePill(dismissBtn,palette.subtleBtnBg,palette.border,palette.textSecondary,this);
+                    dismissBtn.setOnClickListener(v->{
+                        if(isSelf)DeskTouchNotificationListener.cancelByKey(item.key);
+                        else s.dismissNotification(targetId,item.key);
+                        setFeedback("Dismissed notification.",false);
+                    });
+                    btnRow.addView(dismissBtn,new LinearLayout.LayoutParams(-2,-2));
+                }
+                row.addView(btnRow);
+
+                LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
+                rowLp.bottomMargin=dp(8);
+                container.addView(row,rowLp);
+            }
+        }
+
+        ScrollView scroller=new ScrollView(this);
+        scroller.addView(container);
+        new AlertDialog.Builder(this)
+            .setTitle(deviceName+" Notifications")
+            .setView(scroller)
+            .setPositiveButton("Close",null)
+            .show();
+    }
+
+    private void promptNotificationReply(int targetId,String key,String title,boolean isSelf){
+        final EditText input=new EditText(this);
+        input.setHint("Write quick reply...");
+        new AlertDialog.Builder(this)
+            .setTitle("Reply"+(title.isEmpty() ? "" : ": "+title))
+            .setView(input)
+            .setPositiveButton("Send",(dlg,which)->{
+                String reply=input.getText()!=null ? input.getText().toString().trim() : "";
+                if(reply.isEmpty())return;
+                if(isSelf){
+                    DeskTouchNotificationListener.sendInlineReply(this,key,reply);
+                }else{
+                    DeskTouchRuntime.session(this).replyNotification(targetId,key,reply);
+                }
+                setFeedback("Reply sent.",true);
+            })
+            .setNegativeButton("Cancel",null)
+            .show();
     }
 }

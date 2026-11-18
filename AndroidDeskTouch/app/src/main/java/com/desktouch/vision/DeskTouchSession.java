@@ -144,20 +144,30 @@ final class DeskTouchSession implements AutoCloseable {
         final int notificationCount;
         final int arrangementOrder;
         final double layoutX,layoutY,layoutW,layoutH;
+        final int batteryPercent;
+        final boolean charging;
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled){
-            this(id,name,platform,layout,enabled,-1,-1,0,0,0,0);
+            this(id,name,platform,layout,enabled,-1,-1,0,0,0,0,-1,false);
         }
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,int notificationCount){
-            this(id,name,platform,layout,enabled,notificationCount,-1,0,0,0,0);
+            this(id,name,platform,layout,enabled,notificationCount,-1,0,0,0,0,-1,false);
         }
         EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,
                 int notificationCount,int arrangementOrder,
                 double layoutX,double layoutY,double layoutW,double layoutH){
+            this(id,name,platform,layout,enabled,notificationCount,arrangementOrder,layoutX,layoutY,layoutW,layoutH,-1,false);
+        }
+        EnvironmentTarget(int id,String name,String platform,String layout,boolean enabled,
+                int notificationCount,int arrangementOrder,
+                double layoutX,double layoutY,double layoutW,double layoutH,
+                int batteryPercent,boolean charging){
             this.id=id;this.name=name;this.platform=platform;
             this.layout=layout;this.supportsInput=enabled;
             this.notificationCount=notificationCount;
             this.arrangementOrder=arrangementOrder;
             this.layoutX=layoutX;this.layoutY=layoutY;this.layoutW=layoutW;this.layoutH=layoutH;
+            this.batteryPercent=batteryPercent;
+            this.charging=charging;
         }
         @Override public String toString(){
             String base=platform+" • "+name+(supportsInput?"":" (view only)");
@@ -400,6 +410,25 @@ final class DeskTouchSession implements AutoCloseable {
         java.util.Collections.emptyList();
     private static final java.util.concurrent.ConcurrentHashMap<String,android.graphics.Bitmap> TASKBAR_ICON_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
+    private final EcosystemFeatures.ChunkAssembler screenPreviewAssembler = new EcosystemFeatures.ChunkAssembler();
+    private final EcosystemFeatures.ChunkAssembler clipboardImgAssembler = new EcosystemFeatures.ChunkAssembler();
+    private final java.util.concurrent.ConcurrentHashMap<Integer,java.util.List<EcosystemFeatures.NotificationItem>> peerNotifications =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<Integer,EcosystemFeatures.InboundFileWriter> inboundFiles = new HashMap<>();
+    private volatile android.graphics.Bitmap latestScreenPreview;
+    private volatile int screenPreviewWatchTarget = -1;
+    private volatile int screenPreviewWatchMonitor = -1;
+    private volatile String activeForegroundProc = "";
+    private volatile String activeForegroundTitle = "";
+    private volatile EcosystemFeatures.ProfileSummary profileSummary = EcosystemFeatures.parseProfileState("");
+    private volatile String lastAppliedClipboardHash = "";
+    private static final java.util.concurrent.atomic.AtomicInteger OUT_FILE_SEQ = new java.util.concurrent.atomic.AtomicInteger(1000);
+    private volatile int lastPublishedBatteryPct = -1;
+    private volatile boolean lastPublishedCharging;
+    private static volatile java.util.function.Consumer<String> remoteClipboardTextApplier;
+    static void setRemoteClipboardTextApplier(java.util.function.Consumer<String> applier){
+        remoteClipboardTextApplier = applier;
+    }
     private static final SecureRandom RANDOM=new SecureRandom();
 
     DeskTouchSession(Context context,TrustedWindows trust,Events events) {
@@ -741,7 +770,9 @@ final class DeskTouchSession implements AutoCloseable {
                     m.optDouble("LayoutX",0.0),
                     m.optDouble("LayoutY",0.0),
                     m.optDouble("LayoutW",0.0),
-                    m.optDouble("LayoutH",0.0)));
+                    m.optDouble("LayoutH",0.0),
+                    m.optInt("BatteryPercent",-1),
+                    m.optBoolean("IsCharging",false)));
             }
             if(!ids.contains(0))return;
             environmentOwnId=packet.a;
@@ -943,6 +974,7 @@ final class DeskTouchSession implements AutoCloseable {
                 }
                 ShellInputClient.warmConnectIfConfigured(application);
                 publishKeyboardBindings();
+                publishCurrentBatteryAndNotifications();
                 if(onConnected!=null) onConnected.run();
                 DeskTouchRuntime.notifyLiveStatusChanged();
                 Thread heartbeat=new Thread(()->{
@@ -1195,6 +1227,68 @@ final class DeskTouchSession implements AutoCloseable {
                 } else if("keyboard-layout".equals(p.type)){
                     pcKeyboardLayout=p.text!=null ? p.text : "";
                     publishKeyboardBindings();
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("clipboard-text".equals(p.type) && p.text!=null){
+                    if(EcosystemFeatures.isClipboardSyncEnabled(application)){
+                        try {
+                            JSONObject o=new JSONObject(p.text);
+                            String h=o.optString("h","");
+                            String t=o.optString("t","");
+                            if(!t.isEmpty() && !h.equals(lastAppliedClipboardHash)){
+                                lastAppliedClipboardHash=h;
+                                java.util.function.Consumer<String> applier=remoteClipboardTextApplier;
+                                if(applier!=null) applier.accept(t);
+                            }
+                        } catch(Exception ignored){}
+                    }
+                } else if("file-offer".equals(p.type)){
+                    beginInboundFile(p);
+                } else if("file-chunk".equals(p.type)){
+                    appendInboundFile(p);
+                } else if("file-done".equals(p.type)){
+                    completeInboundFile(p);
+                } else if("file-reject".equals(p.type)){
+                    closeInboundFile(p.a,true);
+                    if(p.text!=null && !p.text.isEmpty()) status("File rejected: "+p.text);
+                } else if("screen-preview-chunk".equals(p.type)){
+                    if(screenPreviewWatchMonitor>=0 && p.text!=null){
+                        int w=(p.d>>>16)&0xFFFF;
+                        int h=p.d&0xFFFF;
+                        EcosystemFeatures.ChunkAssembler.Result res=screenPreviewAssembler.addChunk(
+                            p.a,p.b,p.c,w,h,p.text,"");
+                        if(res!=null && res.data!=null){
+                            android.graphics.Bitmap bmp=android.graphics.BitmapFactory.decodeByteArray(res.data,0,res.data.length);
+                            if(bmp!=null){
+                                latestScreenPreview=bmp;
+                                DeskTouchRuntime.notifyLiveStatusChanged();
+                            }
+                        }
+                    }
+                } else if("foreground-app".equals(p.type) && p.text!=null){
+                    int sep=p.text.indexOf('|');
+                    activeForegroundProc=sep>=0 ? p.text.substring(0,sep) : p.text;
+                    activeForegroundTitle=sep>=0 ? p.text.substring(sep+1) : "";
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("notif-preview-state".equals(p.type) && p.text!=null){
+                    java.util.List<EcosystemFeatures.NotificationItem> items=EcosystemFeatures.parseNotificationList(p.text);
+                    peerNotifications.put(p.a,items);
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("notif-dismiss".equals(p.type) && p.text!=null){
+                    DeskTouchNotificationListener.cancelByKey(p.text);
+                } else if("notif-reply".equals(p.type) && p.text!=null){
+                    try {
+                        JSONObject o=new JSONObject(p.text);
+                        String k=o.optString("k","");
+                        String r=o.optString("r","");
+                        if(!k.isEmpty() && !r.isEmpty()){
+                            DeskTouchNotificationListener.sendInlineReply(application,k,r);
+                        }
+                    } catch(Exception ignored){}
+                } else if("profile-state".equals(p.type) && p.text!=null){
+                    profileSummary=EcosystemFeatures.parseProfileState(p.text);
+                    EcosystemFeatures.setClipboardSyncEnabled(application,profileSummary.clipboardSync);
+                    EcosystemFeatures.setNotifPreviewsEnabled(application,profileSummary.notifPreviews);
+                    EcosystemFeatures.setOtpHelperEnabled(application,profileSummary.otpHelper);
                     DeskTouchRuntime.notifyLiveStatusChanged();
                 } else if("pause-accessibility".equals(p.type)){
                     handlePauseAccessibilityFromWindows();
@@ -1486,6 +1580,241 @@ final class DeskTouchSession implements AutoCloseable {
     void publishNotificationCount(int count){
         if(!running)return;
         send(new Packet("notify-count",count));
+    }
+
+    void publishNotificationPreviews(String json){
+        if(!running || json==null || json.length()>7600) return;
+        send(new Packet("notif-preview-state",0,0,0,0,json));
+    }
+
+    void publishOtpOffer(String app, String code, String title){
+        if(!running || code==null || code.isEmpty()) return;
+        try {
+            String json=new JSONObject().put("App",app==null?"Phone":app)
+                .put("Code",code).put("Title",title==null?"":title).toString();
+            send(new Packet("otp-offer",0,0,0,0,json));
+        } catch(Exception ignored){}
+    }
+
+    void publishBatteryState(int percent, boolean charging, String signalLabel){
+        if(!running)return;
+        if(percent==lastPublishedBatteryPct && charging==lastPublishedCharging) return;
+        lastPublishedBatteryPct=percent;
+        lastPublishedCharging=charging;
+        send(new Packet("device-battery",percent,charging?1:0,0,0,signalLabel==null?"":signalLabel));
+    }
+
+    private void publishCurrentBatteryAndNotifications(){
+        try {
+            android.content.Intent batt=application.registerReceiver(null,
+                new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
+            if(batt!=null){
+                int lvl=batt.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL,-1);
+                int scale=batt.getIntExtra(android.os.BatteryManager.EXTRA_SCALE,100);
+                int pct=lvl>=0 && scale>0 ? Math.min(100,Math.max(0,(lvl*100)/scale)) : -1;
+                int st=batt.getIntExtra(android.os.BatteryManager.EXTRA_STATUS,-1);
+                boolean chg=st==android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+                    st==android.os.BatteryManager.BATTERY_STATUS_FULL;
+                publishBatteryState(pct,chg,liveLinkBand);
+            }
+            if(EcosystemFeatures.isNotifPreviewsEnabled(application)){
+                java.util.List<EcosystemFeatures.NotificationItem> items=DeskTouchNotificationListener.readRecentItems(application);
+                if(!items.isEmpty()) publishNotificationPreviews(EcosystemFeatures.serializeNotificationList(items));
+            }
+        } catch(Exception ignored){}
+    }
+
+    boolean isLastReceivedClipboardHash(String hash){
+        return hash!=null && hash.equals(lastAppliedClipboardHash);
+    }
+
+    void sendClipboardText(String hash, String text){
+        if(!running || text==null || text.isEmpty() || !EcosystemFeatures.isClipboardSyncEnabled(application)) return;
+        if(hash!=null && hash.equals(lastAppliedClipboardHash)) return;
+        String clipped=text.length()>2800 ? text.substring(0,2800) : text;
+        lastAppliedClipboardHash=hash;
+        try {
+            String json=new JSONObject().put("h",hash==null?"":hash).put("t",clipped).toString();
+            send(new Packet("clipboard-text",0,0,0,0,json));
+        } catch(Exception ignored){}
+    }
+
+    void sendMediaAction(int targetId, String action, int value){
+        if(!running || action==null || action.isEmpty()) return;
+        send(new Packet("media-action",targetId,value,0,0,action));
+    }
+
+    void sendPowerAction(int targetId, String action){
+        if(!running || action==null || action.isEmpty()) return;
+        send(new Packet("power-action",targetId,0,0,0,action));
+    }
+
+    void applyProfile(String profileName){
+        if(!running || profileName==null || profileName.isEmpty()) return;
+        send(new Packet("profile-apply",0,0,0,0,profileName));
+    }
+
+    void dismissNotification(int targetId, String key){
+        if(!running || key==null || key.isEmpty()) return;
+        send(new Packet("notif-dismiss",targetId,0,0,0,key));
+    }
+
+    void replyNotification(int targetId, String key, String reply){
+        if(!running || key==null || key.isEmpty() || reply==null || reply.isEmpty()) return;
+        try {
+            String json=new JSONObject().put("k",key).put("r",reply).toString();
+            send(new Packet("notif-reply",targetId,0,0,0,json));
+        } catch(Exception ignored){}
+    }
+
+    void setScreenPreviewWatch(int targetId, int monitorIndex){
+        screenPreviewWatchTarget=targetId;
+        screenPreviewWatchMonitor=monitorIndex;
+        if(monitorIndex<0) latestScreenPreview=null;
+        if(running) send(new Packet("screen-preview-watch",targetId,monitorIndex));
+    }
+
+    android.graphics.Bitmap currentScreenPreview(){ return latestScreenPreview; }
+    boolean isScreenPreviewWatching(){ return running && screenPreviewWatchMonitor>=0; }
+    String activeForegroundProc(){ return activeForegroundProc; }
+    String activeForegroundTitle(){ return activeForegroundTitle; }
+    EcosystemFeatures.ProfileSummary profileSummary(){ return profileSummary; }
+    java.util.List<EcosystemFeatures.NotificationItem> peerNotifications(int id){
+        java.util.List<EcosystemFeatures.NotificationItem> list=peerNotifications.get(id);
+        return list!=null ? list : java.util.Collections.emptyList();
+    }
+
+    void moveToNormalizedInActiveMonitor(float nx, float ny){
+        if(!running)return;
+        if(!active && !hasClaim()) claimControl();
+        synchronized(monitors){
+            if(monitors.isEmpty()) return;
+            int idx=activeMonitorIndex();
+            if(idx<0 || idx>=monitors.size()) idx=0;
+            int[] mon=monitors.get(idx);
+            cursorX=mon[0]+Math.round(Math.max(0f,Math.min(1f,nx))*(mon[2]-1));
+            cursorY=mon[1]+Math.round(Math.max(0f,Math.min(1f,ny))*(mon[3]-1));
+            clampToMonitor();
+            sendMovePacket(cursorX,cursorY);
+        }
+    }
+
+    private void sendMovePacket(int x, int y){
+        FastUdpChannel ch=activeForwardUdp(false);
+        if(ch!=null && !udpPacer.isShutdown()){
+            final int lease=claim;
+            udpPacer.execute(()->ch.sendWithTag(FastUdpChannel.OP_MOVE,x,y,lease,(int)SystemClock.uptimeMillis()));
+        } else {
+            send(new Packet("move",x,y));
+        }
+    }
+
+    void sendFileUriAsync(int targetId, android.net.Uri uri, java.util.function.Consumer<String> onDone){
+        if(!running || uri==null){
+            if(onDone!=null) onDone.accept("Connect to a computer first.");
+            return;
+        }
+        String fileName=EcosystemFeatures.sanitizeFileName(EcosystemFeatures.queryUriFileName(application,uri));
+        long size=EcosystemFeatures.queryUriSize(application,uri);
+        if(size>EcosystemFeatures.MAX_FILE_BYTES){
+            if(onDone!=null) onDone.accept("File exceeds 25 MB limit.");
+            return;
+        }
+        Thread t=new Thread(()->{
+            try (java.io.InputStream in=application.getContentResolver().openInputStream(uri)){
+                if(in==null){ if(onDone!=null)onDone.accept("Cannot read selected file."); return; }
+                java.io.ByteArrayOutputStream bos=new java.io.ByteArrayOutputStream();
+                byte[] buf=new byte[8192];
+                int n;
+                int total=0;
+                while((n=in.read(buf))>0){
+                    total+=n;
+                    if(total>EcosystemFeatures.MAX_FILE_BYTES){
+                        if(onDone!=null)onDone.accept("File exceeds 25 MB limit.");
+                        return;
+                    }
+                    bos.write(buf,0,n);
+                }
+                byte[] all=bos.toByteArray();
+                if(all.length==0){ if(onDone!=null)onDone.accept("File is empty."); return; }
+                int txId=OUT_FILE_SEQ.incrementAndGet();
+                writeNow(new Packet("file-offer",txId,all.length,targetId,0,fileName));
+                int seq=0;
+                for(int off=0;off<all.length;off+=EcosystemFeatures.FILE_CHUNK_RAW_BYTES){
+                    if(!running) return;
+                    int len=Math.min(EcosystemFeatures.FILE_CHUNK_RAW_BYTES,all.length-off);
+                    String b64=android.util.Base64.encodeToString(all,off,len,android.util.Base64.NO_WRAP);
+                    writeNow(new Packet("file-chunk",txId,seq++,targetId,0,b64));
+                }
+                writeNow(new Packet("file-done",txId,seq,targetId,0,""));
+                if(onDone!=null) onDone.accept("Sent '"+fileName+"' cleanly.");
+            } catch(Exception ex){
+                if(onDone!=null) onDone.accept("File transfer failed: "+ex.getMessage());
+            }
+        },"DeskTouch FileSend");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void beginInboundFile(Packet p){
+        int txId=p.a;
+        int size=p.b;
+        String safe=EcosystemFeatures.sanitizeFileName(p.text);
+        if(txId<=0 || size<=0 || size>EcosystemFeatures.MAX_FILE_BYTES){
+            send(new Packet("file-reject",txId,0,0,0,"Exceeds 25 MB limit"));
+            return;
+        }
+        synchronized(inboundFiles){
+            if(inboundFiles.size()>=4){
+                send(new Packet("file-reject",txId,0,0,0,"Too many transfers"));
+                return;
+            }
+            try {
+                java.io.File tmp=new java.io.File(application.getCacheDir(),"dt_rx_"+txId+".part");
+                java.io.FileOutputStream fos=new java.io.FileOutputStream(tmp);
+                inboundFiles.put(txId,new EcosystemFeatures.InboundFileWriter(txId,safe,tmp,fos,size));
+            } catch(Exception ignored){}
+        }
+    }
+
+    private void appendInboundFile(Packet p){
+        if(p.text==null || p.text.isEmpty()) return;
+        byte[] chunk;
+        try { chunk=android.util.Base64.decode(p.text,android.util.Base64.DEFAULT); }
+        catch(Exception ignored){ return; }
+        synchronized(inboundFiles){
+            EcosystemFeatures.InboundFileWriter w=inboundFiles.get(p.a);
+            if(w==null) return;
+            try {
+                if(w.receivedBytes+chunk.length>w.expectedBytes+1024){
+                    closeInboundFile(p.a,true);
+                    return;
+                }
+                w.out.write(chunk);
+                w.receivedBytes+=chunk.length;
+            } catch(Exception ignored){ closeInboundFile(p.a,true); }
+        }
+    }
+
+    private void completeInboundFile(Packet p){
+        EcosystemFeatures.InboundFileWriter w;
+        synchronized(inboundFiles){ w=inboundFiles.remove(p.a); }
+        if(w==null) return;
+        try { w.out.flush(); w.out.close(); } catch(Exception ignored){}
+        String saved=EcosystemFeatures.saveCompletedDownload(application,w.fileName,w.tempFile);
+        if(saved!=null){
+            status("Saved received file: "+saved);
+        } else {
+            w.tempFile.delete();
+        }
+    }
+
+    private void closeInboundFile(int txId,boolean deleteTemp){
+        EcosystemFeatures.InboundFileWriter w;
+        synchronized(inboundFiles){ w=inboundFiles.remove(txId); }
+        if(w==null) return;
+        try { w.out.close(); } catch(Exception ignored){}
+        if(deleteTemp) w.tempFile.delete();
     }
 
     void claimControl(){
@@ -2671,6 +3000,16 @@ final class DeskTouchSession implements AutoCloseable {
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         taskbarTargetId=-1;taskbarItems=java.util.Collections.emptyList();
+        screenPreviewWatchTarget=-1;screenPreviewWatchMonitor=-1;latestScreenPreview=null;
+        activeForegroundProc="";activeForegroundTitle="";
+        lastPublishedBatteryPct=-1;peerNotifications.clear();
+        synchronized(inboundFiles){
+            for(EcosystemFeatures.InboundFileWriter w:inboundFiles.values()){
+                try{w.out.close();}catch(Exception ignored){}
+                w.tempFile.delete();
+            }
+            inboundFiles.clear();
+        }
         if(DeskTouchRuntime.connectedCount()==0) RemoteInputPower.end();
         else RemoteInputPower.begin(application);
         AutoConnectService.onConnectionCountChanged(application);

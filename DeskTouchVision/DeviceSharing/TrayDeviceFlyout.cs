@@ -16,16 +16,20 @@ internal sealed class TrayDeviceFlyout : Form
         private bool _hovered;
         private readonly Action<BridgeDeviceItemDto> _onSelect;
         private readonly Action<BridgeDeviceItemDto> _onTogglePay;
+        private readonly Action<BridgeDeviceItemDto, Point>? _onOpenNotifs;
         private Rectangle _payRect;
+        private Rectangle _badgeRect;
 
         internal DeviceCardControl(
             BridgeDeviceItemDto device,
             Action<BridgeDeviceItemDto> onSelect,
-            Action<BridgeDeviceItemDto> onTogglePay)
+            Action<BridgeDeviceItemDto> onTogglePay,
+            Action<BridgeDeviceItemDto, Point>? onOpenNotifs = null)
         {
             _device = device;
             _onSelect = onSelect;
             _onTogglePay = onTogglePay;
+            _onOpenNotifs = onOpenNotifs;
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.UserPaint |
@@ -60,6 +64,11 @@ internal sealed class TrayDeviceFlyout : Form
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
+            if (!_badgeRect.IsEmpty && _badgeRect.Contains(e.Location) && _onOpenNotifs != null)
+            {
+                _onOpenNotifs(_device, PointToScreen(e.Location));
+                return;
+            }
             if (!_payRect.IsEmpty && _payRect.Contains(e.Location))
             {
                 _onTogglePay(_device);
@@ -88,6 +97,7 @@ internal sealed class TrayDeviceFlyout : Form
             int badgeW = Math.Max(34, Math.Min(Width - 16, badgeTextSize.Width + 16));
             int badgeH = 20;
             var badgeRect = new Rectangle((Width - badgeW) / 2, 0, badgeW, badgeH);
+            _badgeRect = badgeRect;
             using (var badgePath = RoundedRect(badgeRect, 10))
             using (var badgeBrush = new SolidBrush(notifBg))
             {
@@ -114,7 +124,10 @@ internal sealed class TrayDeviceFlyout : Form
                 g.DrawPath(borderPen, cardPath);
             }
 
-            string tag = _device.IsLocal ? "THIS PC" : (_device.Platform == "Android" ? "PHONE" : "PC");
+            string battText = _device.BatteryPercent >= 0
+                ? (_device.IsCharging ? $" • ⚡{_device.BatteryPercent}%" : $" • {_device.BatteryPercent}%")
+                : "";
+            string tag = (_device.IsLocal ? "THIS PC" : (_device.Platform == "Android" ? "PHONE" : "PC")) + battText;
             Color tagColor = _device.IsLocal
                 ? Color.FromArgb(147, 197, 253)
                 : (_device.Platform == "Android"
@@ -210,18 +223,21 @@ internal sealed class TrayDeviceFlyout : Form
     private readonly Action _onReturnLocal;
     private readonly Action<int> _onTogglePay;
     private readonly Action _onOpenMainWindow;
+    private readonly Action<int, string, Point>? _onOpenNotifications;
     private BridgeDeviceSnapshotDto? _snapshot;
 
     internal TrayDeviceFlyout(
         Action<int> onSwitchTarget,
         Action onReturnLocal,
         Action<int> onTogglePay,
-        Action onOpenMainWindow)
+        Action onOpenMainWindow,
+        Action<int, string, Point>? onOpenNotifications = null)
     {
         _onSwitchTarget = onSwitchTarget;
         _onReturnLocal = onReturnLocal;
         _onTogglePay = onTogglePay;
         _onOpenMainWindow = onOpenMainWindow;
+        _onOpenNotifications = onOpenNotifications;
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -336,6 +352,11 @@ internal sealed class TrayDeviceFlyout : Form
                     d =>
                     {
                         _onTogglePay(d.Id);
+                    },
+                    (d, pt) =>
+                    {
+                        Hide();
+                        _onOpenNotifications?.Invoke(d.Id, d.Name, pt);
                     });
                 _cardsPanel.Controls.Add(card);
             }

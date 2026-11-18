@@ -47,6 +47,9 @@ public final class MainActivity extends Activity {
     private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout,trackpadTaskbarLbl;
     private LinearLayout trackpadTaskbarCard,trackpadPcBar,trackpadScreenBar;
     private HorizontalScrollView trackpadScreenScroll;
+    private LinearLayout winTaskbarCard,winTaskbarRow;
+    private TextView winTaskbarTitle;
+    private String lastWindowsTaskbarSig="";
     private TextView findStatus,findCountTag;
     private EditText pairingCodeInput;
     private volatile List<DesktopDiscovery.Device> lastScannedDevices=new ArrayList<>();
@@ -865,7 +868,7 @@ public final class MainActivity extends Activity {
         };
         pointerPad.setFocusable(true);
         pointerPad.setFocusableInTouchMode(true);
-        LinearLayout.LayoutParams padLp=new LinearLayout.LayoutParams(-1,dp(220));
+        LinearLayout.LayoutParams padLp=new LinearLayout.LayoutParams(-1,dp(190));
         padLp.topMargin=dp(10);
         padCard.addView(pointerPad,padLp);
         pointerPad.setOnTouchListener((v,event)->{
@@ -969,6 +972,30 @@ public final class MainActivity extends Activity {
         keyboardInput.setMinHeight(dp(44));
         keyboardInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT|
             android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+
+        winTaskbarCard=new LinearLayout(this);
+        winTaskbarCard.setOrientation(LinearLayout.VERTICAL);
+        winTaskbarCard.setPadding(dp(8),dp(6),dp(8),dp(6));
+        LinearLayout.LayoutParams wtWrapLp=new LinearLayout.LayoutParams(-1,-2);
+        wtWrapLp.topMargin=dp(10);
+        padCard.addView(winTaskbarCard,wtWrapLp);
+
+        winTaskbarTitle=new TextView(this);
+        winTaskbarTitle.setText("Windows Taskbar");
+        winTaskbarTitle.setTextSize(10f);
+        winTaskbarTitle.setTypeface(null,Typeface.BOLD);
+        winTaskbarTitle.setTextColor(palette.textSecondary);
+        winTaskbarTitle.setPadding(dp(2),0,dp(2),dp(4));
+        winTaskbarCard.addView(winTaskbarTitle);
+
+        HorizontalScrollView winTaskbarScroll=new HorizontalScrollView(this);
+        winTaskbarScroll.setHorizontalScrollBarEnabled(false);
+        winTaskbarRow=new LinearLayout(this);
+        winTaskbarRow.setOrientation(LinearLayout.HORIZONTAL);
+        winTaskbarRow.setGravity(Gravity.CENTER_VERTICAL);
+        winTaskbarRow.setMinimumHeight(dp(42));
+        winTaskbarScroll.addView(winTaskbarRow,new HorizontalScrollView.LayoutParams(-2,-2));
+        winTaskbarCard.addView(winTaskbarScroll,new LinearLayout.LayoutParams(-1,-2));
 
         LinearLayout mouseActions=new LinearLayout(this);
         mouseActions.setOrientation(LinearLayout.HORIZONTAL);
@@ -1095,7 +1122,9 @@ public final class MainActivity extends Activity {
             PhoneUiKit.styleCard(controlCard,p,this);
             PhoneUiKit.styleSubcard(trackpadTaskbarCard,p,this);
             trackpadTaskbarLbl.setTextColor(p.textSecondary);
+            lastWindowsTaskbarSig="";
             refreshTrackpadPcTaskbar();
+            refreshWindowsTaskbar();
             PhoneUiKit.styleCard(padCard,p,this);
             trackpadTargetTitle.setTextColor(p.textPrimary);
             padSurfaceTitle.setTextColor(p.textPrimary);
@@ -1837,9 +1866,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.79";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.80";
         }catch(Exception ignored){
-            return "0.3.79";
+            return "0.3.80";
         }
     }
 
@@ -2035,6 +2064,7 @@ public final class MainActivity extends Activity {
                     controlling ? p.emeraldText : p.accentText,this);
             }
         }
+        refreshWindowsTaskbar();
     }
 
     private void refreshTelemetryCards(DeskTouchSession.LiveStatusSnapshot snap,
@@ -2566,6 +2596,7 @@ public final class MainActivity extends Activity {
             }else{
                 trackpadPcBar.addView(createTaskbarChip("No PC linked • Tap to Find",false,v->selectTab(PhoneUiKit.TAB_FIND)));
             }
+            refreshWindowsTaskbar();
             return;
         }
 
@@ -2634,6 +2665,263 @@ public final class MainActivity extends Activity {
                     setFeedback("Moved cursor to Display 1.",false);
                 }));
         }
+        refreshWindowsTaskbar();
+    }
+
+    private void refreshWindowsTaskbar(){
+        if(winTaskbarCard==null || winTaskbarRow==null)return;
+        DeskTouchSession active=DeskTouchRuntime.session(this);
+        DeskTouchSession.LiveStatusSnapshot snap=DeskTouchRuntime.liveSnapshot(this);
+        boolean connected=snap!=null && snap.connected;
+        int targetId=connected ? active.selectedEnvironmentTarget() : -1;
+        String targetName=connected ? resolveTargetPcName(active,targetId,snap.peerName) : "Computer";
+        boolean hasState=connected && active.hasTaskbarSnapshotForTarget(targetId);
+        List<DeskTouchSession.TaskbarItem> items=connected
+            ? active.taskbarItemsForTarget(targetId)
+            : java.util.Collections.emptyList();
+
+        StringBuilder sig=new StringBuilder(128);
+        sig.append(palette.themeId).append('|').append(connected?'1':'0').append('|')
+            .append(targetId).append('|').append(targetName).append('|').append(hasState?'1':'0');
+        for(DeskTouchSession.TaskbarItem item:items){
+            boolean hasIcon=active.taskbarIcon(item.iconHash)!=null;
+            sig.append(';').append(item.key).append(':')
+                .append(item.active?'1':'0').append(item.minimized?'1':'0').append(item.running?'1':'0')
+                .append(':').append(item.title).append(':').append(hasIcon?'1':'0');
+        }
+        String nextSig=sig.toString();
+        if(nextSig.equals(lastWindowsTaskbarSig))return;
+        lastWindowsTaskbarSig=nextSig;
+
+        PhoneUiKit.Palette p=palette;
+        boolean lightTheme=p.themeId==PhoneUiKit.THEME_LIGHT;
+        int barFill=lightTheme ? 0xFFEAEFF6 : 0xFF151E2E;
+        int barBorder=lightTheme ? 0xFFD0D9E6 : 0xFF28354C;
+        winTaskbarCard.setBackground(PhoneUiKit.roundedBox(barFill,barBorder,dp(10),Math.max(1,dp(1))));
+        if(winTaskbarTitle!=null){
+            winTaskbarTitle.setTextColor(p.textSecondary);
+            winTaskbarTitle.setText(connected
+                ? targetName+" • Windows Taskbar (Tap app to focus)"
+                : "Windows Taskbar (Connect a computer in Find)");
+        }
+
+        winTaskbarRow.removeAllViews();
+
+        // Start button (Windows 4-pane logo)
+        LinearLayout startTile=createStartTaskbarButton(lightTheme,v->{
+            if(!connected){
+                setFeedback("Connect to a computer in Find first.",true);
+                selectTab(PhoneUiKit.TAB_FIND);
+                return;
+            }
+            active.sendTaskbarAction(targetId,"__start__");
+            setFeedback("Opened Start menu on "+targetName+".",false);
+        });
+        winTaskbarRow.addView(startTile);
+
+        // Search pill
+        LinearLayout searchTile=createSearchTaskbarButton(lightTheme,v->{
+            if(!connected){
+                setFeedback("Connect to a computer in Find first.",true);
+                selectTab(PhoneUiKit.TAB_FIND);
+                return;
+            }
+            active.sendTaskbarAction(targetId,"__search__");
+            setFeedback("Opened Search on "+targetName+".",false);
+        });
+        LinearLayout.LayoutParams searchLp=new LinearLayout.LayoutParams(-2,dp(36));
+        searchLp.leftMargin=dp(5);
+        winTaskbarRow.addView(searchTile,searchLp);
+
+        View sep=new View(this);
+        sep.setBackgroundColor(lightTheme ? 0xFFC8D2E0 : 0xFF2D3C55);
+        LinearLayout.LayoutParams sepLp=new LinearLayout.LayoutParams(Math.max(1,dp(1)),dp(24));
+        sepLp.leftMargin=dp(6);
+        sepLp.rightMargin=dp(4);
+        winTaskbarRow.addView(sep,sepLp);
+
+        if(!connected){
+            TextView prompt=createTaskbarChip("Link Computer →",false,v->selectTab(PhoneUiKit.TAB_FIND));
+            LinearLayout.LayoutParams pLp=new LinearLayout.LayoutParams(-2,-2);
+            pLp.leftMargin=dp(4);
+            winTaskbarRow.addView(prompt,pLp);
+            return;
+        }
+
+        if(!hasState){
+            TextView loading=new TextView(this);
+            loading.setText("Syncing taskbar apps...");
+            loading.setTextSize(10.5f);
+            loading.setTextColor(p.textMuted);
+            loading.setPadding(dp(8),dp(4),dp(8),dp(4));
+            winTaskbarRow.addView(loading);
+            return;
+        }
+
+        if(items.isEmpty()){
+            TextView none=new TextView(this);
+            none.setText("No open apps");
+            none.setTextSize(10.5f);
+            none.setTextColor(p.textMuted);
+            none.setPadding(dp(8),dp(4),dp(8),dp(4));
+            winTaskbarRow.addView(none);
+            return;
+        }
+
+        for(int i=0;i<items.size();i++){
+            final DeskTouchSession.TaskbarItem item=items.get(i);
+            android.graphics.Bitmap bmp=active.taskbarIcon(item.iconHash);
+            LinearLayout appTile=createWindowsTaskbarAppButton(item,bmp,lightTheme,v->{
+                active.sendTaskbarAction(targetId,item.key);
+                setFeedback((item.running ? "Switched to " : "Opening ")+item.title+" on "+targetName+".",false);
+            });
+            LinearLayout.LayoutParams aLp=new LinearLayout.LayoutParams(-2,dp(42));
+            if(i>0)aLp.leftMargin=dp(4);
+            winTaskbarRow.addView(appTile,aLp);
+        }
+    }
+
+    private String resolveTargetPcName(DeskTouchSession active,int targetId,String fallbackName){
+        for(DeskTouchSession.EnvironmentTarget t:active.environmentTargets()){
+            if(t.id==targetId && t.name!=null && !t.name.trim().isEmpty())
+                return t.name.trim();
+        }
+        return (fallbackName!=null && !fallbackName.trim().isEmpty()) ? fallbackName.trim() : "Windows";
+    }
+
+    private LinearLayout createStartTaskbarButton(boolean lightTheme,View.OnClickListener onClick){
+        LinearLayout box=new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setMinimumWidth(dp(36));
+        box.setLayoutParams(new LinearLayout.LayoutParams(dp(36),dp(36)));
+        int bg=lightTheme ? 0xFFF7F9FC : 0xFF1F2B40;
+        int pressed=lightTheme ? 0xFFE0E8F3 : 0xFF2B3B56;
+        int stroke=lightTheme ? 0xFFD2DCE8 : 0xFF314361;
+        box.setBackground(PhoneUiKit.interactiveBg(bg,pressed,stroke,dp(8),Math.max(1,dp(1)),palette.rippleColor));
+        View logo=new View(this){
+            final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
+            @Override protected void onDraw(Canvas c){
+                int size=Math.min(getWidth(),getHeight());
+                float gap=Math.max(1.5f,size*0.09f);
+                float cell=(size-gap)/2f;
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(0xFF0EA5E9);
+                c.drawRoundRect(0,0,cell,cell,1.5f,1.5f,paint);
+                c.drawRoundRect(cell+gap,0,size,cell,1.5f,1.5f,paint);
+                paint.setColor(0xFF0284C7);
+                c.drawRoundRect(0,cell+gap,cell,size,1.5f,1.5f,paint);
+                c.drawRoundRect(cell+gap,cell+gap,size,size,1.5f,1.5f,paint);
+            }
+        };
+        box.addView(logo,new LinearLayout.LayoutParams(dp(16),dp(16)));
+        box.setClickable(true);box.setFocusable(true);box.setOnClickListener(onClick);
+        return box;
+    }
+
+    private LinearLayout createSearchTaskbarButton(boolean lightTheme,View.OnClickListener onClick){
+        LinearLayout box=new LinearLayout(this);
+        box.setOrientation(LinearLayout.HORIZONTAL);
+        box.setGravity(Gravity.CENTER_VERTICAL);
+        box.setPadding(dp(8),dp(4),dp(9),dp(4));
+        int bg=lightTheme ? 0xFFFFFFFF : 0xFF223047;
+        int pressed=lightTheme ? 0xFFE2E8F0 : 0xFF2D3F5C;
+        int stroke=lightTheme ? 0xFFCBD5E1 : 0xFF334766;
+        box.setBackground(PhoneUiKit.interactiveBg(bg,pressed,stroke,dp(16),Math.max(1,dp(1)),palette.rippleColor));
+        PhoneUiKit.TabIconView searchIcon=new PhoneUiKit.TabIconView(this,PhoneUiKit.TAB_FIND);
+        searchIcon.setColor(lightTheme ? 0xFF334155 : 0xFFCBD5E1);
+        LinearLayout.LayoutParams icLp=new LinearLayout.LayoutParams(dp(14),dp(14));
+        icLp.rightMargin=dp(4);
+        box.addView(searchIcon,icLp);
+        TextView txt=new TextView(this);
+        txt.setText("Search");
+        txt.setTextSize(10f);
+        txt.setTypeface(null,Typeface.BOLD);
+        txt.setTextColor(lightTheme ? 0xFF334155 : 0xFFE2E8F0);
+        box.addView(txt);
+        box.setClickable(true);box.setFocusable(true);box.setOnClickListener(onClick);
+        return box;
+    }
+
+    private LinearLayout createWindowsTaskbarAppButton(
+            DeskTouchSession.TaskbarItem item,
+            android.graphics.Bitmap iconBmp,
+            boolean lightTheme,
+            View.OnClickListener onClick){
+        LinearLayout tile=new LinearLayout(this);
+        tile.setOrientation(LinearLayout.VERTICAL);
+        tile.setGravity(Gravity.CENTER_HORIZONTAL);
+        tile.setPadding(dp(6),dp(3),dp(6),dp(2));
+        tile.setMinimumWidth(dp(44));
+
+        int bg;
+        int pressed;
+        int stroke;
+        if(item.active){
+            bg=lightTheme ? 0xFFFFFFFF : 0xFF253752;
+            pressed=lightTheme ? 0xFFF1F5F9 : 0xFF2F4463;
+            stroke=lightTheme ? 0xFF93C5FD : 0xFF38BDF8;
+        }else if(item.running){
+            bg=lightTheme ? 0x44FFFFFF : 0xFF1B273B;
+            pressed=lightTheme ? 0xFFDCE4F0 : 0xFF26354E;
+            stroke=lightTheme ? 0x44CBD5E1 : 0xFF2B3B56;
+        }else{
+            bg=Color.TRANSPARENT;
+            pressed=lightTheme ? 0xFFDCE4F0 : 0xFF233148;
+            stroke=Color.TRANSPARENT;
+        }
+        tile.setBackground(PhoneUiKit.interactiveBg(
+            bg,pressed,stroke,dp(8),item.active ? Math.max(1,dp(1)) : 0,palette.rippleColor));
+
+        if(iconBmp!=null){
+            ImageView img=new ImageView(this);
+            img.setImageBitmap(iconBmp);
+            img.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            if(!item.running)img.setAlpha(0.78f);
+            LinearLayout.LayoutParams imLp=new LinearLayout.LayoutParams(dp(20),dp(20));
+            tile.addView(img,imLp);
+        }else{
+            TextView mono=new TextView(this);
+            String letter=item.app.isEmpty() ? "A" : item.app.substring(0,1).toUpperCase(Locale.ROOT);
+            mono.setText(letter);
+            mono.setTextSize(10.5f);
+            mono.setTypeface(null,Typeface.BOLD);
+            mono.setTextColor(Color.WHITE);
+            mono.setGravity(Gravity.CENTER);
+            mono.setBackground(PhoneUiKit.roundedBox(
+                item.active ? 0xFF0284C7 : 0xFF475569,Color.TRANSPARENT,dp(5),0));
+            tile.addView(mono,new LinearLayout.LayoutParams(dp(20),dp(20)));
+        }
+
+        TextView lbl=new TextView(this);
+        lbl.setText(item.app);
+        lbl.setTextSize(8.5f);
+        lbl.setTypeface(null,item.active ? Typeface.BOLD : Typeface.NORMAL);
+        lbl.setTextColor(item.active
+            ? (lightTheme ? 0xFF0F172A : Color.WHITE)
+            : (lightTheme ? 0xFF475569 : 0xFFCBD5E1));
+        lbl.setSingleLine(true);
+        lbl.setMaxWidth(dp(56));
+        lbl.setEllipsize(TextUtils.TruncateAt.END);
+        lbl.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams lLp=new LinearLayout.LayoutParams(-2,-2);
+        lLp.topMargin=dp(1);
+        tile.addView(lbl,lLp);
+
+        View indicator=new View(this);
+        int indW=item.active ? dp(14) : (item.running ? dp(5) : dp(4));
+        int indColor=item.active
+            ? (lightTheme ? 0xFF0078D4 : 0xFF38BDF8)
+            : (item.running ? (lightTheme ? 0xFF64748B : 0xFF94A3B8) : Color.TRANSPARENT);
+        indicator.setBackground(PhoneUiKit.roundedBox(indColor,Color.TRANSPARENT,dp(2),0));
+        LinearLayout.LayoutParams indLp=new LinearLayout.LayoutParams(indW,Math.max(2,dp(2)));
+        indLp.topMargin=dp(1);
+        tile.addView(indicator,indLp);
+
+        tile.setClickable(true);
+        tile.setFocusable(true);
+        tile.setOnClickListener(onClick);
+        return tile;
     }
 
     private TextView createTaskbarChip(String label,boolean selected,View.OnClickListener onClick){

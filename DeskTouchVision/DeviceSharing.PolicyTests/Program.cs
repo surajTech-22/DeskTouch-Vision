@@ -761,6 +761,36 @@ Check(daemonScript.Contains("umask 077", StringComparison.Ordinal) &&
     "Shell Bridge launcher script must pass token only via stdin 077 file unlinked before exec without pkill self-match");
 Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch scripts enforce safety invariants.");
 
+// Verify live Windows Taskbar capture, wire-size bounds, and strict action token allowlist.
+{
+    Check(WindowsTaskbarHelper.IsValidActionKeyFormat("__start__") &&
+        WindowsTaskbarHelper.IsValidActionKeyFormat("__search__") &&
+        WindowsTaskbarHelper.IsValidActionKeyFormat("w1A2B3C") &&
+        WindowsTaskbarHelper.IsValidActionKeyFormat("p0"),
+        "WindowsTaskbarHelper must accept valid Start, Search, window, and pinned action tokens");
+    Check(!WindowsTaskbarHelper.IsValidActionKeyFormat("") &&
+        !WindowsTaskbarHelper.IsValidActionKeyFormat(null) &&
+        !WindowsTaskbarHelper.IsValidActionKeyFormat("cmd.exe") &&
+        !WindowsTaskbarHelper.IsValidActionKeyFormat("C:\\Windows\\System32\\cmd.exe") &&
+        !WindowsTaskbarHelper.IsValidActionKeyFormat("w_bad_token") &&
+        !WindowsTaskbarHelper.ExecuteAction("C:\\Windows\\System32\\cmd.exe") &&
+        !WindowsTaskbarHelper.ExecuteAction("wDEADBEEF9999"),
+        "WindowsTaskbarHelper must reject arbitrary file paths, shell commands, and unmapped window tokens");
+    var sampleItems = Enumerable.Range(0, 15)
+        .Select(i => new WindowsTaskbarHelper.TaskbarItemDto(
+            $"w{i + 1:X}", $"App Window {i + 1}", $"App{i + 1}", i == 0, false, true, "A1B2C3D4"))
+        .ToArray();
+    string? cappedJson = WindowsTaskbarHelper.SerializeCapped(0, sampleItems, 7500);
+    Check(!string.IsNullOrEmpty(cappedJson) &&
+        System.Text.Encoding.UTF8.GetByteCount(cappedJson) <= 7500,
+        "Serialized taskbar-state payload must always stay within the 8192-byte wire frame limit");
+    var liveCapture = WindowsTaskbarHelper.CaptureSnapshot(0);
+    Check(!string.IsNullOrEmpty(liveCapture.StateJson) &&
+        System.Text.Encoding.UTF8.GetByteCount(liveCapture.StateJson) <= 7500,
+        "Live WindowsTaskbarHelper capture must produce valid bounded JSON");
+    Console.WriteLine("PASS: Live Windows Taskbar snapshot, icon framing bounds, and strict token allowlist verified.");
+}
+
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
 {
     var status = new System.Collections.Concurrent.ConcurrentQueue<string>();

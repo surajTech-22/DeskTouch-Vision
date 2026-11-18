@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.80 — Live Dedicated-PC Windows Taskbar Inside Android Trackpad
+
+- **Live Windows 11 Taskbar inside Android Trackpad (`WindowsTaskbarHelper`, `NetworkSessions`, `DeskTouchSession`, `MainActivity`):** Streams the selected computer's real Windows Taskbar (Start menu button, Search button, open application windows with foreground/running indicators, pinned taskbar shortcuts, and real Windows application icons) directly into the Android `Trackpad` panel so tapping any app icon focuses, restores, or opens it on that dedicated computer immediately.
+- **Multi-PC Taskbar Relay (`NetworkSessions`):** Automatically switches the Trackpad's Windows Taskbar strip when selecting between the Hub computer and any connected peer Windows computer.
+
+---
+
 # DeskTouch Vision v0.3.79 — Reliable Trackpad PC & Screen Taskbar and Automatic In-App Update Prompt
 
 - **Always-visible Trackpad PC & Screen Taskbar (`MainActivity`):** Refreshes the Trackpad taskbar cleanly across empty states, tab switches, resumptions, theme updates, and single-display computers (`Display 1 • W×H`), removes leftover blank scroll margins when disconnected, and provides a 1-tap `Find` link when no computer is connected yet.

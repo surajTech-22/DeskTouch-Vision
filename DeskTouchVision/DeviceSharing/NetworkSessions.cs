@@ -228,6 +228,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ForwardLastButtonSeq;
         internal int ForwardHighestKeySeq;
         internal long ForwardSeenKeyMask;
+        internal readonly object TaskbarGate = new();
+        internal readonly HashSet<string> SentTaskbarIcons = new(StringComparer.Ordinal);
+        internal string LastSentTaskbarSig = "";
+        internal int LastSentTaskbarTarget = -1;
+        internal bool TaskbarWatchSent;
 
         internal void ResetForwardDedup()
         {
@@ -488,6 +493,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     private readonly object _customPairAttemptLock = new();
     private long _customPairWindowStartTicks;
     private int _customPairFailedAttempts;
+    private sealed class PeerTaskbarCache
+    {
+        internal string StateJson = "";
+        internal string Signature = "";
+        internal readonly Dictionary<string, string> Icons = new(StringComparer.Ordinal);
+    }
+    private readonly object _taskbarGate = new();
+    private readonly Dictionary<int, PeerTaskbarCache> _peerTaskbars = new();
+    private int _localTaskbarNudge;
 
     internal void SetCustomPairingCode(string? code) =>
         _customPairingCode = PairingCodeHelper.NormalizeCustomCode(code);
@@ -1347,6 +1361,117 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         _listener.Start(MaxPeers);
         _serverTask = Task.Run(LoopAsync);
         _ = Task.Run(() => ReportTelemetryLoopAsync(_cancel.Token));
+        _ = Task.Run(() => TaskbarMonitorLoopAsync(_cancel.Token));
+    }
+
+    private async Task DeliverTaskbarToAndroidAsync(
+        Session recipient,
+        int targetId,
+        string stateJson,
+        string signature,
+        IReadOnlyDictionary<string, string>? icons,
+        CancellationToken token)
+    {
+        if (recipient.Peer.Platform != "Android" || string.IsNullOrEmpty(stateJson))
+            return;
+        List<KeyValuePair<string, string>> pendingIcons = new();
+        lock (recipient.TaskbarGate)
+        {
+            if (recipient.LastSentTaskbarTarget == targetId &&
+                string.Equals(recipient.LastSentTaskbarSig, signature, StringComparison.Ordinal))
+            {
+                return;
+            }
+            if (icons != null)
+            {
+                if (recipient.SentTaskbarIcons.Count > 128)
+                    recipient.SentTaskbarIcons.Clear();
+                foreach (var kv in icons)
+                {
+                    if (!string.IsNullOrEmpty(kv.Key) && !string.IsNullOrEmpty(kv.Value) &&
+                        recipient.SentTaskbarIcons.Add(kv.Key))
+                    {
+                        pendingIcons.Add(kv);
+                    }
+                }
+            }
+            recipient.LastSentTaskbarTarget = targetId;
+            recipient.LastSentTaskbarSig = signature;
+        }
+        try
+        {
+            foreach (var kv in pendingIcons)
+            {
+                string payload = kv.Key + "|" + kv.Value;
+                if (System.Text.Encoding.UTF8.GetByteCount(payload) <= 7800)
+                    await SendToAsync(recipient, new Packet("taskbar-icon", targetId, Text: payload), token);
+            }
+            if (System.Text.Encoding.UTF8.GetByteCount(stateJson) <= 7800)
+                await SendToAsync(recipient, new Packet("taskbar-state", targetId, Text: stateJson), token);
+        }
+        catch (Exception)
+        {
+            lock (recipient.TaskbarGate)
+            {
+                if (recipient.LastSentTaskbarTarget == targetId)
+                    recipient.LastSentTaskbarSig = "";
+            }
+        }
+    }
+
+    private async Task TaskbarMonitorLoopAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var androidSessions = _sessions.Values
+                    .Where(s => s.Peer.Platform == "Android")
+                    .ToArray();
+                if (androidSessions.Length == 0)
+                {
+                    await Task.Delay(1200, token);
+                    continue;
+                }
+
+                var watchedTargets = new HashSet<int>();
+                foreach (var android in androidSessions)
+                    watchedTargets.Add(android.EnvironmentTargetId);
+
+                foreach (var peer in _sessions.Values)
+                {
+                    if (peer.Peer.Platform != "Windows") continue;
+                    bool shouldWatch = watchedTargets.Contains(peer.Id);
+                    if (peer.TaskbarWatchSent != shouldWatch)
+                    {
+                        peer.TaskbarWatchSent = shouldWatch;
+                        try { await SendToAsync(peer, new Packet("taskbar-watch", shouldWatch ? 1 : 0), token); }
+                        catch (Exception) { }
+                    }
+                }
+
+                if (watchedTargets.Contains(0))
+                {
+                    var capture = WindowsTaskbarHelper.CaptureSnapshot(0);
+                    foreach (var android in androidSessions)
+                    {
+                        if (android.EnvironmentTargetId == 0)
+                        {
+                            await DeliverTaskbarToAndroidAsync(
+                                android, 0, capture.StateJson, capture.Signature, capture.IconsByHash, token);
+                        }
+                    }
+                }
+
+                for (int step = 0; step < 5 && !token.IsCancellationRequested; step++)
+                {
+                    if (Interlocked.Exchange(ref _localTaskbarNudge, 0) != 0)
+                        break;
+                    await Task.Delay(200, token);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     private void BroadcastWarmToConfirmedTargets(int excludingSessionId)
@@ -3278,6 +3403,48 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if(target?.UdpPeer is { Confirmed: true } targetUdp)
                         _udpHub?.Send(targetUdp, FastUdpOp.Warm, 0, 0, 0);
                     await SendToAsync(session,new Packet("environment-selected",p.A),token);
+                    if (session.Peer.Platform == "Android")
+                    {
+                        lock (session.TaskbarGate)
+                        {
+                            session.LastSentTaskbarTarget = -1;
+                            session.LastSentTaskbarSig = "";
+                        }
+                        if (p.A == 0)
+                        {
+                            var cap = WindowsTaskbarHelper.CaptureSnapshot(0);
+                            await DeliverTaskbarToAndroidAsync(
+                                session, 0, cap.StateJson, cap.Signature, cap.IconsByHash, token);
+                        }
+                        else if (p.A > 0)
+                        {
+                            if (_sessions.TryGetValue(p.A, out var watchPeer) &&
+                                watchPeer.Peer.Platform == "Windows" && !watchPeer.TaskbarWatchSent)
+                            {
+                                watchPeer.TaskbarWatchSent = true;
+                                try { await SendToAsync(watchPeer, new Packet("taskbar-watch", 1), token); }
+                                catch (Exception) { }
+                            }
+                            string? cachedJson = null;
+                            string cachedSig = "";
+                            Dictionary<string, string>? cachedIcons = null;
+                            lock (_taskbarGate)
+                            {
+                                if (_peerTaskbars.TryGetValue(p.A, out var peerCache) &&
+                                    !string.IsNullOrEmpty(peerCache.StateJson))
+                                {
+                                    cachedJson = peerCache.StateJson;
+                                    cachedSig = peerCache.Signature;
+                                    cachedIcons = new Dictionary<string, string>(peerCache.Icons, StringComparer.Ordinal);
+                                }
+                            }
+                            if (!string.IsNullOrEmpty(cachedJson))
+                            {
+                                await DeliverTaskbarToAndroidAsync(
+                                    session, p.A, cachedJson, cachedSig, cachedIcons, token);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if (p.Type == "claim" && session.EnvironmentTargetId >= 10000)
@@ -3481,6 +3648,93 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     BroadcastWarmToConfirmedTargets(session.Id);
                     continue;
                 }
+                if (p.Type == "taskbar-icon" && session.Peer.Platform == "Windows" &&
+                    p.Text is { Length: > 10 and <= 7800 } tbIconPayload)
+                {
+                    int sep = tbIconPayload.IndexOf('|');
+                    if (sep is >= 4 and <= 16 && sep + 1 < tbIconPayload.Length)
+                    {
+                        string hash = tbIconPayload[..sep];
+                        string b64 = tbIconPayload[(sep + 1)..];
+                        lock (_taskbarGate)
+                        {
+                            if (!_peerTaskbars.TryGetValue(session.Id, out var cache))
+                            {
+                                cache = new PeerTaskbarCache();
+                                _peerTaskbars[session.Id] = cache;
+                            }
+                            if (cache.Icons.Count > 64) cache.Icons.Clear();
+                            cache.Icons[hash] = b64;
+                        }
+                        foreach (var android in _sessions.Values)
+                        {
+                            if (android.Peer.Platform != "Android" || android.EnvironmentTargetId != session.Id)
+                                continue;
+                            bool shouldSend;
+                            lock (android.TaskbarGate)
+                            {
+                                if (android.SentTaskbarIcons.Count > 128) android.SentTaskbarIcons.Clear();
+                                shouldSend = android.SentTaskbarIcons.Add(hash);
+                            }
+                            if (shouldSend)
+                            {
+                                try { await SendToAsync(android, new Packet("taskbar-icon", session.Id, Text: tbIconPayload), token); }
+                                catch (Exception) { }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "taskbar-state" && session.Peer.Platform == "Windows" &&
+                    p.Text is { Length: > 2 and <= 7800 } tbStateJson)
+                {
+                    string sig = tbStateJson;
+                    Dictionary<string, string>? iconsCopy = null;
+                    lock (_taskbarGate)
+                    {
+                        if (!_peerTaskbars.TryGetValue(session.Id, out var cache))
+                        {
+                            cache = new PeerTaskbarCache();
+                            _peerTaskbars[session.Id] = cache;
+                        }
+                        cache.StateJson = tbStateJson;
+                        cache.Signature = sig;
+                        if (cache.Icons.Count > 0)
+                            iconsCopy = new Dictionary<string, string>(cache.Icons, StringComparer.Ordinal);
+                    }
+                    foreach (var android in _sessions.Values)
+                    {
+                        if (android.Peer.Platform == "Android" && android.EnvironmentTargetId == session.Id)
+                        {
+                            await DeliverTaskbarToAndroidAsync(
+                                android, session.Id, tbStateJson, sig, iconsCopy, token);
+                        }
+                    }
+                    continue;
+                }
+                if (p.Type == "taskbar-action" && session.Peer.Platform == "Android" &&
+                    AllowsForwardInput(session.Peer) &&
+                    p.A == session.EnvironmentTargetId &&
+                    WindowsTaskbarHelper.IsValidActionKeyFormat(p.Text))
+                {
+                    string actionKey = p.Text!;
+                    if (p.A == 0)
+                    {
+                        _ = Task.Run(() =>
+                        {
+                            WindowsTaskbarHelper.ExecuteAction(actionKey);
+                            Thread.Sleep(180);
+                            Interlocked.Exchange(ref _localTaskbarNudge, 1);
+                        });
+                    }
+                    else if (_sessions.TryGetValue(p.A, out var targetWin) &&
+                             targetWin.Peer.Platform == "Windows")
+                    {
+                        try { await SendToAsync(targetWin, new Packet("taskbar-action", Text: actionKey), token); }
+                        catch (Exception) { }
+                    }
+                    continue;
+                }
                 (int VirtualTargetId, int Claim, Session Source, Session BridgeSession, int LocalSubId)? virtualForward = null;
                 RelayLease? forward=null;
                 lock(_authorityGate)
@@ -3566,6 +3820,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             linked.Cancel();
             ClearSessionSubPeers(session);
+            lock (_taskbarGate)
+                _peerTaskbars.Remove(id);
             session.ReverseQueue.Writer.TryComplete();
             _sessions.TryRemove(id,out _);
             lock(_authorityGate)
@@ -4328,6 +4584,11 @@ internal sealed class HostSession : IInputSession, IDisposable
         AuthorityDiagnostic?.Invoke("Local Windows keyboard/mouse reclaimed authority from remote computer.");
     }
 
+    private int _hostTaskbarNudge;
+    private volatile bool _taskbarWatched;
+    private string _lastHostTaskbarSig = "";
+    private readonly HashSet<string> _sentHostTaskbarIcons = new(StringComparer.Ordinal);
+
     private void ReleaseReverseAuthority()
     {
         Interlocked.Exchange(ref _reverseLease, 0);
@@ -5069,6 +5330,27 @@ internal sealed class HostSession : IInputSession, IDisposable
                     AuthorityControlPacket?.Invoke(p);
                     RemoteControlState?.Invoke(p.Type);
                 }
+                else if (p.Type == "taskbar-watch")
+                {
+                    bool watch = p.A != 0;
+                    _taskbarWatched = watch;
+                    if (watch)
+                    {
+                        _lastHostTaskbarSig = "";
+                        _sentHostTaskbarIcons.Clear();
+                        Interlocked.Exchange(ref _hostTaskbarNudge, 1);
+                    }
+                }
+                else if (p.Type == "taskbar-action" && WindowsTaskbarHelper.IsValidActionKeyFormat(p.Text))
+                {
+                    string actionKey = p.Text!;
+                    _ = Task.Run(() =>
+                    {
+                        WindowsTaskbarHelper.ExecuteAction(actionKey);
+                        Thread.Sleep(180);
+                        Interlocked.Exchange(ref _hostTaskbarNudge, 1);
+                    });
+                }
                 else if (ReverseInputProtocol.TryDecode(p, out _))
                     ProcessReverseInput(p);
             }
@@ -5171,6 +5453,30 @@ internal sealed class HostSession : IInputSession, IDisposable
                 }
                 if ((tick % 30) == 29)
                     EmitTelemetryIfActive();
+                if (_taskbarWatched && (Interlocked.Exchange(ref _hostTaskbarNudge, 0) != 0 || (tick % 10) == 0))
+                {
+                    var capture = WindowsTaskbarHelper.CaptureSnapshot(0);
+                    if (!string.Equals(capture.Signature, _lastHostTaskbarSig, StringComparison.Ordinal))
+                    {
+                        if (_sentHostTaskbarIcons.Count > 128)
+                            _sentHostTaskbarIcons.Clear();
+                        foreach (var kv in capture.IconsByHash)
+                        {
+                            if (!string.IsNullOrEmpty(kv.Key) && !string.IsNullOrEmpty(kv.Value) &&
+                                _sentHostTaskbarIcons.Add(kv.Key))
+                            {
+                                string iconPayload = kv.Key + "|" + kv.Value;
+                                if (System.Text.Encoding.UTF8.GetByteCount(iconPayload) <= 7800)
+                                    TrySend(new Packet("taskbar-icon", Text: iconPayload));
+                            }
+                        }
+                        if (System.Text.Encoding.UTF8.GetByteCount(capture.StateJson) <= 7800)
+                        {
+                            TrySend(new Packet("taskbar-state", 0, Text: capture.StateJson));
+                            _lastHostTaskbarSig = capture.Signature;
+                        }
+                    }
+                }
             }
         }
         catch (OperationCanceledException) { }

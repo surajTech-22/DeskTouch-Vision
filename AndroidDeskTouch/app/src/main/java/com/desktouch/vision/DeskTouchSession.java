@@ -164,6 +164,16 @@ final class DeskTouchSession implements AutoCloseable {
             return notificationCount>=0 ? base+" ["+notificationCount+"]" : base;
         }
     }
+    static final class TaskbarItem {
+        final String key,title,app,iconHash;
+        final boolean active,minimized,running;
+        TaskbarItem(String key,String title,String app,
+                boolean active,boolean minimized,boolean running,String iconHash){
+            this.key=key;this.title=title;this.app=app;
+            this.active=active;this.minimized=minimized;
+            this.running=running;this.iconHash=iconHash;
+        }
+    }
     private final Events events;
     private final TrustedWindows trust;
     private final Context application;
@@ -384,6 +394,11 @@ final class DeskTouchSession implements AutoCloseable {
         java.util.Collections.emptyList();
     private volatile int environmentOwnId;
     private volatile int selectedEnvironmentId;
+    private volatile int taskbarTargetId = -1;
+    private volatile java.util.List<TaskbarItem> taskbarItems =
+        java.util.Collections.emptyList();
+    private final java.util.concurrent.ConcurrentHashMap<String,android.graphics.Bitmap> taskbarIcons =
+        new java.util.concurrent.ConcurrentHashMap<>();
     private static final SecureRandom RANDOM=new SecureRandom();
 
     DeskTouchSession(Context context,TrustedWindows trust,Events events) {
@@ -505,6 +520,47 @@ final class DeskTouchSession implements AutoCloseable {
     }
     int selectedEnvironmentTarget(){return selectedEnvironmentId;}
     int ownEnvironmentId(){return environmentOwnId;}
+    boolean hasTaskbarSnapshotForTarget(int targetId){
+        return running && taskbarTargetId==targetId;
+    }
+    java.util.List<TaskbarItem> taskbarItemsForTarget(int targetId){
+        return (running && taskbarTargetId==targetId) ? taskbarItems : java.util.Collections.emptyList();
+    }
+    android.graphics.Bitmap taskbarIcon(String iconHash){
+        return iconHash!=null && !iconHash.isEmpty() ? taskbarIcons.get(iconHash) : null;
+    }
+    void sendTaskbarAction(int targetId,String key){
+        if(!running || key==null || key.isEmpty() || controlSender.isShutdown())return;
+        controlSender.execute(()->writeNow(new Packet("taskbar-action",targetId,0,0,0,key)));
+    }
+    static java.util.List<TaskbarItem> parseTaskbarItems(String jsonText){
+        if(jsonText==null || jsonText.isEmpty())return java.util.Collections.emptyList();
+        try{
+            JSONObject obj=new JSONObject(jsonText);
+            JSONArray arr=obj.optJSONArray("items");
+            if(arr==null || arr.length()==0)return java.util.Collections.emptyList();
+            ArrayList<TaskbarItem> out=new ArrayList<>(arr.length());
+            for(int i=0;i<arr.length() && i<20;i++){
+                JSONObject item=arr.optJSONObject(i);
+                if(item==null)continue;
+                String k=item.optString("k","").trim();
+                String n=item.optString("n","").trim();
+                String p=item.optString("p","").trim();
+                if(k.isEmpty() || (n.isEmpty() && p.isEmpty()))continue;
+                out.add(new TaskbarItem(
+                    k,
+                    n.isEmpty() ? p : n,
+                    p.isEmpty() ? n : p,
+                    item.optBoolean("a",false),
+                    item.optBoolean("m",false),
+                    item.optBoolean("r",false),
+                    item.optString("h","")));
+            }
+            return java.util.Collections.unmodifiableList(out);
+        }catch(Exception ignored){
+            return java.util.Collections.emptyList();
+        }
+    }
 
     void selectEnvironmentTarget(int id){
         if(!running) {status("Join a shared environment first.");return;}
@@ -543,6 +599,10 @@ final class DeskTouchSession implements AutoCloseable {
             status("Cannot select device: invalid screen geometry.");return;
         }
         selectedEnvironmentId=id;
+        if(taskbarTargetId!=id){
+            taskbarTargetId=-1;
+            taskbarItems=java.util.Collections.emptyList();
+        }
         send(new Packet("environment-select",id));
         DeskTouchRuntime.notifyLiveStatusChanged();
         status("Selected "+selected.name+" in the same environment.");
@@ -885,6 +945,27 @@ final class DeskTouchSession implements AutoCloseable {
                     status("Environment member went offline. Select another device.");
                     if(selectedEnvironmentId==p.a){
                         selectedEnvironmentId=-1;selectEnvironmentTarget(0);
+                    }
+                } else if("taskbar-state".equals(p.type)){
+                    taskbarItems=parseTaskbarItems(p.text);
+                    taskbarTargetId=p.a;
+                    DeskTouchRuntime.notifyLiveStatusChanged();
+                } else if("taskbar-icon".equals(p.type)){
+                    if(p.text!=null){
+                        int sep=p.text.indexOf('|');
+                        if(sep>=4 && sep<=16 && sep+1<p.text.length()){
+                            String hash=p.text.substring(0,sep);
+                            String b64=p.text.substring(sep+1);
+                            try{
+                                byte[] raw=android.util.Base64.decode(b64,android.util.Base64.DEFAULT);
+                                android.graphics.Bitmap bmp=android.graphics.BitmapFactory.decodeByteArray(raw,0,raw.length);
+                                if(bmp!=null){
+                                    if(taskbarIcons.size()>=64)taskbarIcons.clear();
+                                    taskbarIcons.put(hash,bmp);
+                                    DeskTouchRuntime.notifyLiveStatusChanged();
+                                }
+                            }catch(Exception ignored){}
+                        }
                     }
                 } else if("granted".equals(p.type) && p.a==claim && claim>0){
                     // The remote Windows endpoint must successfully move its cursor
@@ -2490,6 +2571,8 @@ final class DeskTouchSession implements AutoCloseable {
         lastPongReceivedMs=0L;connectedAtMs=0L;
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
+        taskbarTargetId=-1;taskbarItems=java.util.Collections.emptyList();
+        taskbarIcons.clear();
         if(DeskTouchRuntime.connectedCount()==0) RemoteInputPower.end();
         else RemoteInputPower.begin(application);
         AutoConnectService.onConnectionCountChanged(application);

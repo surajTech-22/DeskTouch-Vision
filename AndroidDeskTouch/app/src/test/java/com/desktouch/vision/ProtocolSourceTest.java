@@ -1560,11 +1560,29 @@ public final class ProtocolSourceTest {
         assertNotNull(customMatched);
         assertEquals(fpMember, customMatched.fingerprint);
 
-        // Verify v0.3.79 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
+        // Verify v0.3.80 Trackpad Windows Taskbar + PC/Screen selector & in-app onResume update check.
         String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
         assertTrue(mainSource.contains("trackpadScreenScroll.setVisibility("));
         assertTrue(mainSource.replace("\r\n", "\n").contains("if(index==PhoneUiKit.TAB_TRACKPAD){\n            refreshTrackpadPcTaskbar();"));
         assertTrue(mainSource.contains("AndroidUpdater.checkInAppOnResume(this);"));
+        assertTrue(mainSource.contains("private void refreshWindowsTaskbar(){"));
+        assertTrue(mainSource.contains("createWindowsTaskbarAppButton("));
+        assertTrue(mainSource.contains("active.sendTaskbarAction(targetId,\"__start__\");"));
+        assertTrue(mainSource.contains("active.sendTaskbarAction(targetId,\"__search__\");"));
+
+        String sampleTaskbarJson = "{\"targetId\":0,\"items\":["
+            + "{\"k\":\"w101\",\"n\":\"Google Chrome\",\"p\":\"Chrome\",\"a\":true,\"m\":false,\"r\":true,\"h\":\"A1B2C3D4\"},"
+            + "{\"k\":\"p2\",\"n\":\"WhatsApp\",\"p\":\"WhatsApp\",\"a\":false,\"m\":false,\"r\":false,\"h\":\"E5F60708\"}"
+            + "]}";
+        java.util.List<DeskTouchSession.TaskbarItem> parsedTaskbar =
+            DeskTouchSession.parseTaskbarItems(sampleTaskbarJson);
+        assertEquals(2, parsedTaskbar.size());
+        assertEquals("w101", parsedTaskbar.get(0).key);
+        assertEquals("Chrome", parsedTaskbar.get(0).app);
+        assertTrue(parsedTaskbar.get(0).active);
+        assertTrue(parsedTaskbar.get(0).running);
+        assertEquals("p2", parsedTaskbar.get(1).key);
+        assertFalse(parsedTaskbar.get(1).running);
 
         String updaterSource = readProjectSource("src/main/java/com/desktouch/vision/AndroidUpdater.java");
         assertTrue(updaterSource.contains("static void checkInAppOnResume(Activity activity)"));

@@ -1559,5 +1559,31 @@ public final class ProtocolSourceTest {
         DesktopDiscovery.Device customMatched = LinkedDisplayHelper.findDeviceByPairingCode(found, "suraj-99");
         assertNotNull(customMatched);
         assertEquals(fpMember, customMatched.fingerprint);
+
+        // Verify v0.3.77 Trackpad taskbar visibility/refresh guarantees & in-app onResume update check.
+        String mainSource = readProjectSource("app/src/main/java/com/desktouch/vision/MainActivity.java");
+        assertTrue(mainSource.contains("trackpadScreenScroll.setVisibility("));
+        assertTrue(mainSource.replace("\r\n", "\n").contains("if(index==PhoneUiKit.TAB_TRACKPAD){\n            refreshTrackpadPcTaskbar();"));
+        assertTrue(mainSource.contains("AndroidUpdater.checkInAppOnResume(this);"));
+
+        String updaterSource = readProjectSource("app/src/main/java/com/desktouch/vision/AndroidUpdater.java");
+        assertTrue(updaterSource.contains("static void checkInAppOnResume(Activity activity)"));
+        assertTrue(updaterSource.contains("promptInAppUpdate("));
+    }
+
+    private static String readProjectSource(String relFromAndroidRoot) {
+        try {
+            java.nio.file.Path direct = java.nio.file.Path.of(relFromAndroidRoot);
+            if (java.nio.file.Files.isRegularFile(direct)) {
+                return java.nio.file.Files.readString(direct);
+            }
+            java.nio.file.Path nested = java.nio.file.Path.of("AndroidDeskTouch", relFromAndroidRoot);
+            if (java.nio.file.Files.isRegularFile(nested)) {
+                return java.nio.file.Files.readString(nested);
+            }
+            throw new java.io.FileNotFoundException("Cannot locate " + relFromAndroidRoot);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

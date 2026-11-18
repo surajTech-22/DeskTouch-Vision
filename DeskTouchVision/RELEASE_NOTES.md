@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.77 — Reliable Trackpad PC & Screen Taskbar and Automatic In-App Update Prompt
+
+- **Always-visible Trackpad PC & Screen Taskbar (`MainActivity`):** Refreshes the Trackpad taskbar cleanly across empty states, tab switches, resumptions, theme updates, and single-display computers (`Display 1 • W×H`), removes leftover blank scroll margins when disconnected, and provides a 1-tap `Find` link when no computer is connected yet.
+- **Automatic in-app Android update prompt on resume (`AndroidUpdater`, `MainActivity`):** Checks official GitHub releases cleanly on foreground resume as well as startup and prompts directly inside the app when a verified newer Android package is ready.
+
+---
+
 # DeskTouch Vision v0.3.76 — Ordered Mobile Linked Displays, Dedicated Trackpad PC & Screen Taskbar, and Editable Windows Pairing Code
 
 - **Ordered `Linked Displays` on Android (`NetworkSessions`, `DisplaySettingsForm`, `DeskTouchSession`, `LinkedDisplayHelper`, `MainActivity`):** Synchronizes arranged device order and normalized 2D layout coordinates over the environment roster so Android Home `Linked Displays` matches the exact Left/Center/Right and stacked Windows display arrangement, with 1-tap switching synced across tabs.

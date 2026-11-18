@@ -46,6 +46,7 @@ public final class MainActivity extends Activity {
     private Button pauseBankingButton,captureMouseBtn,resetPathsBtn,shortcutsBtn,notifAccessBtn;
     private TextView trackpadTargetTitle,trackpadReadout,trackpadLinkPill,sensReadout,trackpadTaskbarLbl;
     private LinearLayout trackpadTaskbarCard,trackpadPcBar,trackpadScreenBar;
+    private HorizontalScrollView trackpadScreenScroll;
     private TextView findStatus,findCountTag;
     private EditText pairingCodeInput;
     private volatile List<DesktopDiscovery.Device> lastScannedDevices=new ArrayList<>();
@@ -101,6 +102,7 @@ public final class MainActivity extends Activity {
                 if(isFinishing()||isDestroyed())return;
                 setDiscoveryStatus(message);
                 if(environmentList!=null)refreshEnvironmentMembers();
+                else if(trackpadPcBar!=null)refreshTrackpadPcTaskbar();
                 refreshPermissionState();
                 refreshTrustSummary();
                 refreshLiveLinkAndKeyboard();
@@ -740,6 +742,7 @@ public final class MainActivity extends Activity {
         trackpadTaskbarLbl.setText("PC & Screen Taskbar (Tap to select)");
         trackpadTaskbarLbl.setTextSize(10.5f);
         trackpadTaskbarLbl.setTypeface(null,Typeface.BOLD);
+        trackpadTaskbarLbl.setTextColor(palette.textSecondary);
         trackpadTaskbarCard.addView(trackpadTaskbarLbl);
 
         HorizontalScrollView pcTaskbarScroll=new HorizontalScrollView(this);
@@ -747,20 +750,21 @@ public final class MainActivity extends Activity {
         trackpadPcBar=new LinearLayout(this);
         trackpadPcBar.setOrientation(LinearLayout.HORIZONTAL);
         trackpadPcBar.setGravity(Gravity.CENTER_VERTICAL);
+        trackpadPcBar.setMinimumHeight(dp(28));
         pcTaskbarScroll.addView(trackpadPcBar,new HorizontalScrollView.LayoutParams(-2,-2));
         LinearLayout.LayoutParams pcScrollLp=new LinearLayout.LayoutParams(-1,-2);
         pcScrollLp.topMargin=dp(6);
         trackpadTaskbarCard.addView(pcTaskbarScroll,pcScrollLp);
 
-        HorizontalScrollView scrTaskbarScroll=new HorizontalScrollView(this);
-        scrTaskbarScroll.setHorizontalScrollBarEnabled(false);
+        trackpadScreenScroll=new HorizontalScrollView(this);
+        trackpadScreenScroll.setHorizontalScrollBarEnabled(false);
         trackpadScreenBar=new LinearLayout(this);
         trackpadScreenBar.setOrientation(LinearLayout.HORIZONTAL);
         trackpadScreenBar.setGravity(Gravity.CENTER_VERTICAL);
-        scrTaskbarScroll.addView(trackpadScreenBar,new HorizontalScrollView.LayoutParams(-2,-2));
+        trackpadScreenScroll.addView(trackpadScreenBar,new HorizontalScrollView.LayoutParams(-2,-2));
         LinearLayout.LayoutParams scrScrollLp=new LinearLayout.LayoutParams(-1,-2);
         scrScrollLp.topMargin=dp(6);
-        trackpadTaskbarCard.addView(scrTaskbarScroll,scrScrollLp);
+        trackpadTaskbarCard.addView(trackpadScreenScroll,scrScrollLp);
 
         LinearLayout padCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(padCard,cardParams(10));
@@ -1091,6 +1095,7 @@ public final class MainActivity extends Activity {
             PhoneUiKit.styleCard(controlCard,p,this);
             PhoneUiKit.styleSubcard(trackpadTaskbarCard,p,this);
             trackpadTaskbarLbl.setTextColor(p.textSecondary);
+            refreshTrackpadPcTaskbar();
             PhoneUiKit.styleCard(padCard,p,this);
             trackpadTargetTitle.setTextColor(p.textPrimary);
             padSurfaceTitle.setTextColor(p.textPrimary);
@@ -1730,6 +1735,10 @@ public final class MainActivity extends Activity {
                 tabScrolls[i].setVisibility(i==index ? View.VISIBLE : View.GONE);
             }
         }
+        if(index==PhoneUiKit.TAB_TRACKPAD){
+            refreshTrackpadPcTaskbar();
+            refreshLiveLinkAndKeyboard();
+        }
         refreshTabBarStyles();
     }
 
@@ -1828,9 +1837,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.76";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.77";
         }catch(Exception ignored){
-            return "0.3.76";
+            return "0.3.77";
         }
     }
 
@@ -1863,6 +1872,8 @@ public final class MainActivity extends Activity {
     @Override protected void onResume(){
         super.onResume();
         updateVisibleScreenAwake();
+        if(environmentList!=null)refreshEnvironmentMembers();
+        refreshTrackpadPcTaskbar();
         refreshPermissionState();
         refreshTrustSummary();
         refreshStreamOptionControls();
@@ -1872,6 +1883,7 @@ public final class MainActivity extends Activity {
         startLiveUiTicker();
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+        AndroidUpdater.checkInAppOnResume(this);
     }
 
     private void refreshStreamOptionControls(){
@@ -2399,6 +2411,7 @@ public final class MainActivity extends Activity {
             placeholder.addView(pSub);
 
             environmentList.addView(placeholder,new LinearLayout.LayoutParams(dp(196),dp(78)));
+            refreshTrackpadPcTaskbar();
             renderConnectedHubOnFindIfIdle();
             return;
         }
@@ -2546,12 +2559,13 @@ public final class MainActivity extends Activity {
         List<LinkedDisplayHelper.DisplayTileModel> pcs=LinkedDisplayHelper.buildTrackpadPcTiles(targets,selectedId,ownId);
 
         if(pcs.isEmpty()){
+            if(trackpadScreenScroll!=null)trackpadScreenScroll.setVisibility(View.GONE);
             trackpadScreenBar.setVisibility(View.GONE);
-            TextView empty=new TextView(this);
-            empty.setText(active.isConnected() ? "Waiting for PC list..." : "Not connected yet • Open Find to link a PC");
-            empty.setTextSize(11f);
-            empty.setTextColor(palette.textSecondary);
-            trackpadPcBar.addView(empty);
+            if(active.isConnected()){
+                trackpadPcBar.addView(createTaskbarChip("Waiting for PC list...",false,v->refreshEnvironmentMembers()));
+            }else{
+                trackpadPcBar.addView(createTaskbarChip("No PC linked • Tap to Find",false,v->selectTab(PhoneUiKit.TAB_FIND)));
+            }
             return;
         }
 
@@ -2578,17 +2592,25 @@ public final class MainActivity extends Activity {
             if(i>0)clp.leftMargin=dp(7);
             trackpadPcBar.addView(chip,clp);
         }
+        if(activePc==null)activePc=pcs.get(0);
+        final LinkedDisplayHelper.DisplayTileModel screenPc=activePc;
 
-        if(activePc!=null && activePc.monitors!=null && activePc.monitors.size()>1){
-            trackpadScreenBar.setVisibility(View.VISIBLE);
-            int activeMonIdx=active.activeMonitorIndex();
-            for(int m=0;m<activePc.monitors.size();m++){
+        if(trackpadScreenScroll!=null)trackpadScreenScroll.setVisibility(View.VISIBLE);
+        trackpadScreenBar.setVisibility(View.VISIBLE);
+        int activeMonIdx=active.activeMonitorIndex();
+        if(screenPc.monitors!=null && !screenPc.monitors.isEmpty()){
+            for(int m=0;m<screenPc.monitors.size();m++){
                 final int monIdx=m;
-                LinkedDisplayHelper.MonitorBox mb=activePc.monitors.get(m);
+                LinkedDisplayHelper.MonitorBox mb=screenPc.monitors.get(m);
                 TextView screenChip=createTaskbarChip(
                     "Display "+mb.displayNumber+" • "+mb.width+"×"+mb.height,
                     m==activeMonIdx,
                     v->{
+                        if(active.selectedEnvironmentTarget()!=screenPc.id){
+                            boolean keepControl=active.hasClaim();
+                            active.selectEnvironmentTarget(screenPc.id);
+                            if(keepControl)active.claimControl();
+                        }
                         active.focusMonitor(monIdx);
                         refreshTrackpadPcTaskbar();
                         setFeedback("Moved cursor to Display "+mb.displayNumber+".",false);
@@ -2598,7 +2620,19 @@ public final class MainActivity extends Activity {
                 trackpadScreenBar.addView(screenChip,slp);
             }
         }else{
-            trackpadScreenBar.setVisibility(View.GONE);
+            trackpadScreenBar.addView(createTaskbarChip(
+                "Display 1",
+                true,
+                v->{
+                    if(active.selectedEnvironmentTarget()!=screenPc.id){
+                        boolean keepControl=active.hasClaim();
+                        active.selectEnvironmentTarget(screenPc.id);
+                        if(keepControl)active.claimControl();
+                    }
+                    active.focusMonitor(0);
+                    refreshTrackpadPcTaskbar();
+                    setFeedback("Moved cursor to Display 1.",false);
+                }));
         }
     }
 

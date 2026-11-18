@@ -34,6 +34,9 @@ final class AndroidUpdater {
     private static final ExecutorService WORK=Executors.newSingleThreadExecutor();
     private static volatile Release latest;
     private static volatile boolean busy;
+    private static volatile String promptedInSession;
+    private static volatile long lastResumeCheckMs;
+    private static volatile AlertDialog activeUpdatePrompt;
 
     private static final class Release {
         final String version,apk,shaUrl;
@@ -171,6 +174,7 @@ final class AndroidUpdater {
                 }
             });
         }
+        lastResumeCheckMs=System.currentTimeMillis();
         WORK.execute(()->{
             try{
                 Release release=fetchRelease();
@@ -179,18 +183,12 @@ final class AndroidUpdater {
                 if(comparison>0){
                     if(interactive)activity.runOnUiThread(()->{
                         dismissDialog(activity,checking[0]);
-                        new AlertDialog.Builder(activity)
-                            .setTitle("DeskTouch update "+release.version)
-                            .setMessage("An official Android update is available. The APK is SHA-256 verified. "+
-                                "DeskTouch will download and install it directly without opening a browser; "+
-                                "Android will ask for your approval to install.")
-                            .setNegativeButton("Later",null)
-                            .setPositiveButton("Update existing app",(d,w)->installAvailableUpdate(activity))
-                            .show();
+                        showUpdatePromptDialog(activity,release,false);
                     });
                     else {
                         File cached=downloadVerified(activity.getApplicationContext(),release);
                         notifyAvailable(activity.getApplicationContext(),release.version);
+                        promptInAppUpdate(activity,release,cached!=null && cached.isFile());
                     }
                 }else if(interactive)
                     activity.runOnUiThread(()->{
@@ -210,6 +208,41 @@ final class AndroidUpdater {
                 else Log.w("DeskTouch","Update check deferred",e);
             }finally{busy=false;}
         });
+    }
+
+    static void checkInAppOnResume(Activity activity){
+        if(activity==null||activity.isFinishing()||activity.isDestroyed())return;
+        Release cached=latest;
+        if(cached!=null
+            && compareVersions(cached.version,installedVersion(activity))>0
+            && !cached.version.equals(promptedInSession)){
+            promptInAppUpdate(activity,cached,verifiedPath(activity,cached.version).isFile());
+            return;
+        }
+        if(busy)return;
+        long now=System.currentTimeMillis();
+        if(now-lastResumeCheckMs<45_000L)return;
+        checkForUpdates(activity,false);
+    }
+
+    private static void promptInAppUpdate(Activity activity,Release release,boolean downloaded){
+        if(release==null||release.version.equals(promptedInSession))return;
+        promptedInSession=release.version;
+        activity.runOnUiThread(()->showUpdatePromptDialog(activity,release,downloaded));
+    }
+
+    private static void showUpdatePromptDialog(Activity activity,Release release,boolean downloaded){
+        if(activity==null||activity.isFinishing()||activity.isDestroyed())return;
+        if(activeUpdatePrompt!=null&&activeUpdatePrompt.isShowing())return;
+        String detail=downloaded
+            ? "An official verified Android update ("+release.version+") is downloaded and ready. Tap Update existing app to install inside DeskTouch."
+            : "An official Android update ("+release.version+") is available. The APK is SHA-256 verified; Android will ask for your approval to install.";
+        activeUpdatePrompt=new AlertDialog.Builder(activity)
+            .setTitle("DeskTouch update "+release.version)
+            .setMessage(detail)
+            .setNegativeButton("Later",null)
+            .setPositiveButton("Update existing app",(d,w)->installAvailableUpdate(activity))
+            .show();
     }
     static void checkBackground(Context context){
         long now=System.currentTimeMillis();

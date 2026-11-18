@@ -467,6 +467,25 @@ final class EcosystemFeatures {
         return -1L;
     }
 
+    static float[] mapTouchToBitmapNormalized(
+            float touchX, float touchY, int viewW, int viewH, int bmpW, int bmpH) {
+        if (viewW <= 0 || viewH <= 0) return new float[]{0.5f, 0.5f};
+        if (bmpW <= 0 || bmpH <= 0) {
+            return new float[]{
+                Math.max(0f, Math.min(1f, touchX / (float) viewW)),
+                Math.max(0f, Math.min(1f, touchY / (float) viewH))
+            };
+        }
+        float scale = Math.min(viewW / (float) bmpW, viewH / (float) bmpH);
+        float drawW = bmpW * scale;
+        float drawH = bmpH * scale;
+        float left = (viewW - drawW) * 0.5f;
+        float top = (viewH - drawH) * 0.5f;
+        float nx = Math.max(0f, Math.min(1f, (touchX - left) / Math.max(1f, drawW)));
+        float ny = Math.max(0f, Math.min(1f, (touchY - top) / Math.max(1f, drawH)));
+        return new float[]{nx, ny};
+    }
+
     private static String truncate(String s, int maxLen) {
         if (s == null) return "";
         String t = s.trim();

@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.83 — Full-Screen Monitor Preview on Android & Reliable Post-Update Window Activation on Windows
+
+- **Proper Full-Screen Live Screen Preview on Android (`MainActivity`, `EcosystemFeatures`, `DeskTouchSession`, `ScreenPreviewHelper`, `NetworkSessions`):** Adds an interactive `⛶ Full Screen` viewer in `Trackpad` (plus double-tap on the inline preview) with edge-to-edge immersive display, automatic landscape rotation with manual rotate toggle, aspect-ratio-accurate touch-to-screen coordinate mapping (`mapTouchToBitmapNormalized`), multi-monitor cycling, inline quick typing bar, right-click / two-finger scroll support, and high-resolution (~3.5 FPS) streaming when viewing full screen.
+- **Reliable Windows Post-Update Notification, Foreground Activation & DeskSpace Launch Fallback (`DisplaySettingsForm`, `WinNative`, `SingleInstanceActivation`, `Update-DeskTouch.ps1`):** Uses `AttachThreadInput` foreground activation so `ShowFromTray` and post-update launches surface reliably on Windows 11, extends tray-wake recovery timing, and shows a clickable Windows notification balloon (`DeskTouch Vision updated`) when background tray auto-updates complete silently in the system tray.
+
+---
+
 # DeskTouch Vision v0.3.82 — Shared Clipboard, File Drop, OTP Helper, Live Trackpad Screen Preview, Gestures, Power, Media & Profiles
 
 - **Automatic Shared Clipboard (`EcosystemHelpers`, `DisplaySettingsForm`, `NetworkSessions`, `MainActivity`):** Syncs text and PNG clipboard images automatically across all linked Windows computers and Android devices with loop-safe hash deduplication and a one-click pause toggle.

@@ -1668,10 +1668,14 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     void setScreenPreviewWatch(int targetId, int monitorIndex){
+        setScreenPreviewWatch(targetId,monitorIndex,false);
+    }
+
+    void setScreenPreviewWatch(int targetId, int monitorIndex, boolean highRes){
         screenPreviewWatchTarget=targetId;
         screenPreviewWatchMonitor=monitorIndex;
         if(monitorIndex<0) latestScreenPreview=null;
-        if(running) send(new Packet("screen-preview-watch",targetId,monitorIndex));
+        if(running) send(new Packet("screen-preview-watch",targetId,monitorIndex,highRes ? 1 : 0,0));
     }
 
     android.graphics.Bitmap currentScreenPreview(){ return latestScreenPreview; }

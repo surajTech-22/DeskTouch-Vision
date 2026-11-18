@@ -63,6 +63,36 @@ internal static class Win
     internal static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo,
+        [MarshalAs(UnmanagedType.Bool)] bool fAttach);
+
+    internal static void ForceWindowToFront(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        IntPtr fg = GetForegroundWindow();
+        uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out _) : 0;
+        uint curThread = GetCurrentThreadId();
+        bool attached = false;
+        try
+        {
+            if (fgThread != 0 && fgThread != curThread)
+                attached = AttachThreadInput(curThread, fgThread, true);
+            _ = BringWindowToTop(hwnd);
+            _ = SetForegroundWindow(hwnd);
+        }
+        catch { }
+        finally
+        {
+            if (attached)
+            {
+                try { _ = AttachThreadInput(curThread, fgThread, false); } catch { }
+            }
+        }
+    }
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint desiredAccess,
         [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);

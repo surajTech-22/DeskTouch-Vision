@@ -2996,6 +2996,15 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
           bridgeSnapJson.Contains("\"activeForegroundApp\":\"vlc.exe\"", StringComparison.Ordinal),
           "DeskSpaceDeckBridge snapshot and ecosystem metadata must serialize cleanly");
 
+    var shotLow = ScreenPreviewHelper.CaptureMonitorPreview(0, highRes: false);
+    var shotHigh = ScreenPreviewHelper.CaptureMonitorPreview(0, highRes: true);
+    if (shotLow.Chunks != null && shotHigh.Chunks != null)
+    {
+        int wLow = (shotLow.PackedDims >> 16) & 0xFFFF;
+        int wHigh = (shotHigh.PackedDims >> 16) & 0xFFFF;
+        Check(wHigh >= wLow && wHigh > 0, "Fullscreen highRes preview mode must preserve >= resolution than inline preview");
+    }
+
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");
 }
 

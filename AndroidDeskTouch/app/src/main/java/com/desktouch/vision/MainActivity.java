@@ -96,17 +96,19 @@ public final class MainActivity extends Activity {
     private float pointerSpeed=2.8f;
     private boolean suppressTypedText;
 
-    private TextView profilePillBtn,fgAppBanner,trackpadPresetPill,previewEmptyHint;
-    private Button homeSendFileBtn,homePowerBtn,previewToggleBtn;
+    private TextView profilePillBtn,fgAppBanner,trackpadPresetPill,previewEmptyHint,fullscreenStatusHint;
+    private Button homeSendFileBtn,homePowerBtn,previewToggleBtn,previewFullscreenBtn;
     private LinearLayout previewWrap,shortcutStripRow,mediaBar;
-    private ImageView previewImageView;
+    private ImageView previewImageView,fullscreenPreviewImage;
+    private Dialog fullscreenPreviewDialog;
     private PhoneUiKit.SwitchRow clipSyncSwitch,notifPreviewSwitch,otpHelperSwitch;
     private final List<Runnable> dynamicEcoButtonThemeUpdaters=new ArrayList<>();
     private String lastShortcutSig="";
     private boolean previewExpanded;
+    private boolean fullscreenLandscape=true;
     private boolean suppressClipboardPush;
     private String lastLocalClipHash="";
-    private android.graphics.Bitmap lastRenderedPreviewBmp;
+    private android.graphics.Bitmap lastRenderedPreviewBmp,lastRenderedFullscreenBmp;
     private ClipboardManager.OnPrimaryClipChangedListener clipboardListener;
     private BroadcastReceiver batteryReceiver;
 
@@ -895,35 +897,73 @@ public final class MainActivity extends Activity {
 
         previewWrap=new LinearLayout(this);
         previewWrap.setOrientation(LinearLayout.VERTICAL);
-        previewWrap.setPadding(dp(6),dp(6),dp(6),dp(6));
+        previewWrap.setPadding(dp(8),dp(6),dp(8),dp(8));
         previewWrap.setVisibility(View.GONE);
         PhoneUiKit.styleSubcard(previewWrap,palette,this);
         LinearLayout.LayoutParams pvWrapLp=new LinearLayout.LayoutParams(-1,-2);
         pvWrapLp.topMargin=dp(8);
         padCard.addView(previewWrap,pvWrapLp);
 
+        LinearLayout previewHeader=new LinearLayout(this);
+        previewHeader.setOrientation(LinearLayout.HORIZONTAL);
+        previewHeader.setGravity(Gravity.CENTER_VERTICAL);
+        previewWrap.addView(previewHeader,new LinearLayout.LayoutParams(-1,-2));
+
+        TextView previewBarTitle=new TextView(this);
+        previewBarTitle.setText("Live Monitor Preview");
+        previewBarTitle.setTextSize(11.5f);
+        previewBarTitle.setTypeface(null,Typeface.BOLD);
+        previewHeader.addView(previewBarTitle,new LinearLayout.LayoutParams(0,-2,1f));
+
+        previewFullscreenBtn=PhoneUiKit.createButton(this,"⛶ Full Screen",palette,PhoneUiKit.BTN_TINT_ACCENT);
+        previewFullscreenBtn.setTextSize(11f);
+        previewFullscreenBtn.setPadding(dp(10),dp(5),dp(10),dp(5));
+        previewFullscreenBtn.setOnClickListener(v->openFullscreenScreenPreview());
+        previewHeader.addView(previewFullscreenBtn,new LinearLayout.LayoutParams(-2,-2));
+
         previewImageView=new ImageView(this);
         previewImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        previewImageView.setAdjustViewBounds(true);
+        previewImageView.setAdjustViewBounds(false);
         previewImageView.setBackgroundColor(0xFF0F172A);
+        final float[] pvDownXY={0f,0f};
+        final boolean[] pvDragged={false};
+        final long[] pvLastTapMs={0L};
         previewImageView.setOnTouchListener((iv,ev)->{
             if(iv.getWidth()<=0 || iv.getHeight()<=0)return true;
-            if(ev.getActionMasked()==MotionEvent.ACTION_DOWN || ev.getActionMasked()==MotionEvent.ACTION_MOVE){
+            android.graphics.Bitmap curBmp=DeskTouchRuntime.session(MainActivity.this).currentScreenPreview();
+            int bw=curBmp!=null && !curBmp.isRecycled() ? curBmp.getWidth() : 0;
+            int bh=curBmp!=null && !curBmp.isRecycled() ? curBmp.getHeight() : 0;
+            float[] norm=EcosystemFeatures.mapTouchToBitmapNormalized(ev.getX(),ev.getY(),iv.getWidth(),iv.getHeight(),bw,bh);
+            if(ev.getActionMasked()==MotionEvent.ACTION_DOWN){
                 if(iv.getParent()!=null)iv.getParent().requestDisallowInterceptTouchEvent(true);
-                float nx=Math.max(0f,Math.min(1f,ev.getX()/(float)iv.getWidth()));
-                float ny=Math.max(0f,Math.min(1f,ev.getY()/(float)iv.getHeight()));
-                DeskTouchRuntime.session(MainActivity.this).moveToNormalizedInActiveMonitor(nx,ny);
+                pvDownXY[0]=ev.getX();pvDownXY[1]=ev.getY();
+                pvDragged[0]=false;
+                DeskTouchRuntime.session(MainActivity.this).moveToNormalizedInActiveMonitor(norm[0],norm[1]);
+            }else if(ev.getActionMasked()==MotionEvent.ACTION_MOVE){
+                if(Math.abs(ev.getX()-pvDownXY[0])+Math.abs(ev.getY()-pvDownXY[1])>dp(6))pvDragged[0]=true;
+                DeskTouchRuntime.session(MainActivity.this).moveToNormalizedInActiveMonitor(norm[0],norm[1]);
             }else if(ev.getActionMasked()==MotionEvent.ACTION_UP){
                 if(iv.getParent()!=null)iv.getParent().requestDisallowInterceptTouchEvent(false);
-                float nx=Math.max(0f,Math.min(1f,ev.getX()/(float)iv.getWidth()));
-                float ny=Math.max(0f,Math.min(1f,ev.getY()/(float)iv.getHeight()));
                 DeskTouchSession ps=DeskTouchRuntime.session(MainActivity.this);
-                ps.moveToNormalizedInActiveMonitor(nx,ny);
-                ps.click(1);
+                ps.moveToNormalizedInActiveMonitor(norm[0],norm[1]);
+                if(!pvDragged[0]){
+                    long nowMs=android.os.SystemClock.uptimeMillis();
+                    if(nowMs-pvLastTapMs[0]<280L){
+                        pvLastTapMs[0]=0L;
+                        openFullscreenScreenPreview();
+                    }else{
+                        pvLastTapMs[0]=nowMs;
+                        ps.click(1);
+                    }
+                }
+            }else if(ev.getActionMasked()==MotionEvent.ACTION_CANCEL){
+                if(iv.getParent()!=null)iv.getParent().requestDisallowInterceptTouchEvent(false);
             }
             return true;
         });
-        previewWrap.addView(previewImageView,new LinearLayout.LayoutParams(-1,dp(136)));
+        LinearLayout.LayoutParams pvImgLp=new LinearLayout.LayoutParams(-1,dp(156));
+        pvImgLp.topMargin=dp(6);
+        previewWrap.addView(previewImageView,pvImgLp);
 
         previewEmptyHint=new TextView(this);
         previewEmptyHint.setText("Tap screen preview to aim and click accurately");
@@ -1340,7 +1380,9 @@ public final class MainActivity extends Activity {
             trackpadReadout.setTextColor(p.textSecondary);
             PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(previewToggleBtn,p,previewExpanded ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(previewFullscreenBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
             PhoneUiKit.styleSubcard(previewWrap,p,this);
+            previewBarTitle.setTextColor(p.textPrimary);
             previewEmptyHint.setTextColor(p.textSecondary);
             PhoneUiKit.stylePill(trackpadPresetPill,p.subtleBtnBg,p.border,p.textPrimary,this);
             lastShortcutSig="";
@@ -2032,10 +2074,11 @@ public final class MainActivity extends Activity {
             if(previewExpanded){
                 DeskTouchSession s=DeskTouchRuntime.session(this);
                 int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
-                s.setScreenPreviewWatch(tid,s.activeMonitorIndex());
+                boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
+                s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),fullOpen);
             }
-        }else{
-            DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
+        }else if(fullscreenPreviewDialog==null || !fullscreenPreviewDialog.isShowing()){
+            DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1,false);
         }
         refreshTabBarStyles();
     }
@@ -2135,9 +2178,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.82";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.83";
         }catch(Exception ignored){
-            return "0.3.82";
+            return "0.3.83";
         }
     }
 
@@ -2213,7 +2256,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onPause(){
         stopLiveUiTicker();
-        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
+        if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing()){
+            fullscreenPreviewDialog.dismiss();
+        }
+        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1,false);
         super.onPause();
     }
 
@@ -2938,7 +2984,8 @@ public final class MainActivity extends Activity {
                         }
                         active.focusMonitor(monIdx);
                         if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD){
-                            active.setScreenPreviewWatch(screenPc.id,monIdx);
+                            boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
+                            active.setScreenPreviewWatch(screenPc.id,monIdx,fullOpen);
                         }
                         refreshTrackpadPcTaskbar();
                         setFeedback("Moved cursor to Display "+mb.displayNumber+".",false);
@@ -3697,8 +3744,11 @@ public final class MainActivity extends Activity {
 
     @Override protected void onDestroy(){
         stopLiveUiTicker();
+        if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing()){
+            try{fullscreenPreviewDialog.dismiss();}catch(RuntimeException ignored){}
+        }
         DeskTouchSession.setRemoteClipboardTextApplier(null);
-        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1);
+        DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1,false);
         if(clipboardListener!=null){
             try{
                 ClipboardManager cm=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
@@ -3898,14 +3948,296 @@ public final class MainActivity extends Activity {
         }
         if(previewExpanded){
             int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
-            s.setScreenPreviewWatch(tid,s.activeMonitorIndex());
+            boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
+            s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),fullOpen);
             if(previewEmptyHint!=null)previewEmptyHint.setText("Requesting live monitor snapshot...");
             refreshEcosystemLiveUi();
         }else{
-            s.setScreenPreviewWatch(-1,-1);
+            if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing()){
+                fullscreenPreviewDialog.dismiss();
+            }
+            s.setScreenPreviewWatch(-1,-1,false);
             lastRenderedPreviewBmp=null;
             if(previewImageView!=null)previewImageView.setImageDrawable(null);
         }
+    }
+
+    private void openFullscreenScreenPreview(){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        if(!s.isConnected()){
+            setFeedback("Connect to a computer in Find before opening Full Screen Preview.",true);
+            return;
+        }
+        if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing())return;
+
+        final Dialog dlg=new Dialog(this,android.R.style.Theme_Black_NoTitleBar_Fullscreen);
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        fullscreenPreviewDialog=dlg;
+        fullscreenLandscape=true;
+        try{
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }catch(RuntimeException ignored){}
+
+        FrameLayout root=new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
+
+        final ImageView fullImg=new ImageView(this);
+        fullImg.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        fullImg.setBackgroundColor(Color.BLACK);
+        fullscreenPreviewImage=fullImg;
+        lastRenderedFullscreenBmp=null;
+        android.graphics.Bitmap initialBmp=s.currentScreenPreview();
+        if(initialBmp!=null && !initialBmp.isRecycled()){
+            fullImg.setImageBitmap(initialBmp);
+            lastRenderedFullscreenBmp=initialBmp;
+        }
+        root.addView(fullImg,new FrameLayout.LayoutParams(-1,-1));
+
+        final float[] downXY={0f,0f};
+        final float[] twoPrevY={0f};
+        final float[] twoCarry={0f};
+        final boolean[] moved={false};
+        final boolean[] multiMoved={false};
+        final int[] maxPtrs={1};
+        final Runnable[] longPressTask={null};
+
+        fullImg.setOnTouchListener((iv,ev)->{
+            if(iv.getWidth()<=0 || iv.getHeight()<=0)return true;
+            DeskTouchSession activeSession=DeskTouchRuntime.session(MainActivity.this);
+            android.graphics.Bitmap curBmp=activeSession.currentScreenPreview();
+            int bw=curBmp!=null && !curBmp.isRecycled() ? curBmp.getWidth() : 0;
+            int bh=curBmp!=null && !curBmp.isRecycled() ? curBmp.getHeight() : 0;
+            float[] norm=EcosystemFeatures.mapTouchToBitmapNormalized(
+                ev.getX(),ev.getY(),iv.getWidth(),iv.getHeight(),bw,bh);
+            switch(ev.getActionMasked()){
+                case MotionEvent.ACTION_DOWN:
+                    downXY[0]=ev.getX();downXY[1]=ev.getY();
+                    moved[0]=false;multiMoved[0]=false;maxPtrs[0]=1;twoCarry[0]=0f;
+                    activeSession.moveToNormalizedInActiveMonitor(norm[0],norm[1]);
+                    if(longPressTask[0]!=null)liveUiHandler.removeCallbacks(longPressTask[0]);
+                    longPressTask[0]=()->{
+                        if(!moved[0] && maxPtrs[0]==1 && dlg.isShowing()){
+                            DeskTouchRuntime.session(MainActivity.this).click(2);
+                            moved[0]=true;
+                            showToast("Right click");
+                        }
+                    };
+                    liveUiHandler.postDelayed(longPressTask[0],520L);
+                    return true;
+                case MotionEvent.ACTION_POINTER_DOWN:
+                    maxPtrs[0]=Math.max(maxPtrs[0],ev.getPointerCount());
+                    if(longPressTask[0]!=null){liveUiHandler.removeCallbacks(longPressTask[0]);longPressTask[0]=null;}
+                    if(ev.getPointerCount()>=2){
+                        twoPrevY[0]=(ev.getY(0)+ev.getY(1))*0.5f;
+                        twoCarry[0]=0f;
+                    }
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if(ev.getPointerCount()>=2){
+                        maxPtrs[0]=Math.max(maxPtrs[0],ev.getPointerCount());
+                        float avgY=(ev.getY(0)+ev.getY(1))*0.5f;
+                        float sdy=avgY-twoPrevY[0];
+                        twoPrevY[0]=avgY;
+                        twoCarry[0]+=sdy;
+                        if(Math.abs(twoCarry[0])>dp(8))multiMoved[0]=true;
+                        int step=dp(16);
+                        while(Math.abs(twoCarry[0])>=step){
+                            activeSession.wheel(twoCarry[0]>0 ? 120 : -120,false);
+                            twoCarry[0]-=twoCarry[0]>0 ? step : -step;
+                        }
+                        return true;
+                    }
+                    if(maxPtrs[0]>1)return true;
+                    if(Math.abs(ev.getX()-downXY[0])+Math.abs(ev.getY()-downXY[1])>dp(8)){
+                        moved[0]=true;
+                        if(longPressTask[0]!=null){liveUiHandler.removeCallbacks(longPressTask[0]);longPressTask[0]=null;}
+                    }
+                    activeSession.moveToNormalizedInActiveMonitor(norm[0],norm[1]);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    if(longPressTask[0]!=null){liveUiHandler.removeCallbacks(longPressTask[0]);longPressTask[0]=null;}
+                    if(maxPtrs[0]>=2){
+                        if(!multiMoved[0])activeSession.click(2);
+                    }else if(!moved[0]){
+                        activeSession.moveToNormalizedInActiveMonitor(norm[0],norm[1]);
+                        activeSession.click(1);
+                    }
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    if(longPressTask[0]!=null){liveUiHandler.removeCallbacks(longPressTask[0]);longPressTask[0]=null;}
+                    return true;
+                default:
+                    return true;
+            }
+        });
+
+        final LinearLayout quickKeyBar=new LinearLayout(this);
+        quickKeyBar.setOrientation(LinearLayout.HORIZONTAL);
+        quickKeyBar.setGravity(Gravity.CENTER_VERTICAL);
+        quickKeyBar.setPadding(dp(8),dp(5),dp(8),dp(5));
+        quickKeyBar.setBackground(PhoneUiKit.roundedBox(0xCC0F172A,0xFF38BDF8,dp(12),Math.max(1,dp(1))));
+        quickKeyBar.setVisibility(View.GONE);
+        final EditText fsKeyInput=new EditText(this);
+        fsKeyInput.setHint("Type to computer...");
+        fsKeyInput.setTextColor(Color.WHITE);
+        fsKeyInput.setHintTextColor(0xFF94A3B8);
+        fsKeyInput.setTextSize(12.5f);
+        fsKeyInput.setSingleLine(true);
+        quickKeyBar.addView(fsKeyInput,new LinearLayout.LayoutParams(dp(190),-2));
+        final String[] prevFsTyped={""};
+        final boolean[] suppressFs={false};
+        fsKeyInput.addTextChangedListener(new TextWatcher(){
+            public void beforeTextChanged(CharSequence t,int s1,int c,int a){}
+            public void onTextChanged(CharSequence t,int s1,int b,int c){}
+            public void afterTextChanged(Editable e){
+                if(suppressFs[0])return;
+                String next=e.toString();
+                DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                if(!act.isActive() && !act.hasClaim())act.claimControl();
+                int common=0;
+                while(common<prevFsTyped[0].length() && common<next.length() &&
+                    prevFsTyped[0].charAt(common)==next.charAt(common))common++;
+                for(int n=common;n<prevFsTyped[0].length();n++){act.key(0x08,true);act.key(0x08,false);}
+                if(common<next.length())sendRemoteTextWithNewlines(act,next.substring(common));
+                prevFsTyped[0]=next;
+            }
+        });
+        TextView fsEnterBtn=createFullscreenHudChip("↵",()->{
+            DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+            act.key(0x0D,true);act.key(0x0D,false);
+            suppressFs[0]=true;fsKeyInput.setText("");prevFsTyped[0]="";suppressFs[0]=false;
+        });
+        LinearLayout.LayoutParams feLp=new LinearLayout.LayoutParams(-2,-2);
+        feLp.leftMargin=dp(6);
+        quickKeyBar.addView(fsEnterBtn,feLp);
+
+        FrameLayout.LayoutParams kbBarLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START);
+        kbBarLp.leftMargin=dp(12);kbBarLp.topMargin=dp(12);
+        root.addView(quickKeyBar,kbBarLp);
+
+        LinearLayout hudBar=new LinearLayout(this);
+        hudBar.setOrientation(LinearLayout.HORIZONTAL);
+        hudBar.setGravity(Gravity.CENTER_VERTICAL);
+        hudBar.setPadding(dp(8),dp(5),dp(8),dp(5));
+        hudBar.setBackground(PhoneUiKit.roundedBox(0xB80F172A,0xFF334155,dp(14),Math.max(1,dp(1))));
+
+        final TextView monBtn=createFullscreenHudChip("Display "+(s.activeMonitorIndex()+1),null);
+        monBtn.setOnClickListener(v->{
+            DeskTouchSession cur=DeskTouchRuntime.session(MainActivity.this);
+            int tidNow=cur.selectedEnvironmentTarget()>0 ? cur.selectedEnvironmentTarget() : 0;
+            int count=1;
+            for(DeskTouchSession.EnvironmentTarget t:cur.environmentTargets()){
+                if(t.id==tidNow){
+                    count=Math.max(1,LinkedDisplayHelper.parseTileModel(t,cur.selectedEnvironmentTarget(),cur.ownEnvironmentId()).monitorCount);
+                    break;
+                }
+            }
+            int nextMon=(cur.activeMonitorIndex()+1)%Math.max(1,count);
+            cur.focusMonitor(nextMon);
+            cur.setScreenPreviewWatch(tidNow,nextMon,true);
+            monBtn.setText("Display "+(nextMon+1)+(count>1 ? "/"+count : ""));
+            if(fullscreenStatusHint!=null){
+                fullscreenStatusHint.setText("Live Display "+(nextMon+1)+" • Tap = Click • Drag = Move • Long-press = Right");
+            }
+        });
+        hudBar.addView(monBtn);
+
+        TextView rotBtn=createFullscreenHudChip("↻ Rotate",()->{
+            fullscreenLandscape=!fullscreenLandscape;
+            try{
+                setRequestedOrientation(fullscreenLandscape
+                    ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            }catch(RuntimeException ignored){}
+        });
+        LinearLayout.LayoutParams rotLp=new LinearLayout.LayoutParams(-2,-2);
+        rotLp.leftMargin=dp(6);
+        hudBar.addView(rotBtn,rotLp);
+
+        TextView rClickBtn=createFullscreenHudChip("R-Click",()->DeskTouchRuntime.session(MainActivity.this).click(2));
+        LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(-2,-2);
+        rcLp.leftMargin=dp(6);
+        hudBar.addView(rClickBtn,rcLp);
+
+        TextView keysHudBtn=createFullscreenHudChip("⌨ Keys",()->{
+            boolean show=quickKeyBar.getVisibility()!=View.VISIBLE;
+            quickKeyBar.setVisibility(show ? View.VISIBLE : View.GONE);
+            if(show){
+                fsKeyInput.requestFocus();
+                InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
+                if(imm!=null)imm.showSoftInput(fsKeyInput,InputMethodManager.SHOW_IMPLICIT);
+            }
+        });
+        LinearLayout.LayoutParams khLp=new LinearLayout.LayoutParams(-2,-2);
+        khLp.leftMargin=dp(6);
+        hudBar.addView(keysHudBtn,khLp);
+
+        TextView closeBtn=createFullscreenHudChip("✕ Exit",dlg::dismiss);
+        closeBtn.setBackground(PhoneUiKit.roundedBox(0xFF991B1B,0xFFFCA5A5,dp(10),Math.max(1,dp(1))));
+        LinearLayout.LayoutParams clLp=new LinearLayout.LayoutParams(-2,-2);
+        clLp.leftMargin=dp(6);
+        hudBar.addView(closeBtn,clLp);
+
+        FrameLayout.LayoutParams hudLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.END);
+        hudLp.rightMargin=dp(12);hudLp.topMargin=dp(12);
+        root.addView(hudBar,hudLp);
+
+        fullscreenStatusHint=new TextView(this);
+        fullscreenStatusHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Tap = Click • Drag = Move • Long-press / 2-finger tap = Right");
+        fullscreenStatusHint.setTextSize(10.5f);
+        fullscreenStatusHint.setTextColor(0xFFE2E8F0);
+        fullscreenStatusHint.setPadding(dp(10),dp(4),dp(10),dp(4));
+        fullscreenStatusHint.setBackground(PhoneUiKit.roundedBox(0x990F172A,0x4438BDF8,dp(10),Math.max(1,dp(1))));
+        FrameLayout.LayoutParams hintLp=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+        hintLp.bottomMargin=dp(10);
+        root.addView(fullscreenStatusHint,hintLp);
+
+        dlg.setContentView(root);
+        Window win=dlg.getWindow();
+        if(win!=null){
+            win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.MATCH_PARENT);
+            win.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            WindowCompat.setDecorFitsSystemWindows(win,false);
+            WindowInsetsControllerCompat ctrl=WindowCompat.getInsetsController(win,root);
+            if(ctrl!=null){
+                ctrl.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                ctrl.hide(WindowInsetsCompat.Type.systemBars());
+            }
+        }
+
+        int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+        s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),true);
+        dlg.setOnDismissListener(d->{
+            fullscreenPreviewImage=null;
+            fullscreenStatusHint=null;
+            fullscreenPreviewDialog=null;
+            lastRenderedFullscreenBmp=null;
+            try{
+                setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            }catch(RuntimeException ignored){}
+            DeskTouchSession cs=DeskTouchRuntime.session(MainActivity.this);
+            if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && !isFinishing() && !isDestroyed()){
+                int curTid=cs.selectedEnvironmentTarget()>0 ? cs.selectedEnvironmentTarget() : 0;
+                cs.setScreenPreviewWatch(curTid,cs.activeMonitorIndex(),false);
+            }else{
+                cs.setScreenPreviewWatch(-1,-1,false);
+            }
+        });
+        dlg.show();
+    }
+
+    private TextView createFullscreenHudChip(String label,Runnable onClick){
+        TextView tv=new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(11f);
+        tv.setTypeface(null,Typeface.BOLD);
+        tv.setTextColor(Color.WHITE);
+        tv.setPadding(dp(10),dp(6),dp(10),dp(6));
+        tv.setBackground(PhoneUiKit.roundedBox(0xFF1E293B,0xFF475569,dp(10),Math.max(1,dp(1))));
+        tv.setClickable(true);
+        tv.setFocusable(true);
+        if(onClick!=null)tv.setOnClickListener(v->onClick.run());
+        return tv;
     }
 
     private void populateMediaAndPowerBar(){
@@ -4015,15 +4347,21 @@ public final class MainActivity extends Activity {
             fgAppBanner.setText(base);
         }
         refreshShortcutStrip();
-        if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && previewImageView!=null){
-            android.graphics.Bitmap bmp=s.currentScreenPreview();
-            if(bmp!=null && !bmp.isRecycled()){
+        android.graphics.Bitmap bmp=s.currentScreenPreview();
+        if(bmp!=null && !bmp.isRecycled()){
+            if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && previewImageView!=null){
                 if(bmp!=lastRenderedPreviewBmp){
                     previewImageView.setImageBitmap(bmp);
                     lastRenderedPreviewBmp=bmp;
                 }
                 if(previewEmptyHint!=null){
-                    previewEmptyHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Tap anywhere to move & click");
+                    previewEmptyHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Double-tap or use ⛶ Full Screen");
+                }
+            }
+            if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing() && fullscreenPreviewImage!=null){
+                if(bmp!=lastRenderedFullscreenBmp){
+                    fullscreenPreviewImage.setImageBitmap(bmp);
+                    lastRenderedFullscreenBmp=bmp;
                 }
             }
         }

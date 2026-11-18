@@ -1640,6 +1640,19 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("REQ_SEND_FILE"));
         assertTrue(sessionSource.contains("screen-preview-chunk"));
         assertTrue(sessionSource.contains("sendFileUriAsync"));
+
+        // Verify v0.3.83 FIT_CENTER letterbox touch mapping & Full Screen Preview support.
+        float[] centerMapped = EcosystemFeatures.mapTouchToBitmapNormalized(500f, 500f, 1000, 1000, 1920, 1080);
+        assertEquals(0.5f, centerMapped[0], 0.01f);
+        assertEquals(0.5f, centerMapped[1], 0.01f);
+        float[] topBarClamped = EcosystemFeatures.mapTouchToBitmapNormalized(500f, 10f, 1000, 1000, 1920, 1080);
+        assertEquals(0.5f, topBarClamped[0], 0.01f);
+        assertEquals(0.0f, topBarClamped[1], 0.001f);
+        float[] bottomBarClamped = EcosystemFeatures.mapTouchToBitmapNormalized(500f, 990f, 1000, 1000, 1920, 1080);
+        assertEquals(1.0f, bottomBarClamped[1], 0.001f);
+        assertTrue(mainSource.contains("openFullscreenScreenPreview("));
+        assertTrue(mainSource.contains("SCREEN_ORIENTATION_SENSOR_LANDSCAPE"));
+        assertTrue(sessionSource.contains("void setScreenPreviewWatch(int targetId, int monitorIndex, boolean highRes)"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

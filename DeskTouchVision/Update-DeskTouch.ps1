@@ -176,6 +176,10 @@ try {
       }
     }
   } catch { Log ("Startup entry sync skipped: {0}" -f $_.Exception.Message) }
+  try {
+    New-Item -ItemType Directory -Force -Path $logs | Out-Null
+    Set-Content -LiteralPath (Join-Path (Split-Path $logs -Parent) 'just-updated.txt') -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString()) -Encoding utf8
+  } catch { }
   $restartArgs = if ($StartInTray) { @('--tray') } else { @() }
   if ($restartArgs.Count -gt 0) {
     Start-Process -FilePath (Join-Path $targetFull 'DeskTouchVision.exe') -ArgumentList $restartArgs

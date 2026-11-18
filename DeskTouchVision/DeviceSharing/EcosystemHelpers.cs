@@ -470,7 +470,8 @@ internal static class ScreenPreviewHelper
     private static readonly ImageCodecInfo? JpegCodec = ImageCodecInfo.GetImageEncoders()
         .FirstOrDefault(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
-    internal static (int FrameId, int PackedDims, IReadOnlyList<Packet> Chunks) CaptureMonitorPreview(int monitorIndex = 0)
+    internal static (int FrameId, int PackedDims, IReadOnlyList<Packet> Chunks) CaptureMonitorPreview(
+        int monitorIndex = 0, bool highRes = false)
     {
         try
         {
@@ -480,7 +481,9 @@ internal static class ScreenPreviewHelper
             Rectangle bounds = screens[idx].Bounds;
             if (bounds.Width < 16 || bounds.Height < 16) return default;
 
-            const int targetMaxWidth = 480;
+            int targetMaxWidth = highRes ? 1120 : 560;
+            long jpegQuality = highRes ? 66L : 58L;
+            int maxBytes = highRes ? 240 * 1024 : 140 * 1024;
             int dstW = Math.Min(targetMaxWidth, bounds.Width);
             int dstH = Math.Max(40, (int)Math.Round(bounds.Height * (dstW / (double)bounds.Width)));
 
@@ -492,14 +495,14 @@ internal static class ScreenPreviewHelper
             using var dstBmp = new Bitmap(dstW, dstH, PixelFormat.Format24bppRgb);
             using (var gDst = Graphics.FromImage(dstBmp))
             {
-                gDst.InterpolationMode = InterpolationMode.Bilinear;
+                gDst.InterpolationMode = highRes ? InterpolationMode.HighQualityBicubic : InterpolationMode.Bilinear;
                 gDst.DrawImage(srcBmp, 0, 0, dstW, dstH);
             }
             using var ms = new MemoryStream();
             if (JpegCodec != null)
             {
                 using var ep = new EncoderParameters(1);
-                ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 52L);
+                ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, jpegQuality);
                 dstBmp.Save(ms, JpegCodec, ep);
             }
             else
@@ -508,7 +511,7 @@ internal static class ScreenPreviewHelper
             }
 
             byte[] jpeg = ms.ToArray();
-            if (jpeg.Length == 0 || jpeg.Length > 120 * 1024)
+            if (jpeg.Length == 0 || jpeg.Length > maxBytes)
                 return default;
             int frameId = Interlocked.Increment(ref _nextFrameId);
             int packedDims = (dstW << 16) | (dstH & 0xFFFF);

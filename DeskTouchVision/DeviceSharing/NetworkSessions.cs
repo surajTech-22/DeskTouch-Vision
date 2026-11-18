@@ -242,6 +242,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal bool TaskbarWatchSent;
         internal int ScreenPreviewTarget = -1;
         internal int ScreenPreviewMonitor = -1;
+        internal int ScreenPreviewHighRes = 0;
         internal int LowBatteryAlertSent;
 
         internal void ResetForwardDedup()
@@ -1678,13 +1679,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
 
                 // Active screen preview frames (only when Android expands Screen Preview on this hub).
+                bool anyPreviewActive = false;
                 foreach (var android in androidSessions)
                 {
                     int monIdx = Volatile.Read(ref android.ScreenPreviewMonitor);
                     int previewTarget = Volatile.Read(ref android.ScreenPreviewTarget);
+                    if (monIdx >= 0) anyPreviewActive = true;
                     if (monIdx >= 0 && previewTarget == 0 && Volatile.Read(ref android.UrgentControlWaiters) == 0)
                     {
-                        var shot = ScreenPreviewHelper.CaptureMonitorPreview(monIdx);
+                        bool highRes = Volatile.Read(ref android.ScreenPreviewHighRes) != 0;
+                        var shot = ScreenPreviewHelper.CaptureMonitorPreview(monIdx, highRes);
                         if (shot.Chunks != null && shot.Chunks.Count > 0)
                         {
                             foreach (var chunk in shot.Chunks)
@@ -1714,11 +1718,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                 }
 
-                for (int step = 0; step < 5 && !token.IsCancellationRequested; step++)
+                if (anyPreviewActive)
                 {
-                    if (Interlocked.Exchange(ref _localTaskbarNudge, 0) != 0)
-                        break;
-                    await Task.Delay(200, token);
+                    await Task.Delay(260, token);
+                }
+                else
+                {
+                    for (int step = 0; step < 5 && !token.IsCancellationRequested; step++)
+                    {
+                        if (Interlocked.Exchange(ref _localTaskbarNudge, 0) != 0)
+                            break;
+                        await Task.Delay(200, token);
+                    }
                 }
             }
         }
@@ -4232,16 +4243,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     int targetRoute = p.A;
                     int mon = p.B;
+                    int highRes = p.C != 0 ? 1 : 0;
                     int prevTarget = Volatile.Read(ref session.ScreenPreviewTarget);
                     if (prevTarget > 0 && prevTarget != targetRoute && _sessions.TryGetValue(prevTarget, out var oldWin))
                     {
-                        try { await SendToAsync(oldWin, new Packet("screen-preview-watch", 0, -1), token); } catch { }
+                        try { await SendToAsync(oldWin, new Packet("screen-preview-watch", 0, -1, 0), token); } catch { }
                     }
                     Volatile.Write(ref session.ScreenPreviewTarget, targetRoute);
                     Volatile.Write(ref session.ScreenPreviewMonitor, mon);
+                    Volatile.Write(ref session.ScreenPreviewHighRes, highRes);
                     if (targetRoute > 0 && _sessions.TryGetValue(targetRoute, out var newWin))
                     {
-                        try { await SendToAsync(newWin, new Packet("screen-preview-watch", 0, mon), token); } catch { }
+                        try { await SendToAsync(newWin, new Packet("screen-preview-watch", 0, mon, highRes), token); } catch { }
                     }
                     continue;
                 }
@@ -5173,6 +5186,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private string _lastHostTaskbarSig = "";
     private readonly HashSet<string> _sentHostTaskbarIcons = new(StringComparer.Ordinal);
     private int _hostScreenPreviewMonitor = -1;
+    private int _hostScreenPreviewHighRes = 0;
     private string _lastHostForegroundSig = "";
     private readonly FileDropHelper _hostFileDrop = new();
     private readonly Dictionary<int, NotificationPreviewItem[]> _hostPeerNotifications = new();
@@ -6045,6 +6059,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                 else if (p.Type == "screen-preview-watch")
                 {
                     Volatile.Write(ref _hostScreenPreviewMonitor, p.B);
+                    Volatile.Write(ref _hostScreenPreviewHighRes, p.C != 0 ? 1 : 0);
                 }
                 else if (p.Type == "notif-preview-state" && p.Text is { Length: >= 2 and <= 7800 })
                 {
@@ -6194,9 +6209,10 @@ internal sealed class HostSession : IInputSession, IDisposable
                     }
                 }
                 int previewMon = Volatile.Read(ref _hostScreenPreviewMonitor);
-                if (previewMon >= 0 && (tick % 4) == 0)
+                if (previewMon >= 0 && (tick % 3) == 0)
                 {
-                    var shot = ScreenPreviewHelper.CaptureMonitorPreview(previewMon);
+                    bool highRes = Volatile.Read(ref _hostScreenPreviewHighRes) != 0;
+                    var shot = ScreenPreviewHelper.CaptureMonitorPreview(previewMon, highRes);
                     if (shot.Chunks != null)
                     {
                         foreach (var c in shot.Chunks)

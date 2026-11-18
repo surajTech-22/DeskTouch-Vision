@@ -499,15 +499,28 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             PublishDeckBridgeSnapshot();
             if (_trustLoadError != null)
                 Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
+            bool justUpdated = ConsumeJustUpdatedMarker();
             if (_startInTray && !_showRequestedBeforeShown)
             {
                 HideToTray(showBalloon: false);
+                if (justUpdated && _trayIcon != null && !_trayTipShown)
+                {
+                    _trayTipShown = true;
+                    _trayIcon.BalloonTipTitle = $"DeskTouch Vision updated to v{MonitorTopology.CurrentAppVersion()}";
+                    _trayIcon.BalloonTipText = "Updated automatically in the background. Click here to open Displays.";
+                    try { _trayIcon.ShowBalloonTip(5000); } catch { }
+                }
                 if (_showRequestedBeforeShown)
                     ShowFromTray();
             }
             else
             {
                 BringWindowToForegroundSafely();
+                if (justUpdated)
+                {
+                    _ = Task.Delay(250, _closing.Token).ContinueWith(
+                        _ => PostToUi(BringWindowToForegroundSafely), TaskScheduler.Default);
+                }
             }
         };
         InitializeTray();
@@ -581,6 +594,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         };
         _trayIcon.MouseClick += OnTrayIconMouseClick;
         _trayIcon.DoubleClick += (_, _) =>
+        {
+            _trayFlyout?.Hide();
+            ShowFromTray();
+        };
+        _trayIcon.BalloonTipClicked += (_, _) =>
         {
             _trayFlyout?.Hide();
             ShowFromTray();
@@ -689,21 +707,44 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         Activate();
         BringToFront();
 
-        // If Windows 11 Foreground Lock kept another window on top, briefly pulse TopMost.
+        // If Windows 11 Foreground Lock kept another window on top, briefly attach thread input and pulse TopMost.
         if (IsHandleCreated && Win.GetForegroundWindow() != Handle)
         {
             bool prevTopMost = TopMost;
             try
             {
+                Win.ForceWindowToFront(Handle);
                 TopMost = true;
-                Win.BringWindowToTop(Handle);
-                Win.SetForegroundWindow(Handle);
+                Win.ForceWindowToFront(Handle);
                 Activate();
             }
             finally
             {
                 TopMost = prevTopMost;
             }
+        }
+    }
+
+    private static bool ConsumeJustUpdatedMarker()
+    {
+        try
+        {
+            string marker = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "DeskTouchVision", "just-updated.txt");
+            if (!File.Exists(marker)) return false;
+            string raw = File.ReadAllText(marker).Trim();
+            File.Delete(marker);
+            if (long.TryParse(raw, out long ms))
+            {
+                long ageMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - ms;
+                return ageMs is >= -60000 and <= 180000;
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 

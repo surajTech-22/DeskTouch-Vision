@@ -194,18 +194,19 @@ jobs:
           } else {
             $rawNotes = Get-Content -LiteralPath "DeskTouchVision/RELEASE_NOTES.md" -Raw
             $latestSection = ($rawNotes -split "\r?\n---\r?\n", 2)[0].Trim()
-            $releaseBody = @"
-## Direct Downloads (One-Click Install)
-
-- **Windows Single Installer (Recommended):** [Download DeskTouchVision-Install.exe](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-Install.exe)
-- **Android Phone App:** [Download DeskTouchVision-android-preview.apk](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-android-preview.apk)
-
----
-
-$latestSection
-"@
+            $releaseLines = @(
+              "## Direct Downloads (One-Click Install)",
+              "",
+              "- **Windows Single Installer (Recommended):** [Download DeskTouchVision-Install.exe](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-Install.exe)",
+              "- **Android Phone App:** [Download DeskTouchVision-android-preview.apk](https://github.com/${{ github.repository }}/releases/download/$tag/DeskTouchVision-android-preview.apk)",
+              "",
+              "---",
+              "",
+              $latestSection
+            )
+            $releaseBody = $releaseLines -join "`n"
             $notesOut = Join-Path $env:RUNNER_TEMP "release-notes-$tag.md"
-            [IO.File]::WriteAllText($notesOut, $releaseBody, [Text.Encoding]::UTF8)
+            [IO.File]::WriteAllText($notesOut, $releaseBody, [Text.UTF8Encoding]::new($false))
 
             gh release create $tag `
               DeskTouchVision/published/DeskTouchVision-Install.exe `

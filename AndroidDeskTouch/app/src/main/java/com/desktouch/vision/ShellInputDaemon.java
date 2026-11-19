@@ -1,16 +1,23 @@
 package com.desktouch.vision;
 
+import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructPollfd;
+import android.view.InputDevice;
+import android.view.InputEvent;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -74,13 +81,14 @@ public final class ShellInputDaemon {
     };
 
     // Standard 8-byte boot keyboard (modifiers, reserved, 6 active keycodes).
+    // Uses 2-byte positive limits so every kernel HID parser avoids signed 8-bit 0xFF/0xE0 wrap.
     private static final byte[] KEYBOARD_DESC = {
         (byte) 0x05, (byte) 0x01, // Usage Page (Generic Desktop)
         (byte) 0x09, (byte) 0x06, // Usage (Keyboard)
         (byte) 0xA1, (byte) 0x01, // Collection (Application)
         (byte) 0x05, (byte) 0x07, //   Usage Page (Key Codes)
-        (byte) 0x19, (byte) 0xE0, //   Usage Minimum (224)
-        (byte) 0x29, (byte) 0xE7, //   Usage Maximum (231)
+        (byte) 0x1A, (byte) 0xE0, (byte) 0x00, //   Usage Minimum (224)
+        (byte) 0x2A, (byte) 0xE7, (byte) 0x00, //   Usage Maximum (231)
         (byte) 0x15, (byte) 0x00, //   Logical Minimum (0)
         (byte) 0x25, (byte) 0x01, //   Logical Maximum (1)
         (byte) 0x75, (byte) 0x01, //   Report Size (1)
@@ -95,7 +103,7 @@ public final class ShellInputDaemon {
         (byte) 0x26, (byte) 0xFF, (byte) 0x00, // Logical Maximum (255)
         (byte) 0x05, (byte) 0x07, //   Usage Page (Key Codes)
         (byte) 0x19, (byte) 0x00, //   Usage Minimum (0)
-        (byte) 0x29, (byte) 0xFF, //   Usage Maximum (255)
+        (byte) 0x2A, (byte) 0xFF, (byte) 0x00, // Usage Maximum (255)
         (byte) 0x81, (byte) 0x00, //   Input (Data,Array)
         (byte) 0xC0               // End Collection
     };
@@ -136,9 +144,17 @@ public final class ShellInputDaemon {
     private int hWheelCarry;
     private int keyModifierMask;
     private final int[] activeUsages = new int[6];
+    private volatile boolean uhidKeyboardHealthy = true;
+    private volatile boolean softImeOverrideApplied;
+    private volatile long keyDownClockMs;
+    private Object inputMgrInstance;
+    private Method injectInputMethod;
+    private boolean inputMgrResolved;
+    private static final String IME_HARD_PREV_FILE = "/data/local/tmp/dt_ime.prev";
 
     private ShellInputDaemon(byte[] expectedTokenBytes) {
         this.expectedTokenBytes = expectedTokenBytes;
+        Runtime.getRuntime().addShutdownHook(new Thread(this::destroyDevices, "DeskTouch-UhidCleanup"));
     }
 
     public static void main(String[] args) throws Exception {
@@ -571,7 +587,7 @@ public final class ShellInputDaemon {
             boolean createdMouse = false;
             boolean createdKeyboard = false;
             if (mouseFd == null) {
-                mouseFd = createUhidDevice("DeskTouch USB Mouse", 0x3741, MOUSE_DESC);
+                mouseFd = createUhidDevice("DeskTouch USB Mouse", "desktouch-mouse", 0x3741, MOUSE_DESC);
                 pointer.releaseAnchor();
                 buttonMask = 0;
                 mousePrimedForReader = false;
@@ -580,10 +596,20 @@ public final class ShellInputDaemon {
                 createdMouse = true;
             }
             if (keyboardFd == null) {
-                keyboardFd = createUhidDevice("DeskTouch USB Keyboard", 0x3742, KEYBOARD_DESC);
-                keyModifierMask = 0;
-                for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
-                createdKeyboard = true;
+                try {
+                    keyboardFd = createUhidDevice("DeskTouch USB Keyboard", "desktouch-keyboard", 0x3742, KEYBOARD_DESC);
+                    keyModifierMask = 0;
+                    for (int i = 0; i < activeUsages.length; i++) activeUsages[i] = 0;
+                    uhidKeyboardHealthy = writeKeyboardReport(0, activeUsages);
+                    createdKeyboard = true;
+                } catch (Throwable kbdErr) {
+                    closeUhid(keyboardFd);
+                    keyboardFd = null;
+                    uhidKeyboardHealthy = false;
+                }
+            }
+            if (createdKeyboard && keyboardFd != null && uhidKeyboardHealthy) {
+                ensureSoftImeVisibleWhileConnectedAsync();
             }
             if (createdMouse || createdKeyboard) {
                 if (createdMouse && mouseFd != null) {
@@ -592,34 +618,38 @@ public final class ShellInputDaemon {
                     writeMouseReport(-1, 0, 0, 0);
                     mousePrimedForReader = true;
                 }
-                // Let EventHub/InputReader register CursorInputMapper and VelocityControl before probing.
-                LockSupport.parkNanos(140_000_000L);
+                // Let EventHub/InputReader register CursorInputMapper and KeyboardInputMapper cleanly.
+                LockSupport.parkNanos(110_000_000L);
             }
             if (createdMouse || speedChanged || !hasDumpsysVelocityParams) {
-                ShellPointerMath.VelocityParams probed = probeVelocityParamsBlocking(280);
-                if (probed != null) {
-                    hasDumpsysVelocityParams = true;
-                    pointer.updateVelocityParams(probed);
-                } else {
-                    scheduleDelayedVelocityProbe();
-                }
+                scheduleDelayedVelocityProbe(160L);
             }
-            return mouseFd != null && keyboardFd != null;
+            return mouseFd != null || keyboardFd != null;
         } catch (Exception ex) {
             destroyDevices();
             return false;
         }
     }
 
-    private void scheduleDelayedVelocityProbe() {
+    private void scheduleDelayedVelocityProbe(long delayMs) {
         Thread retry = new Thread(() -> {
-            LockSupport.parkNanos(450_000_000L);
+            LockSupport.parkNanos(Math.max(40L, delayMs) * 1_000_000L);
             if (!daemonRunning || mouseFd == null) return;
-            ShellPointerMath.VelocityParams probed = probeVelocityParamsBlocking(600);
-            if (probed != null) {
-                synchronized (this) {
+            String dump = readDumpsysInputBlocking(650);
+            if (dump == null || dump.isEmpty()) return;
+            ShellPointerMath.VelocityParams probed = ShellPointerMath.parseDumpsysVelocityParamsForDevice(
+                dump, "DeskTouch USB Mouse");
+            boolean mouseListed = dump.contains("DeskTouch USB Mouse");
+            boolean keyboardListed = dump.contains("DeskTouch USB Keyboard");
+            synchronized (this) {
+                if (probed != null) {
                     hasDumpsysVelocityParams = true;
                     pointer.updateVelocityParams(probed);
+                }
+                if (keyboardFd != null && mouseListed && !keyboardListed) {
+                    // Kernel/InputReader rejected UHID keyboard; switch keyboard events seamlessly
+                    // to system InputManager/cmd input injection so typing works on every phone.
+                    uhidKeyboardHealthy = false;
                 }
             }
         }, "DeskTouch-VelRetry");
@@ -627,8 +657,8 @@ public final class ShellInputDaemon {
         retry.start();
     }
 
-    private ShellPointerMath.VelocityParams probeVelocityParamsBlocking(long timeoutMs) {
-        final ShellPointerMath.VelocityParams[] foundRef = new ShellPointerMath.VelocityParams[1];
+    private String readDumpsysInputBlocking(long timeoutMs) {
+        final String[] dumpRef = new String[1];
         final Process[] procRef = new Process[1];
         Thread t = new Thread(() -> {
             try {
@@ -641,8 +671,7 @@ public final class ShellInputDaemon {
                     while ((row = br.readLine()) != null) {
                         sb.append(row).append('\n');
                     }
-                    foundRef[0] = ShellPointerMath.parseDumpsysVelocityParamsForDevice(
-                        sb.toString(), "DeskTouch USB Mouse");
+                    dumpRef[0] = sb.toString();
                 }
             } catch (Throwable ignored) {
             } finally {
@@ -663,10 +692,10 @@ public final class ShellInputDaemon {
         if (t.isAlive() && p != null) {
             try { p.destroyForcibly(); } catch (Throwable ignored) {}
         }
-        return foundRef[0];
+        return dumpRef[0];
     }
 
-    private static FileDescriptor createUhidDevice(String name, int productId, byte[] desc)
+    private static FileDescriptor createUhidDevice(String name, String phys, int productId, byte[] desc)
             throws ErrnoException, IOException {
         FileDescriptor fd = Os.open("/dev/uhid", OsConstants.O_RDWR, 0);
         try {
@@ -674,6 +703,11 @@ public final class ShellInputDaemon {
             buf.putInt(UHID_CREATE2);
             byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
             buf.put(nameBytes, 0, Math.min(nameBytes.length, 127));
+            buf.position(4 + 128);
+            if (phys != null && !phys.isEmpty()) {
+                byte[] physBytes = phys.getBytes(StandardCharsets.UTF_8);
+                buf.put(physBytes, 0, Math.min(physBytes.length, 63));
+            }
             buf.position(4 + 128 + 64 + 64);
             buf.putShort((short) desc.length);
             buf.putShort((short) 0x03); // BUS_USB so Android treats keyboard shortcuts as standard USB hardware keyboard
@@ -741,6 +775,7 @@ public final class ShellInputDaemon {
         mouseFd = null;
         closeUhid(keyboardFd);
         keyboardFd = null;
+        restoreSoftImeVisibilityIfApplied();
     }
 
     private static void closeUhid(FileDescriptor fd) {
@@ -876,18 +911,30 @@ public final class ShellInputDaemon {
     }
 
     private synchronized void handleVk(int vk, boolean down) {
-        if (keyboardFd == null && !ensureDevices(screenWidth, screenHeight)) return;
+        if (keyboardFd == null && uhidKeyboardHealthy) {
+            ensureDevices(screenWidth, screenHeight);
+        }
         int modBit = HidKeyTable.modifierBitForVk(vk);
         if (modBit != 0) {
             int next = down ? (keyModifierMask | modBit) : (keyModifierMask & ~modBit);
             if (next != keyModifierMask) {
                 keyModifierMask = next;
-                writeKeyboardReport(keyModifierMask, activeUsages);
+                if (keyboardFd != null && uhidKeyboardHealthy) {
+                    if (!writeKeyboardReport(keyModifierMask, activeUsages)) {
+                        uhidKeyboardHealthy = false;
+                        injectFallbackKeyEvent(vk, down);
+                    }
+                } else {
+                    injectFallbackKeyEvent(vk, down);
+                }
             }
             return;
         }
         int usage = HidKeyTable.usageForVk(vk);
-        if (usage == 0) return;
+        if (usage == 0) {
+            injectFallbackKeyEvent(vk, down);
+            return;
+        }
         boolean changed = false;
         if (down) {
             boolean alreadyDown = false;
@@ -911,11 +958,20 @@ public final class ShellInputDaemon {
                 }
             }
         }
-        if (changed) writeKeyboardReport(keyModifierMask, activeUsages);
+        if (keyboardFd != null && uhidKeyboardHealthy) {
+            if (changed && !writeKeyboardReport(keyModifierMask, activeUsages)) {
+                uhidKeyboardHealthy = false;
+                injectFallbackKeyEvent(vk, down);
+            }
+        } else {
+            injectFallbackKeyEvent(vk, down);
+        }
     }
 
     private synchronized void typeBase64Text(String b64) {
-        if (keyboardFd == null && !ensureDevices(screenWidth, screenHeight)) return;
+        if (keyboardFd == null && uhidKeyboardHealthy) {
+            ensureDevices(screenWidth, screenHeight);
+        }
         byte[] raw;
         try {
             raw = Base64.getDecoder().decode(b64);
@@ -923,15 +979,23 @@ public final class ShellInputDaemon {
             return;
         }
         String text = new String(raw, StandardCharsets.UTF_8);
-        for (int i = 0; i < text.length(); i++) {
-            HidKeyTable.Stroke stroke = HidKeyTable.forAsciiChar(text.charAt(i));
-            if (stroke == null) continue;
-            int mods = (keyModifierMask & ~(HidKeyTable.MOD_LEFT_SHIFT | HidKeyTable.MOD_RIGHT_SHIFT))
-                | stroke.modifier;
-            int[] tempUsages = new int[] { stroke.usage, 0, 0, 0, 0, 0 };
-            writeKeyboardReport(mods, tempUsages);
-            writeKeyboardReport(keyModifierMask, activeUsages);
+        if (keyboardFd != null && uhidKeyboardHealthy) {
+            for (int i = 0; i < text.length(); i++) {
+                HidKeyTable.Stroke stroke = HidKeyTable.forAsciiChar(text.charAt(i));
+                if (stroke == null) continue;
+                int mods = (keyModifierMask & ~(HidKeyTable.MOD_LEFT_SHIFT | HidKeyTable.MOD_RIGHT_SHIFT))
+                    | stroke.modifier;
+                int[] tempUsages = new int[] { stroke.usage, 0, 0, 0, 0, 0 };
+                if (!writeKeyboardReport(mods, tempUsages) ||
+                    !writeKeyboardReport(keyModifierMask, activeUsages)) {
+                    uhidKeyboardHealthy = false;
+                    injectFallbackTextSegment(text.substring(i));
+                    return;
+                }
+            }
+            return;
         }
+        injectFallbackTextSegment(text);
     }
 
     private boolean hasActiveKeys() {
@@ -941,9 +1005,9 @@ public final class ShellInputDaemon {
         return false;
     }
 
-    private void writeKeyboardReport(int mods, int[] usages) {
+    private boolean writeKeyboardReport(int mods, int[] usages) {
         FileDescriptor fd = keyboardFd;
-        if (fd == null) return;
+        if (fd == null) return false;
         ByteBuffer pkt = ByteBuffer.allocate(6 + 8).order(ByteOrder.LITTLE_ENDIAN);
         pkt.putInt(UHID_INPUT2);
         pkt.putShort((short) 8);
@@ -954,7 +1018,160 @@ public final class ShellInputDaemon {
         }
         try {
             Os.write(fd, pkt.array(), 0, pkt.capacity());
-        } catch (ErrnoException | IOException ignored) {}
+            return true;
+        } catch (ErrnoException | IOException ex) {
+            return false;
+        }
+    }
+
+    private void ensureSoftImeVisibleWhileConnectedAsync() {
+        Thread t = new Thread(() -> {
+            try {
+                File prevFile = new File(IME_HARD_PREV_FILE);
+                String cur = runCommandTrimmed("settings", "get", "secure", "show_ime_with_hard_keyboard");
+                if ("0".equals(cur) || "null".equalsIgnoreCase(cur) || cur.isEmpty()) {
+                    if (!prevFile.exists()) {
+                        try (FileOutputStream fos = new FileOutputStream(prevFile)) {
+                            String marker = "0".equals(cur) ? "0\n" : "null\n";
+                            fos.write(marker.getBytes(StandardCharsets.US_ASCII));
+                        }
+                    }
+                    runCommandTrimmed("settings", "put", "secure", "show_ime_with_hard_keyboard", "1");
+                    softImeOverrideApplied = true;
+                } else if (prevFile.exists()) {
+                    softImeOverrideApplied = true;
+                }
+            } catch (Throwable ignored) {}
+        }, "DeskTouch-ImeSoftSync");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void restoreSoftImeVisibilityIfApplied() {
+        File prevFile = new File(IME_HARD_PREV_FILE);
+        if (!softImeOverrideApplied && !prevFile.exists()) return;
+        softImeOverrideApplied = false;
+        try {
+            if (!prevFile.exists()) return;
+            String prev = new String(java.nio.file.Files.readAllBytes(prevFile.toPath()), StandardCharsets.US_ASCII).trim();
+            if ("0".equals(prev)) {
+                runCommandTrimmed("settings", "put", "secure", "show_ime_with_hard_keyboard", "0");
+            } else if ("null".equalsIgnoreCase(prev)) {
+                runCommandTrimmed("settings", "delete", "secure", "show_ime_with_hard_keyboard");
+            }
+            prevFile.delete();
+        } catch (Throwable ignored) {}
+    }
+
+    private static String runCommandTrimmed(String... cmd) {
+        try {
+            Process proc = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    sb.append(line).append('\n');
+                }
+            }
+            proc.waitFor();
+            return sb.toString().trim();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private boolean injectInputEventDirect(InputEvent event) {
+        if (!inputMgrResolved) {
+            inputMgrResolved = true;
+            for (String clsName : new String[] {
+                "android.hardware.input.InputManagerGlobal",
+                "android.hardware.input.InputManager"
+            }) {
+                try {
+                    Class<?> cls = Class.forName(clsName);
+                    Method getInst = cls.getDeclaredMethod("getInstance");
+                    getInst.setAccessible(true);
+                    Object inst = getInst.invoke(null);
+                    Method inj = cls.getDeclaredMethod("injectInputEvent", InputEvent.class, int.class);
+                    inj.setAccessible(true);
+                    if (inst != null) {
+                        inputMgrInstance = inst;
+                        injectInputMethod = inj;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (inputMgrInstance != null && injectInputMethod != null) {
+            try {
+                Object res = injectInputMethod.invoke(inputMgrInstance, event, 0);
+                return !(res instanceof Boolean) || (Boolean) res;
+            } catch (Throwable ignored) {}
+        }
+        return false;
+    }
+
+    private void injectFallbackKeyEvent(int vk, boolean down) {
+        int keyCode = RemoteImeKeys.fullAndroidKeyCode(vk);
+        if (keyCode == KeyEvent.KEYCODE_UNKNOWN) return;
+        long now = SystemClock.uptimeMillis();
+        if (down) keyDownClockMs = now;
+        long downTime = down ? now : (keyDownClockMs > 0 ? keyDownClockMs : now);
+        int meta = RemoteImeKeys.metaStateFromHidModifiers(keyModifierMask);
+        KeyEvent evt = new KeyEvent(downTime, now,
+            down ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP,
+            keyCode, 0, meta, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+            0, InputDevice.SOURCE_KEYBOARD);
+        if (injectInputEventDirect(evt)) return;
+        if (down && HidKeyTable.modifierBitForVk(vk) == 0) {
+            try {
+                new ProcessBuilder("input", "keyevent", String.valueOf(keyCode)).start();
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void injectFallbackTextSegment(String text) {
+        if (text == null || text.isEmpty()) return;
+        KeyCharacterMap kcm = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
+        KeyEvent[] events = kcm.getEvents(text.toCharArray());
+        if (events != null) {
+            boolean allOk = true;
+            for (KeyEvent ev : events) {
+                if (!injectInputEventDirect(ev)) {
+                    allOk = false;
+                    break;
+                }
+            }
+            if (allOk) return;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == ' ') {
+                injectFallbackKeyEvent(0x20, true);
+                injectFallbackKeyEvent(0x20, false);
+            } else if (ch == '\n' || ch == '\r') {
+                injectFallbackKeyEvent(0x0D, true);
+                injectFallbackKeyEvent(0x0D, false);
+            } else if (ch == '\t') {
+                injectFallbackKeyEvent(0x09, true);
+                injectFallbackKeyEvent(0x09, false);
+            } else if (ch >= 'a' && ch <= 'z') {
+                int vk = 0x41 + (ch - 'a');
+                injectFallbackKeyEvent(vk, true);
+                injectFallbackKeyEvent(vk, false);
+            } else if (ch >= 'A' && ch <= 'Z') {
+                keyModifierMask |= HidKeyTable.MOD_LEFT_SHIFT;
+                int vk = 0x41 + (ch - 'A');
+                injectFallbackKeyEvent(vk, true);
+                injectFallbackKeyEvent(vk, false);
+                keyModifierMask &= ~HidKeyTable.MOD_LEFT_SHIFT;
+            } else if (ch >= '0' && ch <= '9') {
+                int vk = 0x30 + (ch - '0');
+                injectFallbackKeyEvent(vk, true);
+                injectFallbackKeyEvent(vk, false);
+            }
+        }
     }
 
     private static int findSpaceOrEnd(String s, int start, int len) {

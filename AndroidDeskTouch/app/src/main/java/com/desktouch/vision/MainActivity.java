@@ -1335,11 +1335,8 @@ public final class MainActivity extends Activity {
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(120,false));
         Button downBtn=addPadActionButton(mouseActions,"↓",PhoneUiKit.BTN_SUBTLE,false,
             ()->DeskTouchRuntime.session(MainActivity.this).wheel(-120,false));
-        Button keysBtn=addPadActionButton(mouseActions,"Keys",PhoneUiKit.BTN_TINT_ACCENT,false,()->{
-            keyboardInput.requestFocus();
-            InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
-            if(imm!=null)imm.showSoftInput(keyboardInput,InputMethodManager.SHOW_IMPLICIT);
-        });
+        Button keysBtn=addPadActionButton(mouseActions,"Keys",PhoneUiKit.BTN_TINT_ACCENT,false,
+            ()->openSoftKeyboardForField(keyboardInput));
 
         HorizontalScrollView mediaScroll=new HorizontalScrollView(this);
         mediaScroll.setHorizontalScrollBarEnabled(false);
@@ -1892,9 +1889,11 @@ public final class MainActivity extends Activity {
         kbXiaomiCard.addView(kxTop);
 
         TextView xiaomiNote=new TextView(this);
-        xiaomiNote.setText("Join one DeskTouch environment hub on your Wi-Fi without developer mode or cables. "
-            +"Xiaomi / Redmi setup tip: in App Info -> tap 3 dots at top-right -> Allow restricted settings, "
-            +"and set Battery to No restrictions so control and auto-reconnect stay instant.");
+        xiaomiNote.setText("Remote typing works automatically with your phone's normal keyboard ("
+            + DeskTouchInputMethod.preferredNativeImeLabel(this)
+            + ") via Virtual Bridge or Accessibility. Enable DeskTouch receiver only as an extra backup if an app blocks normal input.\n"
+            + "Xiaomi / Redmi setup tip: in App Info -> tap 3 dots at top-right -> Allow restricted settings, "
+            + "and set Battery to No restrictions so control and auto-reconnect stay instant.");
         xiaomiNote.setTextSize(11.5f);
         xiaomiNote.setLineSpacing(dp(2),1f);
         xiaomiNote.setPadding(0,dp(8),0,dp(10));
@@ -1904,18 +1903,19 @@ public final class MainActivity extends Activity {
         kxRow1.setOrientation(LinearLayout.HORIZONTAL);
         kbXiaomiCard.addView(kxRow1,new LinearLayout.LayoutParams(-1,-2));
 
-        // A dedicated input method improves editor typing (including WebViews)
-        // without requiring root, developer mode or a Bluetooth pairing.
+        // Optional fallback IME for strict WebViews/editors; normal native phone keyboards
+        // continue working automatically over Virtual Bridge and Accessibility.
         Button enableKbBtn=PhoneUiKit.createButton(this,"Enable Keyboard",palette,PhoneUiKit.BTN_SUBTLE);
         enableKbBtn.setOnClickListener(v->startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)));
         LinearLayout.LayoutParams ekLp=new LinearLayout.LayoutParams(0,-2,1f);
         ekLp.rightMargin=dp(4);
         kxRow1.addView(enableKbBtn,ekLp);
 
-        Button selectKbBtn=PhoneUiKit.createButton(this,"Select Keyboard",palette,PhoneUiKit.BTN_SUBTLE);
+        Button selectKbBtn=PhoneUiKit.createButton(this,"Switch Keyboard",palette,PhoneUiKit.BTN_SUBTLE);
         selectKbBtn.setOnClickListener(v->{
-            InputMethodManager manager=(InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);
-            if(manager!=null)manager.showInputMethodPicker();
+            if(!DeskTouchInputMethod.openKeyboardPicker(MainActivity.this)){
+                setFeedback("Open Android Keyboard Settings to choose your keyboard.",true);
+            }
         });
         LinearLayout.LayoutParams skLp=new LinearLayout.LayoutParams(0,-2,1f);
         skLp.leftMargin=dp(4);
@@ -2346,9 +2346,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.86";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.87";
         }catch(Exception ignored){
-            return "0.3.86";
+            return "0.3.87";
         }
     }
 
@@ -2884,12 +2884,32 @@ public final class MainActivity extends Activity {
         }else{
             bridgeLine="standby — turn ON Wireless debugging or USB debugging in Developer options (or enable Accessibility)";
         }
+        String nativeIme=DeskTouchInputMethod.preferredNativeImeLabel(this);
+        String imeLine=DeskTouchInputMethod.isSelected(this)
+            ? "DeskTouch receiver active — tap Switch Keyboard to return to "+nativeIme+"."
+            : "Native phone keyboard active ("+nativeIme+") — works alongside Virtual Bridge & remote typing.";
         permissionState.setText(PermissionContinuity.state(this) +
             "\nVirtual Bridge: " + bridgeLine +
-            "\nDeskTouch keyboard: " +
-            (DeskTouchInputMethod.isSelected(this)
-                ? "selected for focused-field typing."
-                : "not selected (optional when Accessibility is used)."));
+            "\nPhone keyboard: " + imeLine);
+    }
+
+    private void openSoftKeyboardForField(EditText target){
+        if(target==null)return;
+        target.requestFocus();
+        if(DeskTouchInputMethod.isSelected(this)){
+            String nativeIme=DeskTouchInputMethod.preferredNativeImeLabel(this);
+            setFeedback("Select "+nativeIme+" to open your phone's normal on-screen keyboard.",true);
+            DeskTouchInputMethod.openKeyboardPicker(this);
+            return;
+        }
+        target.post(()->{
+            InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
+            // Request an explicit user-triggered IME open (0 -> SHOW_FORCED fallback) rather than
+            // SHOW_IMPLICIT so any OEM keyboard stays visible even alongside a virtual HID device.
+            if(imm!=null && !imm.showSoftInput(target,0)){
+                imm.showSoftInput(target,InputMethodManager.SHOW_FORCED);
+            }
+        });
     }
 
     private void checkVirtualBridgeFromUi(){
@@ -4473,9 +4493,7 @@ public final class MainActivity extends Activity {
             boolean show=quickKeyBar.getVisibility()!=View.VISIBLE;
             quickKeyBar.setVisibility(show ? View.VISIBLE : View.GONE);
             if(show){
-                fsKeyInput.requestFocus();
-                InputMethodManager imm=(InputMethodManager)getSystemService(Context.INPUT_METHOD_SERVICE);
-                if(imm!=null)imm.showSoftInput(fsKeyInput,InputMethodManager.SHOW_IMPLICIT);
+                openSoftKeyboardForField(fsKeyInput);
             }
         });
         LinearLayout.LayoutParams khLp=new LinearLayout.LayoutParams(-2,-2);

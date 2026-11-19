@@ -333,7 +333,7 @@ final class ShellInputClient {
             done.complete(ok);
         });
         try {
-            return done.get(850, TimeUnit.MILLISECONDS);
+            return done.get(1200, TimeUnit.MILLISECONDS);
         } catch (Exception ex) {
             return ready(app);
         }
@@ -586,6 +586,18 @@ final class ShellInputClient {
         });
     }
 
+    static void destroyDevices() {
+        remoteSessionActive = false;
+        if (!connectedReady) return;
+        WORKER.execute(() -> {
+            synchronized (CLIENT_LOCK) {
+                if (writer != null) {
+                    sendAndReadLine("DESTROY");
+                }
+            }
+        });
+    }
+
     static void disconnect() {
         remoteSessionActive = false;
         synchronized (MOVE_LOCK) {
@@ -599,6 +611,12 @@ final class ShellInputClient {
         configuredSecret = null;
         WORKER.execute(() -> {
             synchronized (CLIENT_LOCK) {
+                if (writer != null) {
+                    try {
+                        writer.write("DESTROY\n");
+                        writer.flush();
+                    } catch (IOException ignored) {}
+                }
                 closeSocketLocked();
             }
         });

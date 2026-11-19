@@ -1,3 +1,10 @@
+# DeskTouch Vision v0.3.87 — Universal Virtual Bridge Typing & Native Phone Keyboard Support
+
+- **Universal Virtual Bridge Keyboard Compatibility (`ShellInputDaemon`, `RemoteImeKeys`, `ShellInputClient`):** Fixes 2-byte unsigned HID descriptor bounds (`0x2A`) and adds an initial idle report plus distinct `phys` identifiers (`desktouch-mouse` / `desktouch-keyboard`) so strict Android kernel HID parsers bind cleanly, runs post-`BEGIN` `dumpsys input` checks asynchronously without blocking Virtual Bridge startup, and automatically falls back to direct system `InputManager` / `cmd input` key & ASCII text injection if `/dev/uhid` keyboard events fail to register on any device.
+- **Native On-Screen Keyboard Preservation Across Every Phone (`ShellInputDaemon`, `DeskTouchInputMethod`, `DeskTouchSession`, `MainActivity`):** Preserves Android's standard `show_ime_with_hard_keyboard` setting while connected and restores it automatically on `DESTROY`/`QUIT`/shutdown so phones without Gboard keep showing their normal native on-screen keyboard (`Gboard`, `Samsung Keyboard`, `AOSP`, etc.), lets `DeskTouchInputMethod` work seamlessly when Virtual Bridge is active without trapping users away from their phone's native keyboard, uses universal `InputMethodManager.getEnabledInputMethodList()` discovery instead of phone-specific rules, opens soft keyboards reliably via `SHOW_FORCED` fallback on `Keys`, and falls back from rejected Virtual Bridge key/text commands to Accessibility or active IME editor cleanly.
+
+---
+
 # DeskTouch Vision v0.3.86 — Automatic Virtual Bridge Recognition, Built-In Windows ADB Tools & One-Time Wireless Pairing
 
 - **Built-In Android Platform Tools on Every Windows PC (`desktouch-vision.yml`, `AdbCableBridge`, `Update-DeskTouch.ps1`):** Bundles official Google `adb.exe`, `AdbWinApi.dll`, and `AdbWinUsbApi.dll` inside `DeskTouchVision-Install.exe` and `DeskTouchVision-win-x64.zip` and stages them into `%LOCALAPPDATA%\DeskTouchVision\platform-tools` so tester PCs without Android Studio auto-start Virtual Bridge cleanly without locking app updates.

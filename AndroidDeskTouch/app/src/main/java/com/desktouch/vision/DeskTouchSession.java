@@ -1526,7 +1526,16 @@ final class DeskTouchSession implements AutoCloseable {
             final int activeLease=reverseLease;
             Runnable accepted=onReverseInputAccepted(activeLease);
             Runnable rejected=onReverseInputRejected(activeLease);
-            if(reverseUsingShell) ShellInputClient.text(p.text,accepted,rejected);
+            if(reverseUsingShell){
+                final String textValue=p.text;
+                ShellInputClient.text(textValue,accepted,()->{
+                    if(DeskTouchAccessibilityService.ready(application))
+                        DeskTouchAccessibilityService.text(textValue,accepted,rejected);
+                    else if(DeskTouchInputMethod.commitRemoteText(textValue))
+                        accepted.run();
+                    else rejected.run();
+                });
+            }
             else DeskTouchAccessibilityService.text(p.text,accepted,rejected);
         }
     }
@@ -1559,7 +1568,17 @@ final class DeskTouchSession implements AutoCloseable {
         final int activeLease=reverseLease;
         Runnable accepted=onReverseInputAccepted(activeLease);
         Runnable rejected=onReverseInputRejected(activeLease);
-        if(reverseUsingShell) ShellInputClient.key(vk,down,accepted,rejected);
+        if(reverseUsingShell){
+            ShellInputClient.key(vk,down,accepted,()->{
+                if(DeskTouchAccessibilityService.ready(application))
+                    DeskTouchAccessibilityService.key(vk,down,accepted,rejected);
+                else if(down && DeskTouchInputMethod.sendRemoteKey(vk))
+                    accepted.run();
+                else if(!down && DeskTouchInputMethod.hasActiveEditor())
+                    accepted.run();
+                else rejected.run();
+            });
+        }
         else DeskTouchAccessibilityService.key(vk,down,accepted,rejected);
     }
     private Runnable onReverseInputAccepted(int activeLease){
@@ -3186,6 +3205,7 @@ final class DeskTouchSession implements AutoCloseable {
         }
         if(DeskTouchRuntime.connectedCount()==0){
             VirtualBridgeHelper.clearRemoteStatus();
+            ShellInputClient.destroyDevices();
             RemoteInputPower.end();
             PhoneMediaService.stopAll(application);
         } else RemoteInputPower.begin(application);

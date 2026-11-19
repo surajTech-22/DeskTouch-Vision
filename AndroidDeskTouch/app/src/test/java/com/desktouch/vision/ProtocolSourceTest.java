@@ -1710,6 +1710,50 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("setLiveStatusListener") && mainSource.contains("refreshPermissionState()"));
     }
 
+    @Test
+    public void universalKeyboardAndNativeImeWorkSafely() throws Exception {
+        String daemonSource = readProjectSource("src/main/java/com/desktouch/vision/ShellInputDaemon.java");
+        String shellClientSource = readProjectSource("src/main/java/com/desktouch/vision/ShellInputClient.java");
+        String imeSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchInputMethod.java");
+        String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
+        String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
+
+        assertEquals(android.view.KeyEvent.KEYCODE_A, RemoteImeKeys.fullAndroidKeyCode('A'));
+        assertEquals(android.view.KeyEvent.KEYCODE_5, RemoteImeKeys.fullAndroidKeyCode('5'));
+        assertEquals(android.view.KeyEvent.KEYCODE_SPACE, RemoteImeKeys.fullAndroidKeyCode(0x20));
+        assertEquals(android.view.KeyEvent.KEYCODE_ENTER, RemoteImeKeys.fullAndroidKeyCode(13));
+        assertEquals(android.view.KeyEvent.KEYCODE_SEMICOLON, RemoteImeKeys.fullAndroidKeyCode(0xBA));
+        assertEquals(android.view.KeyEvent.KEYCODE_UNKNOWN, RemoteImeKeys.androidKeyCode('A'));
+
+        int expectedCtrlShift = android.view.KeyEvent.META_CTRL_ON
+            | android.view.KeyEvent.META_CTRL_LEFT_ON
+            | android.view.KeyEvent.META_SHIFT_ON
+            | android.view.KeyEvent.META_SHIFT_RIGHT_ON;
+        assertEquals(expectedCtrlShift, RemoteImeKeys.metaStateFromHidModifiers(
+            HidKeyTable.MOD_LEFT_CTRL | HidKeyTable.MOD_RIGHT_SHIFT));
+        assertEquals(0, RemoteImeKeys.metaStateFromHidModifiers(0));
+
+        assertTrue(daemonSource.contains("(byte) 0x2A, (byte) 0xE7, (byte) 0x00"));
+        assertTrue(daemonSource.contains("(byte) 0x2A, (byte) 0xFF, (byte) 0x00"));
+        assertTrue(daemonSource.contains("\"desktouch-mouse\"") && daemonSource.contains("\"desktouch-keyboard\""));
+        assertTrue(daemonSource.contains("scheduleDelayedVelocityProbe(160L)"));
+        assertTrue(daemonSource.contains("uhidKeyboardHealthy = false"));
+        assertTrue(daemonSource.contains("injectInputEventDirect("));
+        assertTrue(daemonSource.contains("ensureSoftImeVisibleWhileConnectedAsync()"));
+        assertTrue(daemonSource.contains("restoreSoftImeVisibilityIfApplied()"));
+
+        assertTrue(imeSource.contains("ShellInputClient.ready(this) || DeskTouchAccessibilityService.ready(this)"));
+        assertTrue(imeSource.contains("getEnabledInputMethodList()"));
+        assertTrue(imeSource.contains("preferredNativeImeLabel("));
+        assertTrue(shellClientSource.contains("void destroyDevices()"));
+        assertTrue(shellClientSource.contains("sendAndReadLine(\"DESTROY\")"));
+        assertTrue(sessionSource.contains("ShellInputClient.destroyDevices()"));
+        assertTrue(sessionSource.contains("DeskTouchInputMethod.commitRemoteText("));
+        assertTrue(mainSource.contains("openSoftKeyboardForField("));
+        assertTrue(mainSource.contains("InputMethodManager.SHOW_FORCED"));
+        assertTrue(mainSource.contains("Native phone keyboard active ("));
+    }
+
     private static String readProjectSource(String relFromAppModule) {
         try {
             String[] prefixes = {"", "app/", "AndroidDeskTouch/app/"};

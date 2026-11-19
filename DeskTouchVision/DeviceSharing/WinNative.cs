@@ -44,6 +44,10 @@ internal static class Win
     internal static extern IntPtr GetForegroundWindow();
     internal const uint ASFW_ANY = 0xFFFFFFFF;
     internal const int SW_SHOW = 5, SW_RESTORE = 9;
+    internal static readonly IntPtr HWND_TOP = IntPtr.Zero;
+    internal static readonly IntPtr HWND_TOPMOST = new(-1);
+    internal static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    internal const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040;
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegisterWindowMessageW", SetLastError = true)]
     internal static extern uint RegisterWindowMessage(string lpString);
     [DllImport("user32.dll", SetLastError = true)]
@@ -58,6 +62,20 @@ internal static class Win
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool BringWindowToTop(IntPtr hwnd);
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetWindowPos(IntPtr hwnd, IntPtr hwndInsertAfter,
+        int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")]
+    internal static extern void SwitchToThisWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fUnknown);
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetLastActivePopup(IntPtr hwnd);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool IsIconic(IntPtr hwnd);
@@ -70,24 +88,86 @@ internal static class Win
     private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo,
         [MarshalAs(UnmanagedType.Bool)] bool fAttach);
 
+    internal static IntPtr GetActivationTarget(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return IntPtr.Zero;
+        try
+        {
+            IntPtr popup = GetLastActivePopup(hwnd);
+            if (popup != IntPtr.Zero && popup != hwnd &&
+                IsWindowVisible(popup) && IsWindowEnabled(popup))
+                return popup;
+        }
+        catch { }
+        return hwnd;
+    }
+
+    internal static void RaiseAboveWindowsTemporarily(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        IntPtr target = GetActivationTarget(hwnd);
+        try
+        {
+            _ = SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        }
+        catch { }
+    }
+
+    internal static void RestoreNonTopMost(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        IntPtr target = GetActivationTarget(hwnd);
+        try
+        {
+            _ = SetWindowPos(target, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        catch { }
+    }
+
     internal static void ForceWindowToFront(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero) return;
+        IntPtr target = GetActivationTarget(hwnd);
+        if (IsIconic(hwnd)) _ = ShowWindow(hwnd, SW_RESTORE);
+        else _ = ShowWindow(hwnd, SW_SHOW);
+        if (target != hwnd)
+        {
+            if (IsIconic(target)) _ = ShowWindow(target, SW_RESTORE);
+            else _ = ShowWindow(target, SW_SHOW);
+        }
+        try { _ = AllowSetForegroundWindow(ASFW_ANY); } catch { }
+
         IntPtr fg = GetForegroundWindow();
         uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out _) : 0;
+        uint targetThread = GetWindowThreadProcessId(target, out _);
         uint curThread = GetCurrentThreadId();
-        bool attached = false;
+        bool attachedFg = false;
+        bool attachedTarget = false;
         try
         {
             if (fgThread != 0 && fgThread != curThread)
-                attached = AttachThreadInput(curThread, fgThread, true);
-            _ = BringWindowToTop(hwnd);
-            _ = SetForegroundWindow(hwnd);
+                attachedFg = AttachThreadInput(curThread, fgThread, true);
+            if (targetThread != 0 && targetThread != curThread && targetThread != fgThread)
+                attachedTarget = AttachThreadInput(curThread, targetThread, true);
+            _ = SetWindowPos(target, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            _ = BringWindowToTop(target);
+            _ = SetForegroundWindow(target);
+            if (GetForegroundWindow() != target)
+                SwitchToThisWindow(target, true);
         }
         catch { }
         finally
         {
-            if (attached)
+            if (attachedTarget)
+            {
+                try { _ = AttachThreadInput(curThread, targetThread, false); } catch { }
+            }
+            if (attachedFg)
             {
                 try { _ = AttachThreadInput(curThread, fgThread, false); } catch { }
             }

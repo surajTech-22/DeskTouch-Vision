@@ -254,7 +254,10 @@ internal sealed class TrayDeviceFlyout : Form
         _openButton.Click += (_, _) =>
         {
             Hide();
-            _onOpenMainWindow();
+            if (!IsDisposed && IsHandleCreated)
+                BeginInvoke(_onOpenMainWindow);
+            else
+                _onOpenMainWindow();
         };
 
         var header = new Panel

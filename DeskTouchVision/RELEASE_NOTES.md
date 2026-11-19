@@ -1,3 +1,9 @@
+# DeskTouch Vision v0.3.88 — Reliable Window Foreground & Taskbar Restore Activation
+
+- **Reliable Window Activation From Taskbar, Tray, Shortcuts & DeskSpace (`DisplaySettingsForm`, `WinNative`, `SingleInstanceActivation`, `TrayDeviceFlyout`):** Fixes the issue where DeskTouch appeared in the Windows taskbar (or flashed its taskbar icon behind other windows) without coming to the front: adds active modal-popup resolution (`GetLastActivePopup`), `SwitchToThisWindow` + `AllowSetForegroundWindow` handoff, a real 110ms `HWND_TOPMOST -> HWND_NOTOPMOST` activation pulse so Windows DWM reliably brings the window above foreground apps (even after menu/flyout/pipe launches), handles `WM_SYSCOMMAND` (`SC_RESTORE` / `SC_MAXIMIZE`) and `Activated` / `VisibleChanged` to clamp bounds and keep `Opacity = 1.0`, ignores secondary media windows during single-instance lookup, and defers flyout `Open` activation until the flyout closes cleanly.
+
+---
+
 # DeskTouch Vision v0.3.87 — Universal Virtual Bridge Typing & Native Phone Keyboard Support
 
 - **Universal Virtual Bridge Keyboard Compatibility (`ShellInputDaemon`, `RemoteImeKeys`, `ShellInputClient`):** Fixes 2-byte unsigned HID descriptor bounds (`0x2A`) and adds an initial idle report plus distinct `phys` identifiers (`desktouch-mouse` / `desktouch-keyboard`) so strict Android kernel HID parsers bind cleanly, runs post-`BEGIN` `dumpsys input` checks asynchronously without blocking Virtual Bridge startup, and automatically falls back to direct system `InputManager` / `cmd input` key & ASCII text injection if `/dev/uhid` keyboard events fail to register on any device.

@@ -110,6 +110,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private RegisteredWaitHandle? _showWait;
     private RegisteredWaitHandle? _exitWait;
     private volatile bool _showRequestedBeforeShown;
+    private bool _startInTrayPendingHide;
+    private System.Windows.Forms.Timer? _topMostPulseTimer;
+    private bool _prePulseTopMost;
+    private bool _topMostPulseActive;
     private ReceiverServer? _receiver;
     private NearbyComputerDiscovery? _discovery;
     private AdbCableBridge? _adbBridge;
@@ -235,6 +239,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         AutoScaleMode = AutoScaleMode.Dpi;
         DoubleBuffered = true;
         Icon = LoadAppIcon();
+        _startInTrayPendingHide = startInTray;
         if (startInTray) Opacity = 0;
 
         var header = new Panel { Dock = DockStyle.Top, Height = 115,
@@ -492,61 +497,85 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 BeginInvoke(ExitDeskTouch);
                 return;
             }
-            RefreshDisplays();
-            StartListening();
+            bool justUpdated = false;
             try
             {
-                WindowsStartup.EnsureDefault();
-                if (_startupMenu != null) _startupMenu.Checked = WindowsStartup.Enabled;
-            }
-            catch (Exception ex) { Status("Windows sign-in startup could not be enabled: " + ex.Message); }
-            UpdateClient.StartEventUpdates(this);
-            SystemEvents.PowerModeChanged += OnPowerModeChanged;
-            SystemEvents.SessionSwitch += OnSessionSwitch;
-            NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
-            _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 5000 };
-            _trustedScanTimer.Tick += async (_, _) =>
-            {
-                EnsureCaptureArmedIfConnected();
-                await ScanTrustedAsync();
-            };
-            _trustedScanTimer.Start();
-            _ = Task.Delay(450, _closing.Token).ContinueWith(
-                _ => PostToUi(() => _ = ScanTrustedAsync()),
-                TaskScheduler.Default);
-            _liveLinkTimer = new System.Windows.Forms.Timer { Interval = 750 };
-            _liveLinkTimer.Tick += (_, _) =>
-            {
-                UpdateLiveLinkDisplay();
+                RefreshDisplays();
+                StartListening();
+                try
+                {
+                    WindowsStartup.EnsureDefault();
+                    if (_startupMenu != null) _startupMenu.Checked = WindowsStartup.Enabled;
+                }
+                catch (Exception ex) { Status("Windows sign-in startup could not be enabled: " + ex.Message); }
+                UpdateClient.StartEventUpdates(this);
+                SystemEvents.PowerModeChanged += OnPowerModeChanged;
+                SystemEvents.SessionSwitch += OnSessionSwitch;
+                NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+                _trustedScanTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+                _trustedScanTimer.Tick += async (_, _) =>
+                {
+                    EnsureCaptureArmedIfConnected();
+                    await ScanTrustedAsync();
+                };
+                _trustedScanTimer.Start();
+                _ = Task.Delay(450, _closing.Token).ContinueWith(
+                    _ => PostToUi(() => _ = ScanTrustedAsync()),
+                    TaskScheduler.Default);
+                _liveLinkTimer = new System.Windows.Forms.Timer { Interval = 750 };
+                _liveLinkTimer.Tick += (_, _) =>
+                {
+                    UpdateLiveLinkDisplay();
+                    PublishDeckBridgeSnapshot();
+                };
+                _liveLinkTimer.Start();
+                _deckBridge.Start();
                 PublishDeckBridgeSnapshot();
-            };
-            _liveLinkTimer.Start();
-            _deckBridge.Start();
-            PublishDeckBridgeSnapshot();
-            if (_trustLoadError != null)
-                Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
-            bool justUpdated = ConsumeJustUpdatedMarker();
-            if (_startInTray && !_showRequestedBeforeShown)
-            {
-                HideToTray(showBalloon: false);
-                if (justUpdated && _trayIcon != null && !_trayTipShown)
-                {
-                    _trayTipShown = true;
-                    _trayIcon.BalloonTipTitle = $"DeskTouch Vision updated to v{MonitorTopology.CurrentAppVersion()}";
-                    _trayIcon.BalloonTipText = "Updated automatically in the background. Click here to open Displays.";
-                    try { _trayIcon.ShowBalloonTip(5000); } catch { }
-                }
-                if (_showRequestedBeforeShown)
-                    ShowFromTray();
+                if (_trustLoadError != null)
+                    Status("Trusted device settings unavailable; reconnect disabled: " + _trustLoadError);
+                justUpdated = ConsumeJustUpdatedMarker();
             }
-            else
+            finally
             {
-                BringWindowToForegroundSafely();
-                if (justUpdated)
+                _startInTrayPendingHide = false;
+                if (_startInTray && !_showRequestedBeforeShown)
                 {
-                    _ = Task.Delay(250, _closing.Token).ContinueWith(
-                        _ => PostToUi(BringWindowToForegroundSafely), TaskScheduler.Default);
+                    HideToTray(showBalloon: false);
+                    if (justUpdated && _trayIcon != null && !_trayTipShown)
+                    {
+                        _trayTipShown = true;
+                        _trayIcon.BalloonTipTitle = $"DeskTouch Vision updated to v{MonitorTopology.CurrentAppVersion()}";
+                        _trayIcon.BalloonTipText = "Updated automatically in the background. Click here to open Displays.";
+                        try { _trayIcon.ShowBalloonTip(5000); } catch { }
+                    }
+                    if (_showRequestedBeforeShown)
+                        ShowFromTray();
                 }
+                else
+                {
+                    BringWindowToForegroundSafely();
+                    if (justUpdated)
+                    {
+                        _ = Task.Delay(250, _closing.Token).ContinueWith(
+                            _ => PostToUi(BringWindowToForegroundSafely), TaskScheduler.Default);
+                    }
+                }
+            }
+        };
+        VisibleChanged += (_, _) =>
+        {
+            if (Visible && !_startInTrayPendingHide && !_isHiddenInTray)
+            {
+                if (Opacity < 1.0) Opacity = 1.0;
+                if (WindowState != FormWindowState.Minimized) ClampToVisibleMonitor();
+            }
+        };
+        Activated += (_, _) =>
+        {
+            if (!_startInTrayPendingHide && !_isHiddenInTray && Visible)
+            {
+                if (Opacity < 1.0) Opacity = 1.0;
+                if (WindowState != FormWindowState.Minimized) ClampToVisibleMonitor();
             }
         };
         InitializeTray();
@@ -720,9 +749,68 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_exitRequested && !IsDisposed) PostToUi(ExitDeskTouch);
     }
 
+    private void ClampToVisibleMonitor()
+    {
+        var screens = Screen.AllScreens;
+        if (screens.Length == 0) return;
+        var clamped = EnsureVisibleBounds(
+            Bounds,
+            screens.Select(s => s.WorkingArea).ToArray(),
+            Screen.FromControl(this).WorkingArea);
+        if (clamped != Bounds)
+            Bounds = clamped;
+    }
+
+    private void EndForegroundTopMostPulse()
+    {
+        _topMostPulseTimer?.Stop();
+        if (!_topMostPulseActive) return;
+        _topMostPulseActive = false;
+        if (!IsDisposed && IsHandleCreated && !_prePulseTopMost)
+            Win.RestoreNonTopMost(Handle);
+    }
+
+    private void ScheduleForegroundTopMostPulse()
+    {
+        if (IsDisposed || !IsHandleCreated || _isHiddenInTray || _exitRequested) return;
+        if (!_topMostPulseActive)
+        {
+            _prePulseTopMost = TopMost;
+            _topMostPulseActive = true;
+        }
+        Win.RaiseAboveWindowsTemporarily(Handle);
+        Win.ForceWindowToFront(Handle);
+        Activate();
+        BringToFront();
+
+        _topMostPulseTimer ??= CreateTopMostPulseTimer();
+        _topMostPulseTimer.Stop();
+        _topMostPulseTimer.Start();
+    }
+
+    private System.Windows.Forms.Timer CreateTopMostPulseTimer()
+    {
+        var timer = new System.Windows.Forms.Timer { Interval = 110 };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            if (IsDisposed || _closing.IsCancellationRequested || _exitRequested) return;
+            EndForegroundTopMostPulse();
+            if (_isHiddenInTray || !Visible || !IsHandleCreated) return;
+            IntPtr target = Win.GetActivationTarget(Handle);
+            if (Win.GetForegroundWindow() != target)
+            {
+                Win.ForceWindowToFront(Handle);
+                Activate();
+            }
+        };
+        return timer;
+    }
+
     private void BringWindowToForegroundSafely()
     {
         if (IsDisposed || _exitRequested || _closing.IsCancellationRequested) return;
+        _startInTrayPendingHide = false;
         // Do not toggle ShowInTaskbar: WinForms may recreate the HWND, which
         // would invalidate Raw Input registrations and break mouse handoff.
         Opacity = 1.0;
@@ -739,41 +827,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
         // Clamp bounds only after restoring from Minimized so Windows' (-32000, -32000)
         // iconic coordinates cannot corrupt restored screen placement.
-        var screens = Screen.AllScreens;
-        if (screens.Length > 0)
-        {
-            var clamped = EnsureVisibleBounds(
-                Bounds,
-                screens.Select(s => s.WorkingArea).ToArray(),
-                Screen.FromControl(this).WorkingArea);
-            if (clamped != Bounds)
-                Bounds = clamped;
-        }
+        ClampToVisibleMonitor();
 
-        if (IsHandleCreated)
-        {
-            Win.BringWindowToTop(Handle);
-            Win.SetForegroundWindow(Handle);
-        }
+        if (!IsHandleCreated) return;
+        IntPtr target = Win.GetActivationTarget(Handle);
+        Win.ForceWindowToFront(Handle);
         Activate();
         BringToFront();
 
-        // If Windows 11 Foreground Lock kept another window on top, briefly attach thread input and pulse TopMost.
-        if (IsHandleCreated && Win.GetForegroundWindow() != Handle)
-        {
-            bool prevTopMost = TopMost;
-            try
-            {
-                Win.ForceWindowToFront(Handle);
-                TopMost = true;
-                Win.ForceWindowToFront(Handle);
-                Activate();
-            }
-            finally
-            {
-                TopMost = prevTopMost;
-            }
-        }
+        // Hold a real 110ms HWND_TOPMOST pulse + deferred re-activation whenever another
+        // window or Explorer/flyout dismissal could otherwise keep DeskTouch in the taskbar.
+        if (Win.GetForegroundWindow() != target || !_topMostPulseActive)
+            ScheduleForegroundTopMostPulse();
     }
 
     private static bool ConsumeJustUpdatedMarker()
@@ -810,13 +875,15 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void HideToTray(bool showBalloon = true)
     {
+        _startInTrayPendingHide = false;
+        EndForegroundTopMostPulse();
         _isHiddenInTray = true;
         // Hide() naturally removes an invisible Form from the taskbar
         // WITHOUT changing ShowInTaskbar (which can recreate the HWND).
         // The same handle must keep receiving raw mouse input even in tray.
         // The UI message loop continues to receive GitHub release SSE events.
-        Hide();
         Opacity = 1.0;
+        Hide();
         if (showBalloon && !_trayTipShown && _trayIcon != null)
         {
             _trayTipShown = true;
@@ -3016,6 +3083,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ShowFromTray();
             return;
         }
+        if (message.Msg == 0x0112 /* WM_SYSCOMMAND */ && !_exitRequested && !_isHiddenInTray)
+        {
+            int sysCmd = unchecked((int)(message.WParam.ToInt64() & 0xFFF0));
+            if (sysCmd == 0xF120 /* SC_RESTORE */ || sysCmd == 0xF030 /* SC_MAXIMIZE */)
+            {
+                base.WndProc(ref message);
+                PostToUi(BringWindowToForegroundSafely);
+                return;
+            }
+        }
         if (message.Msg == Win.WM_INPUT)
         {
             // Crucial for TWO-WAY input: native priority detection AND mouse
@@ -3132,6 +3209,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trustedScanTimer = null;
             _liveLinkTimer?.Dispose();
             _liveLinkTimer = null;
+            _topMostPulseTimer?.Stop();
+            _topMostPulseTimer?.Dispose();
+            _topMostPulseTimer = null;
             _showWait?.Unregister(null);
             _showWait = null;
             _exitWait?.Unregister(null);

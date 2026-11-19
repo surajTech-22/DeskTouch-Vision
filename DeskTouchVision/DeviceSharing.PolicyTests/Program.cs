@@ -3128,6 +3128,39 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
                   wfText.Contains("DeviceSharing/platform-tools/adb.exe", StringComparison.Ordinal),
                   "Windows release workflow must bundle Android platform-tools adb.exe for tester PCs");
         }
+
+        // Verify v0.3.88: Taskbar/tray foreground activation reliably raises DeskTouch in front.
+        Check(DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Phone Screen (Pixel)") &&
+              DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Phone Camera & Mic (Pixel)") &&
+              !DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Displays"),
+              "IsSecondaryMediaWindowTitle must distinguish secondary media windows from main Displays");
+
+        string winNativePath = Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "WinNative.cs");
+        string winNativeText = File.ReadAllText(winNativePath);
+        Check(winNativeText.Contains("SwitchToThisWindow", StringComparison.Ordinal) &&
+              winNativeText.Contains("GetLastActivePopup", StringComparison.Ordinal) &&
+              winNativeText.Contains("RaiseAboveWindowsTemporarily", StringComparison.Ordinal),
+              "WinNative must support popup resolution, SwitchToThisWindow, and TopMost pulse");
+
+        string singleInstPath = Path.Combine(Path.GetDirectoryName(issPath!)!, "SingleInstanceActivation.cs");
+        string singleInstText = File.ReadAllText(singleInstPath);
+        Check(singleInstText.Contains("SwitchToThisWindow", StringComparison.Ordinal) &&
+              singleInstText.Contains("HWND_TOPMOST", StringComparison.Ordinal) &&
+              singleInstText.Contains("IsSecondaryMediaWindowTitle", StringComparison.Ordinal),
+              "SingleInstanceActivation must reliably raise occluded or taskbar-shown main windows");
+
+        string formPath = Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "DisplaySettingsForm.cs");
+        string formText = File.ReadAllText(formPath);
+        Check(formText.Contains("ScheduleForegroundTopMostPulse", StringComparison.Ordinal) &&
+              formText.Contains("EndForegroundTopMostPulse", StringComparison.Ordinal) &&
+              formText.Contains("0xF120") &&
+              formText.Contains("ClampToVisibleMonitor", StringComparison.Ordinal),
+              "DisplaySettingsForm must use timed TopMost pulse and handle SC_RESTORE reliably");
+
+        string flyoutPath = Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "TrayDeviceFlyout.cs");
+        string flyoutText = File.ReadAllText(flyoutPath);
+        Check(flyoutText.Contains("BeginInvoke(_onOpenMainWindow)", StringComparison.Ordinal),
+              "TrayDeviceFlyout Open button must defer activation until flyout hides");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

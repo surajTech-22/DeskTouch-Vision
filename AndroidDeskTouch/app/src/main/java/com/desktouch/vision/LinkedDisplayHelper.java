@@ -2,17 +2,28 @@ package com.desktouch.vision;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Pure display-arrangement and hub-pairing helpers shared between the Home
@@ -383,5 +394,195 @@ final class LinkedDisplayHelper {
             }
         }
         return target;
+    }
+
+    private static final String WAN_RECORD_PREFIX = "DTR1|";
+    private static final String WAN_RELAY_BASE_URL = "https://ntfy.sh";
+    private static final byte[] WAN_AAD = "DTR1".getBytes(StandardCharsets.UTF_8);
+
+    static String computeWanTopic(String lookupKey) {
+        if (lookupKey == null) return "";
+        String clean = lookupKey.trim().toUpperCase(Locale.ROOT);
+        if (clean.length() < 4) return "";
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(("DT1-WAN-TOPIC-V1|" + clean).getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(24);
+            for (int i = 0; i < 12; i++) {
+                hex.append(String.format(Locale.ROOT, "%02x", digest[i] & 0xFF));
+            }
+            return "dtv-wan-" + hex.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    static byte[] deriveWanAesKey(String lookupKey) {
+        if (lookupKey == null || lookupKey.trim().length() < 4) {
+            throw new IllegalArgumentException("Lookup key must be at least 4 characters");
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return md.digest(("DT1-WAN-KEY-V1|" + lookupKey.trim().toUpperCase(Locale.ROOT))
+                .getBytes(StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static List<String> parseCandidateAddresses(String rawAddressList) {
+        if (rawAddressList == null || rawAddressList.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+        LinkedHashSet<String> valid = new LinkedHashSet<>();
+        String[] tokens = rawAddressList.split("[,;\\s]+");
+        for (String tok : tokens) {
+            if (tok == null) continue;
+            String t = tok.trim();
+            if (t.startsWith("[") && t.endsWith("]") && t.length() > 2) {
+                t = t.substring(1, t.length() - 1);
+            }
+            int zone = t.indexOf('%');
+            if (zone > 0) t = t.substring(0, zone);
+            if (t.isEmpty()) continue;
+            boolean ipv4 = t.matches("^((25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(25[0-5]|2[0-4]\\d|[01]?\\d\\d?)$");
+            boolean ipv6 = !ipv4 && t.contains(":") && t.matches("^[0-9a-fA-F:]+$");
+            if (!ipv4 && !ipv6) continue;
+            if ("127.0.0.1".equals(t) || "0.0.0.0".equals(t) || "::1".equals(t) || "::".equals(t)) continue;
+            String lower = t.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("fe80:") || lower.startsWith("ff0")) continue;
+            valid.add(t);
+            if (valid.size() >= 6) break;
+        }
+        return new ArrayList<>(valid);
+    }
+
+    static String sealWanRecord(
+            String name, String fingerprint, String addresses, String pairingTag,
+            boolean isHub, int memberCount, long timestampUnixSeconds, String lookupKey) {
+        try {
+            byte[] key = deriveWanAesKey(lookupKey);
+            JSONObject obj = new JSONObject()
+                .put("name", name != null ? name : "DeskTouch PC")
+                .put("fp", fingerprint.trim().toUpperCase(Locale.ROOT))
+                .put("addrs", addresses)
+                .put("tag", pairingTag != null ? pairingTag : "")
+                .put("hub", isHub)
+                .put("members", Math.max(1, memberCount))
+                .put("ts", timestampUnixSeconds);
+            byte[] plain = obj.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] nonce = new byte[12];
+            new SecureRandom().nextBytes(nonce);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+            cipher.updateAAD(WAN_AAD);
+            byte[] sealed = cipher.doFinal(plain);
+            byte[] combined = new byte[12 + sealed.length];
+            System.arraycopy(nonce, 0, combined, 0, 12);
+            System.arraycopy(sealed, 0, combined, 12, sealed.length);
+            return WAN_RECORD_PREFIX + Base64.getEncoder().encodeToString(combined);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static DesktopDiscovery.Device tryOpenWanRecord(String envelope, String lookupKey) {
+        if (envelope == null || lookupKey == null) return null;
+        String trimmed = envelope.trim();
+        if (!trimmed.startsWith(WAN_RECORD_PREFIX)) return null;
+        try {
+            byte[] combined = Base64.getDecoder().decode(trimmed.substring(WAN_RECORD_PREFIX.length()));
+            if (combined.length < 30 || combined.length > 4096) return null;
+            byte[] key = deriveWanAesKey(lookupKey);
+            byte[] nonce = new byte[12];
+            System.arraycopy(combined, 0, nonce, 0, 12);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+            cipher.updateAAD(WAN_AAD);
+            byte[] plain = cipher.doFinal(combined, 12, combined.length - 12);
+            JSONObject root = new JSONObject(new String(plain, StandardCharsets.UTF_8));
+            String name = root.optString("name", "DeskTouch PC").trim();
+            String fp = root.optString("fp", "").trim().toUpperCase(Locale.ROOT);
+            String addrs = root.optString("addrs", "").trim();
+            String tag = root.optString("tag", "").trim().toUpperCase(Locale.ROOT);
+            boolean hub = root.optBoolean("hub", true);
+            int members = Math.max(1, root.optInt("members", 1));
+            long ts = root.optLong("ts", 0L);
+
+            if (!fp.matches("[A-F0-9]{64}")) return null;
+            List<String> validAddrs = parseCandidateAddresses(addrs);
+            if (validAddrs.isEmpty()) return null;
+            long nowUnix = System.currentTimeMillis() / 1000L;
+            if (ts > 0L && Math.abs(nowUnix - ts) > 86400L) return null;
+
+            String joinedAddrs = String.join(",", validAddrs);
+            DesktopDiscovery.Device dev = new DesktopDiscovery.Device(
+                name.isEmpty() ? "DeskTouch PC" : name,
+                joinedAddrs,
+                fp,
+                true,
+                false,
+                false);
+            dev.isHub = hub;
+            dev.hubMemberCount = members;
+            if (!tag.isEmpty()) dev.pairingTag = tag;
+            return dev;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static DesktopDiscovery.Device resolveByCode(String rawCode, int timeoutMs) {
+        String code = normalizeCustomPairingCode(rawCode);
+        if (code.length() < 4) return null;
+        return resolveWanCore(code, timeoutMs);
+    }
+
+    static DesktopDiscovery.Device resolveByFingerprint(String fingerprint, int timeoutMs) {
+        if (fingerprint == null) return null;
+        String fp = fingerprint.trim().toUpperCase(Locale.ROOT);
+        if (!fp.matches("[A-F0-9]{64}")) return null;
+        return resolveWanCore(fp, timeoutMs);
+    }
+
+    private static DesktopDiscovery.Device resolveWanCore(String lookupKey, int timeoutMs) {
+        String topic = computeWanTopic(lookupKey);
+        if (topic.isEmpty()) return null;
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(WAN_RELAY_BASE_URL + "/" + topic + "/json?poll=1&since=45m");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            int t = Math.max(1500, Math.min(timeoutMs, 8000));
+            conn.setConnectTimeout(t);
+            conn.setReadTimeout(t);
+            if (conn.getResponseCode() != 200) return null;
+
+            DesktopDiscovery.Device newest = null;
+            long newestTime = Long.MIN_VALUE;
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty()) continue;
+                    try {
+                        JSONObject event = new JSONObject(line);
+                        String msg = event.optString("message", "");
+                        long evTime = event.optLong("time", 0L);
+                        DesktopDiscovery.Device opened = tryOpenWanRecord(msg, lookupKey);
+                        if (opened != null && evTime >= newestTime) {
+                            newest = opened;
+                            newestTime = evTime;
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+            return newest;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (conn != null) try { conn.disconnect(); } catch (Exception ignored) {}
+        }
     }
 }

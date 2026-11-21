@@ -1829,6 +1829,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.BroadcastProfileState(AutomationAndProfilesStore.SerializeSummaryForAndroid(_ecosystemConfig));
             _receiver.Start();
             _receiver.SetCustomPairingCode(_customPairingCode);
+            TriggerCrossNetworkRendezvousPublish();
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
             if (_adbBridge?.CurrentShellBridge is { } existingBridge)
                 _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret, forceBroadcast: true);
@@ -2163,6 +2164,24 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         return await completion.Task;
     }
 
+    private long _lastRendezvousPublishMs;
+    private long _lastWanTrustedProbeMs;
+
+    private void TriggerCrossNetworkRendezvousPublish(bool force = false)
+    {
+        var recv = _receiver;
+        if (recv == null || _closing.IsCancellationRequested) return;
+        long now = Environment.TickCount64;
+        if (!force && _lastRendezvousPublishMs != 0 && now - _lastRendezvousPublishMs < 180_000)
+            return;
+        _lastRendezvousPublishMs = now;
+        string fp = recv.Fingerprint;
+        string code = _customPairingCode;
+        bool isHub = _host == null;
+        int count = Math.Max(1, recv.ActiveEnvironmentDeviceCount);
+        _ = Task.Run(() => CrossNetworkRendezvous.PublishPresenceAsync(fp, code, isHub, count, _closing.Token));
+    }
+
     private void SaveCustomPairingCode()
     {
         try
@@ -2173,7 +2192,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver?.SetCustomPairingCode(saved);
             _discovery?.SetCustomPairingCode(saved);
             BroadcastOnlinePresence();
-            Status($"Pairing code updated for {Environment.MachineName}: {saved}");
+            TriggerCrossNetworkRendezvousPublish(force: true);
+            Status($"Pairing code updated for {Environment.MachineName}: {saved} (published for cross-network pairing)");
         }
         catch (ArgumentException ex)
         {
@@ -2193,8 +2213,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 Status("Enter a 4–32 character pairing code first.");
                 return;
             }
+            TriggerCrossNetworkRendezvousPublish(force: true);
             Clipboard.SetText(code);
-            Status($"Pairing code {code} copied. Enter it on your phone or another computer.");
+            Status($"Pairing code {code} copied. Works on same Wi-Fi or across different networks / 5G.");
         }
         catch (Exception ex) { Status("Unable to copy pairing code: " + ex.Message); }
     }
@@ -2204,18 +2225,18 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_receiver == null) { Status("This computer is currently controlling another PC."); return; }
         try
         {
-            var addresses = Dns.GetHostAddresses(Dns.GetHostName())
-                .Where(x => x.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(x))
-                .OrderByDescending(x => x.GetAddressBytes()[0] == 192 ||
-                                        x.GetAddressBytes()[0] == 10 ||
-                                        x.GetAddressBytes()[0] == 172)
-                .ToArray();
-            var address = addresses.FirstOrDefault();
-            if (address == null) { Status("No local IPv4 address. Join a private Wi-Fi or Ethernet network."); return; }
+            var allEndpoints = CrossNetworkRendezvous.CollectLocalAndGlobalAddresses();
+            if (allEndpoints.Count == 0)
+            {
+                Status("No local IPv4 or global IPv6 address found. Connect to a network first.");
+                return;
+            }
+            TriggerCrossNetworkRendezvousPublish(force: true);
+            string multiAddr = string.Join(",", allEndpoints);
             // Pairing secret is available only by a deliberate Copy action.
-            var code = $"DT1|{address}|{_receiver.Fingerprint}|{_receiver.Secret}";
+            var code = $"DT1|{multiAddr}|{_receiver.Fingerprint}|{_receiver.Secret}";
             Clipboard.SetText(code);
-            Status($"Full pairing link copied for {Environment.MachineName}. Keep it private.");
+            Status($"Multi-network pairing link copied ({allEndpoints.Count} endpoint(s)). Keep it private.");
         }
         catch (Exception ex) { Status("Unable to copy full pairing link: " + ex.Message); }
     }
@@ -2729,13 +2750,24 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _scanningTrusted = true;
         try
         {
+            TriggerCrossNetworkRendezvousPublish(force: false);
             // Discovery finds CURRENT network addresses; the saved file has
             // NO IP address, only the receiver's persistent TLS fingerprint.
             var targetFingerprints = _trusted.Outgoing
                 .Select(x => x.Fingerprint)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var peers = await NearbyComputerDiscovery.FindFastAsync(
-                targetFingerprints, _closing.Token);
+            var peers = (await NearbyComputerDiscovery.FindFastAsync(
+                targetFingerprints, _closing.Token)).ToList();
+            if (peers.Count == 0 && Environment.TickCount64 - _lastWanTrustedProbeMs >= 25_000)
+            {
+                _lastWanTrustedProbeMs = Environment.TickCount64;
+                foreach (string targetFp in targetFingerprints)
+                {
+                    var wanPeer = await CrossNetworkRendezvous.ResolveByFingerprintAsync(targetFp, _closing.Token);
+                    if (wanPeer != null)
+                        peers.Add(wanPeer);
+                }
+            }
             var candidates = peers
                 .Where(p => !p.IsAndroid && p.CanReceive)
                 .Select(p => new { Peer = p, Saved = _trusted.FindAutoConnect(p.Fingerprint) })
@@ -4274,6 +4306,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             Status("Switch back to ready mode on this computer before generating a pairing QR.");
             return;
         }
+        TriggerCrossNetworkRendezvousPublish(force: true);
         using var dlg = new PairingQrDialog(_receiver.Fingerprint, _receiver.Secret, _customPairingCode);
         dlg.ShowDialog(this);
     }

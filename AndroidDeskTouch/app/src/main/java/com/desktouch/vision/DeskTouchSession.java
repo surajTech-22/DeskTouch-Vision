@@ -838,7 +838,8 @@ final class DeskTouchSession implements AutoCloseable {
         sender.execute(()->{
             if(running || connecting) {status("Already connected or connecting");return;}
             connecting=true;
-            boundNetwork = networkOverride;
+            android.net.Network effectiveNetwork = networkOverride;
+            boundNetwork = effectiveNetwork;
             cellularSession = cellular && !device.cable;
             try {
                 String pinned=device.fingerprint.toUpperCase(Locale.ROOT);
@@ -849,20 +850,79 @@ final class DeskTouchSession implements AutoCloseable {
                 DataInputStream in=null;
                 DataOutputStream out=null;
                 Packet ready=null;
+                java.util.List<String> candidateHosts = LinkedDisplayHelper.parseCandidateAddresses(device.address);
+                if (candidateHosts.isEmpty()) {
+                    candidateHosts = java.util.Collections.singletonList(device.address);
+                }
+                java.util.ArrayList<String> learnedV6 = new java.util.ArrayList<>();
+                for (String h : candidateHosts) {
+                    if (h != null && h.contains(":")) learnedV6.add(h);
+                }
+                if (!learnedV6.isEmpty()) {
+                    DeskTouchRuntime.rememberPeerEndpoints(application, pinned, learnedV6);
+                }
+                String connectedHost = candidateHosts.get(0);
                 for(int attempt=0;attempt<2;attempt++){
                     boolean tryTrusted=attempt==0 && saved!=null;
-                    if (networkOverride != null) {
-                        java.net.Socket raw = new java.net.Socket();
-                        networkOverride.bindSocket(raw);
-                        raw.setTcpNoDelay(true);
-                        raw.setKeepAlive(true);
-                        raw.connect(new java.net.InetSocketAddress(
-                            java.net.InetAddress.getByName(device.address), 37377),
-                            cellular ? 3500 : 5000);
-                        ssl = (SSLSocket) pinnedFactory.createSocket(raw, device.address, 37377, true);
-                    } else {
-                        ssl = (SSLSocket) pinnedFactory.createSocket();
-                        ssl.connect(new java.net.InetSocketAddress(device.address, 37377), 5000);
+                    IOException lastConnectErr = null;
+                    int perHostTimeout = candidateHosts.size() > 1 ? 3200 : (cellular ? 3500 : 5000);
+                    for (String candidateHost : candidateHosts) {
+                        try {
+                            if (effectiveNetwork != null) {
+                                java.net.Socket raw = new java.net.Socket();
+                                effectiveNetwork.bindSocket(raw);
+                                raw.setTcpNoDelay(true);
+                                raw.setKeepAlive(true);
+                                raw.connect(new java.net.InetSocketAddress(
+                                    java.net.InetAddress.getByName(candidateHost), 37377),
+                                    perHostTimeout);
+                                ssl = (SSLSocket) pinnedFactory.createSocket(raw, candidateHost, 37377, true);
+                            } else {
+                                ssl = (SSLSocket) pinnedFactory.createSocket();
+                                ssl.connect(new java.net.InetSocketAddress(candidateHost, 37377), perHostTimeout);
+                            }
+                            connectedHost = candidateHost;
+                            break;
+                        } catch (IOException hostEx) {
+                            lastConnectErr = hostEx;
+                            if (ssl != null) {
+                                try { ssl.close(); } catch (Exception ignored) {}
+                                ssl = null;
+                            }
+                        }
+                    }
+                    // If on a different Wi-Fi with no direct route to the PC, try cellular 5G fallback for IPv6/public endpoints.
+                    if (ssl == null && effectiveNetwork == null && !device.cable) {
+                        for (String candidateHost : candidateHosts) {
+                            if (candidateHost.startsWith("192.168.") || candidateHost.startsWith("10.")) continue;
+                            CellularLinkHelper cellHelper = new CellularLinkHelper(application);
+                            android.net.Network cellNet = cellHelper.acquireCellularNetwork(2800L);
+                            if (cellNet == null) break;
+                            try {
+                                java.net.Socket raw = new java.net.Socket();
+                                cellNet.bindSocket(raw);
+                                raw.setTcpNoDelay(true);
+                                raw.setKeepAlive(true);
+                                raw.connect(new java.net.InetSocketAddress(
+                                    java.net.InetAddress.getByName(candidateHost), 37377), 3200);
+                                ssl = (SSLSocket) pinnedFactory.createSocket(raw, candidateHost, 37377, true);
+                                boundNetwork = cellNet;
+                                effectiveNetwork = cellNet;
+                                cellularSession = true;
+                                connectedHost = candidateHost;
+                                break;
+                            } catch (IOException cellEx) {
+                                lastConnectErr = cellEx;
+                                cellHelper.releaseCellularNetwork();
+                                if (ssl != null) {
+                                    try { ssl.close(); } catch (Exception ignored) {}
+                                    ssl = null;
+                                }
+                            }
+                        }
+                    }
+                    if (ssl == null) {
+                        throw lastConnectErr != null ? lastConnectErr : new IOException("Could not reach " + device.address);
                     }
                     ssl.setTcpNoDelay(true);
                     ssl.setKeepAlive(true);
@@ -959,7 +1019,7 @@ final class DeskTouchSession implements AutoCloseable {
                 peerInetAddress=ssl.getInetAddress();
                 cableSession=device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress());
                 peerName=device.name;
-                peerHostAddress=peerInetAddress!=null ? peerInetAddress.getHostAddress() : device.address;
+                peerHostAddress=peerInetAddress!=null ? peerInetAddress.getHostAddress() : connectedHost;
                 if(!cableSession && peerHostAddress!=null && !peerHostAddress.isEmpty()
                     && !"127.0.0.1".equals(peerHostAddress)) {
                     DeskTouchRuntime.rememberPeerHost(pinned,peerHostAddress);
@@ -1055,7 +1115,7 @@ final class DeskTouchSession implements AutoCloseable {
                             String ip=arr.optString(i,"");
                             if(!ip.isEmpty()) list.add(ip);
                         }
-                        if(!list.isEmpty()) DeskTouchRuntime.rememberPeerEndpoints(fingerprint,list);
+                        if(!list.isEmpty()) DeskTouchRuntime.rememberPeerEndpoints(application,fingerprint,list);
                     }
                 } catch(Exception ignored) {}
             }

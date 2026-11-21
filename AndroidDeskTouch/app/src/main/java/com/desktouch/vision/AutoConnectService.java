@@ -732,13 +732,23 @@ public final class AutoConnectService extends Service {
             return;
         }
 
-        // Fallback only when Wi-Fi is completely disconnected/unavailable (Case 3).
+        // Fallback when PC is not on current Wi-Fi (Mobile Data or a different Wi-Fi network).
         if(DeskTouchRuntime.anyInputLeaseActive() || DeskTouchRuntime.connectedCount()>0) return;
         if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<20_000L) return;
         PhoneScreenGeometry.Info phone=PhoneScreenGeometry.readInfo(this);
-        for(String fp:DeskTouchRuntime.endpointFingerprints()) {
-            if(!allowed.contains(fp) || paused.contains(fp)) continue;
-            java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(fp);
+        for(String fp:allowed) {
+            if(paused.contains(fp)) continue;
+            java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(this,fp);
+            if(ipv6Endpoints.isEmpty()) {
+                lastCellularProbeAtMs=now;
+                DesktopDiscovery.Device wanDev=LinkedDisplayHelper.resolveByFingerprint(fp,3000);
+                if(wanDev!=null) {
+                    ipv6Endpoints=LinkedDisplayHelper.parseCandidateAddresses(wanDev.address);
+                    if(!ipv6Endpoints.isEmpty()) {
+                        DeskTouchRuntime.rememberPeerEndpoints(this,fp,ipv6Endpoints);
+                    }
+                }
+            }
             if(ipv6Endpoints.isEmpty()) continue;
             lastCellularProbeAtMs=now;
             android.net.Network cellNet=cellularHelper.acquireCellularNetwork(4500L);

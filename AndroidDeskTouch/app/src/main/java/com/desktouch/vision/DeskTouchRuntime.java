@@ -386,24 +386,55 @@ final class DeskTouchRuntime {
         listener=observer;
         if(observer!=null)observer.accept(lastStatus);
     }
+    private static final String PREFS_ENDPOINTS = "desktouch_peer_endpoints";
     private static final java.util.Map<String, java.util.List<String>> PEER_ENDPOINTS =
         new java.util.concurrent.ConcurrentHashMap<>();
 
     static void rememberPeerEndpoints(String fingerprint, java.util.List<String> ipv6Endpoints) {
+        rememberPeerEndpoints(null, fingerprint, ipv6Endpoints);
+    }
+
+    static void rememberPeerEndpoints(Context context, String fingerprint, java.util.List<String> ipv6Endpoints) {
         if (fingerprint == null || fingerprint.isEmpty() || ipv6Endpoints == null || ipv6Endpoints.isEmpty()) return;
         java.util.ArrayList<String> copy = new java.util.ArrayList<>();
         for (String s : ipv6Endpoints) {
-            if (s != null && !s.trim().isEmpty()) copy.add(s.trim());
+            if (s != null && !s.trim().isEmpty() && !copy.contains(s.trim())) copy.add(s.trim());
         }
         if (!copy.isEmpty()) {
-            PEER_ENDPOINTS.put(fingerprint.toUpperCase(java.util.Locale.ROOT),
-                java.util.Collections.unmodifiableList(copy));
+            String key = fingerprint.toUpperCase(java.util.Locale.ROOT);
+            PEER_ENDPOINTS.put(key, java.util.Collections.unmodifiableList(copy));
+            if (context != null) {
+                try {
+                    context.getApplicationContext()
+                        .getSharedPreferences(PREFS_ENDPOINTS, Context.MODE_PRIVATE)
+                        .edit()
+                        .putString(key, String.join(",", copy))
+                        .apply();
+                } catch (Exception ignored) {}
+            }
         }
     }
 
     static java.util.List<String> peerEndpoints(String fingerprint) {
+        return peerEndpoints(null, fingerprint);
+    }
+
+    static java.util.List<String> peerEndpoints(Context context, String fingerprint) {
         if (fingerprint == null || fingerprint.isEmpty()) return java.util.Collections.emptyList();
-        java.util.List<String> list = PEER_ENDPOINTS.get(fingerprint.toUpperCase(java.util.Locale.ROOT));
+        String key = fingerprint.toUpperCase(java.util.Locale.ROOT);
+        java.util.List<String> list = PEER_ENDPOINTS.get(key);
+        if ((list == null || list.isEmpty()) && context != null) {
+            try {
+                String saved = context.getApplicationContext()
+                    .getSharedPreferences(PREFS_ENDPOINTS, Context.MODE_PRIVATE)
+                    .getString(key, "");
+                java.util.List<String> parsed = LinkedDisplayHelper.parseCandidateAddresses(saved);
+                if (!parsed.isEmpty()) {
+                    list = java.util.Collections.unmodifiableList(parsed);
+                    PEER_ENDPOINTS.put(key, list);
+                }
+            } catch (Exception ignored) {}
+        }
         return list != null ? list : java.util.Collections.emptyList();
     }
 

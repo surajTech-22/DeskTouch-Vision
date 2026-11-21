@@ -974,6 +974,57 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
             "ManagedAudioOutputEngine must deduplicate identical dual-path audioSeq packets");
     }
 
+    // Verify v0.3.92: Cross-network (off-Wi-Fi) AES-256-GCM DTR1 rendezvous, multi-endpoint IPv4+IPv6 parsing, & RFC 5389 STUN XOR-MAPPED-ADDRESS.
+    {
+        var parsedMulti = CrossNetworkRendezvous.ParseCandidateAddresses(
+            "192.168.1.6, [2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6], 127.0.0.1, ::1, fe80::1, 203.0.113.42");
+        Check(parsedMulti.Count == 3 &&
+              parsedMulti[0].ToString() == "192.168.1.6" &&
+              parsedMulti[1].AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 &&
+              parsedMulti[2].ToString() == "203.0.113.42",
+              "ParseCandidateAddresses must accept IPv4 and Global IPv6 while rejecting loopback/link-local");
+
+        string sampleFp = "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90";
+        string sampleCode = "SURAJ92";
+        string sampleTag = PairingCodeHelper.ComputeDiscoveryTag(sampleFp, sampleCode);
+        long nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var record = new CrossNetworkRendezvous.RendezvousPayload(
+            "DESKTOP-HUB", sampleFp, "192.168.1.6,2401:4900:1cba:3a75::1", sampleTag, true, 3, nowUnix);
+        string sealedEnvelope = CrossNetworkRendezvous.SealRecord(record, sampleCode);
+        Check(sealedEnvelope.StartsWith("DTR1|", StringComparison.Ordinal) &&
+              !sealedEnvelope.Contains("192.168.1.6", StringComparison.Ordinal) &&
+              !sealedEnvelope.Contains("DESKTOP-HUB", StringComparison.Ordinal),
+              "CrossNetworkRendezvous.SealRecord must encrypt endpoints and device metadata");
+        Check(CrossNetworkRendezvous.TryOpenRecord(sealedEnvelope, sampleCode, out var opened) &&
+              opened != null &&
+              opened.Name == "DESKTOP-HUB" &&
+              opened.Fingerprint == sampleFp &&
+              opened.Addresses == "192.168.1.6,2401:4900:1cba:3a75::1" &&
+              opened.PairingTag == sampleTag &&
+              opened.MemberCount == 3,
+              "CrossNetworkRendezvous.TryOpenRecord must decrypt authentic DTR1 envelope");
+        Check(!CrossNetworkRendezvous.TryOpenRecord(sealedEnvelope, "WRONGCODE", out _),
+              "CrossNetworkRendezvous.TryOpenRecord must reject wrong pairing code");
+
+        byte[] fakeTx = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Build RFC 5389 Binding Success Response (0x0101) with XOR-MAPPED-ADDRESS (0x0020) for 203.0.113.88
+        byte[] stunResp = new byte[32];
+        stunResp[0] = 0x01; stunResp[1] = 0x01;
+        stunResp[2] = 0x00; stunResp[3] = 0x0C; // length 12
+        stunResp[4] = 0x21; stunResp[5] = 0x12; stunResp[6] = 0xA4; stunResp[7] = 0x42;
+        Buffer.BlockCopy(fakeTx, 0, stunResp, 8, 12);
+        stunResp[20] = 0x00; stunResp[21] = 0x20; // XOR-MAPPED-ADDRESS
+        stunResp[22] = 0x00; stunResp[23] = 0x08; // attr len 8
+        stunResp[24] = 0x00; stunResp[25] = 0x01; // IPv4 family
+        stunResp[26] = 0x11; stunResp[27] = 0x22; // port
+        stunResp[28] = (byte)(203 ^ 0x21);
+        stunResp[29] = (byte)(0 ^ 0x12);
+        stunResp[30] = (byte)(113 ^ 0xA4);
+        stunResp[31] = (byte)(88 ^ 0x42);
+        Check(CrossNetworkRendezvous.TryParseStunXorMappedIpv4(stunResp, fakeTx) == "203.0.113.88",
+              "TryParseStunXorMappedIpv4 must decode RFC 5389 XOR-MAPPED-ADDRESS accurately");
+    }
+
     Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, WinMM CALLBACK_EVENT smoke test, virtual mic bridge, and capability negotiation.");
 }
 

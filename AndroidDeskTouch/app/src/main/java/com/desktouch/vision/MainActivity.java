@@ -2409,9 +2409,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.91";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.92";
         }catch(Exception ignored){
-            return "0.3.91";
+            return "0.3.92";
         }
     }
 
@@ -3990,12 +3990,27 @@ public final class MainActivity extends Activity {
 
     private void pairByEnteredCode(){
         if(pairingCodeInput==null)return;
-        String rawInput=pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString();
+        String rawInput=pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString().trim();
+        QrScannerDialog.DirectQrTarget directLink=QrScannerDialog.parseDirectQrPayload(rawInput);
+        if(directLink!=null){
+            if(DeskTouchRuntime.connectedCount()>0 && !DeskTouchRuntime.isConnected(directLink.fingerprint)){
+                setFeedback("Disconnect existing hub before pairing a different target.",true);
+                return;
+            }
+            android.graphics.Point size=PhoneScreenGeometry.read(this);
+            AutoConnectService.setReconnect(this,true);
+            AutoConnectService.resumePeer(this,directLink.fingerprint);
+            session=DeskTouchRuntime.select(this,directLink.fingerprint);
+            session.connectWithDirectSecret(directLink.address,directLink.fingerprint,directLink.secret,size.x,size.y);
+            selectTab(PhoneUiKit.TAB_HOME);
+            setFeedback("Connecting across networks to "+directLink.address+"...",true);
+            return;
+        }
         String customCode=LinkedDisplayHelper.normalizeCustomPairingCode(rawInput);
         String hexCode=LinkedDisplayHelper.normalizePairingCode(rawInput);
         String lookupCode=!customCode.isEmpty() ? customCode : hexCode;
         if(lookupCode.isEmpty()){
-            setFeedback("Enter the 4–32 character pairing code shown on DeskTouch Windows.",true);
+            setFeedback("Enter the 4–32 character pairing code or paste the full DT1 link shown on DeskTouch Windows.",true);
             return;
         }
         List<DesktopDiscovery.Device> snapshot=lastScannedDevices;
@@ -4004,22 +4019,30 @@ public final class MainActivity extends Activity {
             pairWithMatchedDevice(snapshot,cached,customCode);
             return;
         }
-        setDiscoveryStatus("Searching Wi-Fi and cable for pairing code...");
+        setDiscoveryStatus("Searching Wi-Fi, cable, and cross-network rendezvous for pairing code...");
         if(scanning)return;
         scanning=true;
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
                 lastScannedDevices=list;
+                DesktopDiscovery.Device matched=LinkedDisplayHelper.findDeviceByPairingCode(list,lookupCode);
+                if(matched==null && !customCode.isEmpty()){
+                    runOnUiThread(()->{
+                        if(!isFinishing()&&!isDestroyed())
+                            setDiscoveryStatus("Not on same Wi-Fi — resolving pairing code across networks...");
+                    });
+                    matched=LinkedDisplayHelper.resolveByCode(customCode,4000);
+                }
+                final DesktopDiscovery.Device finalMatched=matched;
                 runOnUiThread(()->{
                     if(isFinishing()||isDestroyed())return;
                     renderScannedHubs(list);
-                    DesktopDiscovery.Device matched=LinkedDisplayHelper.findDeviceByPairingCode(list,lookupCode);
-                    if(matched==null){
-                        setDiscoveryStatus("No reachable hub or PC matched that pairing code on your network.");
+                    if(finalMatched==null){
+                        setDiscoveryStatus("No reachable hub or PC matched that pairing code on Wi-Fi or cross-network rendezvous.");
                         return;
                     }
-                    pairWithMatchedDevice(list,matched,customCode);
+                    pairWithMatchedDevice(list,finalMatched,customCode);
                 });
             }catch(Exception e){
                 runOnUiThread(()->{

@@ -235,11 +235,19 @@ internal sealed class PairingQrDialog : Form
             Padding = new Padding(44, 4, 16, 4)
         };
         var ipLbl = new Label { Text = "Network IP:", AutoSize = true, Margin = new Padding(0, 5, 8, 0), ForeColor = Color.FromArgb(186, 200, 220) };
-        var ips = GetCandidateIPv4Addresses();
-        foreach (string ip in ips)
-            _adapterPicker.Items.Add(ip);
+        var allEndpoints = CrossNetworkRendezvous.CollectLocalAndGlobalAddresses();
+        if (allEndpoints.Count > 1)
+            _adapterPicker.Items.Add(string.Join(",", allEndpoints));
+        foreach (string ep in allEndpoints)
+            _adapterPicker.Items.Add(ep);
+        if (_adapterPicker.Items.Count == 0)
+        {
+            foreach (string ip in GetCandidateIPv4Addresses())
+                _adapterPicker.Items.Add(ip);
+        }
         if (_adapterPicker.Items.Count > 0) _adapterPicker.SelectedIndex = 0;
         _adapterPicker.SelectedIndexChanged += (_, _) => RenderQr();
+        _ = RefreshStunEndpointInPickerAsync();
         adapterRow.Controls.Add(ipLbl);
         adapterRow.Controls.Add(_adapterPicker);
 
@@ -345,6 +353,40 @@ internal sealed class PairingQrDialog : Form
         {
             _linkInfo.Text = "Could not render QR: " + ex.Message;
         }
+    }
+
+    private async Task RefreshStunEndpointInPickerAsync()
+    {
+        try
+        {
+            string? stunIp = await CrossNetworkRendezvous.DiscoverPublicIpv4ViaStunAsync();
+            if (string.IsNullOrEmpty(stunIp) || IsDisposed) return;
+            BeginInvoke(() =>
+            {
+                if (IsDisposed) return;
+                var all = CrossNetworkRendezvous.CollectLocalAndGlobalAddresses(stunIp);
+                string multi = string.Join(",", all);
+                if (all.Count > 1 && _adapterPicker.Items.Count > 0)
+                {
+                    bool wasFirst = _adapterPicker.SelectedIndex == 0;
+                    _adapterPicker.Items[0] = multi;
+                    if (!ContainsItem(_adapterPicker, stunIp))
+                        _adapterPicker.Items.Add(stunIp);
+                    if (wasFirst) RenderQr();
+                }
+            });
+        }
+        catch { }
+    }
+
+    private static bool ContainsItem(ComboBox box, string value)
+    {
+        for (int i = 0; i < box.Items.Count; i++)
+        {
+            if (string.Equals(box.Items[i]?.ToString(), value, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     private static Button MakeBtn(string text, bool primary) => new()

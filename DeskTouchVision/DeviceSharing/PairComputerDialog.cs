@@ -100,8 +100,8 @@ internal sealed class PairComputerDialog : Form
         Controls.Add(title);
         AcceptButton = connect;
         CancelButton = cancel;
-        connect.Click += (_, _) => AcceptSelection();
-        _nearby.DoubleClick += (_, _) => AcceptSelection();
+        connect.Click += async (_, _) => await AcceptSelectionAsync();
+        _nearby.DoubleClick += async (_, _) => await AcceptSelectionAsync();
         _refresh.Click += async (_, _) => await RefreshAsync();
         _repair.Click += (_, _) => RepairPrivateLanFirewall();
         Shown += async (_, _) => await RefreshAsync();
@@ -179,7 +179,7 @@ internal sealed class PairComputerDialog : Form
         return null;
     }
 
-    private void AcceptSelection()
+    private async Task AcceptSelectionAsync()
     {
         string manual = _manual.Text.Trim();
         if (!string.IsNullOrWhiteSpace(manual))
@@ -187,20 +187,28 @@ internal sealed class PairComputerDialog : Form
             if (manual.Contains('|'))
             {
                 var parts = manual.Split('|');
-                if (parts.Length != 4 || parts[0].Trim() != "DT1" ||
-                    !IPAddress.TryParse(parts[1].Trim(), out var address) ||
-                    address.AddressFamily != AddressFamily.InterNetwork ||
+                var parsedAddrs = parts.Length == 4 ? CrossNetworkRendezvous.ParseCandidateAddresses(parts[1]) : Array.Empty<IPAddress>();
+                string rawSecret = parts.Length == 4 ? parts[3].Trim().ToUpperInvariant() : "";
+                bool validHexSecret = rawSecret.Length == 32 && rawSecret.All(Uri.IsHexDigit);
+                bool validCustomSecret = !string.IsNullOrEmpty(PairingCodeHelper.NormalizeCustomCode(rawSecret));
+                if (parts.Length != 4 || !parts[0].Trim().Equals("DT1", StringComparison.OrdinalIgnoreCase) ||
+                    parsedAddrs.Count == 0 ||
                     parts[2].Trim().Length != 64 || !parts[2].Trim().All(Uri.IsHexDigit) ||
-                    parts[3].Trim().Length != 32 || !parts[3].Trim().All(Uri.IsHexDigit))
+                    (!validHexSecret && !validCustomSecret))
                 {
                     _error.Text = "Invalid pairing link. Copy the full link or enter a pairing code.";
                     return;
                 }
-                Address = address.ToString();
+                Address = string.Join(",", parsedAddrs.Select(a => a.ToString()));
                 Fingerprint = parts[2].Trim().ToUpperInvariant();
-                Secret = parts[3].Trim().ToUpperInvariant();
-                ComputerName = Address;
+                Secret = validHexSecret ? rawSecret : PairingCodeHelper.NormalizeCustomCode(rawSecret);
+                ComputerName = parsedAddrs[0].ToString();
                 UseRemoteApproval = false;
+            }
+            else if (CrossNetworkRendezvous.ParseCandidateAddresses(manual).Count > 0)
+            {
+                _error.Text = "For a direct IP, paste the full DT1|ip|fingerprint|secret link or enter the 4–32 character Pairing Code.";
+                return;
             }
             else
             {
@@ -210,7 +218,15 @@ internal sealed class PairComputerDialog : Form
                     out bool matchedCustomTag);
                 if (codeMatched == null)
                 {
-                    _error.Text = "No discovered computer matched that pairing code. Click Scan devices first, or paste the full DT1 link.";
+                    _discoveryStatus.Text = "Not on same Wi-Fi — resolving pairing code across networks...";
+                    _error.Text = "";
+                    codeMatched = await CrossNetworkRendezvous.ResolveByCodeAsync(manual, _cancel.Token);
+                    if (codeMatched != null)
+                        matchedCustomTag = true;
+                }
+                if (codeMatched == null)
+                {
+                    _error.Text = "No computer matched that pairing code on local Wi-Fi or cross-network rendezvous. Check the code or paste the full DT1 link.";
                     return;
                 }
                 if (!codeMatched.CanReceive)

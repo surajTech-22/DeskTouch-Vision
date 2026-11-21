@@ -6793,20 +6793,49 @@ internal sealed class HostSession : IInputSession, IDisposable
         bool validCustomCode = !trustedConnection && !string.IsNullOrEmpty(PairingCodeHelper.NormalizeCustomCode(secret));
         if (!askReceiver && !validFixedSecret && !validCustomCode)
             throw new ArgumentException("Invalid authenticated pairing credential.");
-        if (!IPAddress.TryParse(ip.Trim(), out var address) ||
-            address.AddressFamily != AddressFamily.InterNetwork)
-            throw new ArgumentException("Enter the receiver's IPv4 address.");
+        var candidateAddresses = CrossNetworkRendezvous.ParseCandidateAddresses(ip);
+        if (candidateAddresses.Count == 0)
+            throw new ArgumentException("Enter the receiver's IPv4 or IPv6 address.");
 
-        var client = new TcpClient { NoDelay = true };
-        try { client.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10); }
-        catch (Exception) { }
+        TcpClient? client = null;
+        IPAddress address = candidateAddresses[0];
         SslStream? ssl = null;
         string stage = "TCP connection";
         try
         {
+            Exception? lastConnectError = null;
+            int perAttemptSeconds = candidateAddresses.Count > 1 ? 5 : 15;
+            foreach (var candidateAddr in candidateAddresses)
+            {
+                var attemptClient = new TcpClient(candidateAddr.AddressFamily) { NoDelay = true };
+                try
+                {
+                    if (candidateAddr.AddressFamily == AddressFamily.InterNetwork)
+                        attemptClient.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.TypeOfService, 0x10);
+                    else if (candidateAddr.AddressFamily == AddressFamily.InterNetworkV6)
+                        attemptClient.Client.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.TypeOfService, 0x10);
+                }
+                catch (Exception) { }
+                try
+                {
+                    using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                    attemptTimeout.CancelAfter(TimeSpan.FromSeconds(perAttemptSeconds));
+                    await attemptClient.ConnectAsync(candidateAddr, Wire.Port, attemptTimeout.Token);
+                    client = attemptClient;
+                    address = candidateAddr;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastConnectError = ex;
+                    attemptClient.Dispose();
+                }
+            }
+            if (client == null)
+                throw lastConnectError ?? new SocketException((int)SocketError.HostUnreachable);
+
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
             timeout.CancelAfter(TimeSpan.FromSeconds(15));
-            await client.ConnectAsync(address, Wire.Port, timeout.Token);
             stage = "TLS certificate verification";
             ssl = new SslStream(client.GetStream(), false, (_, cert, _, _) =>
             {
@@ -6868,7 +6897,7 @@ internal sealed class HostSession : IInputSession, IDisposable
         catch (Exception ex)
         {
             ssl?.Dispose();
-            client.Dispose();
+            client?.Dispose();
             string guidance = stage switch
             {
                 "TCP connection" =>

@@ -62,14 +62,17 @@ final class QrScannerDialog {
         String[] parts = raw.trim().split("\\|");
         if (parts.length != 4 || !"DT1".equalsIgnoreCase(parts[0].trim()))
             return null;
-        String ip = parts[1].trim();
+        String ipField = parts[1].trim();
         String fp = parts[2].trim().toUpperCase(Locale.ROOT);
         String secret = parts[3].trim().toUpperCase(Locale.ROOT);
-        if (!ip.matches("^((25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(25[0-5]|2[0-4]\\d|[01]?\\d\\d?)$"))
+        java.util.List<String> validAddrs = LinkedDisplayHelper.parseCandidateAddresses(ipField);
+        if (validAddrs.isEmpty())
             return null;
-        if (!fp.matches("[A-F0-9]{64}") || !secret.matches("[A-F0-9]{32}"))
+        boolean validHexSecret = secret.matches("[A-F0-9]{32}");
+        boolean validCustomCode = !LinkedDisplayHelper.normalizeCustomPairingCode(secret).isEmpty();
+        if (!fp.matches("[A-F0-9]{64}") || (!validHexSecret && !validCustomCode))
             return null;
-        return new DirectQrTarget(ip, fp, secret);
+        return new DirectQrTarget(String.join(",", validAddrs), fp, secret);
     }
 
     private QrScannerDialog() {}

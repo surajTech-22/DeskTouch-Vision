@@ -1840,6 +1840,36 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("onMicShareRequested()"));
         assertTrue(mainSource.contains("handleAutoMediaActionIntent"));
         assertTrue(mainSource.contains("moveTaskToBack(true)"));
+
+        // Verify v0.3.92: Cross-network (off-Wi-Fi) DTR1 AES-256-GCM rendezvous & multi-endpoint IPv4+IPv6 QR parsing
+        java.util.List<String> parsedAddrs = LinkedDisplayHelper.parseCandidateAddresses(
+            "192.168.1.6, [2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6], 127.0.0.1, ::1, fe80::1, 203.0.113.42");
+        assertEquals(3, parsedAddrs.size());
+        assertEquals("192.168.1.6", parsedAddrs.get(0));
+        assertEquals("2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6", parsedAddrs.get(1));
+        assertEquals("203.0.113.42", parsedAddrs.get(2));
+
+        String sampleFp = "A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90";
+        String sampleCode = "SURAJ92";
+        String sampleTag = LinkedDisplayHelper.computePairingTag(sampleFp, sampleCode);
+        long nowUnix = System.currentTimeMillis() / 1000L;
+        String sealedWan = LinkedDisplayHelper.sealWanRecord(
+            "DESKTOP-HUB", sampleFp, "192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6",
+            sampleTag, true, 3, nowUnix, sampleCode);
+        assertTrue(sealedWan.startsWith("DTR1|"));
+        DesktopDiscovery.Device openedWan = LinkedDisplayHelper.tryOpenWanRecord(sealedWan, sampleCode);
+        assertNotNull(openedWan);
+        assertEquals("DESKTOP-HUB", openedWan.name);
+        assertEquals(sampleFp, openedWan.fingerprint);
+        assertEquals("192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6", openedWan.address);
+        assertEquals(sampleTag, openedWan.pairingTag);
+        assertEquals(3, openedWan.hubMemberCount);
+        assertNull(LinkedDisplayHelper.tryOpenWanRecord(sealedWan, "WRONGCODE"));
+
+        QrScannerDialog.DirectQrTarget multiQr = QrScannerDialog.parseDirectQrPayload(
+            "DT1|192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6|" + sampleFp + "|00112233445566778899AABBCCDDEEFF");
+        assertNotNull(multiQr);
+        assertEquals("192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6", multiQr.address);
     }
 
     private static String readProjectSource(String relFromAppModule) {

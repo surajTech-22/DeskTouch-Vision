@@ -543,7 +543,10 @@ internal sealed class PhoneWebcamForm : Form
             }
             catch { }
             if (!keepMicInBackground && _sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost))
+            {
                 _sharedMic.Stop(restoreDefaultMic: true);
+                WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+            }
             _onMediaStateChanged?.Invoke();
             _mjpeg.Dispose();
             lock (_frameLock)

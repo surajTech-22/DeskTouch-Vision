@@ -52,7 +52,10 @@ import java.util.Collections;
  */
 public final class PhoneMediaService extends Service {
     private static final String CHANNEL_ID = "desktouch_media_share";
+    private static final String PROMPT_CHANNEL_ID = "desktouch_media_prompt";
     private static final int NOTIF_ID = 3849;
+    private static final int MIC_PROMPT_NOTIF_ID = 3850;
+    static final String EXTRA_AUTO_ACTION = "desktouch_auto_action";
     static final String ACTION_START_SCREEN = "com.desktouch.vision.START_SCREEN";
     static final String ACTION_STOP_SCREEN = "com.desktouch.vision.STOP_SCREEN";
     static final String ACTION_START_CAMERA = "com.desktouch.vision.START_CAMERA";
@@ -81,9 +84,13 @@ public final class PhoneMediaService extends Service {
     private static volatile boolean screenRunning;
     private static volatile boolean cameraRunning;
     private static volatile boolean micRunning;
+    private static volatile boolean standaloneMicRequested;
     private static volatile int desiredLens;
     private static volatile boolean desiredTorch;
     private static volatile boolean desiredMic;
+    private static final Object staticMicLock = new Object();
+    private static volatile boolean staticMicLoopRunning;
+    private static Thread staticMicThread;
 
     private HandlerThread mediaThread;
     private Handler mediaHandler;
@@ -130,38 +137,53 @@ public final class PhoneMediaService extends Service {
     static void startCameraShare(Context ctx, int lens, boolean torch, boolean mic) {
         desiredLens = lens;
         desiredTorch = torch;
-        desiredMic = mic;
+        desiredMic = mic || standaloneMicRequested;
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_START_CAMERA);
         i.putExtra(EXTRA_LENS, lens);
         i.putExtra(EXTRA_TORCH, torch);
-        i.putExtra(EXTRA_MIC, mic);
+        i.putExtra(EXTRA_MIC, desiredMic);
         startForegroundCompat(ctx, i);
     }
 
     static void stopCameraShare(Context ctx) {
-        stopCameraShare(ctx, true);
+        stopCameraShare(ctx, !standaloneMicRequested);
     }
 
     static void stopCameraShare(Context ctx, boolean stopMicAlso) {
         if (!cameraRunning && !screenRunning && !micRunning) return;
-        if (stopMicAlso) desiredMic = false;
+        boolean effectiveStopMic = stopMicAlso && !standaloneMicRequested;
+        if (effectiveStopMic) desiredMic = false;
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_STOP_CAMERA);
-        i.putExtra(EXTRA_STOP_MIC_WITH_CAM, stopMicAlso);
+        i.putExtra(EXTRA_STOP_MIC_WITH_CAM, effectiveStopMic);
         try { ctx.startService(i); } catch (Throwable ignored) {}
     }
 
     static void startMicShare(Context ctx) {
+        standaloneMicRequested = true;
         desiredMic = true;
+        boolean hasMic = ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (!hasMic) {
+            micRunning = false;
+            postMicPromptNotification(ctx);
+            emitMicStatus(2, "Tap DeskTouch notification on phone to grant microphone permission");
+            return;
+        }
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_START_MIC);
-        startForegroundCompat(ctx, i);
+        if (!startForegroundCompat(ctx, i)) {
+            startDirectMicFallback(ctx);
+        }
     }
 
     static void stopMicShare(Context ctx) {
+        standaloneMicRequested = false;
         desiredMic = false;
+        stopStaticMicLoop();
+        cancelMicPromptNotification(ctx);
         if (!micRunning && !cameraRunning && !screenRunning) return;
+        micRunning = false;
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_STOP_MIC);
         try { ctx.startService(i); } catch (Throwable ignored) {}
@@ -171,18 +193,69 @@ public final class PhoneMediaService extends Service {
         screenRunning = false;
         cameraRunning = false;
         micRunning = false;
+        standaloneMicRequested = false;
         desiredMic = false;
+        stopStaticMicLoop();
         if (ctx != null) {
+            cancelMicPromptNotification(ctx);
             try { ctx.stopService(new Intent(ctx, PhoneMediaService.class)); }
             catch (Throwable ignored) {}
         }
     }
 
-    private static void startForegroundCompat(Context ctx, Intent i) {
+    private static boolean startForegroundCompat(Context ctx, Intent i) {
         try {
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i);
             else ctx.startService(i);
+            return true;
+        } catch (Throwable ex) {
+            return false;
+        }
+    }
+
+    static void postMicPromptNotification(Context ctx) {
+        if (ctx == null) return;
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(PROMPT_CHANNEL_ID) == null) {
+                NotificationChannel ch = new NotificationChannel(
+                    PROMPT_CHANNEL_ID,
+                    "DeskTouch Microphone & Camera Prompts",
+                    NotificationManager.IMPORTANCE_HIGH);
+                ch.setDescription("One-tap prompt when Windows requests phone microphone or camera in background");
+                nm.createNotificationChannel(ch);
+            }
+            Intent launch = new Intent(ctx, MainActivity.class)
+                .putExtra(EXTRA_AUTO_ACTION, "start_mic")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            PendingIntent pi = PendingIntent.getActivity(
+                ctx, 51, launch, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                ? new Notification.Builder(ctx, PROMPT_CHANNEL_ID)
+                : new Notification.Builder(ctx).setPriority(Notification.PRIORITY_HIGH);
+            Notification n = b.setSmallIcon(R.drawable.ic_desktouch)
+                .setContentTitle("Enable Phone Microphone for Windows")
+                .setContentText("Tap once to allow live microphone streaming in background")
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .build();
+            nm.notify(MIC_PROMPT_NOTIF_ID, n);
         } catch (Throwable ignored) {}
+    }
+
+    static void cancelMicPromptNotification(Context ctx) {
+        if (ctx == null) return;
+        try {
+            NotificationManager nm = (NotificationManager) ctx.getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(MIC_PROMPT_NOTIF_ID);
+        } catch (Throwable ignored) {}
+    }
+
+    private static void startDirectMicFallback(Context ctx) {
+        final Context appCtx = ctx.getApplicationContext();
+        micRunning = true;
+        startStaticMicLoop(appCtx);
     }
 
     @Override public void onCreate() {
@@ -223,18 +296,21 @@ public final class PhoneMediaService extends Service {
             boolean hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
             if (!hasMic) {
                 micRunning = false;
+                postMicPromptNotification(this);
                 emitMicStatus(2, "Grant Microphone permission on Android");
                 if (!screenRunning && !cameraRunning) stopSelfCleanly();
                 return START_NOT_STICKY;
             }
             micRunning = true;
             if (!promoteForeground()) {
-                micRunning = false;
-                emitMicStatus(2, "Open DeskTouch on phone and tap Share Mic");
+                // Android 14/15 blocked FGS microphone type from background; try in-process AudioRecord
+                // and post a 1-tap notification prompt if Android silences or rejects background mic.
+                startMicLoop();
                 if (!screenRunning && !cameraRunning) stopSelfCleanly();
                 return START_NOT_STICKY;
             }
-            if (micLoopRunning) {
+            cancelMicPromptNotification(this);
+            if (micLoopRunning || staticMicLoopRunning) {
                 emitMicStatus(1, "Live phone mic");
             }
             startMicLoop();
@@ -255,7 +331,7 @@ public final class PhoneMediaService extends Service {
         if (ACTION_START_CAMERA.equals(action)) {
             int lens = intent.getIntExtra(EXTRA_LENS, desiredLens);
             boolean torch = intent.getBooleanExtra(EXTRA_TORCH, desiredTorch);
-            boolean mic = intent.getBooleanExtra(EXTRA_MIC, desiredMic);
+            boolean mic = intent.getBooleanExtra(EXTRA_MIC, desiredMic) || standaloneMicRequested;
             boolean hasCam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
             boolean hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
             if (!hasCam) {
@@ -263,24 +339,31 @@ public final class PhoneMediaService extends Service {
                 if (mic && hasMic) {
                     micRunning = true;
                     if (promoteForeground()) startMicLoop();
-                    else { micRunning = false; emitMicStatus(2, "Open DeskTouch on phone and tap Share Mic"); }
+                    else {
+                        startMicLoop();
+                        postMicPromptNotification(this);
+                    }
                 } else if (mic) {
+                    postMicPromptNotification(this);
                     emitMicStatus(2, "Grant Microphone permission on Android");
                 }
                 if (!screenRunning && !micRunning) stopSelfCleanly();
                 return START_NOT_STICKY;
             }
             cameraRunning = true;
-            micRunning = mic && hasMic;
+            micRunning = (mic && hasMic) || (micRunning && standaloneMicRequested);
             if (!promoteForeground()) {
                 cameraRunning = false;
-                micRunning = false;
+                if (!standaloneMicRequested) micRunning = false;
                 emitCameraStatus(2, "Open DeskTouch on phone and tap Share Camera & Mic");
-                if (mic) emitMicStatus(2, "Open DeskTouch on phone and tap Share Mic");
+                if (mic) {
+                    postMicPromptNotification(this);
+                    emitMicStatus(2, "Tap DeskTouch notification on phone to enable mic");
+                }
                 if (!screenRunning) stopSelfCleanly();
                 return START_NOT_STICKY;
             }
-            startCameraAndMic(lens, torch, mic);
+            startCameraAndMic(lens, torch, micRunning);
             return START_NOT_STICKY;
         }
         promoteForeground();
@@ -333,6 +416,12 @@ public final class PhoneMediaService extends Service {
                         startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
                         return !cameraRunning && !micRunning;
                     } catch (SecurityException ignored) {}
+                }
+                if (Build.VERSION.SDK_INT >= 34 && !screenRunning && !cameraRunning) {
+                    try {
+                        startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+                        return true;
+                    } catch (Throwable ignored) {}
                 }
                 return false;
             }
@@ -426,12 +515,13 @@ public final class PhoneMediaService extends Service {
 
     @SuppressLint("MissingPermission")
     private void startCameraAndMic(int lens, boolean torch, boolean mic) {
-        if (mic) {
+        if (mic || standaloneMicRequested) {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 micRunning = true;
                 startMicLoop();
             } else {
                 micRunning = false;
+                postMicPromptNotification(this);
                 emitMicStatus(2, "Grant Microphone permission on Android");
             }
         } else {
@@ -542,118 +632,200 @@ public final class PhoneMediaService extends Service {
 
     @SuppressLint("MissingPermission")
     private void startMicLoop() {
-        if (micLoopRunning) return;
-        micLoopRunning = true;
-        micThread = new Thread(() -> {
-            try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-            } catch (Throwable ignored) {}
+        startStaticMicLoop(getApplicationContext());
+    }
 
-            AudioRecord rec = null;
-            AcousticEchoCanceler aec = null;
-            NoiseSuppressor ns = null;
-            AutomaticGainControl agc = null;
-            int selectedRate = 16000;
-            try {
-                int[] candidateRates = { 24000, 16000 };
-                int[] candidateSources = {
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    MediaRecorder.AudioSource.MIC
-                };
-                for (int r : candidateRates) {
-                    int minBuf = AudioRecord.getMinBufferSize(
-                        r, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-                    if (minBuf <= 0) continue;
-                    int bufSize = Math.max(minBuf * 2, r * 2 / 5);
-                    for (int src : candidateSources) {
-                        AudioRecord attempt = null;
-                        try {
-                            attempt = new AudioRecord(src, r,
-                                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
-                            if (attempt.getState() == AudioRecord.STATE_INITIALIZED) {
+    private static boolean isAllZeroPcm(byte[] buf, int len) {
+        for (int i = 0; i < len; i++) {
+            if (buf[i] != 0) return false;
+        }
+        return true;
+    }
+
+    @SuppressLint("MissingPermission")
+    private static AudioRecord tryOpenAudioRecord(int rate, int source) {
+        int minBuf = AudioRecord.getMinBufferSize(
+            rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        if (minBuf <= 0) return null;
+        int bufSize = Math.max(minBuf * 2, rate * 2 / 5);
+        AudioRecord attempt = null;
+        try {
+            attempt = new AudioRecord(source, rate,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+            if (attempt.getState() == AudioRecord.STATE_INITIALIZED) {
+                return attempt;
+            }
+            attempt.release();
+        } catch (Throwable ignored) {
+            if (attempt != null) try { attempt.release(); } catch (Throwable ignored2) {}
+        }
+        return null;
+    }
+
+    @SuppressLint("MissingPermission")
+    private static void startStaticMicLoop(final Context appCtx) {
+        synchronized (staticMicLock) {
+            if (staticMicLoopRunning) return;
+            staticMicLoopRunning = true;
+            staticMicThread = new Thread(() -> {
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                } catch (Throwable ignored) {}
+
+                AudioRecord rec = null;
+                AcousticEchoCanceler aec = null;
+                NoiseSuppressor ns = null;
+                AutomaticGainControl agc = null;
+                int selectedRate = 16000;
+                int selectedSource = MediaRecorder.AudioSource.MIC;
+                try {
+                    int[] candidateRates = { 16000, 24000, 48000 };
+                    int[] candidateSources = {
+                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                        MediaRecorder.AudioSource.MIC,
+                        MediaRecorder.AudioSource.DEFAULT
+                    };
+                    for (int r : candidateRates) {
+                        for (int src : candidateSources) {
+                            AudioRecord attempt = tryOpenAudioRecord(r, src);
+                            if (attempt != null) {
                                 rec = attempt;
                                 selectedRate = r;
+                                selectedSource = src;
                                 break;
                             }
-                            attempt.release();
-                        } catch (Throwable ignored) {
-                            if (attempt != null) try { attempt.release(); } catch (Throwable ignored2) {}
+                        }
+                        if (rec != null) break;
+                    }
+
+                    if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                        micRunning = false;
+                        postMicPromptNotification(appCtx);
+                        emitMicStatus(2, "Tap DeskTouch notification on phone to allow background mic");
+                        return;
+                    }
+
+                    int sessionId = rec.getAudioSessionId();
+                    try {
+                        if (AcousticEchoCanceler.isAvailable()) {
+                            aec = AcousticEchoCanceler.create(sessionId);
+                            if (aec != null) aec.setEnabled(true);
+                        }
+                    } catch (Throwable ignored) {}
+                    try {
+                        if (NoiseSuppressor.isAvailable()) {
+                            ns = NoiseSuppressor.create(sessionId);
+                            if (ns != null) ns.setEnabled(true);
+                        }
+                    } catch (Throwable ignored) {}
+                    try {
+                        if (AutomaticGainControl.isAvailable()) {
+                            agc = AutomaticGainControl.create(sessionId);
+                            if (agc != null) agc.setEnabled(true);
+                        }
+                    } catch (Throwable ignored) {}
+
+                    rec.startRecording();
+                    if (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                        micRunning = false;
+                        postMicPromptNotification(appCtx);
+                        emitMicStatus(2, "Tap DeskTouch notification on phone to enable mic");
+                        return;
+                    }
+
+                    emitMicStatus(1, "Live phone mic (" + (selectedRate / 1000) + " kHz)");
+                    int frameBytes = (selectedRate * 2) / 50; // exact 20ms mono PCM16 (640B @ 16kHz -> fits in 1 DTM1 datagram)
+                    byte[] chunk = new byte[frameBytes];
+                    boolean sawNonZero = false;
+                    boolean promptedForSilence = false;
+                    int consecutiveZeroChunks = 0;
+
+                    while (staticMicLoopRunning && (micRunning || (cameraRunning && desiredMic))) {
+                        int n = rec.read(chunk, 0, chunk.length);
+                        if (n > 0) {
+                            if (!sawNonZero) {
+                                if (!isAllZeroPcm(chunk, n)) {
+                                    sawNonZero = true;
+                                    consecutiveZeroChunks = 0;
+                                    cancelMicPromptNotification(appCtx);
+                                } else {
+                                    consecutiveZeroChunks++;
+                                    // Silence watchdog #1: Xiaomi/MIUI HALs sometimes return 100% digital zeros on VOICE_COMMUNICATION
+                                    // outside a cellular/VoIP call; seamlessly hot-swap to MIC after ~900ms of all-zeros.
+                                    if (consecutiveZeroChunks == 45 &&
+                                        selectedSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION) {
+                                        if (aec != null) { try { aec.release(); } catch (Throwable ignored) {} aec = null; }
+                                        if (ns != null) { try { ns.release(); } catch (Throwable ignored) {} ns = null; }
+                                        if (agc != null) { try { agc.release(); } catch (Throwable ignored) {} agc = null; }
+                                        try { rec.stop(); } catch (Throwable ignored) {}
+                                        try { rec.release(); } catch (Throwable ignored) {}
+                                        rec = tryOpenAudioRecord(selectedRate, MediaRecorder.AudioSource.MIC);
+                                        if (rec == null) {
+                                            rec = tryOpenAudioRecord(16000, MediaRecorder.AudioSource.MIC);
+                                            if (rec != null) {
+                                                selectedRate = 16000;
+                                                frameBytes = (selectedRate * 2) / 50;
+                                                chunk = new byte[frameBytes];
+                                            }
+                                        }
+                                        if (rec != null) {
+                                            selectedSource = MediaRecorder.AudioSource.MIC;
+                                            rec.startRecording();
+                                            continue;
+                                        } else {
+                                            postMicPromptNotification(appCtx);
+                                            emitMicStatus(2, "Tap DeskTouch notification on phone to allow background mic");
+                                            break;
+                                        }
+                                    } else if (consecutiveZeroChunks == 95 && !promptedForSilence) {
+                                        // Silence watchdog #2: Android 14/15 background privacy is zeroing mic until FGS is promoted.
+                                        promptedForSilence = true;
+                                        postMicPromptNotification(appCtx);
+                                        emitMicStatus(2, "Tap DeskTouch notification on phone to allow background mic");
+                                    }
+                                }
+                            }
+                            byte[] exact = new byte[n];
+                            System.arraycopy(chunk, 0, exact, 0, n);
+                            MediaSink sink = activeSink;
+                            if (sink != null) sink.onMicAudio(exact, selectedRate);
+                        } else if (n < 0) {
+                            emitMicStatus(0, "Microphone stream interrupted (" + n + ")");
+                            break;
                         }
                     }
-                    if (rec != null) break;
-                }
-
-                if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                    micRunning = false;
-                    emitMicStatus(0, "Microphone busy or blocked on Android");
-                    return;
-                }
-
-                int sessionId = rec.getAudioSessionId();
-                try {
-                    if (AcousticEchoCanceler.isAvailable()) {
-                        aec = AcousticEchoCanceler.create(sessionId);
-                        if (aec != null) aec.setEnabled(true);
-                    }
-                } catch (Throwable ignored) {}
-                try {
-                    if (NoiseSuppressor.isAvailable()) {
-                        ns = NoiseSuppressor.create(sessionId);
-                        if (ns != null) ns.setEnabled(true);
-                    }
-                } catch (Throwable ignored) {}
-                try {
-                    if (AutomaticGainControl.isAvailable()) {
-                        agc = AutomaticGainControl.create(sessionId);
-                        if (agc != null) agc.setEnabled(true);
-                    }
-                } catch (Throwable ignored) {}
-
-                rec.startRecording();
-                if (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-                    micRunning = false;
-                    emitMicStatus(0, "Microphone could not start recording");
-                    return;
-                }
-
-                emitMicStatus(1, "Live phone mic (" + (selectedRate / 1000) + " kHz)");
-                int frameBytes = (selectedRate * 2) / 50; // exact 20ms mono PCM16 (960B @ 24kHz, 640B @ 16kHz -> fits in DTM1)
-                byte[] chunk = new byte[frameBytes];
-                while (micLoopRunning && (micRunning || (cameraRunning && desiredMic))) {
-                    int n = rec.read(chunk, 0, chunk.length);
-                    if (n > 0) {
-                        byte[] exact = new byte[n];
-                        System.arraycopy(chunk, 0, exact, 0, n);
-                        MediaSink sink = activeSink;
-                        if (sink != null) sink.onMicAudio(exact, selectedRate);
-                    } else if (n < 0) {
-                        emitMicStatus(0, "Microphone stream interrupted (" + n + ")");
-                        break;
+                } catch (Throwable ex) {
+                    postMicPromptNotification(appCtx);
+                    emitMicStatus(2, "Tap DeskTouch notification on phone to enable mic");
+                } finally {
+                    staticMicLoopRunning = false;
+                    if (aec != null) try { aec.release(); } catch (Throwable ignored) {}
+                    if (ns != null) try { ns.release(); } catch (Throwable ignored) {}
+                    if (agc != null) try { agc.release(); } catch (Throwable ignored) {}
+                    if (rec != null) {
+                        try { rec.stop(); } catch (Throwable ignored) {}
+                        try { rec.release(); } catch (Throwable ignored) {}
                     }
                 }
-            } catch (Throwable ex) {
-                emitMicStatus(0, "Microphone error: " + ex.getMessage());
-            } finally {
-                micLoopRunning = false;
-                if (aec != null) try { aec.release(); } catch (Throwable ignored) {}
-                if (ns != null) try { ns.release(); } catch (Throwable ignored) {}
-                if (agc != null) try { agc.release(); } catch (Throwable ignored) {}
-                if (rec != null) {
-                    try { rec.stop(); } catch (Throwable ignored) {}
-                    try { rec.release(); } catch (Throwable ignored) {}
-                }
+            }, "DeskTouch-MicStream");
+            staticMicThread.setDaemon(true);
+            staticMicThread.start();
+        }
+    }
+
+    private static void stopStaticMicLoop() {
+        staticMicLoopRunning = false;
+        synchronized (staticMicLock) {
+            if (staticMicThread != null) {
+                staticMicThread.interrupt();
+                staticMicThread = null;
             }
-        }, "DeskTouch-MicStream");
-        micThread.setDaemon(true);
-        micThread.start();
+        }
     }
 
     private void stopMicLoop() {
         micLoopRunning = false;
-        if (micThread != null) {
-            micThread.interrupt();
-            micThread = null;
-        }
+        stopStaticMicLoop();
     }
 
     private void stopMicInternal() {

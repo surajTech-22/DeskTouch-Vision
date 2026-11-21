@@ -278,10 +278,8 @@ internal static class UpdateClient
                     !checksumText.Contains(ArchiveName, StringComparison.Ordinal))
                     throw new InvalidDataException("The release SHA-256 checksum file is malformed.");
 
-                await using (var destination = new FileStream(
-                    archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
-                await using (var source = await Downloads.GetStreamAsync(archiveUrl, cancellation))
-                    await source.CopyToAsync(destination, cancellation);
+                await DownloadArchiveWithResumeAndStallGuardAsync(
+                    archiveUrl, archivePath, latest, window, cancellation);
 
                 await using var hashStream = new FileStream(
                     archivePath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
@@ -356,6 +354,93 @@ internal static class UpdateClient
             return CheckResult.UpToDate; // background error is logged, never shown as "current"
         }
         finally { UpdateGate.Release(); }
+    }
+
+    private static async Task DownloadArchiveWithResumeAndStallGuardAsync(
+        string archiveUrl,
+        string archivePath,
+        Version latest,
+        Form window,
+        CancellationToken cancellation)
+    {
+        const int maxAttempts = 4;
+        long totalExpectedBytes = 0;
+        Exception? lastError = null;
+
+        await using var destination = new FileStream(
+            archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true);
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            long existingOffset = destination.Length;
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, archiveUrl);
+                if (existingOffset > 0)
+                    req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(existingOffset, null);
+
+                using var headerDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                headerDeadline.CancelAfter(TimeSpan.FromSeconds(25));
+                using var resp = await Downloads.SendAsync(
+                    req, HttpCompletionOption.ResponseHeadersRead, headerDeadline.Token);
+
+                if (existingOffset > 0 && resp.StatusCode == System.Net.HttpStatusCode.OK)
+                {
+                    destination.SetLength(0);
+                    destination.Seek(0, SeekOrigin.Begin);
+                    existingOffset = 0;
+                }
+                else
+                {
+                    resp.EnsureSuccessStatusCode();
+                }
+
+                long? contentLen = resp.Content.Headers.ContentLength;
+                if (contentLen is > 0)
+                    totalExpectedBytes = existingOffset + contentLen.Value;
+
+                await using var source = await resp.Content.ReadAsStreamAsync(headerDeadline.Token);
+                byte[] buffer = new byte[65536];
+                int lastReportedPct = -1;
+                long lastProgressUiTick = 0;
+
+                while (true)
+                {
+                    using var readStallCts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                    readStallCts.CancelAfter(TimeSpan.FromSeconds(25));
+                    int read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), readStallCts.Token);
+                    if (read <= 0) break;
+
+                    await destination.WriteAsync(buffer.AsMemory(0, read), cancellation);
+                    if (totalExpectedBytes > 0)
+                    {
+                        int pct = (int)Math.Clamp(destination.Length * 100L / totalExpectedBytes, 0L, 100L);
+                        long nowTick = Environment.TickCount64;
+                        if (pct >= lastReportedPct + 5 && nowTick - lastProgressUiTick >= 400)
+                        {
+                            lastReportedPct = pct;
+                            lastProgressUiTick = nowTick;
+                            SetStatus(window, $"downloading verified update v{latest.ToString(3)} ({pct}%)");
+                        }
+                    }
+                }
+
+                await destination.FlushAsync(cancellation);
+                if (totalExpectedBytes <= 0 || destination.Length >= totalExpectedBytes)
+                    return;
+
+                throw new IOException($"Archive stream closed early at {destination.Length} / {totalExpectedBytes} bytes.");
+            }
+            catch (Exception ex) when (attempt < maxAttempts && !cancellation.IsCancellationRequested)
+            {
+                lastError = ex;
+                Log($"Archive download attempt {attempt}/{maxAttempts} stalled or interrupted at {destination.Length} bytes ({ex.Message}); resuming with HTTP Range.");
+                await Task.Delay(TimeSpan.FromSeconds(2 * attempt), cancellation);
+            }
+        }
+
+        throw lastError ?? new IOException("Unable to complete verified update download after retries.");
     }
 
     private static void ValidateReleaseUrl(string value)

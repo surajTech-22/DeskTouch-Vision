@@ -205,6 +205,7 @@ public final class MainActivity extends Activity {
             DeskTouchNotificationListener.readActiveCount(this));
         refreshLiveLinkAndKeyboard();
         handleShareIntent(getIntent());
+        handleAutoMediaActionIntent(getIntent());
         DeskTouchSession.setMediaRequestListener(new DeskTouchSession.MediaRequestListener(){
             @Override public void onScreenShareRequested(){
                 runOnUiThread(()->{
@@ -232,6 +233,32 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         handleShareIntent(intent);
+        handleAutoMediaActionIntent(intent);
+    }
+
+    private boolean autoBackAfterMicPermission;
+
+    private void handleAutoMediaActionIntent(Intent intent){
+        if(intent == null) return;
+        String action = intent.getStringExtra(PhoneMediaService.EXTRA_AUTO_ACTION);
+        if(action == null || action.isEmpty()) return;
+        intent.removeExtra(PhoneMediaService.EXTRA_AUTO_ACTION);
+        if("start_mic".equals(action)){
+            PhoneMediaService.cancelMicPromptNotification(this);
+            boolean hasMic = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            if(hasMic){
+                PhoneMediaService.startMicShare(this);
+                refreshLiveShareButtons();
+                setFeedback("Streaming phone microphone over fast UDP.",true);
+                moveTaskToBack(true);
+            }else{
+                autoBackAfterMicPermission = true;
+                requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO},REQ_MEDIA_MIC);
+            }
+        }else if("start_camera".equals(action)){
+            requestPhoneCameraPermissionsAndStart(0,false,true);
+        }
     }
 
     @Override public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] grantResults){
@@ -257,10 +284,14 @@ public final class MainActivity extends Activity {
                 setFeedback("Camera/Microphone permission denied; cannot stream.",true);
             }
         }else if(requestCode==REQ_MEDIA_MIC){
+            boolean goBack = autoBackAfterMicPermission;
+            autoBackAfterMicPermission = false;
             if(checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED){
+                PhoneMediaService.cancelMicPromptNotification(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
                 setFeedback("Streaming phone microphone over fast UDP.",true);
+                if(goBack) moveTaskToBack(true);
             }else{
                 setFeedback("Microphone permission denied; cannot stream phone mic.",true);
             }
@@ -2378,9 +2409,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.90";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.91";
         }catch(Exception ignored){
-            return "0.3.90";
+            return "0.3.91";
         }
     }
 

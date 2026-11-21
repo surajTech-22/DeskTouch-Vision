@@ -1895,9 +1895,39 @@ final class DeskTouchSession implements AutoCloseable {
 
     private FastUdpChannel activeMediaUdp(){
         FastUdpChannel w = udpChannel;
-        if(w != null && w.confirmed) return w;
         FastUdpChannel m = mobileUdpChannel;
-        return (m != null && m.confirmed) ? m : null;
+        boolean wOk = w != null && w.confirmed;
+        boolean mOk = m != null && m.confirmed;
+        if(!wOk) return mOk ? m : null;
+        if(!mOk) return w;
+
+        double wLoss = Math.max(w.linkTracker.getInboundLossPermille(), w.linkTracker.getPeerLossPermille());
+        double mLoss = Math.max(m.linkTracker.getInboundLossPermille(), m.linkTracker.getPeerLossPermille());
+        if(Math.abs(wLoss - mLoss) >= 15.0)
+            return mLoss < wLoss ? m : w;
+
+        double wRtt = w.linkTracker.getSmoothedRttMs();
+        double mRtt = m.linkTracker.getSmoothedRttMs();
+        if(preferMobileMouse && (mRtt <= 0 || wRtt <= 0 || mRtt <= wRtt + 25.0))
+            return m;
+        if(mRtt > 0 && wRtt > 0 && mRtt + 6.0 < wRtt)
+            return m;
+        return w;
+    }
+
+    private boolean sendDualOrBestMicUdp(int seq, int sampleRate, byte[] pcm16Mono){
+        if(!running || pcm16Mono == null || pcm16Mono.length == 0 ||
+            pcm16Mono.length > FastUdpChannel.MAX_MEDIA_PAYLOAD_BYTES) return false;
+        boolean sent = false;
+        FastUdpChannel w = udpChannel;
+        if(w != null && w.confirmed){
+            sent |= w.sendMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, seq, sampleRate, 1, 0, pcm16Mono, 0, pcm16Mono.length);
+        }
+        FastUdpChannel m = mobileUdpChannel;
+        if(m != null && m.confirmed && m != w){
+            sent |= m.sendMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, seq, sampleRate, 1, 0, pcm16Mono, 0, pcm16Mono.length);
+        }
+        return sent;
     }
 
     private boolean sendFastMediaChunks(byte mediaKind, int frameId, int packedDims, byte[] data){
@@ -1911,6 +1941,7 @@ final class DeskTouchSession implements AutoCloseable {
             int len = Math.min(chunkSize, data.length - off);
             if(!ch.sendMedia(mediaKind, frameId, i, total, packedDims, data, off, len))
                 return false;
+            if((i & 7) == 7) Thread.yield();
         }
         return true;
     }
@@ -1940,9 +1971,7 @@ final class DeskTouchSession implements AutoCloseable {
             @Override public void onMicAudio(byte[] pcm16Mono, int sampleRate){
                 if(!running || pcm16Mono==null || pcm16Mono.length==0) return;
                 int seq = ++phoneMicSeq;
-                FastUdpChannel ch = activeMediaUdp();
-                if(ch != null && pcm16Mono.length <= FastUdpChannel.MAX_MEDIA_PAYLOAD_BYTES &&
-                    ch.sendMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, seq, sampleRate, 1, 0, pcm16Mono, 0, pcm16Mono.length)){
+                if(sendDualOrBestMicUdp(seq, sampleRate, pcm16Mono)){
                     return;
                 }
                 String b64=android.util.Base64.encodeToString(pcm16Mono,android.util.Base64.NO_WRAP);
@@ -2023,7 +2052,8 @@ final class DeskTouchSession implements AutoCloseable {
         if(hasMic){
             PhoneMediaService.startMicShare(application);
         }else{
-            send(new Packet("phone-mic-status",2,0,0,0,"Tap Share Mic on phone"));
+            PhoneMediaService.postMicPromptNotification(application);
+            send(new Packet("phone-mic-status",2,0,0,0,"Tap DeskTouch notification on phone to grant mic permission"));
             MediaRequestListener l=mediaRequestListener;
             if(l!=null) l.onMicShareRequested();
         }

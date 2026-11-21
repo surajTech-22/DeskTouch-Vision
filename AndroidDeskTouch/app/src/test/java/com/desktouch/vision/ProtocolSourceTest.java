@@ -1803,14 +1803,34 @@ public final class ProtocolSourceTest {
         assertNotNull(joined);
         assertArrayEquals(new byte[] { 1, 2, 3, 4, 5, 6, 7 }, joined.data);
 
+        // Verify 256-packet DTM1 replay window survives an 80-chunk camera burst without dropping delayed mic packet
+        byte[] delayedMicWire = new byte[FastUdpChannel.MAX_MEDIA_FRAME_SIZE];
+        int delayedMicLen = client.sealMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, 99, 16000, 1, 0, pcm, 0, pcm.length, delayedMicWire);
+        for (int c = 0; c < 80; c++) {
+            int cLen = client.sealMedia(FastUdpChannel.MEDIA_KIND_CAMERA_CHUNK, 50, c, 80, 0, jpegPart, 0, jpegPart.length, wire);
+            assertNotNull(server.tryOpenMedia(wire, cLen));
+        }
+        FastUdpChannel.MediaDatagram survivedMic = server.tryOpenMedia(delayedMicWire, delayedMicLen);
+        assertNotNull(survivedMic);
+        assertEquals(99, survivedMic.frameOrAudioId);
+        assertNull(server.tryOpenMedia(delayedMicWire, delayedMicLen));
+
+        String manifestSource = readProjectSource("src/main/AndroidManifest.xml");
         String mediaServiceSource = readProjectSource("src/main/java/com/desktouch/vision/PhoneMediaService.java");
         String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
         String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
+        assertTrue(manifestSource.contains("mediaProjection|camera|microphone|connectedDevice"));
         assertTrue(mediaServiceSource.contains("ACTION_START_MIC"));
         assertTrue(mediaServiceSource.contains("VOICE_COMMUNICATION"));
         assertTrue(mediaServiceSource.contains("AcousticEchoCanceler"));
         assertTrue(mediaServiceSource.contains("SecurityException"));
+        assertTrue(mediaServiceSource.contains("postMicPromptNotification"));
+        assertTrue(mediaServiceSource.contains("FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE"));
+        assertTrue(mediaServiceSource.contains("isAllZeroPcm"));
+        assertTrue(mediaServiceSource.contains("standaloneMicRequested"));
         assertTrue(sessionSource.contains("sendMedia("));
+        assertTrue(sessionSource.contains("sendDualOrBestMicUdp"));
+        assertTrue(sessionSource.contains("getInboundLossPermille()"));
         assertTrue(sessionSource.contains("\"phone-mic-watch\""));
         assertTrue(sessionSource.contains("\"HasCamera\""));
         assertTrue(sessionSource.contains("FEATURE_CAMERA_ANY"));
@@ -1818,6 +1838,8 @@ public final class ProtocolSourceTest {
         assertTrue(sessionSource.contains("FEATURE_MICROPHONE"));
         assertTrue(mainSource.contains("Share Mic Only"));
         assertTrue(mainSource.contains("onMicShareRequested()"));
+        assertTrue(mainSource.contains("handleAutoMediaActionIntent"));
+        assertTrue(mainSource.contains("moveTaskToBack(true)"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

@@ -413,6 +413,8 @@ internal sealed class PhoneWebcamForm : Form
     private readonly Action<MediaSourceOption, bool, int, bool, bool> _watchCamera;
     private readonly Action<MediaSourceOption, bool> _watchMic;
     private readonly Func<MediaSourceOption, bool> _isFastUdpActive;
+    private readonly Func<MediaSourceOption, string> _getTransportLabel;
+    private readonly RemoteMicBridgeController _sharedMic;
     private readonly Action? _onMediaStateChanged;
 
     private readonly FlowLayoutPanel _toolbar = new();
@@ -437,17 +439,13 @@ internal sealed class PhoneWebcamForm : Form
     private readonly System.Windows.Forms.Timer _uiTimer = new();
 
     private readonly LocalMjpegServer _mjpeg = new();
-    private readonly ManagedAudioOutputEngine _primaryAudio = new();
-    private readonly ManagedAudioOutputEngine _monitorAudio = new();
 
-    private List<WaveOutDeviceInfo> _waveOutDevices = new();
+    private IReadOnlyList<WaveOutDeviceInfo> _waveOutDevices = Array.Empty<WaveOutDeviceInfo>();
     private VirtualMicMatch _virtualMic;
     private MediaSourceOption _currentSource;
     private bool _suppressEvents;
     private volatile bool _camOn = true;
     private volatile bool _micOn = true;
-    private int _routingToVirtualCable;
-    private int _hearMonitorActive = 1;
     private int _lens;
     private bool _torch;
     private int _rotateDeg;
@@ -457,6 +455,7 @@ internal sealed class PhoneWebcamForm : Form
     private float _vuLevel;
     private int _timerTick;
     private string _micStateNote = "";
+    private string _lastCameraStatusText = "";
     private bool _installingDriver;
 
     private Bitmap? _frame;
@@ -467,18 +466,22 @@ internal sealed class PhoneWebcamForm : Form
         MediaSourceOption initialSource,
         bool initialCameraOn,
         bool initialMicOn,
+        RemoteMicBridgeController sharedMic,
         Action<MediaSourceOption, bool, int, bool, bool> watchCamera,
         Action<MediaSourceOption, bool> watchMic,
         Func<MediaSourceOption, bool> isFastUdpActive,
+        Func<MediaSourceOption, string>? getTransportLabel = null,
         Action? onMediaStateChanged = null)
     {
+        _sharedMic = sharedMic;
         _watchCamera = watchCamera;
         _watchMic = watchMic;
         _isFastUdpActive = isFastUdpActive;
+        _getTransportLabel = getTransportLabel ?? (src => isFastUdpActive(src) ? "Fast UDP" : "TCP Fallback");
         _onMediaStateChanged = onMediaStateChanged;
         _currentSource = initialSource;
         _camOn = initialSource.HasCamera && initialCameraOn;
-        _micOn = initialSource.HasMicrophone && initialMicOn;
+        _micOn = initialSource.HasMicrophone && (initialMicOn || _sharedMic.IsActiveFor(initialSource.Id, initialSource.ViaHost));
 
         Text = $"DeskTouch Vision — Camera & Mic ({initialSource.Name})";
         Size = new Size(920, 620);
@@ -513,7 +516,12 @@ internal sealed class PhoneWebcamForm : Form
         Shown += (_, _) =>
         {
             _mjpeg.Start();
-            RefreshAudioDevicesAndRouting(initialAutoSwitch: _micOn);
+            if (_micOn && !_sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost))
+            {
+                _sharedMic.SetActiveSource(_currentSource.Id, _currentSource.ViaHost, _currentSource.Name,
+                    backgroundMode: false, autoSwitchDefault: true);
+            }
+            RefreshAudioDevicesAndRouting(initialAutoSwitch: _micOn && !_sharedMic.IsBackgroundMode);
             UpdateTransportBadge();
             StartWatchingCurrentSource();
             _onMediaStateChanged?.Invoke();
@@ -524,18 +532,20 @@ internal sealed class PhoneWebcamForm : Form
             _uiTimer.Stop();
             _uiTimer.Dispose();
             _camOn = false;
-            _micOn = false;
+            bool keepMicInBackground = _sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost) &&
+                                       _sharedMic.IsBackgroundMode;
+            _micOn = keepMicInBackground;
             try
             {
-                _watchCamera(_currentSource, false, _lens, false, false);
-                _watchMic(_currentSource, false);
+                _watchCamera(_currentSource, false, _lens, false, keepMicInBackground);
+                if (!keepMicInBackground)
+                    _watchMic(_currentSource, false);
             }
             catch { }
-            WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+            if (!keepMicInBackground && _sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost))
+                _sharedMic.Stop(restoreDefaultMic: true);
             _onMediaStateChanged?.Invoke();
             _mjpeg.Dispose();
-            _primaryAudio.Dispose();
-            _monitorAudio.Dispose();
             lock (_frameLock)
             {
                 _frame?.Dispose();
@@ -597,8 +607,14 @@ internal sealed class PhoneWebcamForm : Form
             UpdateMediaToggleButtons();
             if (!_micOn)
             {
-                _primaryAudio.ClearQueue();
-                _monitorAudio.ClearQueue();
+                if (_sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost))
+                    _sharedMic.Stop(restoreDefaultMic: true);
+            }
+            else
+            {
+                _sharedMic.SetActiveSource(_currentSource.Id, _currentSource.ViaHost, _currentSource.Name,
+                    backgroundMode: false, autoSwitchDefault: _autoDefaultMicCheck.Checked);
+                RefreshAudioDevicesAndRouting(initialAutoSwitch: false);
             }
             SyncWatchState(micOnlyChange: true);
             _onMediaStateChanged?.Invoke();
@@ -688,14 +704,14 @@ internal sealed class PhoneWebcamForm : Form
             if (_suppressEvents) return;
             if (_autoDefaultMicCheck.Checked && _virtualMic.Installed)
             {
-                if (WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId))
+                if (_sharedMic.SetDefaultWindowsMic(true))
                     UpdateStatus($"Windows default mic set to {_virtualMic.CaptureName}");
                 else
                     UpdateStatus("Could not set default Windows mic automatically");
             }
             else if (!_autoDefaultMicCheck.Checked)
             {
-                WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+                _sharedMic.SetDefaultWindowsMic(false);
                 UpdateStatus("Restored previous default Windows mic");
             }
         };
@@ -709,14 +725,8 @@ internal sealed class PhoneWebcamForm : Form
         _hearMonitorCheck.Margin = new Padding(4, 5, 6, 2);
         _hearMonitorCheck.CheckedChanged += (_, _) =>
         {
-            Volatile.Write(ref _hearMonitorActive, _hearMonitorCheck.Checked ? 1 : 0);
-            if (!_hearMonitorCheck.Checked)
-            {
-                if (Volatile.Read(ref _routingToVirtualCable) != 0)
-                    _monitorAudio.ClearQueue();
-                else
-                    _primaryAudio.ClearQueue();
-            }
+            if (_suppressEvents) return;
+            _sharedMic.SetHearMonitor(_hearMonitorCheck.Checked);
         };
 
         _outputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
@@ -747,9 +757,7 @@ internal sealed class PhoneWebcamForm : Form
         _gainTrack.Margin = new Padding(0, 3, 8, 2);
         _gainTrack.ValueChanged += (_, _) =>
         {
-            float g = _gainTrack.Value / 100.0f;
-            _primaryAudio.Gain = g;
-            _monitorAudio.Gain = g;
+            _sharedMic.Gain = _gainTrack.Value / 100.0f;
         };
 
         _vuMeter.Size = new Size(108, 18);
@@ -769,6 +777,15 @@ internal sealed class PhoneWebcamForm : Form
     {
         if (IsDisposed || sources == null) return;
         PopulateSourceCombo(sources, _currentSource.Id, _currentSource.ViaHost);
+    }
+
+    internal void SyncExternalMicState()
+    {
+        if (IsDisposed) return;
+        _micOn = _currentSource.HasMicrophone && _sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost);
+        UpdateMediaToggleButtons();
+        RefreshAudioDevicesAndRouting(initialAutoSwitch: false);
+        _canvas.Invalidate();
     }
 
     internal void ApplyExternalSelection(MediaSourceOption source, bool toggleCamera, bool toggleMic)
@@ -796,12 +813,14 @@ internal sealed class PhoneWebcamForm : Form
                 _micOn = !_micOn;
                 if (!_micOn)
                 {
-                    _primaryAudio.ClearQueue();
-                    _monitorAudio.ClearQueue();
+                    if (_sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost))
+                        _sharedMic.Stop(restoreDefaultMic: true);
                 }
                 else
                 {
-                    RefreshAudioDevicesAndRouting(initialAutoSwitch: true);
+                    _sharedMic.SetActiveSource(_currentSource.Id, _currentSource.ViaHost, _currentSource.Name,
+                        backgroundMode: false, autoSwitchDefault: true);
+                    RefreshAudioDevicesAndRouting(initialAutoSwitch: false);
                 }
                 SyncWatchState(micOnlyChange: true);
             }
@@ -813,7 +832,7 @@ internal sealed class PhoneWebcamForm : Form
 
         SwitchSource(source,
             explicitCam: source.HasCamera && toggleCamera,
-            explicitMic: source.HasMicrophone && toggleMic);
+            explicitMic: source.HasMicrophone && (toggleMic || _sharedMic.IsActiveFor(source.Id, source.ViaHost)));
     }
 
     internal void UpdateCameraFrame(byte[] jpegBytes)
@@ -845,33 +864,32 @@ internal sealed class PhoneWebcamForm : Form
         catch { }
     }
 
-    internal void HandleMicAudio(byte[] pcm, int sampleRate)
+    internal void HandleMicAudio(byte[] pcm, int sampleRate, int audioSeq = 0)
     {
         if (IsDisposed || !_micOn || pcm.Length == 0) return;
-        if (Volatile.Read(ref _routingToVirtualCable) != 0)
-        {
-            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate);
-            if (Volatile.Read(ref _hearMonitorActive) != 0)
-                _monitorAudio.EnqueuePcm16Mono(pcm, sampleRate);
-        }
-        else if (Volatile.Read(ref _hearMonitorActive) != 0)
-        {
-            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate);
-        }
+        _sharedMic.HandleIncomingAudio(_currentSource.Id, _currentSource.ViaHost, pcm, sampleRate, audioSeq);
     }
 
     internal void UpdateStatus(string text)
     {
         if (!IsDisposed && !string.IsNullOrWhiteSpace(text))
+        {
+            _lastCameraStatusText = text;
             _statusLabel.Text = text;
+            if (_frame == null)
+                _canvas.Invalidate();
+        }
     }
 
     internal void UpdateMicStatus(int stateCode, string? text)
     {
         if (IsDisposed || string.IsNullOrWhiteSpace(text)) return;
-        _micStateNote = stateCode != 0 ? "Mic Live" : text;
+        _micStateNote = stateCode == 1 ? "Mic Live" : text;
         if (!_camOn || _frame == null)
+        {
             _statusLabel.Text = text;
+            _canvas.Invalidate();
+        }
     }
 
     private void PopulateSourceCombo(IReadOnlyList<MediaSourceOption> sources, int preferredId, bool preferredViaHost)
@@ -904,14 +922,18 @@ internal sealed class PhoneWebcamForm : Form
     private void SwitchSource(MediaSourceOption next, bool? explicitCam = null, bool? explicitMic = null)
     {
         var oldSource = _currentSource;
+        bool keepOldMic = _sharedMic.IsActiveFor(oldSource.Id, oldSource.ViaHost) &&
+                          _sharedMic.IsBackgroundMode &&
+                          !(next.HasMicrophone && (explicitMic ?? false));
         try
         {
-            _watchCamera(oldSource, false, _lens, false, false);
-            _watchMic(oldSource, false);
+            _watchCamera(oldSource, false, _lens, false, keepOldMic);
+            if (!keepOldMic)
+                _watchMic(oldSource, false);
         }
         catch { }
-        _primaryAudio.ClearQueue();
-        _monitorAudio.ClearQueue();
+        if (!keepOldMic && _sharedMic.IsActiveFor(oldSource.Id, oldSource.ViaHost))
+            _sharedMic.Stop(restoreDefaultMic: false);
         lock (_frameLock)
         {
             _frame?.Dispose();
@@ -920,9 +942,15 @@ internal sealed class PhoneWebcamForm : Form
         _fpsCount = 0;
         _fpsStartMs = Environment.TickCount64;
         _micStateNote = "";
+        _lastCameraStatusText = "";
         _currentSource = next;
         _camOn = next.HasCamera && (explicitCam ?? _camOn);
-        _micOn = next.HasMicrophone && (explicitMic ?? _micOn);
+        _micOn = next.HasMicrophone && (explicitMic ?? _sharedMic.IsActiveFor(next.Id, next.ViaHost));
+        if (_micOn && !_sharedMic.IsActiveFor(next.Id, next.ViaHost))
+        {
+            _sharedMic.SetActiveSource(next.Id, next.ViaHost, next.Name,
+                backgroundMode: false, autoSwitchDefault: true);
+        }
         _torch = false;
         _suppressEvents = true;
         try
@@ -999,9 +1027,8 @@ internal sealed class PhoneWebcamForm : Form
 
     private void RefreshAudioDevicesAndRouting(bool initialAutoSwitch)
     {
-        _waveOutDevices = WindowsAudioDeviceBridge.ListWaveOutDevices();
-        var captures = WindowsAudioDeviceBridge.ListCaptureEndpoints();
-        _virtualMic = WindowsAudioDeviceBridge.MatchVirtualMicPair(_waveOutDevices, captures);
+        _virtualMic = _sharedMic.RefreshRouting(initialAutoSwitch);
+        _waveOutDevices = _sharedMic.WaveOutDevices;
 
         _suppressEvents = true;
         try
@@ -1018,23 +1045,15 @@ internal sealed class PhoneWebcamForm : Form
 
             if (_virtualMic.Installed)
             {
-                Volatile.Write(ref _routingToVirtualCable, 1);
-                _primaryAudio.SetOutputDevice(_virtualMic.RenderWaveOutId);
                 _virtMicLabel.Text = $"Native Mic Active: {_virtualMic.CaptureName}";
                 _virtMicLabel.ForeColor = Color.FromArgb(110, 231, 183);
                 _installDriverBtn.Visible = false;
                 _autoDefaultMicCheck.Enabled = true;
-                if (initialAutoSwitch)
-                {
-                    bool setOk = WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId);
-                    _autoDefaultMicCheck.Checked = setOk;
-                }
-                _hearMonitorCheck.Checked = false;
-                Volatile.Write(ref _hearMonitorActive, 0);
+                _autoDefaultMicCheck.Checked = _sharedMic.AutoDefaultMicChecked;
+                _hearMonitorCheck.Checked = _sharedMic.HearMonitorActive;
             }
             else
             {
-                Volatile.Write(ref _routingToVirtualCable, 0);
                 ApplySelectedOutputDevice();
                 _virtMicLabel.Text = "Native Mic Driver not installed (using PC speaker monitor)";
                 _virtMicLabel.ForeColor = Color.FromArgb(253, 224, 71);
@@ -1042,7 +1061,6 @@ internal sealed class PhoneWebcamForm : Form
                 _autoDefaultMicCheck.Checked = false;
                 _autoDefaultMicCheck.Enabled = false;
                 _hearMonitorCheck.Checked = true;
-                Volatile.Write(ref _hearMonitorActive, 1);
             }
         }
         finally
@@ -1069,10 +1087,7 @@ internal sealed class PhoneWebcamForm : Form
                 }
             }
         }
-        if (Volatile.Read(ref _routingToVirtualCable) != 0)
-            _monitorAudio.SetOutputDevice(selectedId);
-        else
-            _primaryAudio.SetOutputDevice(selectedId);
+        _sharedMic.SetMonitorOutputDevice(selectedId);
     }
 
     private async Task InstallVbCableFromUiAsync()
@@ -1101,8 +1116,8 @@ internal sealed class PhoneWebcamForm : Form
     private void OnUiTimerTick(object? sender, EventArgs e)
     {
         if (IsDisposed) return;
-        float lvl = _micOn
-            ? Math.Max(_primaryAudio.CurrentLevel, _monitorAudio.CurrentLevel)
+        float lvl = _micOn && _sharedMic.IsActiveFor(_currentSource.Id, _currentSource.ViaHost)
+            ? _sharedMic.CurrentLevel
             : 0f;
         if (Math.Abs(lvl - _vuLevel) > 0.01f)
         {
@@ -1116,7 +1131,9 @@ internal sealed class PhoneWebcamForm : Form
     private void UpdateTransportBadge()
     {
         bool udp = _isFastUdpActive(_currentSource);
-        string want = udp ? "Fast UDP" : "TCP";
+        string want = _getTransportLabel(_currentSource);
+        if (string.IsNullOrWhiteSpace(want))
+            want = udp ? "Fast UDP" : "TCP Fallback";
         if (string.Equals(_transportBadge.Text, want, StringComparison.Ordinal)) return;
         _transportBadge.Text = want;
         _transportBadge.BackColor = udp ? Color.FromArgb(6, 78, 59) : Color.FromArgb(120, 53, 15);
@@ -1175,8 +1192,11 @@ internal sealed class PhoneWebcamForm : Form
         if (snap == null)
         {
             using var f = new Font("Segoe UI", 10.5f);
+            string statusLine = !string.IsNullOrWhiteSpace(_lastCameraStatusText)
+                ? $"\n\nStatus: {_lastCameraStatusText}"
+                : "";
             string waitingMsg = _camOn
-                ? $"Waiting for live video from {_currentSource.Name}…\n\nDouble-click video or use 'Clean View' to capture cleanly inside Zoom, Meet, Discord, or OBS."
+                ? $"Waiting for live video from {_currentSource.Name}…{statusLine}\n\nDouble-click video or use 'Clean View' to capture cleanly inside Zoom, Meet, Discord, or OBS."
                 : $"Microphone-only mode active for {_currentSource.Name}.\n\nTurn 'Camera: On' above anytime to enable video.";
             TextRenderer.DrawText(
                 e.Graphics,

@@ -141,7 +141,10 @@ final class FastUdpChannel implements Closeable {
         private long recvWindowMask;
         private long mediaSendSeq;
         private long mediaLastRecvSeq;
-        private long mediaRecvWindowMask;
+        private long mediaWin0;
+        private long mediaWin1;
+        private long mediaWin2;
+        private long mediaWin3;
         private volatile boolean closed;
 
         Codec(byte[] key, int peerId, boolean isServer) throws GeneralSecurityException {
@@ -322,12 +325,10 @@ final class FastUdpChannel implements Closeable {
             synchronized (mediaRecvLock) {
                 if (closed) return null;
                 boolean isNewMax = mediaLastRecvSeq == 0L || Long.compareUnsigned(seq, mediaLastRecvSeq) > 0;
-                long backBit = 0L;
+                long back = 0L;
                 if (!isNewMax) {
-                    long back = mediaLastRecvSeq - seq;
-                    if (Long.compareUnsigned(back, 64L) >= 0) return null;
-                    backBit = 1L << (int) back;
-                    if ((mediaRecvWindowMask & backBit) != 0L) return null;
+                    back = mediaLastRecvSeq - seq;
+                    if (isMediaReplayOrTooOldLocked(back)) return null;
                 }
                 writeLongBE(mediaRecvNonce, 4, seq);
                 try {
@@ -339,15 +340,16 @@ final class FastUdpChannel implements Closeable {
                 }
                 if (mediaLastRecvSeq == 0L) {
                     mediaLastRecvSeq = seq;
-                    mediaRecvWindowMask = 1L;
+                    mediaWin0 = 1L;
+                    mediaWin1 = 0L;
+                    mediaWin2 = 0L;
+                    mediaWin3 = 0L;
                 } else if (isNewMax) {
                     long diff = seq - mediaLastRecvSeq;
-                    mediaRecvWindowMask = Long.compareUnsigned(diff, 64L) >= 0
-                        ? 1L
-                        : ((mediaRecvWindowMask << (int) diff) | 1L);
+                    shiftMediaWindowLocked(diff);
                     mediaLastRecvSeq = seq;
                 } else {
-                    mediaRecvWindowMask |= backBit;
+                    setMediaWindowBitLocked(back);
                 }
                 byte[] payload = payloadLen > 0
                     ? Arrays.copyOfRange(mediaRecvPlain, MEDIA_SUBHEADER_SIZE, MEDIA_SUBHEADER_SIZE + payloadLen)
@@ -363,6 +365,60 @@ final class FastUdpChannel implements Closeable {
                     payload
                 );
             }
+        }
+
+        private boolean isMediaReplayOrTooOldLocked(long back) {
+            if (Long.compareUnsigned(back, 256L) >= 0) return true;
+            int word = (int) (back >>> 6);
+            long bit = 1L << ((int) back & 63);
+            switch (word) {
+                case 0: return (mediaWin0 & bit) != 0L;
+                case 1: return (mediaWin1 & bit) != 0L;
+                case 2: return (mediaWin2 & bit) != 0L;
+                default: return (mediaWin3 & bit) != 0L;
+            }
+        }
+
+        private void setMediaWindowBitLocked(long back) {
+            int word = (int) (back >>> 6);
+            long bit = 1L << ((int) back & 63);
+            switch (word) {
+                case 0: mediaWin0 |= bit; break;
+                case 1: mediaWin1 |= bit; break;
+                case 2: mediaWin2 |= bit; break;
+                default: mediaWin3 |= bit; break;
+            }
+        }
+
+        private void shiftMediaWindowLocked(long diff) {
+            if (Long.compareUnsigned(diff, 256L) >= 0) {
+                mediaWin0 = 1L;
+                mediaWin1 = 0L;
+                mediaWin2 = 0L;
+                mediaWin3 = 0L;
+                return;
+            }
+            int wordShift = (int) (diff >>> 6);
+            int bitShift = (int) diff & 63;
+            long a0 = 0L, a1 = 0L, a2 = 0L, a3 = 0L;
+            switch (wordShift) {
+                case 0: a0 = mediaWin0; a1 = mediaWin1; a2 = mediaWin2; a3 = mediaWin3; break;
+                case 1: a1 = mediaWin0; a2 = mediaWin1; a3 = mediaWin2; break;
+                case 2: a2 = mediaWin0; a3 = mediaWin1; break;
+                default: a3 = mediaWin0; break;
+            }
+            if (bitShift == 0) {
+                mediaWin0 = a0 | 1L;
+                mediaWin1 = a1;
+                mediaWin2 = a2;
+                mediaWin3 = a3;
+                return;
+            }
+            int rShift = 64 - bitShift;
+            mediaWin3 = (a3 << bitShift) | (a2 >>> rShift);
+            mediaWin2 = (a2 << bitShift) | (a1 >>> rShift);
+            mediaWin1 = (a1 << bitShift) | (a0 >>> rShift);
+            mediaWin0 = (a0 << bitShift) | 1L;
         }
 
         void close() {

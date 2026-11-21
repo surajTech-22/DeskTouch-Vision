@@ -103,7 +103,10 @@ internal sealed class FastUdpCodec : IDisposable
     private ulong _recvWindowMask;
     private ulong _mediaSendSeq;
     private ulong _mediaLastRecvSeq;
-    private ulong _mediaRecvWindowMask;
+    private ulong _mediaWin0;
+    private ulong _mediaWin1;
+    private ulong _mediaWin2;
+    private ulong _mediaWin3;
     private bool _disposed;
 
     internal FastUdpCodec(byte[] key, ushort peerId, bool isServer)
@@ -309,13 +312,11 @@ internal sealed class FastUdpCodec : IDisposable
         {
             if (_disposed) return false;
             bool isNewMax = _mediaLastRecvSeq == 0 || seq > _mediaLastRecvSeq;
-            ulong backBit = 0;
+            ulong back = 0;
             if (!isNewMax)
             {
-                ulong back = _mediaLastRecvSeq - seq;
-                if (back >= 64) return false;
-                backBit = 1UL << (int)back;
-                if ((_mediaRecvWindowMask & backBit) != 0) return false;
+                back = _mediaLastRecvSeq - seq;
+                if (IsMediaReplayOrTooOldLocked(back)) return false;
             }
             WriteNonceSeq(seq, _mediaRecvNonce);
             Span<byte> plain = _mediaRecvPlain.AsSpan(0, plainLen);
@@ -335,17 +336,20 @@ internal sealed class FastUdpCodec : IDisposable
             if (_mediaLastRecvSeq == 0)
             {
                 _mediaLastRecvSeq = seq;
-                _mediaRecvWindowMask = 1UL;
+                _mediaWin0 = 1UL;
+                _mediaWin1 = 0UL;
+                _mediaWin2 = 0UL;
+                _mediaWin3 = 0UL;
             }
             else if (isNewMax)
             {
                 ulong diff = seq - _mediaLastRecvSeq;
-                _mediaRecvWindowMask = diff >= 64 ? 1UL : ((_mediaRecvWindowMask << (int)diff) | 1UL);
+                ShiftMediaWindowLocked(diff);
                 _mediaLastRecvSeq = seq;
             }
             else
             {
-                _mediaRecvWindowMask |= backBit;
+                SetMediaWindowBitLocked(back);
             }
             byte[] payload = payloadLen > 0 ? plain.Slice(MediaSubHeaderSize, payloadLen).ToArray() : Array.Empty<byte>();
             datagram = new FastUdpMediaDatagram(
@@ -359,6 +363,68 @@ internal sealed class FastUdpCodec : IDisposable
                 payload);
             return true;
         }
+    }
+
+    private bool IsMediaReplayOrTooOldLocked(ulong back)
+    {
+        if (back >= 256UL) return true;
+        int word = (int)(back >> 6);
+        ulong bit = 1UL << (int)(back & 63UL);
+        return word switch
+        {
+            0 => (_mediaWin0 & bit) != 0,
+            1 => (_mediaWin1 & bit) != 0,
+            2 => (_mediaWin2 & bit) != 0,
+            _ => (_mediaWin3 & bit) != 0
+        };
+    }
+
+    private void SetMediaWindowBitLocked(ulong back)
+    {
+        int word = (int)(back >> 6);
+        ulong bit = 1UL << (int)(back & 63UL);
+        switch (word)
+        {
+            case 0: _mediaWin0 |= bit; break;
+            case 1: _mediaWin1 |= bit; break;
+            case 2: _mediaWin2 |= bit; break;
+            default: _mediaWin3 |= bit; break;
+        }
+    }
+
+    private void ShiftMediaWindowLocked(ulong diff)
+    {
+        if (diff >= 256UL)
+        {
+            _mediaWin0 = 1UL;
+            _mediaWin1 = 0UL;
+            _mediaWin2 = 0UL;
+            _mediaWin3 = 0UL;
+            return;
+        }
+        int wordShift = (int)(diff >> 6);
+        int bitShift = (int)(diff & 63UL);
+        ulong a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        switch (wordShift)
+        {
+            case 0: a0 = _mediaWin0; a1 = _mediaWin1; a2 = _mediaWin2; a3 = _mediaWin3; break;
+            case 1: a1 = _mediaWin0; a2 = _mediaWin1; a3 = _mediaWin2; break;
+            case 2: a2 = _mediaWin0; a3 = _mediaWin1; break;
+            default: a3 = _mediaWin0; break;
+        }
+        if (bitShift == 0)
+        {
+            _mediaWin0 = a0 | 1UL;
+            _mediaWin1 = a1;
+            _mediaWin2 = a2;
+            _mediaWin3 = a3;
+            return;
+        }
+        int rShift = 64 - bitShift;
+        _mediaWin3 = (a3 << bitShift) | (a2 >> rShift);
+        _mediaWin2 = (a2 << bitShift) | (a1 >> rShift);
+        _mediaWin1 = (a1 << bitShift) | (a0 >> rShift);
+        _mediaWin0 = (a0 << bitShift) | 1UL;
     }
 
     public void Dispose()
@@ -1215,6 +1281,7 @@ internal sealed class FastUdpHub : IDisposable
                 {
                     if (!peer.Codec.TryOpenMedia(buffer.AsSpan(0, received), out var media)) continue;
                     peer.UpdateEndpointOnAuthenticatedPacket(normalized, srcIp.Port);
+                    peer.Confirmed = true;
                     MediaDatagramReceived?.Invoke(peer, media);
                     continue;
                 }

@@ -305,6 +305,8 @@ internal static class WindowsAudioDeviceBridge
         (string RenderToken, string CaptureToken)[] pairs =
         [
             ("CABLE Input", "CABLE Output"),
+            ("Speakers (VB-Audio Virtual", "CABLE Output"),
+            ("VB-Audio Virtual", "CABLE Output"),
             ("CABLE-A Input", "CABLE-A Output"),
             ("CABLE-B Input", "CABLE-B Output"),
             ("VoiceMeeter Aux Input", "VoiceMeeter Aux Output"),
@@ -510,9 +512,9 @@ internal static class WindowsAudioDeviceBridge
 }
 
 /// <summary>
-/// High-reliability WinMM PCM16 mono output engine using permanently pinned unmanaged
+/// Ultra-low-latency WinMM PCM16 output engine using permanently pinned unmanaged
 /// WAVEHDR & data buffers (`Marshal.AllocHGlobal`), event-driven buffer recycling, linear resampling
-/// to 48kHz native rate, bounded jitter queue (&lt;=160ms), and lock-free RMS metering.
+/// to 48kHz native stereo/mono rate, 32-packet sequence deduplication, and lock-free RMS metering.
 /// </summary>
 internal sealed class ManagedAudioOutputEngine : IDisposable
 {
@@ -521,11 +523,17 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
     internal const uint CallbackEventFlag = 0x00050000;
     private const uint WHDR_DONE = 0x00000001;
     private const uint WHDR_PREPARED = 0x00000002;
-    private const int SlotCount = 16;
-    private const int MaxSlotBytes = 8192;
-    private const int MaxQueuedChunks = 8;
+    private const int SlotCount = 4;
+    private const int TargetPrebufferChunks = 2;
+    private const int MaxMonoChunkBytes = 8192;
+    private const int MaxSlotBytes = 16384;
+    private const int MaxQueuedChunks = 4;
 
     private readonly object _lifecycleGate = new();
+    private readonly object _seqGate = new();
+    private readonly int[] _recentSeqRing = new int[32];
+    private int _recentSeqHead;
+    private int _maxSeenSeq;
     private readonly ConcurrentQueue<byte[]> _pcmQueue = new();
     private readonly AutoResetEvent _signal = new(false);
     private readonly nint[] _hdrPtrs = new nint[SlotCount];
@@ -538,6 +546,8 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
     private IntPtr _hWaveOut;
     private uint _targetDeviceId = WAVE_MAPPER;
     private int _outputSampleRate = 48000;
+    private int _outputChannels = 2;
+    private long _firstQueuedAfterIdleMs;
     private volatile bool _deviceDirty = true;
     private volatile bool _hasAudio;
     private volatile bool _disposed;
@@ -625,12 +635,42 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
     internal void ClearQueue()
     {
         while (_pcmQueue.TryDequeue(out _)) { }
+        lock (_seqGate)
+        {
+            Array.Clear(_recentSeqRing, 0, _recentSeqRing.Length);
+            _recentSeqHead = 0;
+            _maxSeenSeq = 0;
+        }
+        Volatile.Write(ref _firstQueuedAfterIdleMs, 0);
         Volatile.Write(ref _currentLevel, 0f);
     }
 
-    internal void EnqueuePcm16Mono(byte[] pcm, int sourceSampleRate = 16000)
+    internal void EnqueuePcm16Mono(byte[] pcm, int sourceSampleRate = 16000, int audioSeq = 0)
     {
         if (_disposed || pcm == null || pcm.Length < 2) return;
+        if (audioSeq > 0)
+        {
+            lock (_seqGate)
+            {
+                if (_maxSeenSeq > 0 && Math.Abs(audioSeq - _maxSeenSeq) > 1000)
+                {
+                    Array.Clear(_recentSeqRing, 0, _recentSeqRing.Length);
+                    _recentSeqHead = 0;
+                    _maxSeenSeq = 0;
+                }
+                if (_maxSeenSeq > 0 && audioSeq <= _maxSeenSeq - 24)
+                    return;
+                for (int i = 0; i < _recentSeqRing.Length; i++)
+                {
+                    if (_recentSeqRing[i] == audioSeq)
+                        return;
+                }
+                _recentSeqRing[_recentSeqHead] = audioSeq;
+                _recentSeqHead = (_recentSeqHead + 1) & 31;
+                if (audioSeq > _maxSeenSeq)
+                    _maxSeenSeq = audioSeq;
+            }
+        }
         _hasAudio = true;
         int outRate = Volatile.Read(ref _outputSampleRate);
         byte[] processed = ResamplePcm16Mono(pcm, sourceSampleRate, outRate, Gain, out float rmsPeak);
@@ -639,10 +679,31 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
         float smoothed = rmsPeak > prevLevel ? rmsPeak : (prevLevel * 0.72f + rmsPeak * 0.28f);
         Volatile.Write(ref _currentLevel, smoothed);
 
+        if (_pcmQueue.IsEmpty)
+            Volatile.Write(ref _firstQueuedAfterIdleMs, Environment.TickCount64);
         _pcmQueue.Enqueue(processed);
         while (_pcmQueue.Count > MaxQueuedChunks)
             _pcmQueue.TryDequeue(out _);
         _signal.Set();
+    }
+
+    internal static byte[] ExpandMonoToStereoPcm16(ReadOnlySpan<byte> monoPcm16)
+    {
+        int samples = monoPcm16.Length / 2;
+        if (samples <= 0) return Array.Empty<byte>();
+        byte[] stereo = new byte[Math.Min(samples * 4, MaxSlotBytes)];
+        int outSamples = stereo.Length / 4;
+        for (int i = 0; i < outSamples; i++)
+        {
+            byte lo = monoPcm16[i * 2];
+            byte hi = monoPcm16[i * 2 + 1];
+            int dst = i * 4;
+            stereo[dst] = lo;
+            stereo[dst + 1] = hi;
+            stereo[dst + 2] = lo;
+            stereo[dst + 3] = hi;
+        }
+        return stereo;
     }
 
     internal static byte[] ResamplePcm16Mono(
@@ -664,7 +725,7 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
             ? srcSamples
             : Math.Max(1, (int)Math.Round(srcSamples * (double)safeDst / safeSrc));
 
-        byte[] output = new byte[Math.Min(dstSamples * 2, MaxSlotBytes)];
+        byte[] output = new byte[Math.Min(dstSamples * 2, MaxMonoChunkBytes)];
         int actualDst = output.Length / 2;
         double ratio = srcSamples / (double)actualDst;
         double sumSq = 0;
@@ -733,19 +794,27 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
                     if (_hWaveOut != IntPtr.Zero && !_deviceDirty)
                     {
                         RecycleCompletedSlotsLocked();
-                        while (!_pcmQueue.IsEmpty)
+                        int inFlight = CountInFlightLocked();
+                        long firstWaitMs = Volatile.Read(ref _firstQueuedAfterIdleMs);
+                        bool prebufferReady = inFlight > 0 ||
+                                              _pcmQueue.Count >= TargetPrebufferChunks ||
+                                              (firstWaitMs > 0 && Environment.TickCount64 - firstWaitMs >= 22);
+                        if (prebufferReady)
                         {
-                            int freeSlot = FindFreeSlotLocked();
-                            if (freeSlot < 0) break;
-                            if (!_pcmQueue.TryDequeue(out var pcm) || pcm.Length == 0) continue;
-                            SubmitSlotLocked(freeSlot, pcm);
-                            submittedAny = true;
+                            while (!_pcmQueue.IsEmpty)
+                            {
+                                int freeSlot = FindFreeSlotLocked();
+                                if (freeSlot < 0) break;
+                                if (!_pcmQueue.TryDequeue(out var pcm) || pcm.Length == 0) continue;
+                                SubmitSlotLocked(freeSlot, pcm);
+                                submittedAny = true;
+                            }
                         }
                     }
                 }
 
                 if (_pcmQueue.IsEmpty || !submittedAny)
-                    _signal.WaitOne(40);
+                    _signal.WaitOne(15);
             }
         }
         catch { }
@@ -753,28 +822,39 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
 
     private void OpenDeviceLocked(uint deviceId)
     {
-        foreach (int candidateRate in new[] { 48000, 24000, 16000 })
+        foreach (var (candidateRate, channels) in new (int Rate, ushort Channels)[]
+                 { (48000, 2), (48000, 1), (24000, 2), (24000, 1), (16000, 1) })
         {
+            ushort blockAlign = (ushort)(channels * 2);
             var fmt = new WAVEFORMATEX
             {
                 wFormatTag = WAVE_FORMAT_PCM,
-                nChannels = 1,
+                nChannels = channels,
                 nSamplesPerSec = (uint)candidateRate,
                 wBitsPerSample = 16,
-                nBlockAlign = 2,
-                nAvgBytesPerSec = (uint)(candidateRate * 2),
+                nBlockAlign = blockAlign,
+                nAvgBytesPerSec = (uint)(candidateRate * blockAlign),
                 cbSize = 0
             };
             int res = waveOutOpen(out _hWaveOut, deviceId, ref fmt, _signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CallbackEventFlag);
             if (res == 0 && _hWaveOut != IntPtr.Zero)
             {
                 Volatile.Write(ref _outputSampleRate, candidateRate);
+                Volatile.Write(ref _outputChannels, channels);
                 Volatile.Write(ref _lastError, "");
                 return;
             }
         }
         _hWaveOut = IntPtr.Zero;
         Volatile.Write(ref _lastError, "Audio output device busy or unavailable");
+    }
+
+    private int CountInFlightLocked()
+    {
+        int count = 0;
+        for (int i = 0; i < SlotCount; i++)
+            if (_inFlight[i]) count++;
+        return count;
     }
 
     private void RecycleCompletedSlotsLocked()
@@ -797,10 +877,14 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
         return -1;
     }
 
-    private void SubmitSlotLocked(int slot, byte[] pcm)
+    private void SubmitSlotLocked(int slot, byte[] monoPcm)
     {
-        int len = Math.Min(pcm.Length, MaxSlotBytes);
-        Marshal.Copy(pcm, 0, _dataPtrs[slot], len);
+        byte[] payload = Volatile.Read(ref _outputChannels) == 2
+            ? ExpandMonoToStereoPcm16(monoPcm)
+            : monoPcm;
+        int len = Math.Min(payload.Length, MaxSlotBytes);
+        if (len <= 0) return;
+        Marshal.Copy(payload, 0, _dataPtrs[slot], len);
         var hdr = new WAVEHDR
         {
             lpData = _dataPtrs[slot],
@@ -858,5 +942,192 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
             }
         }
         _signal.Dispose();
+    }
+}
+
+/// <summary>
+/// Shared background-capable remote microphone audio router owned by <see cref="DisplaySettingsForm"/>
+/// and shared with <see cref="PhoneWebcamForm"/> so tray Mic toggles stream directly to VB-Cable /
+/// Windows Default Mic in the background without opening a UI window.
+/// </summary>
+internal sealed class RemoteMicBridgeController : IDisposable
+{
+    internal const uint WaveMapperId = 0xFFFFFFFF;
+
+    private readonly ManagedAudioOutputEngine _primaryAudio = new();
+    private readonly ManagedAudioOutputEngine _monitorAudio = new();
+    private IReadOnlyList<WaveOutDeviceInfo> _waveOutDevices =
+        Array.Empty<WaveOutDeviceInfo>();
+    private VirtualMicMatch _virtualMic;
+    private int _routingToVirtualCable;
+    private int _hearMonitorActive;
+    private bool _autoDefaultMicChecked;
+    private uint _monitorDeviceId = WaveMapperId;
+    private int _activeSourceId = int.MinValue;
+    private int _activeViaHost;
+    private int _isActive;
+    private bool _backgroundMode;
+    private string _activeSourceName = "";
+    private string _micStatusNote = "";
+    private bool _disposed;
+
+    internal bool IsActive => Volatile.Read(ref _isActive) != 0;
+    internal int ActiveSourceId => Volatile.Read(ref _activeSourceId);
+    internal bool ActiveViaHost => Volatile.Read(ref _activeViaHost) != 0;
+    internal string SourceName => _activeSourceName;
+    internal bool IsBackgroundMode
+    {
+        get => _backgroundMode;
+        set => _backgroundMode = value;
+    }
+    internal VirtualMicMatch VirtualMic => _virtualMic;
+    internal IReadOnlyList<WaveOutDeviceInfo> WaveOutDevices => _waveOutDevices;
+    internal bool IsRoutingToVirtualCable => Volatile.Read(ref _routingToVirtualCable) != 0;
+    internal bool HearMonitorActive => Volatile.Read(ref _hearMonitorActive) != 0;
+    internal bool AutoDefaultMicChecked => _autoDefaultMicChecked;
+    internal float Gain
+    {
+        get => _primaryAudio.Gain;
+        set
+        {
+            _primaryAudio.Gain = value;
+            _monitorAudio.Gain = value;
+        }
+    }
+    internal float CurrentLevel => _primaryAudio.CurrentLevel;
+    internal string MicStatusNote
+    {
+        get => _micStatusNote;
+        set => _micStatusNote = value ?? "";
+    }
+
+    internal bool IsActiveFor(int sourceId, bool viaHost) =>
+        Volatile.Read(ref _isActive) != 0 &&
+        Volatile.Read(ref _activeSourceId) == sourceId &&
+        (Volatile.Read(ref _activeViaHost) != 0) == viaHost;
+
+    internal VirtualMicMatch RefreshRouting(bool initialAutoSwitch)
+    {
+        _waveOutDevices = WindowsAudioDeviceBridge.ListWaveOutDevices();
+        var captures = WindowsAudioDeviceBridge.ListCaptureEndpoints();
+        _virtualMic = WindowsAudioDeviceBridge.MatchVirtualMicPair(_waveOutDevices, captures);
+
+        if (_virtualMic.Installed)
+        {
+            Volatile.Write(ref _routingToVirtualCable, 1);
+            _primaryAudio.SetOutputDevice(_virtualMic.RenderWaveOutId);
+            _monitorAudio.SetOutputDevice(_monitorDeviceId);
+            if (initialAutoSwitch)
+            {
+                _autoDefaultMicChecked = WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId);
+            }
+        }
+        else
+        {
+            Volatile.Write(ref _routingToVirtualCable, 0);
+            _primaryAudio.SetOutputDevice(_monitorDeviceId);
+            _autoDefaultMicChecked = false;
+            Volatile.Write(ref _hearMonitorActive, 1);
+        }
+        return _virtualMic;
+    }
+
+    internal void SetActiveSource(int sourceId, bool viaHost, string sourceName, bool backgroundMode, bool autoSwitchDefault = true)
+    {
+        if (_disposed) return;
+        _primaryAudio.ClearQueue();
+        _monitorAudio.ClearQueue();
+        RefreshRouting(initialAutoSwitch: autoSwitchDefault);
+        Volatile.Write(ref _activeSourceId, sourceId);
+        Volatile.Write(ref _activeViaHost, viaHost ? 1 : 0);
+        _activeSourceName = string.IsNullOrWhiteSpace(sourceName) ? "Remote Device" : sourceName;
+        _backgroundMode = backgroundMode;
+        _micStatusNote = "Mic Live";
+        Volatile.Write(ref _isActive, 1);
+    }
+
+    internal void Stop(bool restoreDefaultMic = true)
+    {
+        Volatile.Write(ref _isActive, 0);
+        _backgroundMode = false;
+        _micStatusNote = "";
+        _primaryAudio.ClearQueue();
+        _monitorAudio.ClearQueue();
+        if (restoreDefaultMic)
+        {
+            WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+            _autoDefaultMicChecked = false;
+        }
+    }
+
+    internal void HandleIncomingAudio(int sourceId, bool viaHost, byte[] pcm, int sampleRate, int audioSeq = 0)
+    {
+        if (_disposed || Volatile.Read(ref _isActive) == 0 || pcm == null || pcm.Length < 2) return;
+        if (Volatile.Read(ref _activeSourceId) != sourceId || (Volatile.Read(ref _activeViaHost) != 0) != viaHost)
+            return;
+
+        if (Volatile.Read(ref _routingToVirtualCable) != 0)
+        {
+            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate, audioSeq);
+            if (Volatile.Read(ref _hearMonitorActive) != 0)
+                _monitorAudio.EnqueuePcm16Mono(pcm, sampleRate, audioSeq);
+        }
+        else if (Volatile.Read(ref _hearMonitorActive) != 0)
+        {
+            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate, audioSeq);
+        }
+    }
+
+    internal void SetHearMonitor(bool enabled)
+    {
+        Volatile.Write(ref _hearMonitorActive, enabled ? 1 : 0);
+        if (!enabled)
+        {
+            if (Volatile.Read(ref _routingToVirtualCable) != 0)
+                _monitorAudio.ClearQueue();
+            else
+                _primaryAudio.ClearQueue();
+        }
+    }
+
+    internal void SetMonitorOutputDevice(uint waveOutId)
+    {
+        _monitorDeviceId = waveOutId;
+        if (Volatile.Read(ref _routingToVirtualCable) != 0)
+            _monitorAudio.SetOutputDevice(waveOutId);
+        else
+            _primaryAudio.SetOutputDevice(waveOutId);
+    }
+
+    internal bool SetDefaultWindowsMic(bool enable)
+    {
+        if (enable && _virtualMic.Installed)
+        {
+            _autoDefaultMicChecked = WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId);
+            return _autoDefaultMicChecked;
+        }
+        WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+        _autoDefaultMicChecked = false;
+        return false;
+    }
+
+    internal void ClearQueues()
+    {
+        _primaryAudio.ClearQueue();
+        _monitorAudio.ClearQueue();
+    }
+
+    internal string DescribeActiveRoute() =>
+        _virtualMic.Installed
+            ? $"Native Mic: {_virtualMic.CaptureName}"
+            : "PC Speaker Monitor";
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        Stop(restoreDefaultMic: true);
+        _primaryAudio.Dispose();
+        _monitorAudio.Dispose();
     }
 }

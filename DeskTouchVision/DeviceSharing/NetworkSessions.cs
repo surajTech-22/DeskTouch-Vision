@@ -562,7 +562,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action<int, int, string?>? PhoneScreenStatusReceived;
     internal event Action<int, byte[]>? PhoneCameraFrameReceived;
     internal event Action<int, int, string?>? PhoneCameraStatusReceived;
-    internal event Action<int, byte[], int>? PhoneMicAudioReceived;
+    internal event Action<int, byte[], int, int>? PhoneMicAudioReceived;
     internal event Action<int, int, string?>? PhoneMicStatusReceived;
     internal event Action<bool, bool, string>? LocalMediaShareStateChanged;
     internal event Action<string?, bool, bool, int, int, bool, bool>? AndroidBridgeHintReceived;
@@ -571,13 +571,59 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private static FastUdpHub.Peer? ActiveMediaUdpPeer(Session session)
     {
-        if (session.UdpPeer is { Confirmed: true } udp) return udp;
-        if (session.MobileUdpPeer is { Confirmed: true } mob) return mob;
-        return null;
+        var wifi = session.UdpPeer is { Confirmed: true } u ? u : null;
+        var mob = session.MobileUdpPeer is { Confirmed: true } m ? m : null;
+        if (wifi == null) return mob;
+        if (mob == null) return wifi;
+
+        double wifiLoss = wifi.LinkTracker.CombinedLossPermille;
+        double mobLoss = mob.LinkTracker.CombinedLossPermille;
+        if (Math.Abs(wifiLoss - mobLoss) >= 15.0)
+            return mobLoss < wifiLoss ? mob : wifi;
+
+        double wifiRtt = wifi.LinkTracker.SmoothedRttMs;
+        double mobRtt = mob.LinkTracker.SmoothedRttMs;
+        if (Volatile.Read(ref session.PreferMobileMouse) != 0 &&
+            (mobRtt <= 0 || wifiRtt <= 0 || mobRtt <= wifiRtt + 25.0))
+            return mob;
+
+        if (mobRtt > 0 && wifiRtt > 0 && mobRtt + 6.0 < wifiRtt)
+            return mob;
+
+        return wifi;
     }
 
     internal bool IsFastMediaUdpActive(int peerId) =>
         _udpHub != null && _sessions.TryGetValue(peerId, out var s) && ActiveMediaUdpPeer(s) != null;
+
+    internal string GetMediaTransportLabel(int peerId)
+    {
+        if (_udpHub == null || !_sessions.TryGetValue(peerId, out var s))
+            return "TCP Fallback";
+        var active = ActiveMediaUdpPeer(s);
+        if (active == null) return "TCP Fallback";
+        if (s.IsCableSession) return "Fast UDP (Cable)";
+        if (ReferenceEquals(active, s.MobileUdpPeer)) return "Fast UDP (Mobile)";
+        return s.Peer.Platform == "Android" ? "Fast UDP (Wi-Fi)" : "Fast UDP (LAN)";
+    }
+
+    private static bool SendDualOrBestMicUdp(
+        FastUdpHub? hub,
+        Session watcher,
+        int audioSeq,
+        int sampleRate,
+        int sourcePeerId,
+        ReadOnlySpan<byte> pcm)
+    {
+        if (hub == null || pcm.Length > FastUdpCodec.MaxMediaPayloadBytes)
+            return false;
+        bool sent = false;
+        if (watcher.UdpPeer is { Confirmed: true } wifi)
+            sent |= hub.SendMedia(wifi, FastUdpMediaKind.MicAudio, audioSeq, sampleRate, 1, sourcePeerId, pcm);
+        if (watcher.MobileUdpPeer is { Confirmed: true } mob && !ReferenceEquals(mob, watcher.UdpPeer))
+            sent |= hub.SendMedia(mob, FastUdpMediaKind.MicAudio, audioSeq, sampleRate, 1, sourcePeerId, pcm);
+        return sent;
+    }
 
     internal static void SendUdpMediaChunks(
         FastUdpHub hub,
@@ -595,6 +641,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int offset = i * maxChunk;
             int len = Math.Min(maxChunk, payload.Length - offset);
             hub.SendMedia(udpPeer, kind, frameId, i, total, metaOrRouteId, payload.Slice(offset, len));
+            if ((i & 7) == 7) Thread.Yield();
         }
     }
 
@@ -613,6 +660,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int offset = i * maxChunk;
             int len = Math.Min(maxChunk, payload.Length - offset);
             client.SendMedia(kind, frameId, i, total, metaOrRouteId, payload.Slice(offset, len));
+            if ((i & 7) == 7) Thread.Yield();
         }
     }
 
@@ -674,6 +722,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             else if (_hubMicWatchPeerId == targetPeerId)
                 _hubMicWatchPeerId = -1;
         }
+        if (!enable)
+            _fastMediaAssembler.ClearSource(targetPeerId);
         if (prevCam > 0 && prevCam != targetPeerId)
             DispatchTargetMediaWatch(prevCam);
         if (prevMic > 0 && prevMic != targetPeerId && prevMic != prevCam)
@@ -742,6 +792,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     anyMic = true;
             }
         }
+        if ((anyCam || anyMic) && _udpHub is { } hub)
+        {
+            if (target.UdpPeer is { Confirmed: false } u) hub.Send(u, FastUdpOp.Probe, hub.Port, 0, 0);
+            if (target.MobileUdpPeer is { Confirmed: false } m) hub.Send(m, FastUdpOp.Probe, hub.Port, 0, 0);
+        }
         _ = Task.Run(async () =>
         {
             try { await SendToAsync(target, new Packet("phone-camera-watch", anyCam ? 1 : 0, lens, torch ? 1 : 0, anyMic ? 1 : 0), _cancel.Token); }
@@ -757,6 +812,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         {
             anyMic = _hubMicWatchPeerId == targetPeerId ||
                      _sessions.Values.Any(s => Volatile.Read(ref s.WatchingMicTargetId) == targetPeerId);
+        }
+        if (anyMic && _udpHub is { } hub)
+        {
+            if (target.UdpPeer is { Confirmed: false } u) hub.Send(u, FastUdpOp.Probe, hub.Port, 0, 0);
+            if (target.MobileUdpPeer is { Confirmed: false } m) hub.Send(m, FastUdpOp.Probe, hub.Port, 0, 0);
         }
         _ = Task.Run(async () =>
         {
@@ -799,16 +859,28 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 _localMediaCapture = svc;
             }
         }
-        if (svc == null) return;
+        if (svc == null)
+        {
+            if (!needCam) Volatile.Write(ref _localMediaCamStatus, 0);
+            if (!needMic) Volatile.Write(ref _localMediaMicStatus, 0);
+            EmitLocalMediaSummary();
+            return;
+        }
 
         if (needCam) svc.StartCamera(camLens);
-        else svc.StopCamera();
+        else
+        {
+            svc.StopCamera();
+            Volatile.Write(ref _localMediaCamStatus, 0);
+        }
 
         if (needMic) svc.StartMic();
-        else svc.StopMic();
+        else
+        {
+            svc.StopMic();
+            Volatile.Write(ref _localMediaMicStatus, 0);
+        }
 
-        Volatile.Write(ref _localMediaCamStatus, needCam ? 1 : 0);
-        Volatile.Write(ref _localMediaMicStatus, needMic ? 1 : 0);
         EmitLocalMediaSummary();
     }
 
@@ -856,12 +928,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private void OnLocalMediaCameraStatus(int stateCode, string msg)
     {
-        Volatile.Write(ref _localMediaCamStatus, stateCode);
+        bool anyCamWatcher = _sessions.Values.Any(s => Volatile.Read(ref s.WatchingCameraTargetId) == 0);
+        int effectiveState = anyCamWatcher ? stateCode : 0;
+        if (!anyCamWatcher && stateCode != 0)
+            _localMediaCapture?.StopCamera();
+        Volatile.Write(ref _localMediaCamStatus, effectiveState);
         EmitLocalMediaSummary();
         foreach (var w in _sessions.Values)
         {
             if (Volatile.Read(ref w.WatchingCameraTargetId) != 0) continue;
-            _ = Task.Run(async () => { try { await SendToAsync(w, new Packet("phone-camera-status", stateCode, 0, Text: msg), _cancel.Token); } catch { } });
+            _ = Task.Run(async () => { try { await SendToAsync(w, new Packet("phone-camera-status", effectiveState, 0, Text: msg), _cancel.Token); } catch { } });
         }
     }
 
@@ -874,11 +950,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         foreach (var w in _sessions.Values)
         {
             if (Volatile.Read(ref w.WatchingMicTargetId) != 0) continue;
-            if (hub != null && ActiveMediaUdpPeer(w) is { } udpPeer && pcm.Length <= FastUdpCodec.MaxMediaPayloadBytes)
-            {
-                hub.SendMedia(udpPeer, FastUdpMediaKind.MicAudio, seq, sampleRate, 1, 0, pcm);
-            }
-            else
+            if (!SendDualOrBestMicUdp(hub, w, seq, sampleRate, 0, pcm))
             {
                 b64 ??= Convert.ToBase64String(pcm);
                 var pkt = new Packet("phone-mic-audio", seq, sampleRate, 1, 0, b64);
@@ -889,12 +961,16 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     private void OnLocalMediaMicStatus(int stateCode, string msg)
     {
-        Volatile.Write(ref _localMediaMicStatus, stateCode);
+        bool anyMicWatcher = _sessions.Values.Any(s => Volatile.Read(ref s.WatchingMicTargetId) == 0);
+        int effectiveState = anyMicWatcher ? stateCode : 0;
+        if (!anyMicWatcher && stateCode != 0)
+            _localMediaCapture?.StopMic();
+        Volatile.Write(ref _localMediaMicStatus, effectiveState);
         EmitLocalMediaSummary();
         foreach (var w in _sessions.Values)
         {
             if (Volatile.Read(ref w.WatchingMicTargetId) != 0) continue;
-            _ = Task.Run(async () => { try { await SendToAsync(w, new Packet("phone-mic-status", stateCode, 0, Text: msg), _cancel.Token); } catch { } });
+            _ = Task.Run(async () => { try { await SendToAsync(w, new Packet("phone-mic-status", effectiveState, 0, Text: msg), _cancel.Token); } catch { } });
         }
     }
 
@@ -5025,14 +5101,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                         int sr = p.B > 0 ? p.B : 16000;
                         if (pcm.Length > 0)
                         {
-                            PhoneMicAudioReceived?.Invoke(session.Id, pcm, sr);
+                            PhoneMicAudioReceived?.Invoke(session.Id, pcm, sr, p.A);
                             var hub = _udpHub;
                             foreach (var w in _sessions.Values)
                             {
                                 if (Volatile.Read(ref w.WatchingMicTargetId) != session.Id) continue;
-                                if (hub != null && ActiveMediaUdpPeer(w) is { } wUdp && pcm.Length <= FastUdpCodec.MaxMediaPayloadBytes)
-                                    hub.SendMedia(wUdp, FastUdpMediaKind.MicAudio, p.A, sr, 1, session.Id, pcm);
-                                else
+                                if (!SendDualOrBestMicUdp(hub, w, p.A, sr, session.Id, pcm))
                                     try { await SendToAsync(w, p with { D = session.Id }, token); } catch { }
                             }
                         }
@@ -5166,6 +5240,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     notifyDisconnectedMic = true;
                 }
             }
+            _fastMediaAssembler.ClearSource(id);
             if (notifyDisconnectedCam)
                 PhoneCameraStatusReceived?.Invoke(id, 0, "Peer disconnected");
             if (notifyDisconnectedMic)
@@ -5388,16 +5463,12 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 if (media.Payload.Length == 0) return;
                 int sr = media.IndexOrSampleRate is >= 8000 and <= 48000 ? media.IndexOrSampleRate : 16000;
-                PhoneMicAudioReceived?.Invoke(session.Id, media.Payload, sr);
+                PhoneMicAudioReceived?.Invoke(session.Id, media.Payload, sr, media.FrameOrAudioId);
                 string? b64 = null;
                 foreach (var w in _sessions.Values)
                 {
                     if (Volatile.Read(ref w.WatchingMicTargetId) != session.Id) continue;
-                    if (hub != null && ActiveMediaUdpPeer(w) is { } wUdp)
-                    {
-                        hub.SendMedia(wUdp, FastUdpMediaKind.MicAudio, media.FrameOrAudioId, sr, 1, session.Id, media.Payload);
-                    }
-                    else
+                    if (!SendDualOrBestMicUdp(hub, w, media.FrameOrAudioId, sr, session.Id, media.Payload))
                     {
                         b64 ??= Convert.ToBase64String(media.Payload);
                         var pkt = new Packet("phone-mic-audio", media.FrameOrAudioId, sr, 1, session.Id, b64);
@@ -6075,18 +6146,33 @@ internal sealed class HostSession : IInputSession, IDisposable
     internal event Action<string, string, string>? OtpOfferReceived;
     internal event Action<int, byte[]>? RemoteCameraFrameReceived;
     internal event Action<int, int, string?>? RemoteCameraStatusReceived;
-    internal event Action<int, byte[], int>? RemoteMicAudioReceived;
+    internal event Action<int, byte[], int, int>? RemoteMicAudioReceived;
     internal event Action<int, int, string?>? RemoteMicStatusReceived;
     internal event Action<bool, bool, string>? LocalMediaShareStateChanged;
 
     internal bool IsFastMediaUdpActive => Volatile.Read(ref _udpClient) is { Confirmed: true };
 
-    internal void SendRemoteCameraWatch(int targetPeerId, bool enable, int lens, bool torch, bool mic) =>
+    internal string MediaTransportLabel =>
+        Volatile.Read(ref _udpClient) is { Confirmed: true }
+            ? (_linkBand is "ethernet" or "cable" ? "Fast UDP (Cable)" : "Fast UDP (LAN)")
+            : "TCP Fallback";
+
+    internal void SendRemoteCameraWatch(int targetPeerId, bool enable, int lens, bool torch, bool mic)
+    {
+        if (!enable)
+            _hostMediaAssembler.ClearSource(targetPeerId);
+        if (enable && Volatile.Read(ref _udpClient) is { Confirmed: false } unconfirmed)
+            unconfirmed.SendProbe();
         TrySend(new Packet("phone-camera-watch", enable ? 1 : 0, lens, torch ? 1 : 0, mic ? 1 : 0,
             targetPeerId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+    }
 
-    internal void SendRemoteMicWatch(int targetPeerId, bool enable) =>
+    internal void SendRemoteMicWatch(int targetPeerId, bool enable)
+    {
+        if (enable && Volatile.Read(ref _udpClient) is { Confirmed: false } unconfirmed)
+            unconfirmed.SendProbe();
         TrySend(new Packet("phone-mic-watch", enable ? 1 : 0, targetPeerId));
+    }
 
     internal void StopLocalMediaSharing()
     {
@@ -6118,13 +6204,25 @@ internal sealed class HostSession : IInputSession, IDisposable
                 _hostMediaCapture = svc;
             }
         }
-        if (svc == null) return;
+        if (svc == null)
+        {
+            if (!needCam) Volatile.Write(ref _hostCamStatus, 0);
+            if (!needMic) Volatile.Write(ref _hostMicStatus, 0);
+            EmitHostLocalMediaSummary();
+            return;
+        }
         if (needCam) svc.StartCamera(lens);
-        else svc.StopCamera();
+        else
+        {
+            svc.StopCamera();
+            Volatile.Write(ref _hostCamStatus, 0);
+        }
         if (needMic) svc.StartMic();
-        else svc.StopMic();
-        Volatile.Write(ref _hostCamStatus, needCam ? 1 : 0);
-        Volatile.Write(ref _hostMicStatus, needMic ? 1 : 0);
+        else
+        {
+            svc.StopMic();
+            Volatile.Write(ref _hostMicStatus, 0);
+        }
         EmitHostLocalMediaSummary();
     }
 
@@ -6171,9 +6269,13 @@ internal sealed class HostSession : IInputSession, IDisposable
 
     private void OnHostLocalCameraStatus(int stateCode, string msg)
     {
-        Volatile.Write(ref _hostCamStatus, stateCode);
+        bool watchActive = Volatile.Read(ref _hostCamWatchActive) != 0;
+        int effectiveState = watchActive ? stateCode : 0;
+        if (!watchActive && stateCode != 0)
+            _hostMediaCapture?.StopCamera();
+        Volatile.Write(ref _hostCamStatus, effectiveState);
         EmitHostLocalMediaSummary();
-        TrySend(new Packet("phone-camera-status", stateCode, 0, Text: msg));
+        TrySend(new Packet("phone-camera-status", effectiveState, 0, Text: msg));
     }
 
     private void OnHostLocalMicAudio(byte[] pcm, int sampleRate)
@@ -6191,9 +6293,13 @@ internal sealed class HostSession : IInputSession, IDisposable
 
     private void OnHostLocalMicStatus(int stateCode, string msg)
     {
-        Volatile.Write(ref _hostMicStatus, stateCode);
+        bool watchActive = Volatile.Read(ref _hostMicWatchActive) != 0;
+        int effectiveState = watchActive ? stateCode : 0;
+        if (!watchActive && stateCode != 0)
+            _hostMediaCapture?.StopMic();
+        Volatile.Write(ref _hostMicStatus, effectiveState);
         EmitHostLocalMediaSummary();
-        TrySend(new Packet("phone-mic-status", stateCode, 0, Text: msg));
+        TrySend(new Packet("phone-mic-status", effectiveState, 0, Text: msg));
     }
 
     internal NotificationPreviewItem[] GetNotificationsForTarget(int memberId)
@@ -7098,7 +7204,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                     {
                         byte[] pcm = Convert.FromBase64String(p.Text);
                         if (pcm.Length > 0)
-                            RemoteMicAudioReceived?.Invoke(p.D, pcm, p.B > 0 ? p.B : 16000);
+                            RemoteMicAudioReceived?.Invoke(p.D, pcm, p.B > 0 ? p.B : 16000, p.A);
                     }
                     catch { }
                 }
@@ -7437,7 +7543,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                 {
                     if (media.Payload.Length == 0) return;
                     int sr = media.IndexOrSampleRate is >= 8000 and <= 48000 ? media.IndexOrSampleRate : 16000;
-                    RemoteMicAudioReceived?.Invoke(sourcePeerId, media.Payload, sr);
+                    RemoteMicAudioReceived?.Invoke(sourcePeerId, media.Payload, sr, media.FrameOrAudioId);
                 }
                 else if (media.Kind == FastUdpMediaKind.CameraFrameChunk)
                 {
@@ -7481,6 +7587,11 @@ internal sealed class HostSession : IInputSession, IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) return;
+        Volatile.Write(ref _hostCamWatchActive, 0);
+        Volatile.Write(ref _hostMicWatchActive, 0);
+        Volatile.Write(ref _hostCamStatus, 0);
+        Volatile.Write(ref _hostMicStatus, 0);
+        try { LocalMediaShareStateChanged?.Invoke(false, false, ""); } catch { }
         Interlocked.Exchange(ref _pendingTrust, null)?.TrySetResult(false);
         _cancel.Cancel();
         try { _hostPreviewWake.Release(); } catch { }

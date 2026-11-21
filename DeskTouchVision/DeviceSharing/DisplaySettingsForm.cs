@@ -177,6 +177,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private NotificationPreviewFlyout? _notifFlyout;
     private OtpBannerForm? _otpBanner;
     private readonly SharedShelfStore _sharedShelf = new();
+    private readonly RemoteMicBridgeController _sharedMic = new();
+    private bool _localReceiverSharingMedia;
+    private bool _localHostSharingMedia;
+    private string _localReceiverShareSummary = "";
+    private string _localHostShareSummary = "";
     private PhoneScreenForm? _phoneScreenForm;
     private PhoneWebcamForm? _phoneWebcamForm;
     private SharedShelfDialog? _sharedShelfDialog;
@@ -906,6 +911,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _closing.Cancel();
         _trustedScanTimer?.Stop();
         _liveLinkTimer?.Stop();
+        StopActiveRemoteMic();
+        _sharedMic.Dispose();
         WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
         _receiver?.StopLocalMediaSharing();
         _host?.StopLocalMediaSharing();
@@ -1786,25 +1793,31 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 if (_phoneWebcamForm is { IsDisposed: false } f && !f.SourceViaHost && f.PeerId == peerId && !string.IsNullOrWhiteSpace(msg))
                     f.UpdateStatus(msg);
             });
-            _receiver.PhoneMicAudioReceived += (peerId, pcm, rate) =>
+            _receiver.PhoneMicAudioReceived += (peerId, pcm, rate, seq) =>
             {
                 try
                 {
-                    var w = _phoneWebcamForm;
-                    if (w != null && !w.IsDisposed && !w.SourceViaHost && w.PeerId == peerId)
-                        w.HandleMicAudio(pcm, rate);
+                    _sharedMic.HandleIncomingAudio(peerId, viaHost: false, pcm, rate, seq);
                 }
                 catch { }
             };
             _receiver.PhoneMicStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
             {
+                if (_sharedMic.IsActiveFor(peerId, viaHost: false) && !string.IsNullOrWhiteSpace(msg))
+                {
+                    _sharedMic.MicStatusNote = stateCode == 1 ? "Mic Live" : msg;
+                    if (stateCode == 2)
+                    {
+                        Status(msg);
+                        _trayIcon?.ShowBalloonTip(5000, "Phone Microphone Action Needed", msg, ToolTipIcon.Info);
+                    }
+                }
                 if (_phoneWebcamForm is { IsDisposed: false } f && !f.SourceViaHost && f.PeerId == peerId)
                     f.UpdateMicStatus(stateCode, msg);
             });
-            _receiver.LocalMediaShareStateChanged += (_, _, summary) => PostToUi(() =>
+            _receiver.LocalMediaShareStateChanged += (cam, mic, summary) => PostToUi(() =>
             {
-                if (!string.IsNullOrEmpty(summary))
-                    Status(summary);
+                HandleLocalMediaShareState(fromHost: false, cam, mic, summary);
             });
             _receiver.LowBatteryDetected += (devName, pct, _) => PostToUi(() =>
             {
@@ -2969,6 +2982,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _capture = null;
         _host?.Dispose();
         _host = null;
+        if (_sharedMic.IsActive && _sharedMic.ActiveViaHost)
+            _sharedMic.Stop(restoreDefaultMic: true);
+        HandleLocalMediaShareState(fromHost: true, false, false, "");
         // Outgoing controller also hosts a native priority monitor for
         // incoming reverse claims. It belongs to this host session.
         if (hadHost && _receiver?.ConnectedPeerCount == 0)
@@ -3345,6 +3361,32 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _trayMenu.Items.Insert(insertAt++, item);
         }
 
+        if (_sharedMic.IsActive)
+        {
+            var stopMicItem = new ToolStripMenuItem($"Stop Active Mic ({_sharedMic.SourceName} • {_sharedMic.DescribeActiveRoute()})")
+            {
+                Tag = "dynamic-device"
+            };
+            stopMicItem.Click += (_, _) => StopActiveRemoteMic();
+            _trayMenu.Items.Insert(insertAt++, stopMicItem);
+        }
+
+        if (_localReceiverSharingMedia || _localHostSharingMedia)
+        {
+            var stopLocalShareItem = new ToolStripMenuItem("Stop Sharing This PC's Camera/Mic")
+            {
+                Tag = "dynamic-device"
+            };
+            stopLocalShareItem.Click += (_, _) =>
+            {
+                _receiver?.StopLocalMediaSharing();
+                _host?.StopLocalMediaSharing();
+                HandleLocalMediaShareState(fromHost: false, false, false, "");
+                HandleLocalMediaShareState(fromHost: true, false, false, "");
+            };
+            _trayMenu.Items.Insert(insertAt++, stopLocalShareItem);
+        }
+
         _trayMenu.Items.Insert(insertAt, new ToolStripSeparator { Tag = "dynamic-device" });
     }
 
@@ -3493,9 +3535,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             string status = !supportsInput
                 ? (platform == "Android" ? "Paused" : "Unavailable")
                 : (controlling ? "Controlling" : (selected ? "Selected" : "Connected"));
+            bool isHostSource = id <= 0;
+            int sourceId = isHostSource ? -id : id;
             bool activeMediaMatch = wf is { IsDisposed: false } &&
-                ((!wf.SourceViaHost && id > 0 && wf.PeerId == id) ||
-                 (wf.SourceViaHost && id <= 0 && wf.PeerId == -id));
+                wf.SourceViaHost == isHostSource && wf.PeerId == sourceId;
+            bool micActive = hasMic && (_sharedMic.IsActiveFor(sourceId, isHostSource) ||
+                                        (activeMediaMatch && wf!.IsMicStreaming));
             items.Add(new BridgeDeviceItemDto(
                 id, name, platform, IsLocal: false,
                 IsSelected: selected, IsControlling: controlling,
@@ -3508,7 +3553,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 HasCamera: hasCam,
                 HasMicrophone: hasMic,
                 IsCameraActive: hasCam && activeMediaMatch && wf!.IsCameraStreaming,
-                IsMicrophoneActive: hasMic && activeMediaMatch && wf!.IsMicStreaming));
+                IsMicrophoneActive: micActive));
         }
 
         if (_host != null)
@@ -3899,28 +3944,137 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             f.UpdateStatus(msg);
     });
 
-    private void OnHostRemoteMicAudio(int sourceId, byte[] pcm, int rate)
+    private void OnHostRemoteMicAudio(int sourceId, byte[] pcm, int rate, int seq)
     {
         try
         {
-            var w = _phoneWebcamForm;
-            if (w != null && !w.IsDisposed && w.SourceViaHost && w.PeerId == sourceId)
-                w.HandleMicAudio(pcm, rate);
+            _sharedMic.HandleIncomingAudio(sourceId, viaHost: true, pcm, rate, seq);
         }
         catch { }
     }
 
     private void OnHostRemoteMicStatus(int sourceId, int stateCode, string? msg) => PostToUi(() =>
     {
+        if (_sharedMic.IsActiveFor(sourceId, viaHost: true) && !string.IsNullOrWhiteSpace(msg))
+        {
+            _sharedMic.MicStatusNote = stateCode == 1 ? "Mic Live" : msg;
+            if (stateCode == 2)
+            {
+                Status(msg);
+                _trayIcon?.ShowBalloonTip(5000, "Phone Microphone Action Needed", msg, ToolTipIcon.Info);
+            }
+        }
         if (_phoneWebcamForm is { IsDisposed: false } f && f.SourceViaHost && f.PeerId == sourceId)
             f.UpdateMicStatus(stateCode, msg);
     });
 
     private void OnHostLocalMediaShareState(bool cam, bool mic, string summary) => PostToUi(() =>
     {
-        if (!string.IsNullOrEmpty(summary))
-            Status(summary);
+        HandleLocalMediaShareState(fromHost: true, cam, mic, summary);
     });
+
+    private void HandleLocalMediaShareState(bool fromHost, bool cam, bool mic, string summary)
+    {
+        bool active = (cam || mic) && !string.IsNullOrWhiteSpace(summary);
+        bool wasSharing = _localReceiverSharingMedia || _localHostSharingMedia;
+        if (fromHost)
+        {
+            _localHostSharingMedia = active;
+            _localHostShareSummary = active ? summary : "";
+        }
+        else
+        {
+            _localReceiverSharingMedia = active;
+            _localReceiverShareSummary = active ? summary : "";
+        }
+
+        if (active)
+        {
+            Status(summary);
+        }
+        else if (_localReceiverSharingMedia && !string.IsNullOrWhiteSpace(_localReceiverShareSummary))
+        {
+            Status(_localReceiverShareSummary);
+        }
+        else if (_localHostSharingMedia && !string.IsNullOrWhiteSpace(_localHostShareSummary))
+        {
+            Status(_localHostShareSummary);
+        }
+        else if (wasSharing)
+        {
+            Status("Stopped sharing this PC's camera/microphone.");
+        }
+    }
+
+    private void SendWatchCameraForSource(MediaSourceOption src, bool enable, int lens, bool torch, bool mic)
+    {
+        if (src.ViaHost) _host?.SendRemoteCameraWatch(src.Id, enable, lens, torch, mic);
+        else _receiver?.SendPhoneCameraWatch(src.Id, enable, lens, torch, mic);
+    }
+
+    private void SendWatchMicForSource(MediaSourceOption src, bool enable) =>
+        SendWatchMicById(src.Id, src.ViaHost, enable);
+
+    private void SendWatchMicById(int sourceId, bool viaHost, bool enable)
+    {
+        if (sourceId < 0) return;
+        if (viaHost) _host?.SendRemoteMicWatch(sourceId, enable);
+        else _receiver?.SendPhoneMicWatch(sourceId, enable);
+    }
+
+    private string GetTransportLabelForSource(MediaSourceOption src) =>
+        src.ViaHost
+            ? (_host?.MediaTransportLabel ?? "TCP Fallback")
+            : (_receiver?.GetMediaTransportLabel(src.Id) ?? "TCP Fallback");
+
+    private void StopActiveRemoteMic()
+    {
+        if (!_sharedMic.IsActive) return;
+        int prevId = _sharedMic.ActiveSourceId;
+        bool prevViaHost = _sharedMic.ActiveViaHost;
+        string prevName = _sharedMic.SourceName;
+        try { SendWatchMicById(prevId, prevViaHost, false); } catch { }
+        _sharedMic.Stop(restoreDefaultMic: true);
+        if (_phoneWebcamForm is { IsDisposed: false } wf)
+            wf.SyncExternalMicState();
+        Status($"Stopped microphone from {prevName}.");
+        RefreshTrayFlyoutIfVisible();
+        PublishDeckBridgeSnapshot();
+    }
+
+    private void ToggleBackgroundMicForSource(MediaSourceOption chosen)
+    {
+        if (!chosen.HasMicrophone)
+        {
+            Status($"{chosen.Name} does not report a microphone.");
+            return;
+        }
+        if (_sharedMic.IsActiveFor(chosen.Id, chosen.ViaHost))
+        {
+            SendWatchMicForSource(chosen, false);
+            _sharedMic.Stop(restoreDefaultMic: true);
+            if (_phoneWebcamForm is { IsDisposed: false } wf)
+                wf.SyncExternalMicState();
+            Status($"Stopped background microphone from {chosen.Name}.");
+            RefreshTrayFlyoutIfVisible();
+            PublishDeckBridgeSnapshot();
+            return;
+        }
+
+        if (_sharedMic.IsActive)
+        {
+            SendWatchMicById(_sharedMic.ActiveSourceId, _sharedMic.ActiveViaHost, false);
+        }
+        _sharedMic.SetActiveSource(chosen.Id, chosen.ViaHost, chosen.Name,
+            backgroundMode: true, autoSwitchDefault: true);
+        SendWatchMicForSource(chosen, true);
+        if (_phoneWebcamForm is { IsDisposed: false } openWf)
+            openWf.SyncExternalMicState();
+        string transport = GetTransportLabelForSource(chosen);
+        Status($"Background microphone active: {chosen.Name} → {_sharedMic.DescribeActiveRoute()} ({transport})");
+        RefreshTrayFlyoutIfVisible();
+        PublishDeckBridgeSnapshot();
+    }
 
     private List<MediaSourceOption> GetAvailableMediaSources()
     {
@@ -3995,19 +4149,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             initial,
             initialCameraOn,
             initialMicOn,
-            watchCamera: (src, en, lens, torch, mic) =>
-            {
-                if (src.ViaHost) _host?.SendRemoteCameraWatch(src.Id, en, lens, torch, mic);
-                else _receiver?.SendPhoneCameraWatch(src.Id, en, lens, torch, mic);
-            },
-            watchMic: (src, en) =>
-            {
-                if (src.ViaHost) _host?.SendRemoteMicWatch(src.Id, en);
-                else _receiver?.SendPhoneMicWatch(src.Id, en);
-            },
+            _sharedMic,
+            watchCamera: SendWatchCameraForSource,
+            watchMic: SendWatchMicForSource,
             isFastUdpActive: src => src.ViaHost
                 ? _host?.IsFastMediaUdpActive == true
                 : _receiver?.IsFastMediaUdpActive(src.Id) == true,
+            getTransportLabel: GetTransportLabelForSource,
             onMediaStateChanged: () => PostToUi(() =>
             {
                 RefreshTrayFlyoutIfVisible();
@@ -4041,8 +4189,25 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         }
 
         var chosen = sources[matchIdx];
+        if (wantMic && !wantCamera)
+        {
+            // Headless background tray microphone toggle: never open or activate PhoneWebcamForm.
+            ToggleBackgroundMicForSource(chosen);
+            return;
+        }
+
         if (_phoneWebcamForm is { IsDisposed: false } existing)
         {
+            if (wantCamera && !wantMic &&
+                existing.PeerId == chosen.Id &&
+                existing.SourceViaHost == chosen.ViaHost &&
+                existing.IsCameraStreaming)
+            {
+                existing.Close();
+                RefreshTrayFlyoutIfVisible();
+                PublishDeckBridgeSnapshot();
+                return;
+            }
             existing.UpdateSources(sources);
             existing.ApplyExternalSelection(chosen, wantCamera, wantMic);
             if (!existing.Visible) existing.Show(this);
@@ -4057,7 +4222,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
         ShowPhoneWebcamForm(sources, chosen,
             initialCameraOn: wantCamera && chosen.HasCamera,
-            initialMicOn: wantMic && chosen.HasMicrophone);
+            initialMicOn: (wantMic && chosen.HasMicrophone) || _sharedMic.IsActiveFor(chosen.Id, chosen.ViaHost));
     }
 
     private void OpenPhoneWebcamWindow()

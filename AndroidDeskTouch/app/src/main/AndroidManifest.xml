@@ -37,7 +37,7 @@
         <service android:name=".AutoConnectService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
         <service android:name=".PhoneMediaService" android:exported="false"
-            android:foregroundServiceType="mediaProjection|camera|microphone" />
+            android:foregroundServiceType="mediaProjection|camera|microphone|connectedDevice" />
         <service android:name=".BankingPauseTileService"
             android:exported="true"
             android:icon="@drawable/ic_desktouch"

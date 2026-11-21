@@ -924,6 +924,56 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
     Check(caplessAndroidPeer.HasCamera && !caplessAndroidPeer.HasMicrophone,
         "ReadHello must respect explicit Android false capability flags");
 
+    // Verify v0.3.91: 256-packet DTM1 replay window across 80-packet camera burst + stereo expansion + audioSeq dedup + VB-Cable Speakers match.
+    {
+        byte[] burstKey = System.Security.Cryptography.RandomNumberGenerator.GetBytes(FastUdpCodec.KeySize);
+        using var burstSender = new FastUdpCodec(burstKey, 12, isServer: false);
+        using var burstReceiver = new FastUdpCodec(burstKey, 12, isServer: true);
+        byte[] earlyMicWire = new byte[FastUdpCodec.MaxMediaFrameSize];
+        int earlyMicLen = burstSender.SealMedia(FastUdpMediaKind.MicAudio, 1, 16000, 1, 0, new byte[] { 10, 20, 30, 40 }, earlyMicWire);
+
+        byte[] camWire = new byte[FastUdpCodec.MaxMediaFrameSize];
+        for (int c = 0; c < 80; c++)
+        {
+            int camLen = burstSender.SealMedia(FastUdpMediaKind.CameraFrameChunk, 5, c, 80, 0, new byte[] { 1, 2, 3, 4 }, camWire);
+            Check(burstReceiver.TryOpenMedia(camWire.AsSpan(0, camLen), out _),
+                "Receiver must accept 80-chunk camera burst");
+        }
+        // Delayed mic packet (back = 80) would have been dropped by old 64-bit window, must succeed in 256-bit window!
+        Check(burstReceiver.TryOpenMedia(earlyMicWire.AsSpan(0, earlyMicLen), out var survivedMic) &&
+              survivedMic.Kind == FastUdpMediaKind.MicAudio && survivedMic.FrameOrAudioId == 1,
+              "256-packet DTM1 replay window must preserve delayed mic audio across 80-chunk camera frame bursts");
+        Check(!burstReceiver.TryOpenMedia(earlyMicWire.AsSpan(0, earlyMicLen), out _),
+              "256-packet DTM1 replay window must reject exact replay of delayed mic packet");
+    }
+
+    byte[] stereoExpanded = ManagedAudioOutputEngine.ExpandMonoToStereoPcm16(new byte[] { 0x34, 0x12, 0x78, 0x56 });
+    Check(stereoExpanded.Length == 8 &&
+          stereoExpanded[0] == 0x34 && stereoExpanded[1] == 0x12 &&
+          stereoExpanded[2] == 0x34 && stereoExpanded[3] == 0x12 &&
+          stereoExpanded[4] == 0x78 && stereoExpanded[5] == 0x56 &&
+          stereoExpanded[6] == 0x78 && stereoExpanded[7] == 0x56,
+          "ExpandMonoToStereoPcm16 must duplicate each 16-bit mono sample identically across Left and Right channels");
+
+    var matchedVbSpeakers = WindowsAudioDeviceBridge.MatchVirtualMicPair(
+        [new WaveOutDeviceInfo(0, "Speakers (High Definition Audio)"), new WaveOutDeviceInfo(1, "Speakers (VB-Audio Virtual Cable)")],
+        [new AudioEndpointInfo("{vb-out}", "CABLE Output (VB-Audio Virtual Cable)", false)]);
+    Check(matchedVbSpeakers.Installed && matchedVbSpeakers.RenderWaveOutId == 1 && matchedVbSpeakers.CaptureEndpointId == "{vb-out}",
+        "MatchVirtualMicPair must recognize 'Speakers (VB-Audio Virtual Cable)' WaveOut naming");
+
+    using (var seqEngine = new ManagedAudioOutputEngine())
+    {
+        byte[] loudChunk = new byte[640];
+        for (int i = 0; i < 320; i++) { loudChunk[i * 2] = 0x00; loudChunk[i * 2 + 1] = 0x40; }
+        seqEngine.EnqueuePcm16Mono(loudChunk, 16000, audioSeq: 42);
+        float firstLvl = seqEngine.CurrentLevel;
+        byte[] silentChunk = new byte[640];
+        // Duplicate seq 42 must be dropped before updating level/queue.
+        seqEngine.EnqueuePcm16Mono(silentChunk, 16000, audioSeq: 42);
+        Check(Math.Abs(seqEngine.CurrentLevel - firstLvl) < 0.0001f,
+            "ManagedAudioOutputEngine must deduplicate identical dual-path audioSeq packets");
+    }
+
     Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, WinMM CALLBACK_EVENT smoke test, virtual mic bridge, and capability negotiation.");
 }
 
@@ -3334,6 +3384,35 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               !audioBridgeText.Contains("0x00030000", StringComparison.Ordinal) &&
               !captureSvcText.Contains("0x00030000", StringComparison.Ordinal),
               "WinMM waveOut/waveIn must use CALLBACK_EVENT (0x00050000), never CALLBACK_FUNCTION (0x00030000)");
+
+        // Verify v0.3.91: ExclusiveControl camera priority, Realtime reader, Ignore alpha conversion, stale-share status reset,
+        // headless background tray mic, FIFO nextSlot mic capture, 256-pkt DTM1 replay window, and Range updater retry.
+        int exclIdx = captureSvcText.IndexOf("MediaCaptureSharingMode.ExclusiveControl", StringComparison.Ordinal);
+        int sharedIdx = captureSvcText.IndexOf("MediaCaptureSharingMode.SharedReadOnly", StringComparison.Ordinal);
+        Check(exclIdx > 0 && sharedIdx > 0 &&
+              captureSvcText.Contains("? MediaCaptureSharingMode.SharedReadOnly", StringComparison.Ordinal) &&
+              captureSvcText.Contains(": MediaCaptureSharingMode.ExclusiveControl", StringComparison.Ordinal) &&
+              captureSvcText.Contains("MediaFrameReaderAcquisitionMode.Realtime", StringComparison.Ordinal) &&
+              captureSvcText.Contains("BitmapAlphaMode.Ignore", StringComparison.Ordinal) &&
+              captureSvcText.Contains("CreateCopyFromSurfaceAsync", StringComparison.Ordinal) &&
+              captureSvcText.Contains("MonitorFirstCameraFrameAsync", StringComparison.Ordinal) &&
+              captureSvcText.Contains("int nextSlot = 0;", StringComparison.Ordinal),
+              "WindowsMediaCaptureService must prioritize ExclusiveControl, Realtime reader, BitmapAlphaMode.Ignore, Direct3DSurface fallback, first-frame watchdog, and FIFO nextSlot mic draining");
+
+        Check(formText.Contains("ToggleBackgroundMicForSource", StringComparison.Ordinal) &&
+              formText.Contains("HandleLocalMediaShareState", StringComparison.Ordinal) &&
+              formText.Contains("Stopped sharing this PC's camera/microphone.", StringComparison.Ordinal) &&
+              audioBridgeText.Contains("class RemoteMicBridgeController", StringComparison.Ordinal),
+              "DisplaySettingsForm must support headless background tray mic via RemoteMicBridgeController and reset 'Sharing this PC' status on stop");
+
+        string fastUdpText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "FastUdpChannel.cs"));
+        string updateClientText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "UpdateClient.cs"));
+        Check(fastUdpText.Contains("IsMediaReplayOrTooOldLocked", StringComparison.Ordinal) &&
+              fastUdpText.Contains("peer.Confirmed = true;", StringComparison.Ordinal) &&
+              sessionsText.Contains("SendDualOrBestMicUdp", StringComparison.Ordinal) &&
+              updateClientText.Contains("DownloadArchiveWithResumeAndStallGuardAsync", StringComparison.Ordinal) &&
+              updateClientText.Contains("RangeHeaderValue", StringComparison.Ordinal),
+              "v0.3.91 must include 256-pkt DTM1 window, DTM1 hub confirmation, dual-path mic UDP, and HTTP Range updater retry");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

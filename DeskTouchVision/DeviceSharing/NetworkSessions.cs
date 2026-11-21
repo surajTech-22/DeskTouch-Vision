@@ -20,7 +20,9 @@ internal sealed record ConnectedPeer(string Name, MonitorTopology Monitors,
     int NotificationCount = -1,
     int BatteryPercent = -1,
     bool IsCharging = false,
-    string SignalLabel = "")
+    string SignalLabel = "",
+    bool HasCamera = false,
+    bool HasMicrophone = false)
 {
     internal string FormatScreenInfo()
     {
@@ -44,7 +46,9 @@ internal sealed record PeerHello(string Name, string Layout,
     string? Platform = null, bool? ForwardInputSupported = null,
     string? OsVersion = null, string? AppVersion = null,
     int? DensityDpi = null, int? RefreshHz = null, int? RotationDegrees = null,
-    int? NotificationCount = null);
+    int? NotificationCount = null,
+    bool? HasCamera = null,
+    bool? HasMicrophone = null);
 
 // Issued exclusively by the authenticated hub over an existing TLS session.
 // Id is a connection-scoped route identifier, not a device identity or trust proof.
@@ -57,7 +61,9 @@ internal sealed record EnvironmentMember(int Id, string Name, string Platform,
     double LayoutW = 0,
     double LayoutH = 0,
     int BatteryPercent = -1,
-    bool IsCharging = false);
+    bool IsCharging = false,
+    bool HasCamera = false,
+    bool HasMicrophone = false);
 internal sealed record EnvironmentPosition(string Key,float X,float Y)
 {
     internal static bool Valid(EnvironmentPosition? p) =>
@@ -70,7 +76,9 @@ internal sealed record SubPeerDescriptor(int LocalId, string StableIdentity, str
     string Platform, string Layout, bool SupportsReverseInput, string? AppVersion = null,
     int NotificationCount = -1,
     int BatteryPercent = -1,
-    bool IsCharging = false);
+    bool IsCharging = false,
+    bool HasCamera = false,
+    bool HasMicrophone = false);
 
 internal sealed record SubRouteEnvelope(int LocalId, Packet Payload);
 
@@ -1260,7 +1268,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 s.Peer.Monitors.ToWire(),
                 s.Peer.SupportsReverseInput,
                 s.Peer.AppVersion,
-                s.Peer.NotificationCount));
+                s.Peer.NotificationCount,
+                s.Peer.BatteryPercent,
+                s.Peer.IsCharging,
+                s.Peer.HasCamera,
+                s.Peer.HasMicrophone));
         }
         return result;
     }
@@ -2877,16 +2889,19 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         if (token.IsCancellationRequested) return;
         // Roster is an authenticated statement from this hub. Individual
         // session IDs are ephemeral and may never authorize a new pairing.
+        var (localCam, localMic) = WindowsMediaCaptureService.DetectLocalMediaCapabilities();
         var members = new List<EnvironmentMember> {
             new(0, Environment.MachineName, "Windows",
                 MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
-                true, Fingerprint, Volatile.Read(ref _localNotificationCount))
+                true, Fingerprint, Volatile.Read(ref _localNotificationCount),
+                HasCamera: localCam, HasMicrophone: localMic)
         };
         foreach (var peer in _sessions.Values.OrderBy(p => p.Id))
             members.Add(new(peer.Id, peer.Peer.Name, peer.Peer.Platform,
                 peer.Peer.Monitors.ToWire(), peer.Peer.SupportsReverseInput,
                 LayoutIdentity(peer.Peer), peer.Peer.NotificationCount,
-                BatteryPercent: peer.Peer.BatteryPercent, IsCharging: peer.Peer.IsCharging));
+                BatteryPercent: peer.Peer.BatteryPercent, IsCharging: peer.Peer.IsCharging,
+                HasCamera: peer.Peer.HasCamera, HasMicrophone: peer.Peer.HasMicrophone));
         var knownIdentities = new HashSet<string>(
             members.Select(m => m.StableIdentity).OfType<string>().Where(s => !string.IsNullOrWhiteSpace(s)),
             StringComparer.OrdinalIgnoreCase);
@@ -2932,7 +2947,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     new(0, Environment.MachineName, "Windows",
                         MonitorTopology.Capture().WithPrimaryAppVersion(MonitorTopology.CurrentAppVersion()).ToWire(),
-                        true, Fingerprint, Volatile.Read(ref _localNotificationCount))
+                        true, Fingerprint, Volatile.Read(ref _localNotificationCount),
+                        HasCamera: localCam, HasMicrophone: localMic)
                 };
                 var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Fingerprint };
                 foreach (var p in _sessions.Values.OrderBy(s => s.Id))
@@ -2941,14 +2957,15 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     if (seen.Add(id))
                         combined.Add(new(p.Id, p.Peer.Name, p.Peer.Platform,
                             p.Peer.Monitors.ToWire(), p.Peer.SupportsReverseInput, id, p.Peer.NotificationCount,
-                            BatteryPercent: p.Peer.BatteryPercent, IsCharging: p.Peer.IsCharging));
+                            BatteryPercent: p.Peer.BatteryPercent, IsCharging: p.Peer.IsCharging,
+                            HasCamera: p.Peer.HasCamera, HasMicrophone: p.Peer.HasMicrophone));
                 }
                 int extraId = 9900;
                 foreach (var up in overlay.Members)
                 {
                     if (string.IsNullOrWhiteSpace(up.StableIdentity) || !seen.Add(up.StableIdentity))
                         continue;
-                    combined.Add(up with { Id = ++extraId, SupportsReverseInput = false });
+                    combined.Add(up with { Id = ++extraId, SupportsReverseInput = false, HasCamera = false, HasMicrophone = false });
                 }
                 combined = ApplyAndOrderSpatialMembers(combined);
                 string candidate = SerializeCompactRoster(combined);
@@ -2988,6 +3005,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 }
                 if (m.BatteryPercent >= 0) w.WriteNumber("BatteryPercent", m.BatteryPercent);
                 if (m.IsCharging) w.WriteBoolean("IsCharging", true);
+                if (m.HasCamera) w.WriteBoolean("HasCamera", true);
+                if (m.HasMicrophone) w.WriteBoolean("HasMicrophone", true);
                 w.WriteEndObject();
             }
             w.WriteEndArray();
@@ -3467,7 +3486,9 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             hello.DensityDpi ?? primaryMon.DensityDpi,
             hello.RefreshHz ?? primaryMon.RefreshHz,
             hello.RotationDegrees ?? primaryMon.RotationDegrees,
-            hello.NotificationCount is >= 0 and <= 9999 ? hello.NotificationCount.Value : -1);
+            hello.NotificationCount is >= 0 and <= 9999 ? hello.NotificationCount.Value : -1,
+            HasCamera: hello.HasCamera ?? (platform == "Android"),
+            HasMicrophone: hello.HasMicrophone ?? (platform == "Android"));
     }
 
     internal static (string Band, int SpeedMbps) DetectInterfaceForLocalAddress(IPAddress? localAddress)
@@ -6717,9 +6738,12 @@ internal sealed class HostSession : IInputSession, IDisposable
             using var identity = PersistentReceiverIdentity.LoadOrCreate();
             string sourceId = Convert.ToHexString(
                 SHA256.HashData(identity.RawData));
+            var (localCam, localMic) = WindowsMediaCaptureService.DetectLocalMediaCapabilities();
             var hello = JsonSerializer.Serialize(
                 new PeerHello(Environment.MachineName, mine.ToWire(), true, sourceId, "Windows",
-                    AppVersion: MonitorTopology.CurrentAppVersion()));
+                    AppVersion: MonitorTopology.CurrentAppVersion(),
+                    HasCamera: localCam,
+                    HasMicrophone: localMic));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
             var (outBand, outSpeed) = ReceiverServer.DetectInterfaceForLocalAddress(

@@ -1812,6 +1812,10 @@ public final class ProtocolSourceTest {
         assertTrue(mediaServiceSource.contains("SecurityException"));
         assertTrue(sessionSource.contains("sendMedia("));
         assertTrue(sessionSource.contains("\"phone-mic-watch\""));
+        assertTrue(sessionSource.contains("\"HasCamera\""));
+        assertTrue(sessionSource.contains("FEATURE_CAMERA_ANY"));
+        assertTrue(sessionSource.contains("\"HasMicrophone\""));
+        assertTrue(sessionSource.contains("FEATURE_MICROPHONE"));
         assertTrue(mainSource.contains("Share Mic Only"));
         assertTrue(mainSource.contains("onMicShareRequested()"));
     }

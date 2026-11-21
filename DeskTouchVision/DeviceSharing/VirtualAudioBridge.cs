@@ -518,7 +518,7 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
 {
     private const uint WAVE_MAPPER = 0xFFFFFFFF;
     private const int WAVE_FORMAT_PCM = 1;
-    private const uint CALLBACK_EVENT = 0x00030000;
+    internal const uint CallbackEventFlag = 0x00050000;
     private const uint WHDR_DONE = 0x00000001;
     private const uint WHDR_PREPARED = 0x00000002;
     private const int SlotCount = 16;
@@ -539,12 +539,13 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
     private uint _targetDeviceId = WAVE_MAPPER;
     private int _outputSampleRate = 48000;
     private volatile bool _deviceDirty = true;
+    private volatile bool _hasAudio;
     private volatile bool _disposed;
     private float _gain = 1.0f;
     private float _currentLevel;
     private string _lastError = "";
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     private struct WAVEFORMATEX
     {
         public ushort wFormatTag;
@@ -617,7 +618,8 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
         Volatile.Write(ref _targetDeviceId, deviceId);
         _deviceDirty = true;
         ClearQueue();
-        _signal.Set();
+        if (_hasAudio)
+            _signal.Set();
     }
 
     internal void ClearQueue()
@@ -629,6 +631,7 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
     internal void EnqueuePcm16Mono(byte[] pcm, int sourceSampleRate = 16000)
     {
         if (_disposed || pcm == null || pcm.Length < 2) return;
+        _hasAudio = true;
         int outRate = Volatile.Read(ref _outputSampleRate);
         byte[] processed = ResamplePcm16Mono(pcm, sourceSampleRate, outRate, Gain, out float rmsPeak);
 
@@ -708,6 +711,11 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
         {
             while (!_disposed)
             {
+                if (!_hasAudio)
+                {
+                    _signal.WaitOne(100);
+                    continue;
+                }
                 if (_deviceDirty || _hWaveOut == IntPtr.Zero)
                 {
                     lock (_lifecycleGate)
@@ -757,7 +765,7 @@ internal sealed class ManagedAudioOutputEngine : IDisposable
                 nAvgBytesPerSec = (uint)(candidateRate * 2),
                 cbSize = 0
             };
-            int res = waveOutOpen(out _hWaveOut, deviceId, ref fmt, _signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CALLBACK_EVENT);
+            int res = waveOutOpen(out _hWaveOut, deviceId, ref fmt, _signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CallbackEventFlag);
             if (res == 0 && _hWaveOut != IntPtr.Zero)
             {
                 Volatile.Write(ref _outputSampleRate, candidateRate);

@@ -14,28 +14,39 @@ internal sealed class TrayDeviceFlyout : Form
     {
         private BridgeDeviceItemDto _device;
         private bool _hovered;
+        private Point _hoverPoint;
         private readonly Action<BridgeDeviceItemDto> _onSelect;
         private readonly Action<BridgeDeviceItemDto> _onTogglePay;
         private readonly Action<BridgeDeviceItemDto, Point>? _onOpenNotifs;
+        private readonly Action<BridgeDeviceItemDto>? _onToggleCamera;
+        private readonly Action<BridgeDeviceItemDto>? _onToggleMic;
         private Rectangle _payRect;
         private Rectangle _badgeRect;
+        private Rectangle _camRect;
+        private Rectangle _micRect;
 
         internal DeviceCardControl(
             BridgeDeviceItemDto device,
+            int cardWidth,
+            int cardHeight,
             Action<BridgeDeviceItemDto> onSelect,
             Action<BridgeDeviceItemDto> onTogglePay,
-            Action<BridgeDeviceItemDto, Point>? onOpenNotifs = null)
+            Action<BridgeDeviceItemDto, Point>? onOpenNotifs = null,
+            Action<BridgeDeviceItemDto>? onToggleCamera = null,
+            Action<BridgeDeviceItemDto>? onToggleMic = null)
         {
             _device = device;
             _onSelect = onSelect;
             _onTogglePay = onTogglePay;
             _onOpenNotifs = onOpenNotifs;
+            _onToggleCamera = onToggleCamera;
+            _onToggleMic = onToggleMic;
             SetStyle(ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.UserPaint |
                      ControlStyles.ResizeRedraw, true);
             Cursor = Cursors.Hand;
-            Size = new Size(134, 96);
+            Size = new Size(cardWidth, cardHeight);
             Margin = new Padding(5, 2, 5, 6);
         }
 
@@ -50,7 +61,21 @@ internal sealed class TrayDeviceFlyout : Form
         {
             base.OnMouseEnter(e);
             _hovered = true;
+            _hoverPoint = e is MouseEventArgs me ? me.Location : PointToClient(Cursor.Position);
             Invalidate();
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!_hovered) _hovered = true;
+            bool wasInPill = _camRect.Contains(_hoverPoint) || _micRect.Contains(_hoverPoint) ||
+                             _payRect.Contains(_hoverPoint) || _badgeRect.Contains(_hoverPoint);
+            _hoverPoint = e.Location;
+            bool nowInPill = _camRect.Contains(_hoverPoint) || _micRect.Contains(_hoverPoint) ||
+                             _payRect.Contains(_hoverPoint) || _badgeRect.Contains(_hoverPoint);
+            if (wasInPill != nowInPill || nowInPill)
+                Invalidate();
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -72,6 +97,16 @@ internal sealed class TrayDeviceFlyout : Form
             if (!_payRect.IsEmpty && _payRect.Contains(e.Location))
             {
                 _onTogglePay(_device);
+                return;
+            }
+            if (!_camRect.IsEmpty && _camRect.Contains(e.Location) && _onToggleCamera != null)
+            {
+                _onToggleCamera(_device);
+                return;
+            }
+            if (!_micRect.IsEmpty && _micRect.Contains(e.Location) && _onToggleMic != null)
+            {
+                _onToggleMic(_device);
                 return;
             }
             _onSelect(_device);
@@ -144,15 +179,21 @@ internal sealed class TrayDeviceFlyout : Form
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
             _payRect = Rectangle.Empty;
+            _camRect = Rectangle.Empty;
+            _micRect = Rectangle.Empty;
+
+            bool showMediaStrip = !_device.IsLocal && (_device.HasCamera || _device.HasMicrophone);
+            int statusY = showMediaStrip ? (cardRect.Bottom - 47) : (cardRect.Bottom - 23);
+
             using var statusFont = new Font("Segoe UI", 7.8f);
             if (!_device.IsLocal && _device.Platform == "Android" && _device.SupportsInput)
             {
-                var statusRect = new Rectangle(cardRect.Left + 8, cardRect.Bottom - 23, cardRect.Width - 68, 17);
+                var statusRect = new Rectangle(cardRect.Left + 8, statusY, cardRect.Width - 68, 17);
                 TextRenderer.DrawText(g, _device.StatusText, statusFont, statusRect,
                     active ? Color.FromArgb(186, 230, 253) : Color.FromArgb(148, 163, 184),
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
-                _payRect = new Rectangle(cardRect.Right - 58, cardRect.Bottom - 24, 51, 18);
+                _payRect = new Rectangle(cardRect.Right - 58, statusY - 1, 51, 18);
                 using var payPath = RoundedRect(_payRect, 5);
                 using var payBrush = new SolidBrush(Color.FromArgb(66, 32, 48));
                 using var payPen = new Pen(Color.FromArgb(244, 114, 182), 1.0f);
@@ -164,10 +205,60 @@ internal sealed class TrayDeviceFlyout : Form
             }
             else
             {
-                var statusRect = new Rectangle(cardRect.Left + 8, cardRect.Bottom - 23, cardRect.Width - 16, 17);
+                var statusRect = new Rectangle(cardRect.Left + 8, statusY, cardRect.Width - 16, 17);
                 TextRenderer.DrawText(g, _device.StatusText, statusFont, statusRect,
                     active ? Color.FromArgb(186, 230, 253) : Color.FromArgb(148, 163, 184),
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            }
+
+            if (showMediaStrip)
+            {
+                int nextX = cardRect.Left + 8;
+                int pillY = cardRect.Bottom - 25;
+                using var mediaFont = new Font("Segoe UI Semibold", 7.2f, FontStyle.Bold);
+
+                if (_device.HasCamera)
+                {
+                    _camRect = new Rectangle(nextX, pillY, 50, 19);
+                    bool camOn = _device.IsCameraActive;
+                    bool camHover = _hovered && _camRect.Contains(_hoverPoint);
+                    Color camFill = camOn
+                        ? Color.FromArgb(37, 99, 235)
+                        : (camHover ? Color.FromArgb(45, 58, 82) : Color.FromArgb(30, 41, 59));
+                    Color camBorder = camOn || camHover
+                        ? Color.FromArgb(96, 165, 250)
+                        : Color.FromArgb(71, 85, 105);
+                    using var camPath = RoundedRect(_camRect, 5);
+                    using var camBrush = new SolidBrush(camFill);
+                    using var camPen = new Pen(camBorder, 1.0f);
+                    g.FillPath(camBrush, camPath);
+                    g.DrawPath(camPen, camPath);
+                    TextRenderer.DrawText(g, "Cam", mediaFont, _camRect,
+                        camOn ? Color.White : Color.FromArgb(226, 232, 240),
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    nextX += 56;
+                }
+
+                if (_device.HasMicrophone)
+                {
+                    _micRect = new Rectangle(nextX, pillY, 50, 19);
+                    bool micOn = _device.IsMicrophoneActive;
+                    bool micHover = _hovered && _micRect.Contains(_hoverPoint);
+                    Color micFill = micOn
+                        ? Color.FromArgb(5, 150, 105)
+                        : (micHover ? Color.FromArgb(36, 62, 58) : Color.FromArgb(30, 41, 59));
+                    Color micBorder = micOn || micHover
+                        ? Color.FromArgb(52, 211, 153)
+                        : Color.FromArgb(71, 85, 105);
+                    using var micPath = RoundedRect(_micRect, 5);
+                    using var micBrush = new SolidBrush(micFill);
+                    using var micPen = new Pen(micBorder, 1.0f);
+                    g.FillPath(micBrush, micPath);
+                    g.DrawPath(micPen, micPath);
+                    TextRenderer.DrawText(g, "Mic", mediaFont, _micRect,
+                        micOn ? Color.White : Color.FromArgb(226, 232, 240),
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                }
             }
         }
     }
@@ -224,6 +315,8 @@ internal sealed class TrayDeviceFlyout : Form
     private readonly Action<int> _onTogglePay;
     private readonly Action _onOpenMainWindow;
     private readonly Action<int, string, Point>? _onOpenNotifications;
+    private readonly Action<BridgeDeviceItemDto>? _onToggleCamera;
+    private readonly Action<BridgeDeviceItemDto>? _onToggleMic;
     private BridgeDeviceSnapshotDto? _snapshot;
 
     internal TrayDeviceFlyout(
@@ -231,13 +324,17 @@ internal sealed class TrayDeviceFlyout : Form
         Action onReturnLocal,
         Action<int> onTogglePay,
         Action onOpenMainWindow,
-        Action<int, string, Point>? onOpenNotifications = null)
+        Action<int, string, Point>? onOpenNotifications = null,
+        Action<BridgeDeviceItemDto>? onToggleCamera = null,
+        Action<BridgeDeviceItemDto>? onToggleMic = null)
     {
         _onSwitchTarget = onSwitchTarget;
         _onReturnLocal = onReturnLocal;
         _onTogglePay = onTogglePay;
         _onOpenMainWindow = onOpenMainWindow;
         _onOpenNotifications = onOpenNotifications;
+        _onToggleCamera = onToggleCamera;
+        _onToggleMic = onToggleMic;
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -312,10 +409,13 @@ internal sealed class TrayDeviceFlyout : Form
             : $"{snapshot.ConnectedCount} connected";
         _footerLabel.Text = snapshot.IsRemoteActive
             ? $"Controlling {snapshot.ActiveDeviceName} • Click This PC to return"
-            : "Click any connected device to switch mouse & keyboard";
+            : "Click a card to switch input • Use Cam / Mic buttons below supported devices";
 
-        RebuildCards(snapshot);
-        ResizeToFitCards(snapshot.Devices.Count);
+        bool hasMediaButtons = snapshot.Devices.Any(d => !d.IsLocal && (d.HasCamera || d.HasMicrophone));
+        int cardW = hasMediaButtons ? 148 : 134;
+        int cardH = hasMediaButtons ? 118 : 96;
+        RebuildCards(snapshot, cardW, cardH);
+        ResizeToFitCards(snapshot.Devices.Count, cardW, cardH);
     }
 
     internal void ToggleNearCursor(BridgeDeviceSnapshotDto snapshot)
@@ -331,7 +431,7 @@ internal sealed class TrayDeviceFlyout : Form
         Activate();
     }
 
-    private void RebuildCards(BridgeDeviceSnapshotDto snapshot)
+    private void RebuildCards(BridgeDeviceSnapshotDto snapshot, int cardW, int cardH)
     {
         _cardsPanel.SuspendLayout();
         try
@@ -344,6 +444,8 @@ internal sealed class TrayDeviceFlyout : Form
             {
                 var card = new DeviceCardControl(
                     device,
+                    cardW,
+                    cardH,
                     d =>
                     {
                         Hide();
@@ -360,7 +462,27 @@ internal sealed class TrayDeviceFlyout : Form
                     {
                         Hide();
                         _onOpenNotifications?.Invoke(d.Id, d.Name, pt);
-                    });
+                    },
+                    _onToggleCamera != null
+                        ? d =>
+                        {
+                            Hide();
+                            if (!IsDisposed && IsHandleCreated)
+                                BeginInvoke(() => _onToggleCamera(d));
+                            else
+                                _onToggleCamera(d);
+                        }
+                        : null,
+                    _onToggleMic != null
+                        ? d =>
+                        {
+                            Hide();
+                            if (!IsDisposed && IsHandleCreated)
+                                BeginInvoke(() => _onToggleMic(d));
+                            else
+                                _onToggleMic(d);
+                        }
+                        : null);
                 _cardsPanel.Controls.Add(card);
             }
         }
@@ -370,14 +492,14 @@ internal sealed class TrayDeviceFlyout : Form
         }
     }
 
-    private void ResizeToFitCards(int count)
+    private void ResizeToFitCards(int count, int cardW, int cardH)
     {
         int visible = Math.Clamp(count, 1, 8);
         int cols = Math.Min(3, visible);
         int rows = (int)Math.Ceiling(visible / 3.0);
-        int width = Math.Max(316, cols * 144 + 28);
-        int height = 44 + 26 + rows * 104 + 18;
-        Size = new Size(width, Math.Min(460, height));
+        int width = Math.Max(316, cols * (cardW + 10) + 28);
+        int height = 44 + 26 + rows * (cardH + 8) + 18;
+        Size = new Size(width, Math.Min(500, height));
     }
 
     private void PositionAboveTray(Point anchorScreenPoint)

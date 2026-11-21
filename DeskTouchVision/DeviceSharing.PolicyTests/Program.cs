@@ -892,7 +892,39 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
     Check(DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Camera & Mic (My Laptop)") &&
         DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Phone Camera & Mic (Pixel)"),
         "Secondary media window title check must cover unified multi-system Camera & Mic title");
-    Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, pinned resampler, virtual mic bridge, and window title invariants.");
+
+    // Verify v0.3.90: WinMM CALLBACK_EVENT (0x00050000) CFG safety, live audio engine smoke test, & capability detection.
+    Check(ManagedAudioOutputEngine.CallbackEventFlag == 0x00050000u &&
+        WindowsMediaCaptureService.CallbackEventFlag == 0x00050000u,
+        "WinMM CallbackEventFlag must be 0x00050000 (CALLBACK_EVENT), never 0x00030000 (CALLBACK_FUNCTION)");
+    using (var liveOut = new ManagedAudioOutputEngine())
+    {
+        byte[] silent20ms = new byte[640];
+        liveOut.EnqueuePcm16Mono(silent20ms, 16000);
+        Thread.Sleep(50);
+    }
+    _ = WindowsMediaCaptureService.DetectLocalMediaCapabilities(forceRefresh: true);
+    _ = WindowsAudioDeviceBridge.DetectVirtualMicPair();
+
+    string sampleLayout = "[{\"Name\":\"Display 1\",\"Width\":1920,\"Height\":1080,\"Primary\":true}]";
+    var explicitWinPeer = ReceiverServer.ReadHello(System.Text.Json.JsonSerializer.Serialize(
+        new PeerHello("Workstation", sampleLayout, true, null, "Windows", HasCamera: false, HasMicrophone: true)));
+    Check(!explicitWinPeer.HasCamera && explicitWinPeer.HasMicrophone,
+        "ReadHello must honor explicit Windows HasCamera/HasMicrophone capabilities");
+    var legacyWinPeer = ReceiverServer.ReadHello(System.Text.Json.JsonSerializer.Serialize(
+        new PeerHello("LegacyPC", sampleLayout, true, null, "Windows")));
+    Check(!legacyWinPeer.HasCamera && !legacyWinPeer.HasMicrophone,
+        "Legacy Windows peer without capability fields must not fabricate camera/microphone buttons");
+    var legacyAndroidPeer = ReceiverServer.ReadHello(System.Text.Json.JsonSerializer.Serialize(
+        new PeerHello("LegacyPhone", sampleLayout, true, null, "Android")));
+    Check(legacyAndroidPeer.HasCamera && legacyAndroidPeer.HasMicrophone,
+        "Legacy Android peer must retain default camera/microphone compatibility");
+    var caplessAndroidPeer = ReceiverServer.ReadHello(System.Text.Json.JsonSerializer.Serialize(
+        new PeerHello("TabletNoMic", sampleLayout, true, null, "Android", HasCamera: true, HasMicrophone: false)));
+    Check(caplessAndroidPeer.HasCamera && !caplessAndroidPeer.HasMicrophone,
+        "ReadHello must respect explicit Android false capability flags");
+
+    Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, WinMM CALLBACK_EVENT smoke test, virtual mic bridge, and capability negotiation.");
 }
 
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
@@ -3286,6 +3318,22 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               sessionsText.Contains("HostScreenPreviewLoopAsync", StringComparison.Ordinal) &&
               sessionsText.Contains("session.Peer.Platform is (\"Android\" or \"Windows\")", StringComparison.Ordinal),
               "NetworkSessions must route multi-system camera, mic, and screen preview over Fast UDP DTM1 with TCP fallback");
+
+        // Verify v0.3.90: Tray flyout capability gating and WinMM CALLBACK_EVENT (0x00050000) CFG protection.
+        Check(flyoutText.Contains("if (_device.HasCamera)", StringComparison.Ordinal) &&
+              flyoutText.Contains("if (_device.HasMicrophone)", StringComparison.Ordinal) &&
+              flyoutText.Contains("!_device.IsLocal && (_device.HasCamera || _device.HasMicrophone)", StringComparison.Ordinal) &&
+              flyoutText.Contains("BeginInvoke(() => _onToggleCamera(d))", StringComparison.Ordinal) &&
+              flyoutText.Contains("BeginInvoke(() => _onToggleMic(d))", StringComparison.Ordinal),
+              "TrayDeviceFlyout must render Cam/Mic buttons exclusively for remote devices reporting hardware capabilities");
+
+        string audioBridgeText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "VirtualAudioBridge.cs"));
+        string captureSvcText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "WindowsMediaCaptureService.cs"));
+        Check(audioBridgeText.Contains("0x00050000", StringComparison.Ordinal) &&
+              captureSvcText.Contains("0x00050000", StringComparison.Ordinal) &&
+              !audioBridgeText.Contains("0x00030000", StringComparison.Ordinal) &&
+              !captureSvcText.Contains("0x00030000", StringComparison.Ordinal),
+              "WinMM waveOut/waveIn must use CALLBACK_EVENT (0x00050000), never CALLBACK_FUNCTION (0x00030000)");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

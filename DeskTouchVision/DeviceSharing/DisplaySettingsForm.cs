@@ -1778,12 +1778,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             });
             _receiver.PhoneCameraFrameReceived += (peerId, jpg) => PostToUi(() =>
             {
-                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId)
+                if (_phoneWebcamForm is { IsDisposed: false } f && !f.SourceViaHost && f.PeerId == peerId)
                     f.UpdateCameraFrame(jpg);
             });
             _receiver.PhoneCameraStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
             {
-                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId && !string.IsNullOrWhiteSpace(msg))
+                if (_phoneWebcamForm is { IsDisposed: false } f && !f.SourceViaHost && f.PeerId == peerId && !string.IsNullOrWhiteSpace(msg))
                     f.UpdateStatus(msg);
             });
             _receiver.PhoneMicAudioReceived += (peerId, pcm, rate) =>
@@ -1791,14 +1791,14 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 try
                 {
                     var w = _phoneWebcamForm;
-                    if (w != null && !w.IsDisposed && w.PeerId == peerId)
+                    if (w != null && !w.IsDisposed && !w.SourceViaHost && w.PeerId == peerId)
                         w.HandleMicAudio(pcm, rate);
                 }
                 catch { }
             };
             _receiver.PhoneMicStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
             {
-                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId)
+                if (_phoneWebcamForm is { IsDisposed: false } f && !f.SourceViaHost && f.PeerId == peerId)
                     f.UpdateMicStatus(stateCode, msg);
             });
             _receiver.LocalMediaShareStateChanged += (_, _, summary) => PostToUi(() =>
@@ -3298,7 +3298,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ReturnControlLocalFromExternal,
             PausePhoneForPaymentsFromBridge,
             ShowFromTray,
-            (id, name, pt) => OpenNotificationsFlyoutForTarget(id, name, pt));
+            (id, name, pt) => OpenNotificationsFlyoutForTarget(id, name, pt),
+            d => OpenMediaForTrayDevice(d, wantCamera: true, wantMic: false),
+            d => OpenMediaForTrayDevice(d, wantCamera: false, wantMic: true));
         _trayFlyout.ToggleNearCursor(BuildBridgeSnapshot());
     }
 
@@ -3479,8 +3481,10 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 StatusText: isRemoteActive ? "Click to return" : "Controlling")
         };
 
+        var wf = _phoneWebcamForm;
         var seenIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        void AddRemote(int id, string name, string platform, bool supportsInput, int notifCount, string identity, int battPct = -1, bool chg = false, string sig = "")
+        void AddRemote(int id, string name, string platform, bool supportsInput, int notifCount, string identity,
+            int battPct = -1, bool chg = false, string sig = "", bool hasCam = false, bool hasMic = false)
         {
             if (!string.IsNullOrWhiteSpace(identity) && !seenIdentities.Add(identity))
                 return;
@@ -3489,6 +3493,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             string status = !supportsInput
                 ? (platform == "Android" ? "Paused" : "Unavailable")
                 : (controlling ? "Controlling" : (selected ? "Selected" : "Connected"));
+            bool activeMediaMatch = wf is { IsDisposed: false } &&
+                ((!wf.SourceViaHost && id > 0 && wf.PeerId == id) ||
+                 (wf.SourceViaHost && id <= 0 && wf.PeerId == -id));
             items.Add(new BridgeDeviceItemDto(
                 id, name, platform, IsLocal: false,
                 IsSelected: selected, IsControlling: controlling,
@@ -3497,7 +3504,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 StatusText: status,
                 BatteryPercent: battPct,
                 IsCharging: chg,
-                SignalLabel: sig));
+                SignalLabel: sig,
+                HasCamera: hasCam,
+                HasMicrophone: hasMic,
+                IsCameraActive: hasCam && activeMediaMatch && wf!.IsCameraStreaming,
+                IsMicrophoneActive: hasMic && activeMediaMatch && wf!.IsMicStreaming));
         }
 
         if (_host != null)
@@ -3513,16 +3524,20 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                     : member.NotificationCount;
                 int batt = localDirect is { } dB && dB.Peer.BatteryPercent >= 0 ? dB.Peer.BatteryPercent : member.BatteryPercent;
                 bool chg = localDirect is { } dC ? dC.Peer.IsCharging : member.IsCharging;
+                bool hasCam = localDirect is { } dCam ? dCam.Peer.HasCamera : member.HasCamera;
+                bool hasMic = localDirect is { } dMic ? dMic.Peer.HasMicrophone : member.HasMicrophone;
                 string identity = !string.IsNullOrWhiteSpace(member.StableIdentity)
                     ? member.StableIdentity
                     : member.Platform + "|" + member.Name;
-                AddRemote(targetId, member.Name, member.Platform, supportsInput, notif, identity, batt, chg);
+                AddRemote(targetId, member.Name, member.Platform, supportsInput, notif, identity, batt, chg,
+                    hasCam: hasCam, hasMic: hasMic);
             }
             foreach (var (id, peer) in GetDistinctLocalReceiverPeersWhenHosted())
             {
                 AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
                     peer.NotificationCount, ReceiverServer.LayoutIdentity(peer),
-                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel);
+                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel,
+                    peer.HasCamera, peer.HasMicrophone);
             }
         }
         else if (_receiver != null)
@@ -3531,7 +3546,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             {
                 AddRemote(id, peer.Name, peer.Platform, peer.SupportsReverseInput,
                     peer.NotificationCount, ReceiverServer.LayoutIdentity(peer),
-                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel);
+                    peer.BatteryPercent, peer.IsCharging, peer.SignalLabel,
+                    peer.HasCamera, peer.HasMicrophone);
             }
             foreach (var (vid, peer, _) in _receiver.BridgedPeers)
             {
@@ -3873,13 +3889,13 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnHostRemoteCameraFrame(int sourceId, byte[] jpg) => PostToUi(() =>
     {
-        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId)
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.SourceViaHost && f.PeerId == sourceId)
             f.UpdateCameraFrame(jpg);
     });
 
     private void OnHostRemoteCameraStatus(int sourceId, int stateCode, string? msg) => PostToUi(() =>
     {
-        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId && !string.IsNullOrWhiteSpace(msg))
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.SourceViaHost && f.PeerId == sourceId && !string.IsNullOrWhiteSpace(msg))
             f.UpdateStatus(msg);
     });
 
@@ -3888,7 +3904,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         try
         {
             var w = _phoneWebcamForm;
-            if (w != null && !w.IsDisposed && w.PeerId == sourceId)
+            if (w != null && !w.IsDisposed && w.SourceViaHost && w.PeerId == sourceId)
                 w.HandleMicAudio(pcm, rate);
         }
         catch { }
@@ -3896,7 +3912,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnHostRemoteMicStatus(int sourceId, int stateCode, string? msg) => PostToUi(() =>
     {
-        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId)
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.SourceViaHost && f.PeerId == sourceId)
             f.UpdateMicStatus(stateCode, msg);
     });
 
@@ -3909,31 +3925,139 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private List<MediaSourceOption> GetAvailableMediaSources()
     {
         var list = new List<MediaSourceOption>();
-        if (_host != null)
-        {
-            var members = _host.EnvironmentMembers;
-            string hubName = members.FirstOrDefault(m => m.Id == 0)?.Name
-                ?? (!string.IsNullOrWhiteSpace(_remoteAddress) ? _remoteAddress : "Host PC");
-            list.Add(new MediaSourceOption(0, hubName, "Windows", SupportsTorch: false));
-            foreach (var m in members)
-            {
-                if (m.Id == 0 || m.Id == _host.OwnEnvironmentMemberId) continue;
-                bool isAndroid = string.Equals(m.Platform, "Android", StringComparison.OrdinalIgnoreCase);
-                list.Add(new MediaSourceOption(m.Id, m.Name, m.Platform, SupportsTorch: isAndroid));
-            }
-            return list;
-        }
+        var seenIdentities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (_receiver != null)
         {
-            foreach (var p in _receiver.ConnectedPeers)
+            foreach (var p in _receiver.ConnectedPeers.OrderBy(p => p.Id))
             {
                 bool isAndroid = string.Equals(p.Peer.Platform, "Android", StringComparison.OrdinalIgnoreCase);
                 bool isWindows = string.Equals(p.Peer.Platform, "Windows", StringComparison.OrdinalIgnoreCase);
                 if (!isAndroid && !isWindows) continue;
-                list.Add(new MediaSourceOption(p.Id, p.Peer.Name, p.Peer.Platform, SupportsTorch: isAndroid));
+                string identity = ReceiverServer.LayoutIdentity(p.Peer);
+                if (!string.IsNullOrWhiteSpace(identity))
+                    seenIdentities.Add(identity);
+                if (!p.Peer.HasCamera && !p.Peer.HasMicrophone) continue;
+                list.Add(new MediaSourceOption(
+                    p.Id, p.Peer.Name, p.Peer.Platform,
+                    SupportsTorch: isAndroid,
+                    ViaHost: false,
+                    HasCamera: p.Peer.HasCamera,
+                    HasMicrophone: p.Peer.HasMicrophone));
+            }
+        }
+        if (_host != null)
+        {
+            var members = _host.EnvironmentMembers;
+            var hubMember = members.FirstOrDefault(m => m.Id == 0);
+            if (hubMember != null &&
+                (string.IsNullOrWhiteSpace(hubMember.StableIdentity) || seenIdentities.Add(hubMember.StableIdentity)) &&
+                (hubMember.HasCamera || hubMember.HasMicrophone))
+            {
+                string hubName = !string.IsNullOrWhiteSpace(hubMember.Name)
+                    ? hubMember.Name
+                    : (!string.IsNullOrWhiteSpace(_remoteAddress) ? _remoteAddress : "Host PC");
+                list.Add(new MediaSourceOption(
+                    0, hubName, "Windows",
+                    SupportsTorch: false,
+                    ViaHost: true,
+                    HasCamera: hubMember.HasCamera,
+                    HasMicrophone: hubMember.HasMicrophone));
+            }
+            foreach (var m in members)
+            {
+                if (m.Id == 0 || m.Id == _host.OwnEnvironmentMemberId) continue;
+                if (!string.IsNullOrWhiteSpace(m.StableIdentity) && !seenIdentities.Add(m.StableIdentity))
+                    continue;
+                bool isAndroid = string.Equals(m.Platform, "Android", StringComparison.OrdinalIgnoreCase);
+                bool isWindows = string.Equals(m.Platform, "Windows", StringComparison.OrdinalIgnoreCase);
+                if (!isAndroid && !isWindows) continue;
+                if (!m.HasCamera && !m.HasMicrophone) continue;
+                list.Add(new MediaSourceOption(
+                    m.Id, m.Name, m.Platform,
+                    SupportsTorch: isAndroid,
+                    ViaHost: true,
+                    HasCamera: m.HasCamera,
+                    HasMicrophone: m.HasMicrophone));
             }
         }
         return list;
+    }
+
+    private void ShowPhoneWebcamForm(
+        List<MediaSourceOption> sources,
+        MediaSourceOption initial,
+        bool initialCameraOn,
+        bool initialMicOn)
+    {
+        _phoneWebcamForm?.Close();
+        _phoneWebcamForm = new PhoneWebcamForm(
+            sources,
+            initial,
+            initialCameraOn,
+            initialMicOn,
+            watchCamera: (src, en, lens, torch, mic) =>
+            {
+                if (src.ViaHost) _host?.SendRemoteCameraWatch(src.Id, en, lens, torch, mic);
+                else _receiver?.SendPhoneCameraWatch(src.Id, en, lens, torch, mic);
+            },
+            watchMic: (src, en) =>
+            {
+                if (src.ViaHost) _host?.SendRemoteMicWatch(src.Id, en);
+                else _receiver?.SendPhoneMicWatch(src.Id, en);
+            },
+            isFastUdpActive: src => src.ViaHost
+                ? _host?.IsFastMediaUdpActive == true
+                : _receiver?.IsFastMediaUdpActive(src.Id) == true,
+            onMediaStateChanged: () => PostToUi(() =>
+            {
+                RefreshTrayFlyoutIfVisible();
+                PublishDeckBridgeSnapshot();
+            }));
+        _phoneWebcamForm.Show(this);
+        Win.ForceWindowToFront(_phoneWebcamForm.Handle);
+    }
+
+    private void OpenMediaForTrayDevice(BridgeDeviceItemDto device, bool wantCamera, bool wantMic)
+    {
+        if (_closing.IsCancellationRequested || IsDisposed) return;
+        var sources = GetAvailableMediaSources();
+        if (sources.Count == 0)
+        {
+            Status("No connected phone or PC currently reports a camera or microphone.");
+            return;
+        }
+        int matchIdx = sources.FindIndex(s =>
+            device.Id > 0 ? (!s.ViaHost && s.Id == device.Id) : (s.ViaHost && s.Id == -device.Id));
+        if (matchIdx < 0)
+        {
+            matchIdx = sources.FindIndex(s =>
+                string.Equals(s.Name, device.Name, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(s.Platform, device.Platform, StringComparison.OrdinalIgnoreCase));
+        }
+        if (matchIdx < 0)
+        {
+            Status($"{device.Name} does not have a live camera/microphone stream available.");
+            return;
+        }
+
+        var chosen = sources[matchIdx];
+        if (_phoneWebcamForm is { IsDisposed: false } existing)
+        {
+            existing.UpdateSources(sources);
+            existing.ApplyExternalSelection(chosen, wantCamera, wantMic);
+            if (!existing.Visible) existing.Show(this);
+            if (existing.WindowState == FormWindowState.Minimized)
+                existing.WindowState = FormWindowState.Normal;
+            Win.ForceWindowToFront(existing.Handle);
+            existing.Activate();
+            RefreshTrayFlyoutIfVisible();
+            PublishDeckBridgeSnapshot();
+            return;
+        }
+
+        ShowPhoneWebcamForm(sources, chosen,
+            initialCameraOn: wantCamera && chosen.HasCamera,
+            initialMicOn: wantMic && chosen.HasMicrophone);
     }
 
     private void OpenPhoneWebcamWindow()
@@ -3942,13 +4066,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (sources.Count == 0)
         {
             MessageBox.Show(this,
-                "Connect a phone or another Windows computer first to use wireless Camera & Microphone.",
+                "No connected phone or PC currently advertises a camera or microphone.",
                 "DeskTouch Vision — Camera & Mic", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
         if (_phoneWebcamForm is { IsDisposed: false } existing)
         {
             existing.UpdateSources(sources);
+            if (existing.WindowState == FormWindowState.Minimized)
+                existing.WindowState = FormWindowState.Normal;
+            Win.ForceWindowToFront(existing.Handle);
             existing.Activate();
             return;
         }
@@ -3956,26 +4083,12 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         if (_receiver != null)
         {
             int sel = _receiver.SelectedPeerId;
-            int selIdx = sources.FindIndex(s => s.Id == sel);
+            int selIdx = sources.FindIndex(s => !s.ViaHost && s.Id == sel);
             int androidIdx = sources.FindIndex(s => s.Platform == "Android");
             if (selIdx >= 0) initial = sources[selIdx];
             else if (androidIdx >= 0) initial = sources[androidIdx];
         }
-        bool useHost = _host != null;
-        _phoneWebcamForm?.Close();
-        _phoneWebcamForm = new PhoneWebcamForm(
-            sources,
-            initial,
-            watchCamera: useHost
-                ? (id, en, lens, torch, mic) => _host?.SendRemoteCameraWatch(id, en, lens, torch, mic)
-                : (id, en, lens, torch, mic) => _receiver?.SendPhoneCameraWatch(id, en, lens, torch, mic),
-            watchMic: useHost
-                ? (id, en) => _host?.SendRemoteMicWatch(id, en)
-                : (id, en) => _receiver?.SendPhoneMicWatch(id, en),
-            isFastUdpActive: useHost
-                ? _ => _host?.IsFastMediaUdpActive == true
-                : id => _receiver?.IsFastMediaUdpActive(id) == true);
-        _phoneWebcamForm.Show(this);
+        ShowPhoneWebcamForm(sources, initial, initialCameraOn: initial.HasCamera, initialMicOn: initial.HasMicrophone);
     }
 
     private void OpenSharedShelfDialog()

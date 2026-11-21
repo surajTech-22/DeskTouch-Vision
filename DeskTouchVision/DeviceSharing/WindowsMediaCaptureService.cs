@@ -20,12 +20,16 @@ internal sealed class WindowsMediaCaptureService : IDisposable
 {
     private const uint WAVE_MAPPER = 0xFFFFFFFF;
     private const int WAVE_FORMAT_PCM = 1;
-    private const uint CALLBACK_EVENT = 0x00030000;
+    internal const uint CallbackEventFlag = 0x00050000;
     private const uint WHDR_DONE = 0x00000001;
     private const uint WHDR_PREPARED = 0x00000002;
     private const int MicSampleRate = 24000;
     private const int MicChunkBytes = 960; // 20ms PCM16 mono @ 24kHz
     private const int MicSlots = 8;
+
+    private static readonly object _capGate = new();
+    private static long _capCacheMs;
+    private static (bool HasCamera, bool HasMicrophone) _cachedCaps;
 
     private readonly object _gate = new();
     private readonly Func<bool> _isFastUdpActive;
@@ -52,7 +56,7 @@ internal sealed class WindowsMediaCaptureService : IDisposable
     internal bool IsCameraActive => _cameraRunning;
     internal bool IsMicActive => _micRunning;
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     private struct WAVEFORMATEX
     {
         public ushort wFormatTag;
@@ -141,15 +145,70 @@ internal sealed class WindowsMediaCaptureService : IDisposable
         _ = Task.Run(DisposeCameraAsync);
     }
 
+    internal static (bool HasCamera, bool HasMicrophone) DetectLocalMediaCapabilities(bool forceRefresh = false)
+    {
+        long now = Environment.TickCount64;
+        lock (_capGate)
+        {
+            if (!forceRefresh && _capCacheMs != 0 && now - _capCacheMs < 15000)
+                return _cachedCaps;
+        }
+
+        bool hasCam = false;
+        try
+        {
+            var camTask = Task.Run(async () => await DeviceInformation.FindAllAsync(DeviceClass.VideoCapture));
+            if (camTask.Wait(1200))
+                hasCam = camTask.Result is { Count: > 0 };
+        }
+        catch { }
+
+        bool hasMic = false;
+        try
+        {
+            uint count = waveInGetNumDevs();
+            int size = Marshal.SizeOf<WAVEINCAPSW>();
+            for (uint i = 0; i < count; i++)
+            {
+                var caps = new WAVEINCAPSW();
+                if (waveInGetDevCapsW(new UIntPtr(i), ref caps, size) == 0 && !string.IsNullOrWhiteSpace(caps.szPname))
+                {
+                    string name = caps.szPname.TrimEnd('\0', ' ');
+                    if (!WindowsAudioDeviceBridge.IsVirtualLoopbackCaptureName(name))
+                    {
+                        hasMic = true;
+                        break;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        var result = (hasCam, hasMic);
+        lock (_capGate)
+        {
+            _cachedCaps = result;
+            _capCacheMs = Environment.TickCount64;
+        }
+        return result;
+    }
+
     internal void StartMic()
     {
         if (_disposed) return;
+        Thread? prevThread = null;
         lock (_gate)
         {
             if (_micRunning) return;
+            prevThread = _micThread;
+        }
+        if (prevThread != null && prevThread != Thread.CurrentThread)
+            try { prevThread.Join(300); } catch { }
+
+        lock (_gate)
+        {
+            if (_micRunning || _disposed) return;
             _micRunning = true;
-            _micSignal?.Dispose();
-            _micSignal = new AutoResetEvent(false);
             _micThread = new Thread(MicCaptureLoop)
             {
                 IsBackground = true,
@@ -170,15 +229,10 @@ internal sealed class WindowsMediaCaptureService : IDisposable
             toJoin = _micThread;
             _micThread = null;
             signal = _micSignal;
-            signal?.Set();
         }
+        try { signal?.Set(); } catch (ObjectDisposedException) { }
         if (toJoin != null && toJoin != Thread.CurrentThread)
             try { toJoin.Join(600); } catch { }
-        lock (_gate)
-        {
-            _micSignal?.Dispose();
-            _micSignal = null;
-        }
     }
 
     internal void StopAll()
@@ -411,8 +465,12 @@ internal sealed class WindowsMediaCaptureService : IDisposable
 
     private void MicCaptureLoop()
     {
-        var signal = _micSignal;
-        if (signal == null) return;
+        using var localSignal = new AutoResetEvent(false);
+        lock (_gate)
+        {
+            if (!_micRunning || _disposed) return;
+            _micSignal = localSignal;
+        }
 
         int hdrSize = Marshal.SizeOf<WAVEHDR>();
         int flagsOffset = Marshal.OffsetOf<WAVEHDR>(nameof(WAVEHDR.dwFlags)).ToInt32();
@@ -441,7 +499,7 @@ internal sealed class WindowsMediaCaptureService : IDisposable
                 cbSize = 0
             };
 
-            if (waveInOpen(out _hWaveIn, devId, ref fmt, signal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CALLBACK_EVENT) != 0 ||
+            if (waveInOpen(out _hWaveIn, devId, ref fmt, localSignal.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, CallbackEventFlag) != 0 ||
                 _hWaveIn == IntPtr.Zero)
             {
                 _micRunning = false;
@@ -476,7 +534,7 @@ internal sealed class WindowsMediaCaptureService : IDisposable
 
             while (_micRunning && !_disposed)
             {
-                signal.WaitOne(50);
+                localSignal.WaitOne(50);
                 if (!_micRunning || _disposed) break;
 
                 for (int i = 0; i < MicSlots; i++)
@@ -533,6 +591,11 @@ internal sealed class WindowsMediaCaptureService : IDisposable
                 }
                 try { _ = waveInClose(_hWaveIn); } catch { }
                 _hWaveIn = IntPtr.Zero;
+            }
+            lock (_gate)
+            {
+                if (ReferenceEquals(_micSignal, localSignal))
+                    _micSignal = null;
             }
             for (int i = 0; i < MicSlots; i++)
             {

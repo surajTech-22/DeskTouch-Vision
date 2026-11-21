@@ -373,7 +373,14 @@ internal sealed class LocalMjpegServer : IDisposable
     }
 }
 
-internal readonly record struct MediaSourceOption(int Id, string Name, string Platform, bool SupportsTorch)
+internal readonly record struct MediaSourceOption(
+    int Id,
+    string Name,
+    string Platform,
+    bool SupportsTorch,
+    bool ViaHost = false,
+    bool HasCamera = true,
+    bool HasMicrophone = true)
 {
     public override string ToString() => $"{Name} ({Platform})";
 }
@@ -403,9 +410,10 @@ internal sealed class PhoneWebcamForm : Form
 {
     private const uint WaveMapperId = 0xFFFFFFFF;
 
-    private readonly Action<int, bool, int, bool, bool> _watchCamera;
-    private readonly Action<int, bool> _watchMic;
-    private readonly Func<int, bool> _isFastUdpActive;
+    private readonly Action<MediaSourceOption, bool, int, bool, bool> _watchCamera;
+    private readonly Action<MediaSourceOption, bool> _watchMic;
+    private readonly Func<MediaSourceOption, bool> _isFastUdpActive;
+    private readonly Action? _onMediaStateChanged;
 
     private readonly FlowLayoutPanel _toolbar = new();
     private readonly FlowLayoutPanel _micBar = new();
@@ -457,14 +465,20 @@ internal sealed class PhoneWebcamForm : Form
     internal PhoneWebcamForm(
         IReadOnlyList<MediaSourceOption> sources,
         MediaSourceOption initialSource,
-        Action<int, bool, int, bool, bool> watchCamera,
-        Action<int, bool> watchMic,
-        Func<int, bool> isFastUdpActive)
+        bool initialCameraOn,
+        bool initialMicOn,
+        Action<MediaSourceOption, bool, int, bool, bool> watchCamera,
+        Action<MediaSourceOption, bool> watchMic,
+        Func<MediaSourceOption, bool> isFastUdpActive,
+        Action? onMediaStateChanged = null)
     {
         _watchCamera = watchCamera;
         _watchMic = watchMic;
         _isFastUdpActive = isFastUdpActive;
+        _onMediaStateChanged = onMediaStateChanged;
         _currentSource = initialSource;
+        _camOn = initialSource.HasCamera && initialCameraOn;
+        _micOn = initialSource.HasMicrophone && initialMicOn;
 
         Text = $"DeskTouch Vision — Camera & Mic ({initialSource.Name})";
         Size = new Size(920, 620);
@@ -499,9 +513,10 @@ internal sealed class PhoneWebcamForm : Form
         Shown += (_, _) =>
         {
             _mjpeg.Start();
-            RefreshAudioDevicesAndRouting(initialAutoSwitch: true);
+            RefreshAudioDevicesAndRouting(initialAutoSwitch: _micOn);
             UpdateTransportBadge();
             StartWatchingCurrentSource();
+            _onMediaStateChanged?.Invoke();
             _uiTimer.Start();
         };
         FormClosed += (_, _) =>
@@ -512,11 +527,12 @@ internal sealed class PhoneWebcamForm : Form
             _micOn = false;
             try
             {
-                _watchCamera(_currentSource.Id, false, _lens, false, false);
-                _watchMic(_currentSource.Id, false);
+                _watchCamera(_currentSource, false, _lens, false, false);
+                _watchMic(_currentSource, false);
             }
             catch { }
             WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+            _onMediaStateChanged?.Invoke();
             _mjpeg.Dispose();
             _primaryAudio.Dispose();
             _monitorAudio.Dispose();
@@ -529,6 +545,9 @@ internal sealed class PhoneWebcamForm : Form
     }
 
     internal int PeerId => _currentSource.Id;
+    internal bool SourceViaHost => _currentSource.ViaHost;
+    internal bool IsCameraStreaming => !IsDisposed && _camOn;
+    internal bool IsMicStreaming => !IsDisposed && _micOn;
 
     private void BuildTopToolbar(IReadOnlyList<MediaSourceOption> sources, MediaSourceOption initialSource)
     {
@@ -544,16 +563,18 @@ internal sealed class PhoneWebcamForm : Form
         _sourceCombo.BackColor = Color.FromArgb(30, 41, 59);
         _sourceCombo.ForeColor = Color.White;
         _sourceCombo.Margin = new Padding(0, 2, 8, 2);
-        PopulateSourceCombo(sources, initialSource.Id);
+        PopulateSourceCombo(sources, initialSource.Id, initialSource.ViaHost);
         _sourceCombo.SelectedIndexChanged += (_, _) =>
         {
             if (_suppressEvents) return;
-            if (_sourceCombo.SelectedItem is MediaSourceOption next && next.Id != _currentSource.Id)
+            if (_sourceCombo.SelectedItem is MediaSourceOption next &&
+                (next.Id != _currentSource.Id || next.ViaHost != _currentSource.ViaHost))
                 SwitchSource(next);
         };
 
         _camBtn.Click += (_, _) =>
         {
+            if (!_currentSource.HasCamera) return;
             _camOn = !_camOn;
             UpdateMediaToggleButtons();
             if (!_camOn)
@@ -566,10 +587,12 @@ internal sealed class PhoneWebcamForm : Form
                 _canvas.Invalidate();
             }
             SyncWatchState();
+            _onMediaStateChanged?.Invoke();
         };
 
         _micBtn.Click += (_, _) =>
         {
+            if (!_currentSource.HasMicrophone) return;
             _micOn = !_micOn;
             UpdateMediaToggleButtons();
             if (!_micOn)
@@ -578,6 +601,7 @@ internal sealed class PhoneWebcamForm : Form
                 _monitorAudio.ClearQueue();
             }
             SyncWatchState(micOnlyChange: true);
+            _onMediaStateChanged?.Invoke();
         };
 
         _lensBtn.Click += (_, _) =>
@@ -744,7 +768,52 @@ internal sealed class PhoneWebcamForm : Form
     internal void UpdateSources(IReadOnlyList<MediaSourceOption> sources)
     {
         if (IsDisposed || sources == null) return;
-        PopulateSourceCombo(sources, _currentSource.Id);
+        PopulateSourceCombo(sources, _currentSource.Id, _currentSource.ViaHost);
+    }
+
+    internal void ApplyExternalSelection(MediaSourceOption source, bool toggleCamera, bool toggleMic)
+    {
+        if (IsDisposed) return;
+        if (source.Id == _currentSource.Id && source.ViaHost == _currentSource.ViaHost)
+        {
+            _currentSource = source;
+            if (toggleCamera && source.HasCamera)
+            {
+                _camOn = !_camOn;
+                if (!_camOn)
+                {
+                    lock (_frameLock)
+                    {
+                        _frame?.Dispose();
+                        _frame = null;
+                    }
+                    _canvas.Invalidate();
+                }
+                SyncWatchState(micOnlyChange: false);
+            }
+            if (toggleMic && source.HasMicrophone)
+            {
+                _micOn = !_micOn;
+                if (!_micOn)
+                {
+                    _primaryAudio.ClearQueue();
+                    _monitorAudio.ClearQueue();
+                }
+                else
+                {
+                    RefreshAudioDevicesAndRouting(initialAutoSwitch: true);
+                }
+                SyncWatchState(micOnlyChange: true);
+            }
+            UpdateSourceCapabilityButtons();
+            UpdateMediaToggleButtons();
+            _onMediaStateChanged?.Invoke();
+            return;
+        }
+
+        SwitchSource(source,
+            explicitCam: source.HasCamera && toggleCamera,
+            explicitMic: source.HasMicrophone && toggleMic);
     }
 
     internal void UpdateCameraFrame(byte[] jpegBytes)
@@ -805,7 +874,7 @@ internal sealed class PhoneWebcamForm : Form
             _statusLabel.Text = text;
     }
 
-    private void PopulateSourceCombo(IReadOnlyList<MediaSourceOption> sources, int preferredId)
+    private void PopulateSourceCombo(IReadOnlyList<MediaSourceOption> sources, int preferredId, bool preferredViaHost)
     {
         _suppressEvents = true;
         try
@@ -815,7 +884,7 @@ internal sealed class PhoneWebcamForm : Form
             for (int i = 0; i < sources.Count; i++)
             {
                 _sourceCombo.Items.Add(sources[i]);
-                if (sources[i].Id == preferredId)
+                if (sources[i].Id == preferredId && sources[i].ViaHost == preferredViaHost)
                     selectedIdx = i;
             }
             if (selectedIdx < 0 && sources.Count > 0)
@@ -832,13 +901,13 @@ internal sealed class PhoneWebcamForm : Form
         }
     }
 
-    private void SwitchSource(MediaSourceOption next)
+    private void SwitchSource(MediaSourceOption next, bool? explicitCam = null, bool? explicitMic = null)
     {
-        int oldId = _currentSource.Id;
+        var oldSource = _currentSource;
         try
         {
-            _watchCamera(oldId, false, _lens, false, false);
-            _watchMic(oldId, false);
+            _watchCamera(oldSource, false, _lens, false, false);
+            _watchMic(oldSource, false);
         }
         catch { }
         _primaryAudio.ClearQueue();
@@ -852,43 +921,72 @@ internal sealed class PhoneWebcamForm : Form
         _fpsStartMs = Environment.TickCount64;
         _micStateNote = "";
         _currentSource = next;
+        _camOn = next.HasCamera && (explicitCam ?? _camOn);
+        _micOn = next.HasMicrophone && (explicitMic ?? _micOn);
         _torch = false;
+        _suppressEvents = true;
+        try
+        {
+            for (int i = 0; i < _sourceCombo.Items.Count; i++)
+            {
+                if (_sourceCombo.Items[i] is MediaSourceOption opt &&
+                    opt.Id == next.Id && opt.ViaHost == next.ViaHost)
+                {
+                    _sourceCombo.SelectedIndex = i;
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
         Text = $"DeskTouch Vision — Camera & Mic ({next.Name})";
         UpdateSourceCapabilityButtons();
+        UpdateMediaToggleButtons();
         UpdateTransportBadge();
         UpdateStatus($"Connecting to {next.Name}…");
         _canvas.Invalidate();
         StartWatchingCurrentSource();
+        _onMediaStateChanged?.Invoke();
     }
 
     private void StartWatchingCurrentSource()
     {
-        _watchCamera(_currentSource.Id, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
-        _watchMic(_currentSource.Id, _micOn);
+        _watchCamera(_currentSource, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
+        _watchMic(_currentSource, _micOn);
     }
 
     private void SyncWatchState(bool micOnlyChange = false)
     {
         if (micOnlyChange)
-            _watchMic(_currentSource.Id, _micOn);
+            _watchMic(_currentSource, _micOn);
         else
-            _watchCamera(_currentSource.Id, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
+            _watchCamera(_currentSource, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
     }
 
     private void UpdateMediaToggleButtons()
     {
-        _camBtn.Text = _camOn ? "Camera: On" : "Camera: Off";
-        _camBtn.BackColor = _camOn ? Color.FromArgb(37, 99, 235) : Color.FromArgb(51, 65, 85);
-        _micBtn.Text = _micOn ? "Mic: On" : "Mic: Off";
-        _micBtn.BackColor = _micOn ? Color.FromArgb(5, 150, 105) : Color.FromArgb(51, 65, 85);
+        _camBtn.Enabled = _currentSource.HasCamera;
+        _camBtn.Text = !_currentSource.HasCamera ? "Camera: N/A" : (_camOn ? "Camera: On" : "Camera: Off");
+        _camBtn.BackColor = _camOn && _currentSource.HasCamera
+            ? Color.FromArgb(37, 99, 235)
+            : Color.FromArgb(51, 65, 85);
+
+        _micBtn.Enabled = _currentSource.HasMicrophone;
+        _micBtn.Text = !_currentSource.HasMicrophone ? "Mic: N/A" : (_micOn ? "Mic: On" : "Mic: Off");
+        _micBtn.BackColor = _micOn && _currentSource.HasMicrophone
+            ? Color.FromArgb(5, 150, 105)
+            : Color.FromArgb(51, 65, 85);
     }
 
     private void UpdateSourceCapabilityButtons()
     {
+        _lensBtn.Enabled = _currentSource.HasCamera;
         if (_currentSource.Platform == "Android")
         {
             _lensBtn.Text = _lens == 0 ? "Lens: Back" : "Lens: Front";
-            _torchBtn.Enabled = _currentSource.SupportsTorch;
+            _torchBtn.Enabled = _currentSource.SupportsTorch && _currentSource.HasCamera;
             _torchBtn.Text = _torch ? "Torch: On" : "Torch: Off";
         }
         else
@@ -1017,7 +1115,7 @@ internal sealed class PhoneWebcamForm : Form
 
     private void UpdateTransportBadge()
     {
-        bool udp = _isFastUdpActive(_currentSource.Id);
+        bool udp = _isFastUdpActive(_currentSource);
         string want = udp ? "Fast UDP" : "TCP";
         if (string.Equals(_transportBadge.Text, want, StringComparison.Ordinal)) return;
         _transportBadge.Text = want;

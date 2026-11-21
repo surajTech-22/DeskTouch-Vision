@@ -925,6 +925,9 @@ final class DeskTouchSession implements AutoCloseable {
                 if(width!=info.width || height!=info.height)
                     info=new PhoneScreenGeometry.Info(width,height,info.densityDpi,info.refreshHz,
                         info.rotationDegrees,info.deviceName,info.osVersion,info.appVersion);
+                android.content.pm.PackageManager pm=application.getPackageManager();
+                boolean hasCamera=pm!=null && pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_ANY);
+                boolean hasMic=pm!=null && pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_MICROPHONE);
                 JSONArray myLayout=buildLayoutArray(info);
                 JSONObject hello=new JSONObject().put("Name",info.deviceName)
                     .put("Layout",myLayout.toString())
@@ -935,6 +938,8 @@ final class DeskTouchSession implements AutoCloseable {
                     .put("DensityDpi",info.densityDpi)
                     .put("RefreshHz",info.refreshHz)
                     .put("RotationDegrees",info.rotationDegrees)
+                    .put("HasCamera",hasCamera)
+                    .put("HasMicrophone",hasMic)
                     .put("NotificationCount",DeskTouchNotificationListener.readActiveCount(application));
                 if(!info.appVersion.isEmpty())hello.put("AppVersion",info.appVersion);
                 new Packet("hello",0,0,0,0,hello.toString()).write(out);

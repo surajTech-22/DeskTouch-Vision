@@ -1,3 +1,11 @@
+# DeskTouch Vision v0.3.90 — WinMM CFG Crash Fix, Direct Tray Cam/Mic Buttons & Hardware Capability Filtering
+
+- **Fixed Camera & Mic Launch Crash (`VirtualAudioBridge`, `WindowsMediaCaptureService`):** Fixes the immediate `0xc0000409` (`FAST_FAIL_GUARD_ICALL_CHECK_FAILURE`) crash when opening **Camera & Mic** caused by passing `0x00030000` (`CALLBACK_FUNCTION`) instead of `0x00050000` (`CALLBACK_EVENT`) to `waveOutOpen`/`waveInOpen`, switches `WAVEFORMATEX` to packed layout, makes `ManagedAudioOutputEngine` open WinMM lazily only once audio arrives, and fixes `_micSignal` handle ownership during start/stop cycles.
+- **Direct Tray Flyout Camera & Mic Buttons (`TrayDeviceFlyout`, `DisplaySettingsForm`, `DeskSpaceDeckBridge`, `PhoneMediaWindows`):** Adds 1-click **Cam** and **Mic** buttons directly inside the taskbar tray device flyout cards—shown exclusively on remote phones and Windows PCs that actually report camera or microphone hardware—and fixes dual-role routing when this PC simultaneously hosts direct peers (`ReceiverServer`) and connects to an upstream hub (`HostSession`).
+- **Real Hardware Capability Negotiation (`DeskTouchSession`, `NetworkSessions`, `WindowsMediaCaptureService`):** Android (`PackageManager` `FEATURE_CAMERA_ANY` / `FEATURE_MICROPHONE`) and Windows (`VideoCapture` + non-loopback `waveIn` detection) announce their actual camera and microphone capabilities in `hello` and `environment-roster`.
+
+---
+
 # DeskTouch Vision v0.3.89 — Fast UDP Media Streaming, Native Windows System Mic & Multi-System Camera/Mic
 
 - **Fast UDP `DTM1` Binary Media Channel Across Windows & Android (`FastUdpChannel`, `NetworkSessions`, `DeskTouchSession`, `PhoneMediaService`, `EcosystemFeatures`):** Moves PC Screen Preview (`~15 FPS`), Phone Screen Mirroring, Camera Video, and Live Microphone Audio onto the encrypted (`AES-256-GCM`), replay-protected variable-length `DTM1` Fast UDP channel alongside isolated `DTU1` cursor/keyboard frames (with automatic reliable TCP fallback when UDP is unconfirmed).

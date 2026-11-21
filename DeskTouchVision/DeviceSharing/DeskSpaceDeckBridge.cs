@@ -29,7 +29,11 @@ internal sealed record BridgeDeviceItemDto(
     int ArrangementOrder = 0,
     int BatteryPercent = -1,
     bool IsCharging = false,
-    string SignalLabel = "");
+    string SignalLabel = "",
+    bool HasCamera = false,
+    bool HasMicrophone = false,
+    bool IsCameraActive = false,
+    bool IsMicrophoneActive = false);
 
 internal sealed record BridgeDeviceSnapshotDto(
     int Version,
@@ -167,6 +171,10 @@ internal sealed class DeskSpaceDeckBridge : IDisposable
                 .Append(d.SupportsInput ? '1' : '0').Append(':')
                 .Append(d.NotificationCount).Append(':')
                 .Append(d.BatteryPercent).Append(d.IsCharging ? '1' : '0').Append(':')
+                .Append(d.HasCamera ? '1' : '0')
+                .Append(d.HasMicrophone ? '1' : '0')
+                .Append(d.IsCameraActive ? '1' : '0')
+                .Append(d.IsMicrophoneActive ? '1' : '0').Append(':')
                 .Append(d.ArrangementOrder).Append(':')
                 .Append(Math.Round(d.LayoutX, 3)).Append(',')
                 .Append(Math.Round(d.LayoutY, 3)).Append(',')

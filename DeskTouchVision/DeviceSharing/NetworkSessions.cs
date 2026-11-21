@@ -6793,7 +6793,7 @@ internal sealed class HostSession : IInputSession, IDisposable
         bool validCustomCode = !trustedConnection && !string.IsNullOrEmpty(PairingCodeHelper.NormalizeCustomCode(secret));
         if (!askReceiver && !validFixedSecret && !validCustomCode)
             throw new ArgumentException("Invalid authenticated pairing credential.");
-        var candidateAddresses = CrossNetworkRendezvous.ParseCandidateAddresses(ip);
+        var candidateAddresses = CrossNetworkRendezvous.ParseCandidateAddresses(ip, allowLoopback: true);
         if (candidateAddresses.Count == 0)
             throw new ArgumentException("Enter the receiver's IPv4 or IPv6 address.");
 

@@ -138,7 +138,7 @@ internal static class CrossNetworkRendezvous
         return SHA256.HashData(Encoding.UTF8.GetBytes($"DT1-WAN-KEY-V1|{clean}"));
     }
 
-    internal static IReadOnlyList<IPAddress> ParseCandidateAddresses(string? rawAddressList)
+    internal static IReadOnlyList<IPAddress> ParseCandidateAddresses(string? rawAddressList, bool allowLoopback = false)
     {
         if (string.IsNullOrWhiteSpace(rawAddressList))
             return Array.Empty<IPAddress>();
@@ -158,7 +158,7 @@ internal static class CrossNetworkRendezvous
                 ip = ip.MapToIPv4();
             if (ip.AddressFamily is not (AddressFamily.InterNetwork or AddressFamily.InterNetworkV6))
                 continue;
-            if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) ||
+            if ((!allowLoopback && IPAddress.IsLoopback(ip)) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) ||
                 ip.Equals(IPAddress.Broadcast) || ip.IsIPv6LinkLocal || ip.IsIPv6Multicast || ip.IsIPv6SiteLocal)
                 continue;
             string canonical = ip.ToString();

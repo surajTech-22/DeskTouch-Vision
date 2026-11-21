@@ -48,7 +48,8 @@ internal static class SingleInstanceActivation
     internal static bool IsSecondaryMediaWindowTitle(string? title) =>
         !string.IsNullOrWhiteSpace(title) &&
         (title.StartsWith("DeskTouch Vision — Phone Screen", StringComparison.OrdinalIgnoreCase) ||
-         title.StartsWith("DeskTouch Vision — Phone Camera", StringComparison.OrdinalIgnoreCase));
+         title.StartsWith("DeskTouch Vision — Phone Camera", StringComparison.OrdinalIgnoreCase) ||
+         title.StartsWith("DeskTouch Vision — Camera & Mic", StringComparison.OrdinalIgnoreCase));
 
     internal static WakeStepResult EvaluateCurrentDesktopMatches(
         IReadOnlyCollection<WindowMatch> matches,

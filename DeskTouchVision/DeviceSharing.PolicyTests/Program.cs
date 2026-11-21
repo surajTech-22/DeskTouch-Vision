@@ -791,6 +791,110 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
     Console.WriteLine("PASS: Live Windows Taskbar snapshot, icon framing bounds, and strict token allowlist verified.");
 }
 
+// Verify v0.3.89: Fast UDP DTM1 binary media, ManagedAudioOutputEngine resampling, VirtualAudioBridge matching, and window titles.
+{
+    byte[] key = new byte[FastUdpCodec.KeySize];
+    System.Security.Cryptography.RandomNumberGenerator.Fill(key);
+    using var srvCodec = new FastUdpCodec(key, peerId: 7, isServer: true);
+    using var cliCodec = new FastUdpCodec(key, peerId: 7, isServer: false);
+
+    byte[] pcmSample = new byte[640];
+    for (int i = 0; i < 320; i++)
+    {
+        short sample = (short)(Math.Sin(i * 0.25) * 12000);
+        pcmSample[i * 2] = (byte)(sample & 0xFF);
+        pcmSample[i * 2 + 1] = (byte)((sample >> 8) & 0xFF);
+    }
+
+    byte[] mediaWire = new byte[FastUdpCodec.MaxMediaFrameSize];
+    int lenMic = cliCodec.SealMedia(FastUdpMediaKind.MicAudio, frameOrAudioId: 11, indexOrSampleRate: 16000,
+        totalOrChannels: 1, metaOrRouteId: 0, pcmSample, mediaWire);
+    Check(lenMic == FastUdpCodec.MediaMinFrameSize + pcmSample.Length,
+        "DTM1 MicAudio frame length must equal header+subheader+payload+tag");
+    Check(srvCodec.TryOpenMedia(mediaWire.AsSpan(0, lenMic), out var openedMic) &&
+        openedMic.Kind == FastUdpMediaKind.MicAudio &&
+        openedMic.FrameOrAudioId == 11 &&
+        openedMic.IndexOrSampleRate == 16000 &&
+        openedMic.Payload.SequenceEqual(pcmSample),
+        "Server FastUdpCodec must authenticate and decode client DTM1 MicAudio intact");
+
+    // Replay & tamper rejection on DTM1
+    Check(!srvCodec.TryOpenMedia(mediaWire.AsSpan(0, lenMic), out _),
+        "DTM1 must reject replayed media datagram");
+    byte[] tamperedMedia = mediaWire[..lenMic];
+    tamperedMedia[^1] ^= 0x55;
+    Check(!srvCodec.TryOpenMedia(tamperedMedia, out _),
+        "DTM1 must reject tampered media authentication tag");
+
+    // Server -> Client PcScreenPreviewChunk + DTU1 sequence isolation
+    byte[] camChunk = new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 0x11, 0x22, 0x33, 0x44 };
+    int lenPrev = srvCodec.SealMedia(FastUdpMediaKind.PcScreenPreviewChunk, 42, 0, 1, (560 << 16) | 315, camChunk, mediaWire);
+    Check(cliCodec.TryOpenMedia(mediaWire.AsSpan(0, lenPrev), out var openedPrev) &&
+        openedPrev.Kind == FastUdpMediaKind.PcScreenPreviewChunk &&
+        openedPrev.MetaOrRouteId == ((560 << 16) | 315) &&
+        openedPrev.Payload.SequenceEqual(camChunk),
+        "Client must decode server DTM1 PcScreenPreviewChunk with packed dims");
+
+    byte[] dtuBuf = new byte[FastUdpCodec.FrameSize];
+    cliCodec.Seal(FastUdpOp.Move, 100, 200, 1, 99, dtuBuf);
+    Check(srvCodec.TryOpen(dtuBuf, out var dtuMsg) && dtuMsg.Seq == 1 && dtuMsg.A == 100,
+        "DTU1 input sequence space must remain completely isolated from DTM1 media counters");
+
+    // FastMediaFrameAssembler out-of-order + restart recovery + ClearSource
+    var assembler = new FastMediaFrameAssembler();
+    byte[] p0 = new byte[] { 1, 2, 3 };
+    byte[] p1 = new byte[] { 4, 5 };
+    byte[] p2 = new byte[] { 6, 7, 8, 9 };
+    Check(!assembler.AddChunk(7, (byte)FastUdpMediaKind.CameraFrameChunk, 100, 2, 3, 123, p2, out _, out _),
+        "FastMediaFrameAssembler must not complete after only chunk 2 of 3");
+    Check(!assembler.AddChunk(7, (byte)FastUdpMediaKind.CameraFrameChunk, 100, 0, 3, 123, p0, out _, out _),
+        "FastMediaFrameAssembler must not complete after only 2 of 3 chunks");
+    Check(assembler.AddChunk(7, (byte)FastUdpMediaKind.CameraFrameChunk, 100, 1, 3, 123, p1, out byte[] joined, out int meta) &&
+        meta == 123 && joined.SequenceEqual(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 }),
+        "FastMediaFrameAssembler must reassemble out-of-order chunks accurately");
+    Check(assembler.AddChunk(7, (byte)FastUdpMediaKind.CameraFrameChunk, 1, 0, 1, 55, new byte[] { 42 }, out byte[] restarted, out _) &&
+        restarted.SequenceEqual(new byte[] { 42 }),
+        "FastMediaFrameAssembler must recover when sender restarts frame counter after delta > 60");
+    assembler.ClearSource(7);
+    Check(assembler.AddChunk(7, (byte)FastUdpMediaKind.CameraFrameChunk, 1, 0, 1, 77, new byte[] { 99 }, out byte[] postClear, out int postMeta) &&
+        postMeta == 77 && postClear.SequenceEqual(new byte[] { 99 }),
+        "FastMediaFrameAssembler.ClearSource must reset sequence tracking cleanly");
+
+    // ManagedAudioOutputEngine linear resampling & soft saturation
+    byte[] out16To48 = ManagedAudioOutputEngine.ResamplePcm16Mono(pcmSample, 16000, 48000, 1.0f, out float rms16);
+    Check(out16To48.Length == 1920 && rms16 > 0.1f && rms16 <= 1.0f,
+        "16kHz 20ms mono PCM must resample cleanly to 1920 bytes at 48kHz with valid RMS peak");
+    byte[] pcm24 = new byte[960];
+    for (int i = 0; i < 480; i++)
+    {
+        short v = i < 240 ? (short)32767 : (short)-32768;
+        pcm24[i * 2] = (byte)(v & 0xFF);
+        pcm24[i * 2 + 1] = (byte)((v >> 8) & 0xFF);
+    }
+    byte[] out24To48 = ManagedAudioOutputEngine.ResamplePcm16Mono(pcm24, 24000, 48000, 2.5f, out float rms24);
+    short satPos = (short)(out24To48[0] | (out24To48[1] << 8));
+    short satNeg = (short)(out24To48[^2] | (out24To48[^1] << 8));
+    Check(out24To48.Length == 1920 && rms24 > 0.5f && satPos > 29000 && satNeg < -29000,
+        "24kHz->48kHz high-gain audio must soft-saturate without signed 16-bit integer wraparound");
+
+    // VirtualAudioBridge device matching & loopback exclusion
+    var matchedCable = WindowsAudioDeviceBridge.MatchVirtualMicPair(
+        [new WaveOutDeviceInfo(0, "Speakers (Realtek)"), new WaveOutDeviceInfo(2, "CABLE Input (VB-Audio Virtual)")],
+        [new AudioEndpointInfo("{mic-hw}", "Microphone Array", true), new AudioEndpointInfo("{mic-vb}", "CABLE Output (VB-Audio Virtual Cable)", false)]);
+    Check(matchedCable.Installed && matchedCable.RenderWaveOutId == 2 && matchedCable.CaptureEndpointId == "{mic-vb}",
+        "MatchVirtualMicPair must pair CABLE Input waveOut render ID with CABLE Output Core Audio capture endpoint");
+    Check(WindowsAudioDeviceBridge.IsVirtualLoopbackCaptureName("CABLE Output (VB-Audio)") &&
+        WindowsAudioDeviceBridge.IsVirtualLoopbackCaptureName("VoiceMeeter Aux Output") &&
+        WindowsAudioDeviceBridge.IsVirtualLoopbackCaptureName("Stereo Mix") &&
+        !WindowsAudioDeviceBridge.IsVirtualLoopbackCaptureName("Microphone (Jabra Link 380)"),
+        "IsVirtualLoopbackCaptureName must identify virtual cables and allow physical mics");
+
+    Check(DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Camera & Mic (My Laptop)") &&
+        DeskTouchVision.SingleInstanceActivation.IsSecondaryMediaWindowTitle("DeskTouch Vision — Phone Camera & Mic (Pixel)"),
+        "Secondary media window title check must cover unified multi-system Camera & Mic title");
+    Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, pinned resampler, virtual mic bridge, and window title invariants.");
+}
+
 // Real TLS/auth/monitor-mapping integration test on loopback, no remote inputs.
 {
     var status = new System.Collections.Concurrent.ConcurrentQueue<string>();
@@ -3161,6 +3265,27 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         string flyoutText = File.ReadAllText(flyoutPath);
         Check(flyoutText.Contains("BeginInvoke(_onOpenMainWindow)", StringComparison.Ordinal),
               "TrayDeviceFlyout Open button must defer activation until flyout hides");
+
+        // Verify v0.3.89: Pinned audio engine, native mic bridge, Fast UDP media channel, and multi-system cam/mic support.
+        string phoneMediaPath = Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "PhoneMediaWindows.cs");
+        string phoneMediaText = File.ReadAllText(phoneMediaPath);
+        Check(phoneMediaText.Contains("ManagedAudioOutputEngine", StringComparison.Ordinal) &&
+              phoneMediaText.Contains("RestorePreviousDefaultCaptureDeviceIfChanged", StringComparison.Ordinal) &&
+              phoneMediaText.Contains("InstallVbCableDriverAsync", StringComparison.Ordinal) &&
+              !phoneMediaText.Contains("Task.Delay(260)", StringComparison.Ordinal) &&
+              !phoneMediaText.Contains("waveOutPrepareHeader(_hWaveOut, ref hdr", StringComparison.Ordinal),
+              "PhoneMediaWindows must use pinned ManagedAudioOutputEngine and native VB-Cable bridge without unpinned ref WAVEHDR");
+
+        string sessionsPath = Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "NetworkSessions.cs");
+        string sessionsText = File.ReadAllText(sessionsPath);
+        Check(sessionsText.Contains("MediaDatagramReceived", StringComparison.Ordinal) &&
+              sessionsText.Contains("SendPhoneMicWatch", StringComparison.Ordinal) &&
+              sessionsText.Contains("SendRemoteMicWatch", StringComparison.Ordinal) &&
+              sessionsText.Contains("OnUdpHubMediaDatagram", StringComparison.Ordinal) &&
+              sessionsText.Contains("ScreenPreviewLoopAsync", StringComparison.Ordinal) &&
+              sessionsText.Contains("HostScreenPreviewLoopAsync", StringComparison.Ordinal) &&
+              sessionsText.Contains("session.Peer.Platform is (\"Android\" or \"Windows\")", StringComparison.Ordinal),
+              "NetworkSessions must route multi-system camera, mic, and screen preview over Fast UDP DTM1 with TCP fallback");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

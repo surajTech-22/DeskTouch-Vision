@@ -373,200 +373,234 @@ internal sealed class LocalMjpegServer : IDisposable
     }
 }
 
-/// <summary>
-/// Lightweight WinMM waveOut 16kHz 16-bit mono PCM monitor for incoming phone mic audio.
-/// </summary>
-internal sealed class WaveOutAudioPlayer : IDisposable
+internal readonly record struct MediaSourceOption(int Id, string Name, string Platform, bool SupportsTorch)
 {
-    private const uint WAVE_MAPPER = 0xFFFFFFFF;
-    private const int WAVE_FORMAT_PCM = 1;
-    private readonly object _gate = new();
-    private IntPtr _hWaveOut;
-    private bool _disposed;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WAVEFORMATEX
-    {
-        public ushort wFormatTag;
-        public ushort nChannels;
-        public uint nSamplesPerSec;
-        public uint nAvgBytesPerSec;
-        public ushort nBlockAlign;
-        public ushort wBitsPerSample;
-        public ushort cbSize;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct WAVEHDR
-    {
-        public IntPtr lpData;
-        public uint dwBufferLength;
-        public uint dwBytesRecorded;
-        public IntPtr dwUser;
-        public uint dwFlags;
-        public uint dwLoops;
-        public IntPtr lpNext;
-        public IntPtr reserved;
-    }
-
-    [DllImport("winmm.dll")]
-    private static extern int waveOutOpen(out IntPtr phwo, uint uDeviceID, ref WAVEFORMATEX pwfx, IntPtr dwCallback, IntPtr dwInstance, uint fdwOpen);
-    [DllImport("winmm.dll")]
-    private static extern int waveOutPrepareHeader(IntPtr hwo, ref WAVEHDR pwh, int cbwh);
-    [DllImport("winmm.dll")]
-    private static extern int waveOutWrite(IntPtr hwo, ref WAVEHDR pwh, int cbwh);
-    [DllImport("winmm.dll")]
-    private static extern int waveOutUnprepareHeader(IntPtr hwo, ref WAVEHDR pwh, int cbwh);
-    [DllImport("winmm.dll")]
-    private static extern int waveOutReset(IntPtr hwo);
-    [DllImport("winmm.dll")]
-    private static extern int waveOutClose(IntPtr hwo);
-
-    internal void PlayPcm16Mono(byte[] pcm, int sampleRate = 16000)
-    {
-        if (_disposed || pcm.Length == 0) return;
-        lock (_gate)
-        {
-            if (_disposed) return;
-            if (_hWaveOut == IntPtr.Zero)
-            {
-                var fmt = new WAVEFORMATEX
-                {
-                    wFormatTag = WAVE_FORMAT_PCM,
-                    nChannels = 1,
-                    nSamplesPerSec = (uint)Math.Clamp(sampleRate, 8000, 48000),
-                    wBitsPerSample = 16,
-                    nBlockAlign = 2,
-                    nAvgBytesPerSec = (uint)(Math.Clamp(sampleRate, 8000, 48000) * 2),
-                    cbSize = 0
-                };
-                if (waveOutOpen(out _hWaveOut, WAVE_MAPPER, ref fmt, IntPtr.Zero, IntPtr.Zero, 0) != 0)
-                {
-                    _hWaveOut = IntPtr.Zero;
-                    return;
-                }
-            }
-            IntPtr dataPtr = Marshal.AllocHGlobal(pcm.Length);
-            Marshal.Copy(pcm, 0, dataPtr, pcm.Length);
-            var hdr = new WAVEHDR { lpData = dataPtr, dwBufferLength = (uint)pcm.Length };
-            if (waveOutPrepareHeader(_hWaveOut, ref hdr, Marshal.SizeOf<WAVEHDR>()) == 0)
-            {
-                _ = waveOutWrite(_hWaveOut, ref hdr, Marshal.SizeOf<WAVEHDR>());
-                _ = Task.Run(async () =>
-                {
-                    await Task.Delay(260);
-                    try
-                    {
-                        lock (_gate)
-                        {
-                            if (_hWaveOut != IntPtr.Zero)
-                                _ = waveOutUnprepareHeader(_hWaveOut, ref hdr, Marshal.SizeOf<WAVEHDR>());
-                        }
-                    }
-                    catch { }
-                    finally { Marshal.FreeHGlobal(dataPtr); }
-                });
-            }
-            else
-            {
-                Marshal.FreeHGlobal(dataPtr);
-            }
-        }
-    }
-
-    public void Dispose()
-    {
-        lock (_gate)
-        {
-            _disposed = true;
-            if (_hWaveOut != IntPtr.Zero)
-            {
-                try { _ = waveOutReset(_hWaveOut); } catch { }
-                try { _ = waveOutClose(_hWaveOut); } catch { }
-                _hWaveOut = IntPtr.Zero;
-            }
-        }
-    }
+    public override string ToString() => $"{Name} ({Platform})";
 }
 
 /// <summary>
-/// Live wireless Phone Camera & Microphone viewer on Windows with Clean Window Mode,
-/// loopback MJPEG stream for OBS/browsers, Front/Back flip, Torch, Rotate, and Mic monitor.
+/// Compatibility wrapper backed by pinned unmanaged WAVEHDR ring buffers in ManagedAudioOutputEngine.
+/// </summary>
+internal sealed class WaveOutAudioPlayer : IDisposable
+{
+    private readonly ManagedAudioOutputEngine _engine;
+
+    internal WaveOutAudioPlayer(uint deviceId = 0xFFFFFFFF) =>
+        _engine = new ManagedAudioOutputEngine(deviceId);
+
+    internal void PlayPcm16Mono(byte[] pcm, int sampleRate = 16000) =>
+        _engine.EnqueuePcm16Mono(pcm, sampleRate);
+
+    public void Dispose() => _engine.Dispose();
+}
+
+/// <summary>
+/// Live multi-system &amp; phone Camera + Microphone viewer on Windows with Clean Window Mode,
+/// loopback MJPEG stream for OBS/browsers, Front/Back flip, Torch, Rotate, Fast UDP status,
+/// and direct native Windows microphone routing via VB-Cable / Virtual Audio Cable.
 /// </summary>
 internal sealed class PhoneWebcamForm : Form
 {
-    private readonly int _peerId;
+    private const uint WaveMapperId = 0xFFFFFFFF;
+
     private readonly Action<int, bool, int, bool, bool> _watchCamera;
-    private readonly Panel _toolbar = new();
+    private readonly Action<int, bool> _watchMic;
+    private readonly Func<int, bool> _isFastUdpActive;
+
+    private readonly FlowLayoutPanel _toolbar = new();
+    private readonly FlowLayoutPanel _micBar = new();
     private readonly Panel _canvas = new();
-    private readonly Label _statusLabel = new();
+    private readonly ComboBox _sourceCombo = new();
+    private readonly Button _camBtn = MakeBtn("Camera: On", true);
+    private readonly Button _micBtn = MakeBtn("Mic: On", true);
     private readonly Button _lensBtn = MakeBtn("Lens: Back");
     private readonly Button _torchBtn = MakeBtn("Torch: Off");
-    private readonly Button _micBtn = MakeBtn("Mic Audio: Off");
+    private readonly Label _transportBadge = new();
+    private readonly Label _statusLabel = new();
+
+    private readonly Label _virtMicLabel = new();
+    private readonly CheckBox _autoDefaultMicCheck = new();
+    private readonly Button _installDriverBtn = MakeBtn("Install Native Mic Driver", true);
+    private readonly Button _rescanAudioBtn = MakeBtn("Re-scan");
+    private readonly CheckBox _hearMonitorCheck = new();
+    private readonly ComboBox _outputCombo = new();
+    private readonly TrackBar _gainTrack = new();
+    private readonly Panel _vuMeter = new();
+    private readonly System.Windows.Forms.Timer _uiTimer = new();
+
     private readonly LocalMjpegServer _mjpeg = new();
-    private readonly WaveOutAudioPlayer _audioPlayer = new();
-    private Bitmap? _frame;
-    private readonly object _frameLock = new();
-    private int _lens; // 0 = back, 1 = front
+    private readonly ManagedAudioOutputEngine _primaryAudio = new();
+    private readonly ManagedAudioOutputEngine _monitorAudio = new();
+
+    private List<WaveOutDeviceInfo> _waveOutDevices = new();
+    private VirtualMicMatch _virtualMic;
+    private MediaSourceOption _currentSource;
+    private bool _suppressEvents;
+    private volatile bool _camOn = true;
+    private volatile bool _micOn = true;
+    private int _routingToVirtualCable;
+    private int _hearMonitorActive = 1;
+    private int _lens;
     private bool _torch;
-    private bool _micOn;
     private int _rotateDeg;
     private bool _cleanView;
     private int _fpsCount;
     private long _fpsStartMs = Environment.TickCount64;
+    private float _vuLevel;
+    private int _timerTick;
+    private string _micStateNote = "";
+    private bool _installingDriver;
+
+    private Bitmap? _frame;
+    private readonly object _frameLock = new();
 
     internal PhoneWebcamForm(
-        int peerId,
-        string deviceName,
-        Action<int, bool, int, bool, bool> watchCamera)
+        IReadOnlyList<MediaSourceOption> sources,
+        MediaSourceOption initialSource,
+        Action<int, bool, int, bool, bool> watchCamera,
+        Action<int, bool> watchMic,
+        Func<int, bool> isFastUdpActive)
     {
-        _peerId = peerId;
         _watchCamera = watchCamera;
+        _watchMic = watchMic;
+        _isFastUdpActive = isFastUdpActive;
+        _currentSource = initialSource;
 
-        Text = $"DeskTouch Vision — Phone Camera & Mic ({deviceName})";
-        Size = new Size(760, 520);
-        MinimumSize = new Size(480, 360);
+        Text = $"DeskTouch Vision — Camera & Mic ({initialSource.Name})";
+        Size = new Size(920, 620);
+        MinimumSize = new Size(640, 420);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.FromArgb(12, 18, 30);
         ForeColor = Color.FromArgb(241, 245, 249);
         Font = new Font("Segoe UI", 9.5f);
         KeyPreview = true;
 
+        BuildTopToolbar(sources, initialSource);
+        BuildNativeMicBar();
+
+        _canvas.Dock = DockStyle.Fill;
+        _canvas.BackColor = Color.Black;
+        EnableDoubleBuffering(_canvas);
+        _canvas.Paint += PaintVideoCanvas;
+        _canvas.DoubleClick += (_, _) => ToggleCleanView();
+
+        KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Escape && _cleanView) ToggleCleanView();
+        };
+
+        Controls.Add(_canvas);
+        Controls.Add(_micBar);
+        Controls.Add(_toolbar);
+
+        _uiTimer.Interval = 50;
+        _uiTimer.Tick += OnUiTimerTick;
+
+        Shown += (_, _) =>
+        {
+            _mjpeg.Start();
+            RefreshAudioDevicesAndRouting(initialAutoSwitch: true);
+            UpdateTransportBadge();
+            StartWatchingCurrentSource();
+            _uiTimer.Start();
+        };
+        FormClosed += (_, _) =>
+        {
+            _uiTimer.Stop();
+            _uiTimer.Dispose();
+            _camOn = false;
+            _micOn = false;
+            try
+            {
+                _watchCamera(_currentSource.Id, false, _lens, false, false);
+                _watchMic(_currentSource.Id, false);
+            }
+            catch { }
+            WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+            _mjpeg.Dispose();
+            _primaryAudio.Dispose();
+            _monitorAudio.Dispose();
+            lock (_frameLock)
+            {
+                _frame?.Dispose();
+                _frame = null;
+            }
+        };
+    }
+
+    internal int PeerId => _currentSource.Id;
+
+    private void BuildTopToolbar(IReadOnlyList<MediaSourceOption> sources, MediaSourceOption initialSource)
+    {
         _toolbar.Dock = DockStyle.Top;
-        _toolbar.Height = 46;
+        _toolbar.AutoSize = true;
+        _toolbar.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        _toolbar.WrapContents = true;
         _toolbar.BackColor = Color.FromArgb(20, 29, 46);
         _toolbar.Padding = new Padding(10, 8, 10, 6);
 
-        var flow = new FlowLayoutPanel
+        _sourceCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _sourceCombo.Width = 200;
+        _sourceCombo.BackColor = Color.FromArgb(30, 41, 59);
+        _sourceCombo.ForeColor = Color.White;
+        _sourceCombo.Margin = new Padding(0, 2, 8, 2);
+        PopulateSourceCombo(sources, initialSource.Id);
+        _sourceCombo.SelectedIndexChanged += (_, _) =>
         {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false
+            if (_suppressEvents) return;
+            if (_sourceCombo.SelectedItem is MediaSourceOption next && next.Id != _currentSource.Id)
+                SwitchSource(next);
         };
-        _lensBtn.Click += (_, _) =>
+
+        _camBtn.Click += (_, _) =>
         {
-            _lens = _lens == 0 ? 1 : 0;
-            _lensBtn.Text = _lens == 0 ? "Lens: Back" : "Lens: Front";
-            if (_lens == 1) { _torch = false; _torchBtn.Text = "Torch: Off"; }
-            _watchCamera(_peerId, true, _lens, _torch, _micOn);
+            _camOn = !_camOn;
+            UpdateMediaToggleButtons();
+            if (!_camOn)
+            {
+                lock (_frameLock)
+                {
+                    _frame?.Dispose();
+                    _frame = null;
+                }
+                _canvas.Invalidate();
+            }
+            SyncWatchState();
         };
-        _torchBtn.Click += (_, _) =>
-        {
-            if (_lens == 1) _lens = 0;
-            _lensBtn.Text = "Lens: Back";
-            _torch = !_torch;
-            _torchBtn.Text = _torch ? "Torch: On" : "Torch: Off";
-            _watchCamera(_peerId, true, _lens, _torch, _micOn);
-        };
-        var rotBtn = MakeBtn("Rotate 90°");
-        rotBtn.Click += (_, _) => { _rotateDeg = (_rotateDeg + 90) % 360; _canvas.Invalidate(); };
 
         _micBtn.Click += (_, _) =>
         {
             _micOn = !_micOn;
-            _micBtn.Text = _micOn ? "Mic Audio: On" : "Mic Audio: Off";
-            _watchCamera(_peerId, true, _lens, _torch, _micOn);
+            UpdateMediaToggleButtons();
+            if (!_micOn)
+            {
+                _primaryAudio.ClearQueue();
+                _monitorAudio.ClearQueue();
+            }
+            SyncWatchState(micOnlyChange: true);
         };
+
+        _lensBtn.Click += (_, _) =>
+        {
+            _lens = _lens == 0 ? 1 : 0;
+            UpdateSourceCapabilityButtons();
+            if (_lens == 1 && _currentSource.Platform == "Android")
+                _torch = false;
+            UpdateSourceCapabilityButtons();
+            SyncWatchState();
+        };
+
+        _torchBtn.Click += (_, _) =>
+        {
+            if (!_currentSource.SupportsTorch) return;
+            if (_lens == 1) _lens = 0;
+            _torch = !_torch;
+            UpdateSourceCapabilityButtons();
+            SyncWatchState();
+        };
+
+        var rotBtn = MakeBtn("Rotate 90°");
+        rotBtn.Click += (_, _) => { _rotateDeg = (_rotateDeg + 90) % 360; _canvas.Invalidate(); };
 
         var snapBtn = MakeBtn("Snapshot");
         snapBtn.Click += (_, _) => CopySnapshot();
@@ -584,51 +618,138 @@ internal sealed class PhoneWebcamForm : Form
         var cleanBtn = MakeBtn("Clean View");
         cleanBtn.Click += (_, _) => ToggleCleanView();
 
-        _statusLabel.Text = "Waiting for camera permission on phone…";
+        _transportBadge.Text = "TCP";
+        _transportBadge.AutoSize = true;
+        _transportBadge.Padding = new Padding(6, 3, 6, 3);
+        _transportBadge.Margin = new Padding(2, 3, 6, 2);
+        _transportBadge.BackColor = Color.FromArgb(120, 53, 15);
+        _transportBadge.ForeColor = Color.FromArgb(253, 230, 138);
+        _transportBadge.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+
+        _statusLabel.Text = "Connecting media stream…";
         _statusLabel.AutoSize = true;
         _statusLabel.ForeColor = Color.FromArgb(125, 211, 252);
-        _statusLabel.Margin = new Padding(8, 5, 0, 0);
+        _statusLabel.Margin = new Padding(4, 6, 0, 2);
 
-        flow.Controls.AddRange(new Control[] { _lensBtn, _torchBtn, rotBtn, _micBtn, snapBtn, urlBtn, cleanBtn, _statusLabel });
-        _toolbar.Controls.Add(flow);
+        UpdateSourceCapabilityButtons();
+        UpdateMediaToggleButtons();
 
-        _canvas.Dock = DockStyle.Fill;
-        _canvas.BackColor = Color.Black;
-        EnableDoubleBuffering(_canvas);
-        _canvas.Paint += PaintVideoCanvas;
-        _canvas.DoubleClick += (_, _) => ToggleCleanView();
-
-        KeyDown += (_, e) =>
+        _toolbar.Controls.AddRange(new Control[]
         {
-            if (e.KeyCode == Keys.Escape && _cleanView) ToggleCleanView();
-        };
-
-        Controls.Add(_canvas);
-        Controls.Add(_toolbar);
-
-        Shown += (_, _) =>
-        {
-            _mjpeg.Start();
-            _watchCamera(_peerId, true, _lens, _torch, _micOn);
-        };
-        FormClosed += (_, _) =>
-        {
-            _watchCamera(_peerId, false, _lens, false, false);
-            _mjpeg.Dispose();
-            _audioPlayer.Dispose();
-            lock (_frameLock)
-            {
-                _frame?.Dispose();
-                _frame = null;
-            }
-        };
+            _sourceCombo, _camBtn, _micBtn, _lensBtn, _torchBtn, rotBtn,
+            snapBtn, urlBtn, cleanBtn, _transportBadge, _statusLabel
+        });
     }
 
-    internal int PeerId => _peerId;
+    private void BuildNativeMicBar()
+    {
+        _micBar.Dock = DockStyle.Top;
+        _micBar.AutoSize = true;
+        _micBar.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        _micBar.WrapContents = true;
+        _micBar.BackColor = Color.FromArgb(15, 23, 42);
+        _micBar.Padding = new Padding(10, 6, 10, 6);
+
+        _virtMicLabel.Text = "Checking virtual mic driver…";
+        _virtMicLabel.AutoSize = true;
+        _virtMicLabel.Margin = new Padding(0, 6, 8, 2);
+        _virtMicLabel.ForeColor = Color.FromArgb(148, 163, 184);
+
+        _autoDefaultMicCheck.Text = "Default Windows Mic";
+        _autoDefaultMicCheck.AutoSize = true;
+        _autoDefaultMicCheck.ForeColor = Color.White;
+        _autoDefaultMicCheck.Margin = new Padding(0, 5, 8, 2);
+        _autoDefaultMicCheck.CheckedChanged += (_, _) =>
+        {
+            if (_suppressEvents) return;
+            if (_autoDefaultMicCheck.Checked && _virtualMic.Installed)
+            {
+                if (WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId))
+                    UpdateStatus($"Windows default mic set to {_virtualMic.CaptureName}");
+                else
+                    UpdateStatus("Could not set default Windows mic automatically");
+            }
+            else if (!_autoDefaultMicCheck.Checked)
+            {
+                WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+                UpdateStatus("Restored previous default Windows mic");
+            }
+        };
+
+        _installDriverBtn.Click += async (_, _) => await InstallVbCableFromUiAsync();
+        _rescanAudioBtn.Click += (_, _) => RefreshAudioDevicesAndRouting(initialAutoSwitch: _autoDefaultMicCheck.Checked);
+
+        _hearMonitorCheck.Text = "Hear Monitor";
+        _hearMonitorCheck.AutoSize = true;
+        _hearMonitorCheck.ForeColor = Color.White;
+        _hearMonitorCheck.Margin = new Padding(4, 5, 6, 2);
+        _hearMonitorCheck.CheckedChanged += (_, _) =>
+        {
+            Volatile.Write(ref _hearMonitorActive, _hearMonitorCheck.Checked ? 1 : 0);
+            if (!_hearMonitorCheck.Checked)
+            {
+                if (Volatile.Read(ref _routingToVirtualCable) != 0)
+                    _monitorAudio.ClearQueue();
+                else
+                    _primaryAudio.ClearQueue();
+            }
+        };
+
+        _outputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _outputCombo.Width = 175;
+        _outputCombo.BackColor = Color.FromArgb(30, 41, 59);
+        _outputCombo.ForeColor = Color.White;
+        _outputCombo.Margin = new Padding(0, 2, 8, 2);
+        _outputCombo.SelectedIndexChanged += (_, _) =>
+        {
+            if (_suppressEvents) return;
+            ApplySelectedOutputDevice();
+        };
+
+        var gainLabel = new Label
+        {
+            Text = "Gain:",
+            AutoSize = true,
+            ForeColor = Color.FromArgb(203, 213, 225),
+            Margin = new Padding(0, 6, 2, 2)
+        };
+
+        _gainTrack.Minimum = 50;
+        _gainTrack.Maximum = 200;
+        _gainTrack.Value = 100;
+        _gainTrack.TickStyle = TickStyle.None;
+        _gainTrack.AutoSize = false;
+        _gainTrack.Size = new Size(92, 24);
+        _gainTrack.Margin = new Padding(0, 3, 8, 2);
+        _gainTrack.ValueChanged += (_, _) =>
+        {
+            float g = _gainTrack.Value / 100.0f;
+            _primaryAudio.Gain = g;
+            _monitorAudio.Gain = g;
+        };
+
+        _vuMeter.Size = new Size(108, 18);
+        _vuMeter.Margin = new Padding(0, 5, 0, 2);
+        _vuMeter.BackColor = Color.FromArgb(30, 41, 59);
+        EnableDoubleBuffering(_vuMeter);
+        _vuMeter.Paint += PaintVuMeter;
+
+        _micBar.Controls.AddRange(new Control[]
+        {
+            _virtMicLabel, _autoDefaultMicCheck, _installDriverBtn, _rescanAudioBtn,
+            _hearMonitorCheck, _outputCombo, gainLabel, _gainTrack, _vuMeter
+        });
+    }
+
+    internal void UpdateSources(IReadOnlyList<MediaSourceOption> sources)
+    {
+        if (IsDisposed || sources == null) return;
+        PopulateSourceCombo(sources, _currentSource.Id);
+    }
 
     internal void UpdateCameraFrame(byte[] jpegBytes)
     {
-        if (IsDisposed || jpegBytes.Length == 0) return;
+        if (IsDisposed || jpegBytes.Length == 0 || !_camOn) return;
         _mjpeg.PushJpegFrame(jpegBytes);
         try
         {
@@ -647,7 +768,8 @@ internal sealed class PhoneWebcamForm : Form
                 double fps = _fpsCount * 1000.0 / Math.Max(1, now - _fpsStartMs);
                 _fpsCount = 0;
                 _fpsStartMs = now;
-                _statusLabel.Text = $"Live • {fps:F0} FPS • {_mjpeg.StreamUrl}";
+                string micSuffix = string.IsNullOrEmpty(_micStateNote) ? "" : $" • {_micStateNote}";
+                _statusLabel.Text = $"Live • {fps:F0} FPS • {_mjpeg.StreamUrl}{micSuffix}";
             }
             _canvas.Invalidate();
         }
@@ -657,7 +779,16 @@ internal sealed class PhoneWebcamForm : Form
     internal void HandleMicAudio(byte[] pcm, int sampleRate)
     {
         if (IsDisposed || !_micOn || pcm.Length == 0) return;
-        _audioPlayer.PlayPcm16Mono(pcm, sampleRate);
+        if (Volatile.Read(ref _routingToVirtualCable) != 0)
+        {
+            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate);
+            if (Volatile.Read(ref _hearMonitorActive) != 0)
+                _monitorAudio.EnqueuePcm16Mono(pcm, sampleRate);
+        }
+        else if (Volatile.Read(ref _hearMonitorActive) != 0)
+        {
+            _primaryAudio.EnqueuePcm16Mono(pcm, sampleRate);
+        }
     }
 
     internal void UpdateStatus(string text)
@@ -666,10 +797,258 @@ internal sealed class PhoneWebcamForm : Form
             _statusLabel.Text = text;
     }
 
+    internal void UpdateMicStatus(int stateCode, string? text)
+    {
+        if (IsDisposed || string.IsNullOrWhiteSpace(text)) return;
+        _micStateNote = stateCode != 0 ? "Mic Live" : text;
+        if (!_camOn || _frame == null)
+            _statusLabel.Text = text;
+    }
+
+    private void PopulateSourceCombo(IReadOnlyList<MediaSourceOption> sources, int preferredId)
+    {
+        _suppressEvents = true;
+        try
+        {
+            _sourceCombo.Items.Clear();
+            int selectedIdx = -1;
+            for (int i = 0; i < sources.Count; i++)
+            {
+                _sourceCombo.Items.Add(sources[i]);
+                if (sources[i].Id == preferredId)
+                    selectedIdx = i;
+            }
+            if (selectedIdx < 0 && sources.Count > 0)
+            {
+                selectedIdx = 0;
+                _currentSource = sources[0];
+            }
+            if (selectedIdx >= 0)
+                _sourceCombo.SelectedIndex = selectedIdx;
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
+    }
+
+    private void SwitchSource(MediaSourceOption next)
+    {
+        int oldId = _currentSource.Id;
+        try
+        {
+            _watchCamera(oldId, false, _lens, false, false);
+            _watchMic(oldId, false);
+        }
+        catch { }
+        _primaryAudio.ClearQueue();
+        _monitorAudio.ClearQueue();
+        lock (_frameLock)
+        {
+            _frame?.Dispose();
+            _frame = null;
+        }
+        _fpsCount = 0;
+        _fpsStartMs = Environment.TickCount64;
+        _micStateNote = "";
+        _currentSource = next;
+        _torch = false;
+        Text = $"DeskTouch Vision — Camera & Mic ({next.Name})";
+        UpdateSourceCapabilityButtons();
+        UpdateTransportBadge();
+        UpdateStatus($"Connecting to {next.Name}…");
+        _canvas.Invalidate();
+        StartWatchingCurrentSource();
+    }
+
+    private void StartWatchingCurrentSource()
+    {
+        _watchCamera(_currentSource.Id, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
+        _watchMic(_currentSource.Id, _micOn);
+    }
+
+    private void SyncWatchState(bool micOnlyChange = false)
+    {
+        if (micOnlyChange)
+            _watchMic(_currentSource.Id, _micOn);
+        else
+            _watchCamera(_currentSource.Id, _camOn, _lens, _currentSource.SupportsTorch && _torch, _micOn);
+    }
+
+    private void UpdateMediaToggleButtons()
+    {
+        _camBtn.Text = _camOn ? "Camera: On" : "Camera: Off";
+        _camBtn.BackColor = _camOn ? Color.FromArgb(37, 99, 235) : Color.FromArgb(51, 65, 85);
+        _micBtn.Text = _micOn ? "Mic: On" : "Mic: Off";
+        _micBtn.BackColor = _micOn ? Color.FromArgb(5, 150, 105) : Color.FromArgb(51, 65, 85);
+    }
+
+    private void UpdateSourceCapabilityButtons()
+    {
+        if (_currentSource.Platform == "Android")
+        {
+            _lensBtn.Text = _lens == 0 ? "Lens: Back" : "Lens: Front";
+            _torchBtn.Enabled = _currentSource.SupportsTorch;
+            _torchBtn.Text = _torch ? "Torch: On" : "Torch: Off";
+        }
+        else
+        {
+            _lensBtn.Text = _lens == 0 ? "Camera #1" : $"Camera #{Math.Abs(_lens) + 1}";
+            _torchBtn.Enabled = false;
+            _torchBtn.Text = "Torch: N/A";
+        }
+    }
+
+    private void RefreshAudioDevicesAndRouting(bool initialAutoSwitch)
+    {
+        _waveOutDevices = WindowsAudioDeviceBridge.ListWaveOutDevices();
+        var captures = WindowsAudioDeviceBridge.ListCaptureEndpoints();
+        _virtualMic = WindowsAudioDeviceBridge.MatchVirtualMicPair(_waveOutDevices, captures);
+
+        _suppressEvents = true;
+        try
+        {
+            _outputCombo.Items.Clear();
+            _outputCombo.Items.Add("Monitor: Default Speakers");
+            foreach (var d in _waveOutDevices)
+            {
+                if (_virtualMic.Installed && d.WaveOutId == _virtualMic.RenderWaveOutId) continue;
+                _outputCombo.Items.Add($"{d.Name} (#{d.WaveOutId})");
+            }
+            if (_outputCombo.Items.Count > 0)
+                _outputCombo.SelectedIndex = 0;
+
+            if (_virtualMic.Installed)
+            {
+                Volatile.Write(ref _routingToVirtualCable, 1);
+                _primaryAudio.SetOutputDevice(_virtualMic.RenderWaveOutId);
+                _virtMicLabel.Text = $"Native Mic Active: {_virtualMic.CaptureName}";
+                _virtMicLabel.ForeColor = Color.FromArgb(110, 231, 183);
+                _installDriverBtn.Visible = false;
+                _autoDefaultMicCheck.Enabled = true;
+                if (initialAutoSwitch)
+                {
+                    bool setOk = WindowsAudioDeviceBridge.TrySetDefaultCaptureDevice(_virtualMic.CaptureEndpointId);
+                    _autoDefaultMicCheck.Checked = setOk;
+                }
+                _hearMonitorCheck.Checked = false;
+                Volatile.Write(ref _hearMonitorActive, 0);
+            }
+            else
+            {
+                Volatile.Write(ref _routingToVirtualCable, 0);
+                ApplySelectedOutputDevice();
+                _virtMicLabel.Text = "Native Mic Driver not installed (using PC speaker monitor)";
+                _virtMicLabel.ForeColor = Color.FromArgb(253, 224, 71);
+                _installDriverBtn.Visible = true;
+                _autoDefaultMicCheck.Checked = false;
+                _autoDefaultMicCheck.Enabled = false;
+                _hearMonitorCheck.Checked = true;
+                Volatile.Write(ref _hearMonitorActive, 1);
+            }
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
+    }
+
+    private void ApplySelectedOutputDevice()
+    {
+        uint selectedId = WaveMapperId;
+        int idx = _outputCombo.SelectedIndex;
+        if (idx > 0)
+        {
+            int cur = 0;
+            foreach (var d in _waveOutDevices)
+            {
+                if (_virtualMic.Installed && d.WaveOutId == _virtualMic.RenderWaveOutId) continue;
+                cur++;
+                if (cur == idx)
+                {
+                    selectedId = d.WaveOutId;
+                    break;
+                }
+            }
+        }
+        if (Volatile.Read(ref _routingToVirtualCable) != 0)
+            _monitorAudio.SetOutputDevice(selectedId);
+        else
+            _primaryAudio.SetOutputDevice(selectedId);
+    }
+
+    private async Task InstallVbCableFromUiAsync()
+    {
+        if (_installingDriver) return;
+        _installingDriver = true;
+        _installDriverBtn.Enabled = false;
+        try
+        {
+            var result = await WindowsAudioDeviceBridge.InstallVbCableDriverAsync(msg =>
+            {
+                if (!IsDisposed && IsHandleCreated)
+                    BeginInvoke(() => _virtMicLabel.Text = msg);
+            });
+            if (IsDisposed) return;
+            UpdateStatus(result.Message);
+            RefreshAudioDevicesAndRouting(initialAutoSwitch: result.Installed);
+        }
+        finally
+        {
+            _installingDriver = false;
+            if (!IsDisposed) _installDriverBtn.Enabled = true;
+        }
+    }
+
+    private void OnUiTimerTick(object? sender, EventArgs e)
+    {
+        if (IsDisposed) return;
+        float lvl = _micOn
+            ? Math.Max(_primaryAudio.CurrentLevel, _monitorAudio.CurrentLevel)
+            : 0f;
+        if (Math.Abs(lvl - _vuLevel) > 0.01f)
+        {
+            _vuLevel = lvl;
+            _vuMeter.Invalidate();
+        }
+        if ((++_timerTick % 10) == 0)
+            UpdateTransportBadge();
+    }
+
+    private void UpdateTransportBadge()
+    {
+        bool udp = _isFastUdpActive(_currentSource.Id);
+        string want = udp ? "Fast UDP" : "TCP";
+        if (string.Equals(_transportBadge.Text, want, StringComparison.Ordinal)) return;
+        _transportBadge.Text = want;
+        _transportBadge.BackColor = udp ? Color.FromArgb(6, 78, 59) : Color.FromArgb(120, 53, 15);
+        _transportBadge.ForeColor = udp ? Color.FromArgb(110, 231, 183) : Color.FromArgb(253, 230, 138);
+    }
+
+    private void PaintVuMeter(object? sender, PaintEventArgs e)
+    {
+        var r = _vuMeter.ClientRectangle;
+        e.Graphics.Clear(Color.FromArgb(30, 41, 59));
+        int fillW = (int)Math.Round(Math.Clamp(_vuLevel, 0f, 1f) * Math.Max(0, r.Width - 4));
+        if (fillW > 0)
+        {
+            Color c = _vuLevel > 0.88f
+                ? Color.FromArgb(239, 68, 68)
+                : _vuLevel > 0.65f
+                    ? Color.FromArgb(245, 158, 11)
+                    : Color.FromArgb(34, 197, 94);
+            using var b = new SolidBrush(c);
+            e.Graphics.FillRectangle(b, 2, 2, fillW, Math.Max(2, r.Height - 4));
+        }
+        using var pen = new Pen(Color.FromArgb(71, 85, 105));
+        e.Graphics.DrawRectangle(pen, 0, 0, Math.Max(1, r.Width - 1), Math.Max(1, r.Height - 1));
+    }
+
     private void ToggleCleanView()
     {
         _cleanView = !_cleanView;
         _toolbar.Visible = !_cleanView;
+        _micBar.Visible = !_cleanView;
         FormBorderStyle = _cleanView ? FormBorderStyle.None : FormBorderStyle.Sizable;
     }
 
@@ -698,9 +1077,12 @@ internal sealed class PhoneWebcamForm : Form
         if (snap == null)
         {
             using var f = new Font("Segoe UI", 10.5f);
+            string waitingMsg = _camOn
+                ? $"Waiting for live video from {_currentSource.Name}…\n\nDouble-click video or use 'Clean View' to capture cleanly inside Zoom, Meet, Discord, or OBS."
+                : $"Microphone-only mode active for {_currentSource.Name}.\n\nTurn 'Camera: On' above anytime to enable video.";
             TextRenderer.DrawText(
                 e.Graphics,
-                "Waiting for wireless phone camera feed…\n\nOn Android, tap 'Start Camera / Mic' when prompted.\nDouble-click video or use 'Clean View' to capture cleanly inside calls or OBS.",
+                waitingMsg,
                 f,
                 _canvas.ClientRectangle,
                 Color.FromArgb(148, 163, 184),
@@ -735,7 +1117,7 @@ internal sealed class PhoneWebcamForm : Form
         BackColor = primary ? Color.FromArgb(37, 99, 235) : Color.FromArgb(30, 41, 59),
         ForeColor = Color.White,
         Cursor = Cursors.Hand,
-        Margin = new Padding(0, 0, 6, 0)
+        Margin = new Padding(0, 0, 6, 2)
     };
 
     private static void EnableDoubleBuffering(Control c)

@@ -341,13 +341,33 @@ final class EcosystemFeatures {
             } catch (Exception ignored) {
                 return null;
             }
+            return addBinaryChunk(frameId, index, total, width, height, part, tag, 12000L);
+        }
+
+        synchronized Result addRawChunk(int frameId, int index, int total, int width, int height, byte[] part) {
+            if (frameId <= 0 || total < 1 || total > 256 || index < 0 || index >= total ||
+                part == null || part.length == 0) {
+                return null;
+            }
+            return addBinaryChunk(frameId, index, total, width, height, part, "", 450L);
+        }
+
+        private Result addBinaryChunk(int frameId, int index, int total, int width, int height,
+                byte[] part, String tag, long maxAgeMs) {
             if (total == 1) {
                 return new Result(part, tag == null ? "" : tag, width, height);
             }
-            long now = SystemClock.uptimeMillis();
-            pending.entrySet().removeIf(e -> now - e.getValue().createdMs > 12000L);
+            long now = System.nanoTime() / 1_000_000L;
+            pending.entrySet().removeIf(e -> now - e.getValue().createdMs > maxAgeMs);
             Slot slot = pending.get(frameId);
             if (slot == null || slot.parts.length != total) {
+                if (pending.size() >= 6) {
+                    int oldestKey = Integer.MAX_VALUE;
+                    for (Integer k : pending.keySet()) {
+                        if (k < oldestKey) oldestKey = k;
+                    }
+                    if (oldestKey != Integer.MAX_VALUE) pending.remove(oldestKey);
+                }
                 slot = new Slot();
                 slot.parts = new byte[total][];
                 slot.tag = tag == null ? "" : tag;
@@ -357,13 +377,16 @@ final class EcosystemFeatures {
                 pending.put(frameId, slot);
             }
             if (tag != null && !tag.isEmpty() && slot.tag.isEmpty()) slot.tag = tag;
+            if (width > 0 && slot.width <= 0) slot.width = width;
+            if (height > 0 && slot.height <= 0) slot.height = height;
             if (slot.parts[index] == null) slot.received++;
             slot.parts[index] = part;
             if (slot.received < total) return null;
             pending.remove(frameId);
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             for (byte[] p : slot.parts) {
-                if (p != null) bos.write(p, 0, p.length);
+                if (p == null) return null;
+                bos.write(p, 0, p.length);
             }
             return new Result(bos.toByteArray(), slot.tag, slot.width, slot.height);
         }

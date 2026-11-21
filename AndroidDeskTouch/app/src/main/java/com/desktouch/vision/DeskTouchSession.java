@@ -140,6 +140,7 @@ final class DeskTouchSession implements AutoCloseable {
     interface MediaRequestListener {
         void onScreenShareRequested();
         void onCameraShareRequested(int lens, boolean torch, boolean mic);
+        default void onMicShareRequested() {}
     }
     private static volatile MediaRequestListener mediaRequestListener;
     private static int phoneScreenFrameSeq;
@@ -1333,6 +1334,8 @@ final class DeskTouchSession implements AutoCloseable {
                     handlePhoneMirrorText(p.text);
                 } else if("phone-camera-watch".equals(p.type)){
                     handlePhoneCameraWatch(p.a!=0,p.b,p.c!=0,p.d!=0);
+                } else if("phone-mic-watch".equals(p.type)){
+                    handlePhoneMicWatch(p.a!=0);
                 } else if("goodbye".equals(p.type)) break;
             }
         } catch(Exception e){
@@ -1885,27 +1888,67 @@ final class DeskTouchSession implements AutoCloseable {
         if(deleteTemp) w.tempFile.delete();
     }
 
+    private FastUdpChannel activeMediaUdp(){
+        FastUdpChannel w = udpChannel;
+        if(w != null && w.confirmed) return w;
+        FastUdpChannel m = mobileUdpChannel;
+        return (m != null && m.confirmed) ? m : null;
+    }
+
+    private boolean sendFastMediaChunks(byte mediaKind, int frameId, int packedDims, byte[] data){
+        if(!running || data==null || data.length==0 || data.length>160*1024) return false;
+        FastUdpChannel ch = activeMediaUdp();
+        if(ch == null) return false;
+        final int chunkSize = FastUdpChannel.MAX_MEDIA_PAYLOAD_BYTES;
+        int total = (data.length + chunkSize - 1) / chunkSize;
+        for(int i=0;i<total;i++){
+            int off = i * chunkSize;
+            int len = Math.min(chunkSize, data.length - off);
+            if(!ch.sendMedia(mediaKind, frameId, i, total, packedDims, data, off, len))
+                return false;
+        }
+        return true;
+    }
+
     private void registerPhoneMediaSink(){
         PhoneMediaService.setSink(new PhoneMediaService.MediaSink(){
             @Override public void onScreenFrame(byte[] jpeg){
                 if(!running) return;
-                sendMediaChunks("phone-screen-chunk",++phoneScreenFrameSeq,jpeg);
+                int id = ++phoneScreenFrameSeq;
+                if(!sendFastMediaChunks(FastUdpChannel.MEDIA_KIND_PHONE_SCREEN_CHUNK, id, 0, jpeg)){
+                    sendMediaChunks("phone-screen-chunk", id, jpeg);
+                }
             }
             @Override public void onScreenStatus(int stateCode, String msg){
                 if(running) send(new Packet("phone-screen-status",stateCode,0,0,0,msg==null?"":msg));
             }
             @Override public void onCameraFrame(byte[] jpeg){
                 if(!running) return;
-                sendMediaChunks("phone-camera-chunk",++phoneCameraFrameSeq,jpeg);
+                int id = ++phoneCameraFrameSeq;
+                if(!sendFastMediaChunks(FastUdpChannel.MEDIA_KIND_CAMERA_CHUNK, id, 0, jpeg)){
+                    sendMediaChunks("phone-camera-chunk", id, jpeg);
+                }
             }
             @Override public void onCameraStatus(int stateCode, String msg){
                 if(running) send(new Packet("phone-camera-status",stateCode,0,0,0,msg==null?"":msg));
             }
             @Override public void onMicAudio(byte[] pcm16Mono, int sampleRate){
                 if(!running || pcm16Mono==null || pcm16Mono.length==0) return;
+                int seq = ++phoneMicSeq;
+                FastUdpChannel ch = activeMediaUdp();
+                if(ch != null && pcm16Mono.length <= FastUdpChannel.MAX_MEDIA_PAYLOAD_BYTES &&
+                    ch.sendMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, seq, sampleRate, 1, 0, pcm16Mono, 0, pcm16Mono.length)){
+                    return;
+                }
                 String b64=android.util.Base64.encodeToString(pcm16Mono,android.util.Base64.NO_WRAP);
                 if(b64.length()<=7200)
-                    send(new Packet("phone-mic-audio",++phoneMicSeq,sampleRate,1,0,b64));
+                    send(new Packet("phone-mic-audio",seq,sampleRate,1,0,b64));
+            }
+            @Override public void onMicStatus(int stateCode, String msg){
+                if(running) send(new Packet("phone-mic-status",stateCode,0,0,0,msg==null?"":msg));
+            }
+            @Override public boolean isFastUdpMediaActive(){
+                return activeMediaUdp() != null;
             }
         });
     }
@@ -1940,18 +1983,44 @@ final class DeskTouchSession implements AutoCloseable {
 
     private void handlePhoneCameraWatch(boolean enable, int lens, boolean torch, boolean mic){
         if(!enable){
-            PhoneMediaService.stopCameraShare(application);
+            PhoneMediaService.stopCameraShare(application,!mic);
+            if(mic) handlePhoneMicWatch(true);
             return;
         }
         registerPhoneMediaSink();
         boolean hasCam=application.checkSelfPermission(android.Manifest.permission.CAMERA)
             == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        boolean hasMic=application.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
         if(hasCam){
-            PhoneMediaService.startCameraShare(application,lens,torch,mic);
+            PhoneMediaService.startCameraShare(application,lens,torch,mic && hasMic);
+            if(mic && !hasMic){
+                send(new Packet("phone-mic-status",2,0,0,0,"Tap Share Mic on phone"));
+                MediaRequestListener l=mediaRequestListener;
+                if(l!=null) l.onMicShareRequested();
+            }
         }else{
+            if(mic && hasMic) PhoneMediaService.startMicShare(application);
             send(new Packet("phone-camera-status",2,lens,0,0,"Tap Share Camera on phone"));
             MediaRequestListener l=mediaRequestListener;
             if(l!=null) l.onCameraShareRequested(lens,torch,mic);
+        }
+    }
+
+    private void handlePhoneMicWatch(boolean enable){
+        if(!enable){
+            PhoneMediaService.stopMicShare(application);
+            return;
+        }
+        registerPhoneMediaSink();
+        boolean hasMic=application.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(hasMic){
+            PhoneMediaService.startMicShare(application);
+        }else{
+            send(new Packet("phone-mic-status",2,0,0,0,"Tap Share Mic on phone"));
+            MediaRequestListener l=mediaRequestListener;
+            if(l!=null) l.onMicShareRequested();
         }
     }
 
@@ -2492,6 +2561,24 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                     evaluateLossTriggeredStreams();
                     DeskTouchRuntime.notifyLiveStatusChanged();
+                }
+            }
+            @Override public void onMediaDatagram(FastUdpChannel.MediaDatagram d) {
+                if (!running || d == null) return;
+                if (d.kind == FastUdpChannel.MEDIA_KIND_PC_SCREEN_PREVIEW_CHUNK &&
+                    screenPreviewWatchMonitor >= 0 && d.payload != null && d.payload.length > 0) {
+                    int w = (d.metaOrRouteId >>> 16) & 0xFFFF;
+                    int h = d.metaOrRouteId & 0xFFFF;
+                    EcosystemFeatures.ChunkAssembler.Result res = screenPreviewAssembler.addRawChunk(
+                        d.frameOrAudioId, d.indexOrSampleRate, d.totalOrChannels, w, h, d.payload);
+                    if (res != null && res.data != null) {
+                        android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeByteArray(
+                            res.data, 0, res.data.length);
+                        if (bmp != null) {
+                            latestScreenPreview = bmp;
+                            DeskTouchRuntime.notifyLiveStatusChanged();
+                        }
+                    }
                 }
             }
         };

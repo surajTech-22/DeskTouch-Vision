@@ -1754,6 +1754,68 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("Native phone keyboard active ("));
     }
 
+    @Test
+    public void fastUdpMediaAndStandaloneMicProtocolWorkSafely() throws Exception {
+        byte[] key = new byte[FastUdpChannel.KEY_SIZE];
+        new java.security.SecureRandom().nextBytes(key);
+        FastUdpChannel.Codec server = new FastUdpChannel.Codec(key, 9, true);
+        FastUdpChannel.Codec client = new FastUdpChannel.Codec(key, 9, false);
+
+        byte[] pcm = new byte[640];
+        for (int i = 0; i < pcm.length; i++) pcm[i] = (byte) ((i * 19 + 5) & 0xFF);
+        byte[] wire = new byte[FastUdpChannel.MAX_MEDIA_FRAME_SIZE];
+        int micLen = client.sealMedia(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, 21, 16000, 1, 0, pcm, 0, pcm.length, wire);
+        assertEquals(FastUdpChannel.MEDIA_MIN_FRAME_SIZE + pcm.length, micLen);
+
+        FastUdpChannel.MediaDatagram openedMic = server.tryOpenMedia(wire, micLen);
+        assertNotNull(openedMic);
+        assertEquals(FastUdpChannel.MEDIA_KIND_MIC_AUDIO, openedMic.kind);
+        assertEquals(21, openedMic.frameOrAudioId);
+        assertEquals(16000, openedMic.indexOrSampleRate);
+        assertArrayEquals(pcm, openedMic.payload);
+
+        // Replay & tamper rejection
+        assertNull(server.tryOpenMedia(wire, micLen));
+        byte[] tampered = java.util.Arrays.copyOf(wire, micLen);
+        tampered[micLen - 1] ^= 0x3C;
+        assertNull(server.tryOpenMedia(tampered, tampered.length));
+
+        // Server -> client PC Screen Preview + independent DTU1 input sequence
+        byte[] jpegPart = new byte[] { (byte) 0xFF, (byte) 0xD8, 0x12, 0x34, 0x56, 0x78 };
+        int prevLen = server.sealMedia(FastUdpChannel.MEDIA_KIND_PC_SCREEN_PREVIEW_CHUNK, 77, 0, 1, (560 << 16) | 315, jpegPart, 0, jpegPart.length, wire);
+        FastUdpChannel.MediaDatagram openedPrev = client.tryOpenMedia(wire, prevLen);
+        assertNotNull(openedPrev);
+        assertEquals(FastUdpChannel.MEDIA_KIND_PC_SCREEN_PREVIEW_CHUNK, openedPrev.kind);
+        assertEquals((560 << 16) | 315, openedPrev.metaOrRouteId);
+        assertArrayEquals(jpegPart, openedPrev.payload);
+
+        byte[] dtuFrame = new byte[FastUdpChannel.FRAME_SIZE];
+        client.seal(FastUdpChannel.OP_MOVE, 321, 654, 1, 55, dtuFrame);
+        FastUdpChannel.Message dtuMsg = server.tryOpen(dtuFrame, dtuFrame.length);
+        assertNotNull(dtuMsg);
+        assertEquals(1L, dtuMsg.seq);
+        assertEquals(321, dtuMsg.a);
+
+        EcosystemFeatures.ChunkAssembler assembler = new EcosystemFeatures.ChunkAssembler();
+        assertNull(assembler.addRawChunk(88, 2, 3, 560, 315, new byte[] { 6, 7 }));
+        assertNull(assembler.addRawChunk(88, 0, 3, 560, 315, new byte[] { 1, 2, 3 }));
+        EcosystemFeatures.ChunkAssembler.Result joined = assembler.addRawChunk(88, 1, 3, 560, 315, new byte[] { 4, 5 });
+        assertNotNull(joined);
+        assertArrayEquals(new byte[] { 1, 2, 3, 4, 5, 6, 7 }, joined.data);
+
+        String mediaServiceSource = readProjectSource("src/main/java/com/desktouch/vision/PhoneMediaService.java");
+        String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
+        String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
+        assertTrue(mediaServiceSource.contains("ACTION_START_MIC"));
+        assertTrue(mediaServiceSource.contains("VOICE_COMMUNICATION"));
+        assertTrue(mediaServiceSource.contains("AcousticEchoCanceler"));
+        assertTrue(mediaServiceSource.contains("SecurityException"));
+        assertTrue(sessionSource.contains("sendMedia("));
+        assertTrue(sessionSource.contains("\"phone-mic-watch\""));
+        assertTrue(mainSource.contains("Share Mic Only"));
+        assertTrue(mainSource.contains("onMicShareRequested()"));
+    }
+
     private static String readProjectSource(String relFromAppModule) {
         try {
             String[] prefixes = {"", "app/", "AndroidDeskTouch/app/"};

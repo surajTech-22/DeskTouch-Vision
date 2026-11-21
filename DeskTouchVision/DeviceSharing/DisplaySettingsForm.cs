@@ -186,7 +186,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
     private readonly Button _clipboardToggleButton = Button("Clipboard: On");
     private readonly Button _sendFileButton = Button("Send file");
     private readonly Button _phoneScreenButton = Button("Phone Screen");
-    private readonly Button _phoneWebcamButton = Button("Phone Camera");
+    private readonly Button _phoneWebcamButton = Button("Camera & Mic");
     private readonly Button _shelfButton = Button("Recent Shelf");
     private readonly Button _lockAllButton = Button("Lock all");
     private readonly Button _wakeAllButton = Button("Wake PCs");
@@ -634,7 +634,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             ShowFromTray();
             OpenPhoneScreenWindow();
         });
-        _trayMenu.Items.Add("Phone Camera & Mic", null, (_, _) =>
+        _trayMenu.Items.Add("Camera & Mic", null, (_, _) =>
         {
             ShowFromTray();
             OpenPhoneWebcamWindow();
@@ -906,6 +906,9 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _closing.Cancel();
         _trustedScanTimer?.Stop();
         _liveLinkTimer?.Stop();
+        WindowsAudioDeviceBridge.RestorePreviousDefaultCaptureDeviceIfChanged();
+        _receiver?.StopLocalMediaSharing();
+        _host?.StopLocalMediaSharing();
         // Revoke remote control and close the TLS peer before destroying
         // Windows input hooks or receiver listening state.
         DisconnectHost();
@@ -1793,6 +1796,16 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 }
                 catch { }
             };
+            _receiver.PhoneMicStatusReceived += (peerId, stateCode, msg) => PostToUi(() =>
+            {
+                if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == peerId)
+                    f.UpdateMicStatus(stateCode, msg);
+            });
+            _receiver.LocalMediaShareStateChanged += (_, _, summary) => PostToUi(() =>
+            {
+                if (!string.IsNullOrEmpty(summary))
+                    Status(summary);
+            });
             _receiver.LowBatteryDetected += (devName, pct, _) => PostToUi(() =>
             {
                 if (_ecosystemConfig.LowBatteryAlertEnabled)
@@ -1923,6 +1936,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private void OnPeerListChanged() => PostToUi(() =>
     {
+        if (_phoneWebcamForm is { IsDisposed: false } wf)
+            wf.UpdateSources(GetAvailableMediaSources());
         // A Windows peer's controls may be updated on the SAME TLS
         // session, without dropping the entire environment. Keep diagram,
         // keyboard-target availability and active input grant consistent.
@@ -2506,6 +2521,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         });
         session.FileReceived += (fromDev, savedPath) => PostToUi(() => OnIncomingFileSaved(fromDev, savedPath));
         session.OtpOfferReceived += (app, code, title) => PostToUi(() => ShowOtpOfferToast(app, code, title));
+        session.RemoteCameraFrameReceived += OnHostRemoteCameraFrame;
+        session.RemoteCameraStatusReceived += OnHostRemoteCameraStatus;
+        session.RemoteMicAudioReceived += OnHostRemoteMicAudio;
+        session.RemoteMicStatusReceived += OnHostRemoteMicStatus;
+        session.LocalMediaShareStateChanged += OnHostLocalMediaShareState;
         session.MutualTrustOfferRequested = ConfirmMutualTrustOfferAsync;
         if (_receiver != null)
         {
@@ -2868,6 +2888,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         RefreshDisplays();
         PublishDeckBridgeSnapshot();
         RefreshTrayFlyoutIfVisible();
+        if (_phoneWebcamForm is { IsDisposed: false } wf)
+            wf.UpdateSources(GetAvailableMediaSources());
         Status($"Shared environment: {_host.EnvironmentMembers.Count} available devices.");
     });
 
@@ -2934,6 +2956,11 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _host.EnvironmentLayoutChanged -= HandleSharedEnvironmentLayout;
             _host.RemotePlacementChanged -= HandleRemotePlacement;
             _host.SubRoutePacketReceived -= OnHostSubRoutePacket;
+            _host.RemoteCameraFrameReceived -= OnHostRemoteCameraFrame;
+            _host.RemoteCameraStatusReceived -= OnHostRemoteCameraStatus;
+            _host.RemoteMicAudioReceived -= OnHostRemoteMicAudio;
+            _host.RemoteMicStatusReceived -= OnHostRemoteMicStatus;
+            _host.LocalMediaShareStateChanged -= OnHostLocalMediaShareState;
             _host.MutualTrustOfferRequested = null;
         }
         _receiver?.ReleaseAllBridgedClaims();
@@ -3844,26 +3871,110 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
         _phoneScreenForm.Show(this);
     }
 
+    private void OnHostRemoteCameraFrame(int sourceId, byte[] jpg) => PostToUi(() =>
+    {
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId)
+            f.UpdateCameraFrame(jpg);
+    });
+
+    private void OnHostRemoteCameraStatus(int sourceId, int stateCode, string? msg) => PostToUi(() =>
+    {
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId && !string.IsNullOrWhiteSpace(msg))
+            f.UpdateStatus(msg);
+    });
+
+    private void OnHostRemoteMicAudio(int sourceId, byte[] pcm, int rate)
+    {
+        try
+        {
+            var w = _phoneWebcamForm;
+            if (w != null && !w.IsDisposed && w.PeerId == sourceId)
+                w.HandleMicAudio(pcm, rate);
+        }
+        catch { }
+    }
+
+    private void OnHostRemoteMicStatus(int sourceId, int stateCode, string? msg) => PostToUi(() =>
+    {
+        if (_phoneWebcamForm is { IsDisposed: false } f && f.PeerId == sourceId)
+            f.UpdateMicStatus(stateCode, msg);
+    });
+
+    private void OnHostLocalMediaShareState(bool cam, bool mic, string summary) => PostToUi(() =>
+    {
+        if (!string.IsNullOrEmpty(summary))
+            Status(summary);
+    });
+
+    private List<MediaSourceOption> GetAvailableMediaSources()
+    {
+        var list = new List<MediaSourceOption>();
+        if (_host != null)
+        {
+            var members = _host.EnvironmentMembers;
+            string hubName = members.FirstOrDefault(m => m.Id == 0)?.Name
+                ?? (!string.IsNullOrWhiteSpace(_remoteAddress) ? _remoteAddress : "Host PC");
+            list.Add(new MediaSourceOption(0, hubName, "Windows", SupportsTorch: false));
+            foreach (var m in members)
+            {
+                if (m.Id == 0 || m.Id == _host.OwnEnvironmentMemberId) continue;
+                bool isAndroid = string.Equals(m.Platform, "Android", StringComparison.OrdinalIgnoreCase);
+                list.Add(new MediaSourceOption(m.Id, m.Name, m.Platform, SupportsTorch: isAndroid));
+            }
+            return list;
+        }
+        if (_receiver != null)
+        {
+            foreach (var p in _receiver.ConnectedPeers)
+            {
+                bool isAndroid = string.Equals(p.Peer.Platform, "Android", StringComparison.OrdinalIgnoreCase);
+                bool isWindows = string.Equals(p.Peer.Platform, "Windows", StringComparison.OrdinalIgnoreCase);
+                if (!isAndroid && !isWindows) continue;
+                list.Add(new MediaSourceOption(p.Id, p.Peer.Name, p.Peer.Platform, SupportsTorch: isAndroid));
+            }
+        }
+        return list;
+    }
+
     private void OpenPhoneWebcamWindow()
     {
-        var phone = PickConnectedAndroidPeer();
-        if (phone == null)
+        var sources = GetAvailableMediaSources();
+        if (sources.Count == 0)
         {
             MessageBox.Show(this,
-                "Connect an Android phone to this computer first to use its camera and microphone wirelessly.",
-                "DeskTouch Vision — Phone Camera", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                "Connect a phone or another Windows computer first to use wireless Camera & Microphone.",
+                "DeskTouch Vision — Camera & Mic", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
-        if (_phoneWebcamForm is { IsDisposed: false } existing && existing.PeerId == phone.Value.Id)
+        if (_phoneWebcamForm is { IsDisposed: false } existing)
         {
+            existing.UpdateSources(sources);
             existing.Activate();
             return;
         }
+        MediaSourceOption initial = sources[0];
+        if (_receiver != null)
+        {
+            int sel = _receiver.SelectedPeerId;
+            int selIdx = sources.FindIndex(s => s.Id == sel);
+            int androidIdx = sources.FindIndex(s => s.Platform == "Android");
+            if (selIdx >= 0) initial = sources[selIdx];
+            else if (androidIdx >= 0) initial = sources[androidIdx];
+        }
+        bool useHost = _host != null;
         _phoneWebcamForm?.Close();
         _phoneWebcamForm = new PhoneWebcamForm(
-            phone.Value.Id,
-            phone.Value.Name,
-            watchCamera: (id, en, lens, torch, mic) => _receiver?.SendPhoneCameraWatch(id, en, lens, torch, mic));
+            sources,
+            initial,
+            watchCamera: useHost
+                ? (id, en, lens, torch, mic) => _host?.SendRemoteCameraWatch(id, en, lens, torch, mic)
+                : (id, en, lens, torch, mic) => _receiver?.SendPhoneCameraWatch(id, en, lens, torch, mic),
+            watchMic: useHost
+                ? (id, en) => _host?.SendRemoteMicWatch(id, en)
+                : (id, en) => _receiver?.SendPhoneMicWatch(id, en),
+            isFastUdpActive: useHost
+                ? _ => _host?.IsFastMediaUdpActive == true
+                : id => _receiver?.IsFastMediaUdpActive(id) == true);
         _phoneWebcamForm.Show(this);
     }
 

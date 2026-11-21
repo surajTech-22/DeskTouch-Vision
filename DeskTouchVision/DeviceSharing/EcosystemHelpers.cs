@@ -470,7 +470,7 @@ internal static class ScreenPreviewHelper
     private static readonly ImageCodecInfo? JpegCodec = ImageCodecInfo.GetImageEncoders()
         .FirstOrDefault(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
-    internal static (int FrameId, int PackedDims, IReadOnlyList<Packet> Chunks) CaptureMonitorPreview(
+    internal static (int FrameId, int PackedDims, byte[] JpegBytes) CaptureMonitorPreviewRaw(
         int monitorIndex = 0, bool highRes = false)
     {
         try
@@ -515,22 +515,31 @@ internal static class ScreenPreviewHelper
                 return default;
             int frameId = Interlocked.Increment(ref _nextFrameId);
             int packedDims = (dstW << 16) | (dstH & 0xFFFF);
-            const int chunkSize = 3600;
-            int total = (jpeg.Length + chunkSize - 1) / chunkSize;
-            var packets = new List<Packet>(total);
-            for (int i = 0; i < total; i++)
-            {
-                int offset = i * chunkSize;
-                int len = Math.Min(chunkSize, jpeg.Length - offset);
-                string b64 = Convert.ToBase64String(jpeg, offset, len);
-                packets.Add(new Packet("screen-preview-chunk", frameId, i, total, packedDims, b64));
-            }
-            return (frameId, packedDims, packets);
+            return (frameId, packedDims, jpeg);
         }
         catch
         {
             return default;
         }
+    }
+
+    internal static (int FrameId, int PackedDims, IReadOnlyList<Packet> Chunks) CaptureMonitorPreview(
+        int monitorIndex = 0, bool highRes = false)
+    {
+        var raw = CaptureMonitorPreviewRaw(monitorIndex, highRes);
+        if (raw.JpegBytes == null || raw.JpegBytes.Length == 0)
+            return default;
+        const int chunkSize = 3600;
+        int total = (raw.JpegBytes.Length + chunkSize - 1) / chunkSize;
+        var packets = new List<Packet>(total);
+        for (int i = 0; i < total; i++)
+        {
+            int offset = i * chunkSize;
+            int len = Math.Min(chunkSize, raw.JpegBytes.Length - offset);
+            string b64 = Convert.ToBase64String(raw.JpegBytes, offset, len);
+            packets.Add(new Packet("screen-preview-chunk", raw.FrameId, i, total, raw.PackedDims, b64));
+        }
+        return (raw.FrameId, raw.PackedDims, packets);
     }
 }
 

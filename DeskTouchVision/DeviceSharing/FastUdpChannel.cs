@@ -28,6 +28,14 @@ internal enum FastUdpOp : byte
     ForwardKey = 17
 }
 
+internal enum FastUdpMediaKind : byte
+{
+    MicAudio = 1,
+    CameraFrameChunk = 2,
+    PhoneScreenChunk = 3,
+    PcScreenPreviewChunk = 4
+}
+
 internal readonly record struct FastUdpMessage(
     FastUdpOp Op,
     ushort PeerId,
@@ -37,35 +45,65 @@ internal readonly record struct FastUdpMessage(
     int Lease,
     int TimestampMs);
 
+internal readonly record struct FastUdpMediaDatagram(
+    FastUdpMediaKind Kind,
+    ushort PeerId,
+    ulong Seq,
+    int FrameOrAudioId,
+    int IndexOrSampleRate,
+    int TotalOrChannels,
+    int MetaOrRouteId,
+    byte[] Payload);
+
 /// <summary>
 /// Authenticated, replay-protected 48-byte AES-256-GCM UDP codec ("DTU1") for
-/// low-latency coordinate relay without TCP head-of-line blocking.
+/// low-latency coordinate relay and variable-length binary media ("DTM1") without TCP head-of-line blocking.
 /// </summary>
 internal sealed class FastUdpCodec : IDisposable
 {
     internal const int KeySize = 32;
     internal const int FrameSize = 48;
+    internal const int MediaHeaderSize = 16;
+    internal const int MediaSubHeaderSize = 16;
+    internal const int MediaTagSize = 16;
+    internal const int MediaMinFrameSize = MediaHeaderSize + MediaSubHeaderSize + MediaTagSize;
+    internal const int MaxMediaPayloadBytes = 1152;
+    internal const int MaxMediaFrameSize = MediaMinFrameSize + MaxMediaPayloadBytes;
     internal const byte DirectionServerToClient = 1;
     internal const byte DirectionClientToServer = 2;
 
     private static readonly byte[] Magic = [(byte)'D', (byte)'T', (byte)'U', (byte)'1'];
     private static readonly byte[] ServerNoncePrefix = [(byte)'S', (byte)'R', (byte)'V', (byte)'1'];
     private static readonly byte[] ClientNoncePrefix = [(byte)'C', (byte)'L', (byte)'I', (byte)'1'];
+    private static readonly byte[] MediaMagic = [(byte)'D', (byte)'T', (byte)'M', (byte)'1'];
+    private static readonly byte[] ServerMediaNoncePrefix = [(byte)'S', (byte)'R', (byte)'M', (byte)'1'];
+    private static readonly byte[] ClientMediaNoncePrefix = [(byte)'C', (byte)'L', (byte)'M', (byte)'1'];
 
     private readonly byte _outboundDirection;
     private readonly byte _inboundDirection;
     private readonly ushort _peerId;
     private readonly object _sendLock = new();
     private readonly object _recvLock = new();
+    private readonly object _mediaSendLock = new();
+    private readonly object _mediaRecvLock = new();
     private readonly AesGcm _sendAes;
     private readonly AesGcm _recvAes;
+    private readonly AesGcm _mediaSendAes;
+    private readonly AesGcm _mediaRecvAes;
     private readonly byte[] _sendPlain = new byte[16];
     private readonly byte[] _sendNonce = new byte[12];
     private readonly byte[] _recvPlain = new byte[16];
     private readonly byte[] _recvNonce = new byte[12];
+    private readonly byte[] _mediaSendPlain = new byte[MediaSubHeaderSize + MaxMediaPayloadBytes];
+    private readonly byte[] _mediaSendNonce = new byte[12];
+    private readonly byte[] _mediaRecvPlain = new byte[MediaSubHeaderSize + MaxMediaPayloadBytes];
+    private readonly byte[] _mediaRecvNonce = new byte[12];
     private ulong _sendSeq;
     private ulong _lastRecvSeq;
     private ulong _recvWindowMask;
+    private ulong _mediaSendSeq;
+    private ulong _mediaLastRecvSeq;
+    private ulong _mediaRecvWindowMask;
     private bool _disposed;
 
     internal FastUdpCodec(byte[] key, ushort peerId, bool isServer)
@@ -77,8 +115,12 @@ internal sealed class FastUdpCodec : IDisposable
         _inboundDirection = isServer ? DirectionClientToServer : DirectionServerToClient;
         _sendAes = new AesGcm(key, 16);
         _recvAes = new AesGcm(key, 16);
+        _mediaSendAes = new AesGcm(key, 16);
+        _mediaRecvAes = new AesGcm(key, 16);
         CopyNoncePrefix(_outboundDirection, _sendNonce);
         CopyNoncePrefix(_inboundDirection, _recvNonce);
+        CopyMediaNoncePrefix(_outboundDirection, _mediaSendNonce);
+        CopyMediaNoncePrefix(_inboundDirection, _mediaRecvNonce);
     }
 
     internal int Seal(FastUdpOp op, int a, int b, int lease, int timestampMs, byte[] destination)
@@ -192,8 +234,132 @@ internal sealed class FastUdpCodec : IDisposable
         Buffer.BlockCopy(prefix, 0, nonce, 0, 4);
     }
 
+    private static void CopyMediaNoncePrefix(byte direction, byte[] nonce)
+    {
+        byte[] prefix = direction == DirectionServerToClient ? ServerMediaNoncePrefix : ClientMediaNoncePrefix;
+        Buffer.BlockCopy(prefix, 0, nonce, 0, 4);
+    }
+
     private static void WriteNonceSeq(ulong seq, byte[] nonce) =>
         BinaryPrimitives.WriteUInt64BigEndian(nonce.AsSpan(4, 8), seq);
+
+    internal int SealMedia(
+        FastUdpMediaKind kind,
+        int frameOrAudioId,
+        int indexOrSampleRate,
+        int totalOrChannels,
+        int metaOrRouteId,
+        ReadOnlySpan<byte> payload,
+        byte[] destination)
+    {
+        if (payload.Length > MaxMediaPayloadBytes)
+            throw new ArgumentException("Media payload exceeds MaxMediaPayloadBytes.", nameof(payload));
+        int totalLen = MediaMinFrameSize + payload.Length;
+        if (destination.Length < totalLen)
+            throw new ArgumentException("Destination buffer too small.", nameof(destination));
+        lock (_mediaSendLock)
+        {
+            if (_disposed) return 0;
+            ulong seq = ++_mediaSendSeq;
+            Span<byte> frame = destination.AsSpan(0, totalLen);
+            MediaMagic.CopyTo(frame);
+            frame[4] = _outboundDirection;
+            frame[5] = (byte)kind;
+            BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(6, 2), _peerId);
+            BinaryPrimitives.WriteUInt64BigEndian(frame.Slice(8, 8), seq);
+
+            WriteNonceSeq(seq, _mediaSendNonce);
+            int plainLen = MediaSubHeaderSize + payload.Length;
+            Span<byte> plain = _mediaSendPlain.AsSpan(0, plainLen);
+            BinaryPrimitives.WriteInt32BigEndian(plain.Slice(0, 4), frameOrAudioId);
+            BinaryPrimitives.WriteInt32BigEndian(plain.Slice(4, 4), indexOrSampleRate);
+            BinaryPrimitives.WriteInt32BigEndian(plain.Slice(8, 4), totalOrChannels);
+            BinaryPrimitives.WriteInt32BigEndian(plain.Slice(12, 4), metaOrRouteId);
+            if (!payload.IsEmpty)
+                payload.CopyTo(plain.Slice(MediaSubHeaderSize));
+
+            _mediaSendAes.Encrypt(
+                _mediaSendNonce,
+                plain,
+                frame.Slice(MediaHeaderSize, plainLen),
+                frame.Slice(MediaHeaderSize + plainLen, MediaTagSize),
+                frame.Slice(0, MediaHeaderSize));
+            return totalLen;
+        }
+    }
+
+    internal bool TryOpenMedia(ReadOnlySpan<byte> frame, out FastUdpMediaDatagram datagram)
+    {
+        datagram = default;
+        if (frame.Length is < MediaMinFrameSize or > MaxMediaFrameSize) return false;
+        if (!frame[..4].SequenceEqual(MediaMagic)) return false;
+        if (frame[4] != _inboundDirection) return false;
+        ushort peerId = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(6, 2));
+        if (peerId != _peerId) return false;
+        byte rawKind = frame[5];
+        if (!Enum.IsDefined(typeof(FastUdpMediaKind), rawKind)) return false;
+        ulong seq = BinaryPrimitives.ReadUInt64BigEndian(frame.Slice(8, 8));
+        if (seq == 0) return false;
+
+        int plainLen = frame.Length - MediaHeaderSize - MediaTagSize;
+        int payloadLen = plainLen - MediaSubHeaderSize;
+        if (payloadLen is < 0 or > MaxMediaPayloadBytes) return false;
+
+        lock (_mediaRecvLock)
+        {
+            if (_disposed) return false;
+            bool isNewMax = _mediaLastRecvSeq == 0 || seq > _mediaLastRecvSeq;
+            ulong backBit = 0;
+            if (!isNewMax)
+            {
+                ulong back = _mediaLastRecvSeq - seq;
+                if (back >= 64) return false;
+                backBit = 1UL << (int)back;
+                if ((_mediaRecvWindowMask & backBit) != 0) return false;
+            }
+            WriteNonceSeq(seq, _mediaRecvNonce);
+            Span<byte> plain = _mediaRecvPlain.AsSpan(0, plainLen);
+            try
+            {
+                _mediaRecvAes.Decrypt(
+                    _mediaRecvNonce,
+                    frame.Slice(MediaHeaderSize, plainLen),
+                    frame.Slice(MediaHeaderSize + plainLen, MediaTagSize),
+                    plain,
+                    frame[..MediaHeaderSize]);
+            }
+            catch (CryptographicException)
+            {
+                return false;
+            }
+            if (_mediaLastRecvSeq == 0)
+            {
+                _mediaLastRecvSeq = seq;
+                _mediaRecvWindowMask = 1UL;
+            }
+            else if (isNewMax)
+            {
+                ulong diff = seq - _mediaLastRecvSeq;
+                _mediaRecvWindowMask = diff >= 64 ? 1UL : ((_mediaRecvWindowMask << (int)diff) | 1UL);
+                _mediaLastRecvSeq = seq;
+            }
+            else
+            {
+                _mediaRecvWindowMask |= backBit;
+            }
+            byte[] payload = payloadLen > 0 ? plain.Slice(MediaSubHeaderSize, payloadLen).ToArray() : Array.Empty<byte>();
+            datagram = new FastUdpMediaDatagram(
+                (FastUdpMediaKind)rawKind,
+                peerId,
+                seq,
+                BinaryPrimitives.ReadInt32BigEndian(plain.Slice(0, 4)),
+                BinaryPrimitives.ReadInt32BigEndian(plain.Slice(4, 4)),
+                BinaryPrimitives.ReadInt32BigEndian(plain.Slice(8, 4)),
+                BinaryPrimitives.ReadInt32BigEndian(plain.Slice(12, 4)),
+                payload);
+            return true;
+        }
+    }
 
     public void Dispose()
     {
@@ -201,10 +367,18 @@ internal sealed class FastUdpCodec : IDisposable
         {
             lock (_recvLock)
             {
-                if (_disposed) return;
-                _disposed = true;
-                _sendAes.Dispose();
-                _recvAes.Dispose();
+                lock (_mediaSendLock)
+                {
+                    lock (_mediaRecvLock)
+                    {
+                        if (_disposed) return;
+                        _disposed = true;
+                        _sendAes.Dispose();
+                        _recvAes.Dispose();
+                        _mediaSendAes.Dispose();
+                        _mediaRecvAes.Dispose();
+                    }
+                }
             }
         }
     }
@@ -745,8 +919,8 @@ internal static class FastUdpSocketOptions
     {
         try { socket.IOControl(SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null); }
         catch (Exception) { }
-        try { socket.SendBufferSize = 262144; } catch (Exception) { }
-        try { socket.ReceiveBufferSize = 262144; } catch (Exception) { }
+        try { socket.SendBufferSize = 1048576; } catch (Exception) { }
+        try { socket.ReceiveBufferSize = 1048576; } catch (Exception) { }
         try
         {
             if (socket.AddressFamily == AddressFamily.InterNetworkV6)
@@ -778,6 +952,7 @@ internal sealed class FastUdpHub : IDisposable
         internal readonly FastUdpCodec Codec;
         internal readonly AdaptiveLinkTracker LinkTracker;
         private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
+        private readonly byte[] _mediaSendBuffer = new byte[FastUdpCodec.MaxMediaFrameSize];
         private IPEndPoint? _remoteEndPoint;
         private IPEndPoint[]? _candidateEndPoints;
         internal readonly bool IsAuxiliary;
@@ -885,6 +1060,34 @@ internal sealed class FastUdpHub : IDisposable
             return SendToEndPoint(socket, target, op, a, b, lease, payloadTag);
         }
 
+        internal bool SendMedia(
+            Socket socket,
+            FastUdpMediaKind kind,
+            int frameOrAudioId,
+            int indexOrSampleRate,
+            int totalOrChannels,
+            int metaOrRouteId,
+            ReadOnlySpan<byte> payload)
+        {
+            IPEndPoint? target = Volatile.Read(ref _remoteEndPoint);
+            if (target == null) return false;
+            lock (_mediaSendBuffer)
+            {
+                int len = Codec.SealMedia(
+                    kind, frameOrAudioId, indexOrSampleRate, totalOrChannels, metaOrRouteId, payload, _mediaSendBuffer);
+                if (len <= 0) return false;
+                try
+                {
+                    var dest = FastUdpSocketOptions.MapForSocket(socket, target);
+                    return socket.SendTo(_mediaSendBuffer, 0, len, SocketFlags.None, dest) == len;
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
         public void Dispose()
         {
             CryptographicOperations.ZeroMemory(Key);
@@ -899,6 +1102,7 @@ internal sealed class FastUdpHub : IDisposable
 
     internal int Port { get; }
     internal event Action<Peer, FastUdpMessage>? MessageReceived;
+    internal event Action<Peer, FastUdpMediaDatagram>? MediaDatagramReceived;
 
     internal FastUdpHub()
     {
@@ -971,6 +1175,19 @@ internal sealed class FastUdpHub : IDisposable
         return peer.Send(_socket, op, a, b, lease, payloadTag);
     }
 
+    internal bool SendMedia(
+        Peer peer,
+        FastUdpMediaKind kind,
+        int frameOrAudioId,
+        int indexOrSampleRate,
+        int totalOrChannels,
+        int metaOrRouteId,
+        ReadOnlySpan<byte> payload)
+    {
+        if (_disposed) return false;
+        return peer.SendMedia(_socket, kind, frameOrAudioId, indexOrSampleRate, totalOrChannels, metaOrRouteId, payload);
+    }
+
     internal void RemovePeer(Peer? peer)
     {
         if (peer == null) return;
@@ -981,7 +1198,7 @@ internal sealed class FastUdpHub : IDisposable
 
     private void ReceiveLoop()
     {
-        byte[] buffer = new byte[256];
+        byte[] buffer = new byte[2048];
         EndPoint remote = new IPEndPoint(
             _socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any,
             0);
@@ -990,10 +1207,18 @@ internal sealed class FastUdpHub : IDisposable
             try
             {
                 int received = _socket.ReceiveFrom(buffer, 0, buffer.Length, SocketFlags.None, ref remote);
-                if (received != FastUdpCodec.FrameSize || remote is not IPEndPoint srcIp) continue;
+                if (received < FastUdpCodec.FrameSize || remote is not IPEndPoint srcIp) continue;
                 ushort wireId = (ushort)((buffer[6] << 8) | buffer[7]);
                 if (!_peers.TryGetValue(wireId, out var peer)) continue;
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
+                if (buffer[0] == (byte)'D' && buffer[1] == (byte)'T' && buffer[2] == (byte)'M' && buffer[3] == (byte)'1')
+                {
+                    if (!peer.Codec.TryOpenMedia(buffer.AsSpan(0, received), out var media)) continue;
+                    peer.UpdateEndpointOnAuthenticatedPacket(normalized, srcIp.Port);
+                    MediaDatagramReceived?.Invoke(peer, media);
+                    continue;
+                }
+                if (received != FastUdpCodec.FrameSize) continue;
                 if (!peer.Codec.TryOpen(buffer.AsSpan(0, received), out var msg, peer.LinkTracker)) continue;
 
                 peer.UpdateEndpointOnAuthenticatedPacket(normalized, srcIp.Port);
@@ -1064,6 +1289,7 @@ internal sealed class FastUdpClient : IDisposable
     private readonly FastUdpCodec _codec;
     internal readonly AdaptiveLinkTracker LinkTracker;
     private readonly byte[] _sendBuffer = new byte[FastUdpCodec.FrameSize];
+    private readonly byte[] _mediaSendBuffer = new byte[FastUdpCodec.MaxMediaFrameSize];
     private readonly Thread _recvThread;
     private volatile bool _disposed;
     internal volatile bool Confirmed;
@@ -1072,6 +1298,7 @@ internal sealed class FastUdpClient : IDisposable
 
     internal int LocalPort { get; }
     internal event Action<FastUdpMessage>? MessageReceived;
+    internal event Action<FastUdpMediaDatagram>? MediaDatagramReceived;
     internal event Action? ConfirmedChanged;
 
     internal FastUdpClient(IPAddress serverAddress, int serverPort, int peerId, byte[] key,
@@ -1135,9 +1362,35 @@ internal sealed class FastUdpClient : IDisposable
         }
     }
 
+    internal bool SendMedia(
+        FastUdpMediaKind kind,
+        int frameOrAudioId,
+        int indexOrSampleRate,
+        int totalOrChannels,
+        int metaOrRouteId,
+        ReadOnlySpan<byte> payload)
+    {
+        if (_disposed) return false;
+        lock (_mediaSendBuffer)
+        {
+            int len = _codec.SealMedia(
+                kind, frameOrAudioId, indexOrSampleRate, totalOrChannels, metaOrRouteId, payload, _mediaSendBuffer);
+            if (len <= 0) return false;
+            try
+            {
+                var dest = FastUdpSocketOptions.MapForSocket(_socket, _serverEndPoint);
+                return _socket.SendTo(_mediaSendBuffer, 0, len, SocketFlags.None, dest) == len;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+    }
+
     private void ReceiveLoop()
     {
-        byte[] buffer = new byte[256];
+        byte[] buffer = new byte[2048];
         EndPoint remote = new IPEndPoint(
             _socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any,
             0);
@@ -1146,8 +1399,23 @@ internal sealed class FastUdpClient : IDisposable
             try
             {
                 int received = _socket.ReceiveFrom(buffer, 0, buffer.Length, SocketFlags.None, ref remote);
-                if (received != FastUdpCodec.FrameSize || remote is not IPEndPoint srcIp) continue;
+                if (received < FastUdpCodec.FrameSize || remote is not IPEndPoint srcIp) continue;
                 IPAddress normalized = FastUdpSocketOptions.NormalizeAddress(srcIp.Address);
+                if (buffer[0] == (byte)'D' && buffer[1] == (byte)'T' && buffer[2] == (byte)'M' && buffer[3] == (byte)'1')
+                {
+                    if (!_codec.TryOpenMedia(buffer.AsSpan(0, received), out var media)) continue;
+                    var ep = _serverEndPoint;
+                    if (!normalized.Equals(ep.Address) || srcIp.Port != ep.Port)
+                        _serverEndPoint = new IPEndPoint(normalized, srcIp.Port);
+                    if (!Confirmed)
+                    {
+                        Confirmed = true;
+                        ConfirmedChanged?.Invoke();
+                    }
+                    MediaDatagramReceived?.Invoke(media);
+                    continue;
+                }
+                if (received != FastUdpCodec.FrameSize) continue;
                 if (!_codec.TryOpen(buffer.AsSpan(0, received), out var msg)) continue;
                 var currentEp = _serverEndPoint;
                 if (!normalized.Equals(currentEp.Address) || srcIp.Port != currentEp.Port)
@@ -1626,6 +1894,168 @@ internal sealed class FastMovePacer : IDisposable
             _warmCooldownUntilTicks = 0;
         }
         _timer.Dispose();
+    }
+}
+
+/// <summary>
+/// Thread-safe zero-Base64 binary frame reassembler for streamed JPEG frames sent over DTM1 Fast UDP.
+/// Drops partial frames older than 350ms and prevents out-of-order stale frames from overwriting newer ones.
+/// </summary>
+internal sealed class FastMediaFrameAssembler
+{
+    private sealed class FrameSlot
+    {
+        internal byte[][] Parts = Array.Empty<byte[]>();
+        internal int Received;
+        internal int Meta;
+        internal long CreatedMs;
+    }
+
+    private sealed class StreamState
+    {
+        internal int LastCompletedFrameId;
+        internal readonly Dictionary<int, FrameSlot> Slots = new();
+    }
+
+    private readonly object _gate = new();
+    private readonly Dictionary<(int SourceKey, byte Kind), StreamState> _streams = new();
+
+    internal bool AddChunk(
+        int sourceKey,
+        byte kind,
+        int frameId,
+        int chunkIndex,
+        int totalChunks,
+        int meta,
+        byte[] payload,
+        out byte[] assembled,
+        out int completedMeta)
+    {
+        assembled = Array.Empty<byte>();
+        completedMeta = meta;
+        if (frameId <= 0 || totalChunks is < 1 or > 256 || chunkIndex < 0 || chunkIndex >= totalChunks || payload.Length == 0)
+            return false;
+
+        lock (_gate)
+        {
+            var key = (sourceKey, kind);
+            if (!_streams.TryGetValue(key, out var stream))
+            {
+                stream = new StreamState();
+                _streams[key] = stream;
+            }
+
+            if (stream.LastCompletedFrameId > 0)
+            {
+                int delta = stream.LastCompletedFrameId - frameId;
+                if (delta > 60)
+                {
+                    // Sender restarted its frame counter (reconnect / camera toggle).
+                    stream.LastCompletedFrameId = 0;
+                    stream.Slots.Clear();
+                }
+                else if (delta >= 0)
+                {
+                    return false;
+                }
+            }
+
+            if (totalChunks == 1)
+            {
+                stream.LastCompletedFrameId = frameId;
+                assembled = payload;
+                completedMeta = meta;
+                return true;
+            }
+
+            long now = Environment.TickCount64;
+            if (stream.Slots.Count > 0)
+            {
+                List<int>? stale = null;
+                foreach (var kv in stream.Slots)
+                {
+                    if (now - kv.Value.CreatedMs > 350 || kv.Key <= stream.LastCompletedFrameId)
+                    {
+                        stale ??= new List<int>();
+                        stale.Add(kv.Key);
+                    }
+                }
+                if (stale != null)
+                {
+                    foreach (int s in stale) stream.Slots.Remove(s);
+                }
+            }
+
+            if (!stream.Slots.TryGetValue(frameId, out var slot) || slot.Parts.Length != totalChunks)
+            {
+                if (stream.Slots.Count >= 4)
+                {
+                    int oldestKey = int.MaxValue;
+                    foreach (int k in stream.Slots.Keys)
+                        if (k < oldestKey) oldestKey = k;
+                    if (oldestKey != int.MaxValue) stream.Slots.Remove(oldestKey);
+                }
+                slot = new FrameSlot
+                {
+                    Parts = new byte[totalChunks][],
+                    Meta = meta,
+                    CreatedMs = now
+                };
+                stream.Slots[frameId] = slot;
+            }
+
+            if (slot.Parts[chunkIndex] == null)
+                slot.Received++;
+            slot.Parts[chunkIndex] = payload;
+            if (meta != 0) slot.Meta = meta;
+
+            if (slot.Received < totalChunks)
+                return false;
+
+            stream.Slots.Remove(frameId);
+            stream.LastCompletedFrameId = frameId;
+
+            int totalBytes = 0;
+            for (int i = 0; i < totalChunks; i++)
+            {
+                byte[]? part = slot.Parts[i];
+                if (part == null) return false;
+                totalBytes += part.Length;
+            }
+            if (totalBytes is <= 0 or > 512 * 1024) return false;
+
+            byte[] output = new byte[totalBytes];
+            int offset = 0;
+            for (int i = 0; i < totalChunks; i++)
+            {
+                byte[] part = slot.Parts[i];
+                Buffer.BlockCopy(part, 0, output, offset, part.Length);
+                offset += part.Length;
+            }
+            assembled = output;
+            completedMeta = slot.Meta;
+            return true;
+        }
+    }
+
+    internal void ClearSource(int sourceKey)
+    {
+        lock (_gate)
+        {
+            List<(int, byte)>? toRemove = null;
+            foreach (var k in _streams.Keys)
+            {
+                if (k.SourceKey == sourceKey)
+                {
+                    toRemove ??= new List<(int, byte)>();
+                    toRemove.Add(k);
+                }
+            }
+            if (toRemove != null)
+            {
+                foreach (var k in toRemove) _streams.Remove(k);
+            }
+        }
     }
 }
 

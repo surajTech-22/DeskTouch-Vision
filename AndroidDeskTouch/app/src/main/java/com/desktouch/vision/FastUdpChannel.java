@@ -20,6 +20,17 @@ import javax.crypto.spec.SecretKeySpec;
 final class FastUdpChannel implements Closeable {
     static final int KEY_SIZE = 32;
     static final int FRAME_SIZE = 48;
+    static final int MEDIA_HEADER_SIZE = 16;
+    static final int MEDIA_SUBHEADER_SIZE = 16;
+    static final int MEDIA_TAG_SIZE = 16;
+    static final int MEDIA_MIN_FRAME_SIZE = MEDIA_HEADER_SIZE + MEDIA_SUBHEADER_SIZE + MEDIA_TAG_SIZE;
+    static final int MAX_MEDIA_PAYLOAD_BYTES = 1152;
+    static final int MAX_MEDIA_FRAME_SIZE = MEDIA_MIN_FRAME_SIZE + MAX_MEDIA_PAYLOAD_BYTES;
+
+    static final byte MEDIA_KIND_MIC_AUDIO = 1;
+    static final byte MEDIA_KIND_CAMERA_CHUNK = 2;
+    static final byte MEDIA_KIND_PHONE_SCREEN_CHUNK = 3;
+    static final byte MEDIA_KIND_PC_SCREEN_PREVIEW_CHUNK = 4;
 
     static final byte DIR_SERVER_TO_CLIENT = 1;
     static final byte DIR_CLIENT_TO_SERVER = 2;
@@ -74,10 +85,36 @@ final class FastUdpChannel implements Closeable {
         }
     }
 
+    static final class MediaDatagram {
+        final byte kind;
+        final int peerId;
+        final long seq;
+        final int frameOrAudioId;
+        final int indexOrSampleRate;
+        final int totalOrChannels;
+        final int metaOrRouteId;
+        final byte[] payload;
+
+        MediaDatagram(byte kind, int peerId, long seq, int frameOrAudioId,
+                int indexOrSampleRate, int totalOrChannels, int metaOrRouteId, byte[] payload) {
+            this.kind = kind;
+            this.peerId = peerId;
+            this.seq = seq;
+            this.frameOrAudioId = frameOrAudioId;
+            this.indexOrSampleRate = indexOrSampleRate;
+            this.totalOrChannels = totalOrChannels;
+            this.metaOrRouteId = metaOrRouteId;
+            this.payload = payload;
+        }
+    }
+
     static final class Codec {
         private static final byte[] MAGIC = {'D', 'T', 'U', '1'};
         private static final byte[] SRV_PREFIX = "SRV1".getBytes(StandardCharsets.US_ASCII);
         private static final byte[] CLI_PREFIX = "CLI1".getBytes(StandardCharsets.US_ASCII);
+        private static final byte[] MEDIA_MAGIC = {'D', 'T', 'M', '1'};
+        private static final byte[] SRV_MEDIA_PREFIX = "SRM1".getBytes(StandardCharsets.US_ASCII);
+        private static final byte[] CLI_MEDIA_PREFIX = "CLM1".getBytes(StandardCharsets.US_ASCII);
 
         private final byte outboundDir;
         private final byte inboundDir;
@@ -85,15 +122,26 @@ final class FastUdpChannel implements Closeable {
         private final SecretKeySpec keySpec;
         private final Object sendLock = new Object();
         private final Object recvLock = new Object();
+        private final Object mediaSendLock = new Object();
+        private final Object mediaRecvLock = new Object();
         private final Cipher sendCipher;
         private final Cipher recvCipher;
+        private final Cipher mediaSendCipher;
+        private final Cipher mediaRecvCipher;
         private final byte[] sendPlain = new byte[16];
         private final byte[] sendNonce = new byte[12];
         private final byte[] recvPlain = new byte[16];
         private final byte[] recvNonce = new byte[12];
+        private final byte[] mediaSendPlain = new byte[MEDIA_SUBHEADER_SIZE + MAX_MEDIA_PAYLOAD_BYTES];
+        private final byte[] mediaSendNonce = new byte[12];
+        private final byte[] mediaRecvPlain = new byte[MEDIA_SUBHEADER_SIZE + MAX_MEDIA_PAYLOAD_BYTES];
+        private final byte[] mediaRecvNonce = new byte[12];
         private long sendSeq;
         private long lastRecvSeq;
         private long recvWindowMask;
+        private long mediaSendSeq;
+        private long mediaLastRecvSeq;
+        private long mediaRecvWindowMask;
         private volatile boolean closed;
 
         Codec(byte[] key, int peerId, boolean isServer) throws GeneralSecurityException {
@@ -106,8 +154,12 @@ final class FastUdpChannel implements Closeable {
             this.keySpec = new SecretKeySpec(key, "AES");
             this.sendCipher = Cipher.getInstance("AES/GCM/NoPadding");
             this.recvCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            this.mediaSendCipher = Cipher.getInstance("AES/GCM/NoPadding");
+            this.mediaRecvCipher = Cipher.getInstance("AES/GCM/NoPadding");
             System.arraycopy(outboundDir == DIR_SERVER_TO_CLIENT ? SRV_PREFIX : CLI_PREFIX, 0, sendNonce, 0, 4);
             System.arraycopy(inboundDir == DIR_SERVER_TO_CLIENT ? SRV_PREFIX : CLI_PREFIX, 0, recvNonce, 0, 4);
+            System.arraycopy(outboundDir == DIR_SERVER_TO_CLIENT ? SRV_MEDIA_PREFIX : CLI_MEDIA_PREFIX, 0, mediaSendNonce, 0, 4);
+            System.arraycopy(inboundDir == DIR_SERVER_TO_CLIENT ? SRV_MEDIA_PREFIX : CLI_MEDIA_PREFIX, 0, mediaRecvNonce, 0, 4);
         }
 
         int seal(byte op, int a, int b, int lease, int timestampMs, byte[] destination)
@@ -207,10 +259,118 @@ final class FastUdpChannel implements Closeable {
             }
         }
 
+        int sealMedia(byte kind, int frameOrAudioId, int indexOrSampleRate, int totalOrChannels,
+                int metaOrRouteId, byte[] payload, int payloadOffset, int payloadLength, byte[] destination)
+                throws GeneralSecurityException {
+            if (payloadLength < 0 || payloadLength > MAX_MEDIA_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("Media payload length out of range");
+            }
+            int totalLen = MEDIA_MIN_FRAME_SIZE + payloadLength;
+            if (destination == null || destination.length < totalLen) {
+                throw new IllegalArgumentException("Destination buffer too small");
+            }
+            synchronized (mediaSendLock) {
+                if (closed) return 0;
+                long seq = ++mediaSendSeq;
+                destination[0] = MEDIA_MAGIC[0];
+                destination[1] = MEDIA_MAGIC[1];
+                destination[2] = MEDIA_MAGIC[2];
+                destination[3] = MEDIA_MAGIC[3];
+                destination[4] = outboundDir;
+                destination[5] = kind;
+                destination[6] = (byte) ((peerId >>> 8) & 0xFF);
+                destination[7] = (byte) (peerId & 0xFF);
+                writeLongBE(destination, 8, seq);
+
+                writeLongBE(mediaSendNonce, 4, seq);
+                writeIntBE(mediaSendPlain, 0, frameOrAudioId);
+                writeIntBE(mediaSendPlain, 4, indexOrSampleRate);
+                writeIntBE(mediaSendPlain, 8, totalOrChannels);
+                writeIntBE(mediaSendPlain, 12, metaOrRouteId);
+                if (payloadLength > 0 && payload != null) {
+                    System.arraycopy(payload, payloadOffset, mediaSendPlain, MEDIA_SUBHEADER_SIZE, payloadLength);
+                }
+
+                int plainLen = MEDIA_SUBHEADER_SIZE + payloadLength;
+                mediaSendCipher.init(Cipher.ENCRYPT_MODE, keySpec, new GCMParameterSpec(128, mediaSendNonce));
+                mediaSendCipher.updateAAD(destination, 0, MEDIA_HEADER_SIZE);
+                mediaSendCipher.doFinal(mediaSendPlain, 0, plainLen, destination, MEDIA_HEADER_SIZE);
+                return totalLen;
+            }
+        }
+
+        MediaDatagram tryOpenMedia(byte[] frame, int length) {
+            if (closed || frame == null || length < MEDIA_MIN_FRAME_SIZE || length > MAX_MEDIA_FRAME_SIZE) {
+                return null;
+            }
+            if (frame[0] != MEDIA_MAGIC[0] || frame[1] != MEDIA_MAGIC[1]
+                    || frame[2] != MEDIA_MAGIC[2] || frame[3] != MEDIA_MAGIC[3]) {
+                return null;
+            }
+            if (frame[4] != inboundDir) return null;
+            int id = ((frame[6] & 0xFF) << 8) | (frame[7] & 0xFF);
+            if (id != peerId) return null;
+            byte kind = frame[5];
+            if (kind < MEDIA_KIND_MIC_AUDIO || kind > MEDIA_KIND_PC_SCREEN_PREVIEW_CHUNK) return null;
+            long seq = readLongBE(frame, 8);
+            if (seq == 0) return null;
+
+            int plainLen = length - MEDIA_HEADER_SIZE - MEDIA_TAG_SIZE;
+            int payloadLen = plainLen - MEDIA_SUBHEADER_SIZE;
+            if (payloadLen < 0 || payloadLen > MAX_MEDIA_PAYLOAD_BYTES) return null;
+
+            synchronized (mediaRecvLock) {
+                if (closed) return null;
+                boolean isNewMax = mediaLastRecvSeq == 0L || Long.compareUnsigned(seq, mediaLastRecvSeq) > 0;
+                long backBit = 0L;
+                if (!isNewMax) {
+                    long back = mediaLastRecvSeq - seq;
+                    if (Long.compareUnsigned(back, 64L) >= 0) return null;
+                    backBit = 1L << (int) back;
+                    if ((mediaRecvWindowMask & backBit) != 0L) return null;
+                }
+                writeLongBE(mediaRecvNonce, 4, seq);
+                try {
+                    mediaRecvCipher.init(Cipher.DECRYPT_MODE, keySpec, new GCMParameterSpec(128, mediaRecvNonce));
+                    mediaRecvCipher.updateAAD(frame, 0, MEDIA_HEADER_SIZE);
+                    mediaRecvCipher.doFinal(frame, MEDIA_HEADER_SIZE, plainLen + MEDIA_TAG_SIZE, mediaRecvPlain, 0);
+                } catch (GeneralSecurityException badAuth) {
+                    return null;
+                }
+                if (mediaLastRecvSeq == 0L) {
+                    mediaLastRecvSeq = seq;
+                    mediaRecvWindowMask = 1L;
+                } else if (isNewMax) {
+                    long diff = seq - mediaLastRecvSeq;
+                    mediaRecvWindowMask = Long.compareUnsigned(diff, 64L) >= 0
+                        ? 1L
+                        : ((mediaRecvWindowMask << (int) diff) | 1L);
+                    mediaLastRecvSeq = seq;
+                } else {
+                    mediaRecvWindowMask |= backBit;
+                }
+                byte[] payload = payloadLen > 0
+                    ? Arrays.copyOfRange(mediaRecvPlain, MEDIA_SUBHEADER_SIZE, MEDIA_SUBHEADER_SIZE + payloadLen)
+                    : new byte[0];
+                return new MediaDatagram(
+                    kind,
+                    id,
+                    seq,
+                    readIntBE(mediaRecvPlain, 0),
+                    readIntBE(mediaRecvPlain, 4),
+                    readIntBE(mediaRecvPlain, 8),
+                    readIntBE(mediaRecvPlain, 12),
+                    payload
+                );
+            }
+        }
+
         void close() {
             closed = true;
             Arrays.fill(sendPlain, (byte) 0);
             Arrays.fill(recvPlain, (byte) 0);
+            Arrays.fill(mediaSendPlain, (byte) 0);
+            Arrays.fill(mediaRecvPlain, (byte) 0);
         }
     }
 
@@ -229,6 +389,7 @@ final class FastUdpChannel implements Closeable {
         default void onReverseKey(int vk, boolean down, int lease, int actionSeq) {}
         default void onLinkPing(int pingToken, int senderPaceTenths, int lease, int ts) {}
         default void onLinkFeedback(int echoToken, int packedLossJitter, int packedDisplayRate, int lease) {}
+        default void onMediaDatagram(MediaDatagram datagram) {}
     }
 
     private final DatagramSocket socket;
@@ -239,6 +400,7 @@ final class FastUdpChannel implements Closeable {
     private final Listener listener;
     final AdaptiveLinkTracker linkTracker = new AdaptiveLinkTracker();
     private final byte[] sendBuffer = new byte[FRAME_SIZE];
+    private final byte[] mediaSendBuffer = new byte[MAX_MEDIA_FRAME_SIZE];
     private final DatagramPacket sendPacket;
     private final Thread recvThread;
     private volatile boolean closed;
@@ -287,8 +449,8 @@ final class FastUdpChannel implements Closeable {
         } catch (Exception ignored) {
         }
         try {
-            this.socket.setReceiveBufferSize(262144);
-            this.socket.setSendBufferSize(262144);
+            this.socket.setReceiveBufferSize(1048576);
+            this.socket.setSendBufferSize(1048576);
         } catch (Exception ignored) {
         }
         this.sendPacket = new DatagramPacket(sendBuffer, FRAME_SIZE, serverAddress, serverPort);
@@ -387,19 +549,57 @@ final class FastUdpChannel implements Closeable {
         }
     }
 
+    boolean sendMedia(byte kind, int frameOrAudioId, int indexOrSampleRate, int totalOrChannels,
+            int metaOrRouteId, byte[] payload, int offset, int length) {
+        if (closed) return false;
+        synchronized (mediaSendBuffer) {
+            if (closed) return false;
+            try {
+                int len = codec.sealMedia(kind, frameOrAudioId, indexOrSampleRate, totalOrChannels,
+                        metaOrRouteId, payload, offset, length, mediaSendBuffer);
+                if (len <= 0) return false;
+                DatagramPacket pkt = new DatagramPacket(mediaSendBuffer, len, serverAddress, serverPort);
+                socket.send(pkt);
+                return true;
+            } catch (Exception ignored) {
+                return false;
+            }
+        }
+    }
+
     private void receiveLoop() {
         try {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
         } catch (Throwable ignored) {
         }
-        byte[] recvBuf = new byte[256];
+        byte[] recvBuf = new byte[2048];
         DatagramPacket packet = new DatagramPacket(recvBuf, recvBuf.length);
         while (!closed) {
             try {
                 packet.setLength(recvBuf.length);
                 socket.receive(packet);
-                if (packet.getLength() != FRAME_SIZE) continue;
-                Message msg = codec.tryOpen(recvBuf, packet.getLength(), linkTracker);
+                int pktLen = packet.getLength();
+                if (pktLen < FRAME_SIZE) continue;
+                if (recvBuf[0] == 'D' && recvBuf[1] == 'T' && recvBuf[2] == 'M' && recvBuf[3] == '1') {
+                    MediaDatagram media = codec.tryOpenMedia(recvBuf, pktLen);
+                    if (media == null) continue;
+                    InetAddress mAddr = packet.getAddress();
+                    int mPort = packet.getPort();
+                    if (mAddr != null && (!mAddr.equals(serverAddress) || mPort != serverPort)) {
+                        synchronized (sendBuffer) {
+                            serverAddress = mAddr;
+                            serverPort = mPort;
+                            sendPacket.setAddress(mAddr);
+                            sendPacket.setPort(mPort);
+                            extraCandidates = java.util.Collections.emptyList();
+                        }
+                    }
+                    markConfirmed();
+                    listener.onMediaDatagram(media);
+                    continue;
+                }
+                if (pktLen != FRAME_SIZE) continue;
+                Message msg = codec.tryOpen(recvBuf, pktLen, linkTracker);
                 if (msg == null) continue;
                 InetAddress srcAddr = packet.getAddress();
                 int srcPort = packet.getPort();

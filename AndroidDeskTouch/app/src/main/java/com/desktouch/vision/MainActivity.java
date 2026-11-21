@@ -33,11 +33,12 @@ public final class MainActivity extends Activity {
     private static final int REQ_QR_CAMERA=38202;
     private static final int REQ_MEDIA_CAMERA=38203;
     private static final int REQ_MEDIA_PROJECTION=38204;
+    private static final int REQ_MEDIA_MIC=38205;
 
     private int pendingCamLens;
     private boolean pendingCamTorch;
     private boolean pendingCamMic=true;
-    private Button shareScreenBtn,shareCameraBtn;
+    private Button shareScreenBtn,shareCameraBtn,shareMicBtn;
 
     private PhoneUiKit.Palette palette;
     private final List<Consumer<PhoneUiKit.Palette>> themeUpdaters=new ArrayList<>();
@@ -215,6 +216,11 @@ public final class MainActivity extends Activity {
                     if(!isFinishing() && !isDestroyed()) requestPhoneCameraPermissionsAndStart(lens,torch,mic);
                 });
             }
+            @Override public void onMicShareRequested(){
+                runOnUiThread(()->{
+                    if(!isFinishing() && !isDestroyed()) requestPhoneMicPermissionAndStart();
+                });
+            }
         });
 
         // Only checks official GitHub metadata; never downloads or silently
@@ -237,11 +243,26 @@ public final class MainActivity extends Activity {
                 setFeedback("Camera permission is needed to scan a Windows pairing QR code.",true);
             }
         }else if(requestCode==REQ_MEDIA_CAMERA){
-            if(checkSelfPermission(android.Manifest.permission.CAMERA)==android.content.pm.PackageManager.PERMISSION_GRANTED){
-                PhoneMediaService.startCameraShare(this,pendingCamLens,pendingCamTorch,pendingCamMic);
+            boolean hasCam=checkSelfPermission(android.Manifest.permission.CAMERA)==android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED;
+            if(hasCam){
+                PhoneMediaService.startCameraShare(this,pendingCamLens,pendingCamTorch,pendingCamMic && hasMic);
+                if(pendingCamMic && !hasMic) setFeedback("Camera started; grant Microphone permission to stream audio.",true);
                 refreshLiveShareButtons();
+            }else if(pendingCamMic && hasMic){
+                PhoneMediaService.startMicShare(this);
+                refreshLiveShareButtons();
+                setFeedback("Camera permission denied; streaming microphone only.",true);
             }else{
-                setFeedback("Camera permission denied; cannot stream phone camera.",true);
+                setFeedback("Camera/Microphone permission denied; cannot stream.",true);
+            }
+        }else if(requestCode==REQ_MEDIA_MIC){
+            if(checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED){
+                PhoneMediaService.startMicShare(this);
+                refreshLiveShareButtons();
+                setFeedback("Streaming phone microphone over fast UDP.",true);
+            }else{
+                setFeedback("Microphone permission denied; cannot stream phone mic.",true);
             }
         }
     }
@@ -2061,6 +2082,16 @@ public final class MainActivity extends Activity {
         scLp.leftMargin=dp(4);
         shareRow1.addView(shareCameraBtn,scLp);
 
+        LinearLayout shareRowMic=new LinearLayout(this);
+        shareRowMic.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams srmLp=new LinearLayout.LayoutParams(-1,-2);
+        srmLp.topMargin=dp(8);
+        liveShareCard.addView(shareRowMic,srmLp);
+
+        shareMicBtn=PhoneUiKit.createButton(this,"Share Mic Only",palette,PhoneUiKit.BTN_SUBTLE);
+        shareMicBtn.setOnClickListener(v->toggleShareMicFromUi());
+        shareRowMic.addView(shareMicBtn,new LinearLayout.LayoutParams(-1,-2));
+
         LinearLayout shareRow2=new LinearLayout(this);
         shareRow2.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams sr2Lp=new LinearLayout.LayoutParams(-1,-2);
@@ -2085,6 +2116,7 @@ public final class MainActivity extends Activity {
             liveShareSub.setTextColor(p.textSecondary);
             PhoneUiKit.styleButton(shareScreenBtn,p,PhoneMediaService.isScreenSharingActive() ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_TINT_ACCENT,this);
             PhoneUiKit.styleButton(shareCameraBtn,p,PhoneMediaService.isCameraSharingActive() ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(shareMicBtn,p,PhoneMediaService.isMicSharingActive() ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(setupShelfBtn,p,PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(fixConnBtn,p,PhoneUiKit.BTN_TINT_EMERALD,this);
         });
@@ -2346,9 +2378,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.88";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.89";
         }catch(Exception ignored){
-            return "0.3.88";
+            return "0.3.89";
         }
     }
 
@@ -4997,6 +5029,28 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void toggleShareMicFromUi(){
+        if(PhoneMediaService.isMicSharingActive()){
+            PhoneMediaService.stopMicShare(this);
+            setFeedback("Stopped phone microphone stream.",true);
+            refreshLiveShareButtons();
+        }else{
+            requestPhoneMicPermissionAndStart();
+        }
+    }
+
+    private void requestPhoneMicPermissionAndStart(){
+        boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(hasMic){
+            PhoneMediaService.startMicShare(this);
+            refreshLiveShareButtons();
+            setFeedback("Streaming phone microphone over fast UDP.",true);
+        }else{
+            requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO},REQ_MEDIA_MIC);
+        }
+    }
+
     private void refreshLiveShareButtons(){
         if(shareScreenBtn!=null){
             boolean scr=PhoneMediaService.isScreenSharingActive();
@@ -5007,6 +5061,11 @@ public final class MainActivity extends Activity {
             boolean cam=PhoneMediaService.isCameraSharingActive();
             shareCameraBtn.setText(cam ? "Stop Camera & Mic" : "Share Camera & Mic");
             PhoneUiKit.styleButton(shareCameraBtn,palette,cam ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
+        }
+        if(shareMicBtn!=null){
+            boolean micOn=PhoneMediaService.isMicSharingActive();
+            shareMicBtn.setText(micOn ? "Stop Mic Stream" : "Share Mic Only");
+            PhoneUiKit.styleButton(shareMicBtn,palette,micOn ? PhoneUiKit.BTN_DANGER : PhoneUiKit.BTN_SUBTLE,this);
         }
     }
 

@@ -732,48 +732,35 @@ public final class AutoConnectService extends Service {
             return;
         }
 
-        // Fallback when PC is not on current Wi-Fi (Mobile Data or a different Wi-Fi network).
+        // Fallback when PC is not on current Wi-Fi: probe only previously exchanged direct
+        // IPv6/peer endpoints over cellular without background relay/lookup polling.
         if(DeskTouchRuntime.anyInputLeaseActive() || DeskTouchRuntime.connectedCount()>0) return;
         if(lastCellularProbeAtMs>0L && now-lastCellularProbeAtMs<20_000L) return;
         PhoneScreenGeometry.Info phone=PhoneScreenGeometry.readInfo(this);
         for(String fp:allowed) {
             if(paused.contains(fp)) continue;
+            java.util.List<String> ipv6Endpoints=DeskTouchRuntime.peerEndpoints(this,fp);
+            if(ipv6Endpoints.isEmpty()) continue;
             lastCellularProbeAtMs=now;
-            DesktopDiscovery.Device wanDev=LinkedDisplayHelper.resolveByFingerprint(fp,3500);
-            java.util.List<String> ipv6Endpoints=wanDev!=null
-                ? LinkedDisplayHelper.parseCandidateAddresses(wanDev.address)
-                : DeskTouchRuntime.peerEndpoints(this,fp);
-            if(!ipv6Endpoints.isEmpty()) {
-                DeskTouchRuntime.rememberPeerEndpoints(this,fp,ipv6Endpoints);
-            }
-            if(ipv6Endpoints.isEmpty() && wanDev==null) continue;
 
             android.net.Network cellNet=cellularHelper.acquireCellularNetwork(3500L);
-            if(cellNet!=null && !ipv6Endpoints.isEmpty()) {
-                CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
-                    cellNet,fp,trust,ipv6Endpoints,2400);
-                if(cellProbe.reachable) {
-                    DesktopDiscovery.Device cellDev=new DesktopDiscovery.Device(
-                        wanDev!=null ? wanDev.name : "DeskTouch PC",cellProbe.address,fp,true,false);
-                    if(!DeskTouchRuntime.switchTransportMakeBeforeBreak(
-                        this,cellDev,phone.width,phone.height,cellNet,true,
-                        ()->Log.i("DeskTouch","Connected directly via Mobile network ("+cellProbe.address+")"),
-                        ()->cellularHelper.releaseCellularNetwork())) {
-                        cellularHelper.releaseCellularNetwork();
-                    }
-                    return;
-                }
+            if(cellNet==null) return;
+            CellularLinkHelper.ProbeResult cellProbe=CellularLinkHelper.probeDirectEndpoints(
+                cellNet,fp,trust,ipv6Endpoints,2400);
+            if(!cellProbe.reachable) {
+                Log.i("DeskTouch","Offline mobile reconnect failed ("+cellProbe.errorMessage+")");
+                cellularHelper.releaseCellularNetwork();
+                continue;
+            }
+            DesktopDiscovery.Device cellDev=new DesktopDiscovery.Device(
+                "DeskTouch PC",cellProbe.address,fp,true,false);
+            if(!DeskTouchRuntime.switchTransportMakeBeforeBreak(
+                this,cellDev,phone.width,phone.height,cellNet,true,
+                ()->Log.i("DeskTouch","Connected directly via Mobile network ("+cellProbe.address+")"),
+                ()->cellularHelper.releaseCellularNetwork())) {
                 cellularHelper.releaseCellularNetwork();
             }
-
-            if(wanDev!=null && wanDev.relaySessionId!=null) {
-                if(DeskTouchRuntime.switchTransportMakeBeforeBreak(
-                    this,wanDev,phone.width,phone.height,null,false,
-                    ()->Log.i("DeskTouch","Connected via encrypted cross-network relay"),
-                    null)) {
-                    return;
-                }
-            }
+            return;
         }
     }
     @Override public int onStartCommand(Intent intent,int flags,int startId) {

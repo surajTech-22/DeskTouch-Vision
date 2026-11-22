@@ -173,7 +173,9 @@ public final class PhoneMediaService extends Service {
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_START_MIC);
         if (!startForegroundCompat(ctx, i)) {
-            startDirectMicFallback(ctx);
+            micRunning = false;
+            postMicPromptNotification(ctx);
+            emitMicStatus(2, "Tap DeskTouch notification on phone to allow microphone");
         }
     }
 
@@ -252,12 +254,6 @@ public final class PhoneMediaService extends Service {
         } catch (Throwable ignored) {}
     }
 
-    private static void startDirectMicFallback(Context ctx) {
-        final Context appCtx = ctx.getApplicationContext();
-        micRunning = true;
-        startStaticMicLoop(appCtx);
-    }
-
     @Override public void onCreate() {
         super.onCreate();
         mediaThread = new HandlerThread("DeskTouch-MediaShare");
@@ -303,9 +299,11 @@ public final class PhoneMediaService extends Service {
             }
             micRunning = true;
             if (!promoteForeground()) {
-                // Android 14/15 blocked FGS microphone type from background; try in-process AudioRecord
-                // and post a 1-tap notification prompt if Android silences or rejects background mic.
-                startMicLoop();
+                // Never record silently in the background if Android refuses microphone FGS promotion;
+                // post a clear user-initiated tap prompt instead.
+                micRunning = false;
+                postMicPromptNotification(this);
+                emitMicStatus(2, "Tap DeskTouch notification on phone to allow microphone");
                 if (!screenRunning && !cameraRunning) stopSelfCleanly();
                 return START_NOT_STICKY;
             }
@@ -338,10 +336,12 @@ public final class PhoneMediaService extends Service {
                 emitCameraStatus(2, "Grant Camera permission on Android");
                 if (mic && hasMic) {
                     micRunning = true;
-                    if (promoteForeground()) startMicLoop();
-                    else {
+                    if (promoteForeground()) {
                         startMicLoop();
+                    } else {
+                        micRunning = false;
                         postMicPromptNotification(this);
+                        emitMicStatus(2, "Tap DeskTouch notification on phone to allow microphone");
                     }
                 } else if (mic) {
                     postMicPromptNotification(this);
@@ -416,12 +416,6 @@ public final class PhoneMediaService extends Service {
                         startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
                         return !cameraRunning && !micRunning;
                     } catch (SecurityException ignored) {}
-                }
-                if (Build.VERSION.SDK_INT >= 34 && !screenRunning && !cameraRunning) {
-                    try {
-                        startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-                        return true;
-                    } catch (Throwable ignored) {}
                 }
                 return false;
             }

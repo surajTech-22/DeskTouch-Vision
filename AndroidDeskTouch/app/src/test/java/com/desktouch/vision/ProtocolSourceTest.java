@@ -1819,13 +1819,14 @@ public final class ProtocolSourceTest {
         String mediaServiceSource = readProjectSource("src/main/java/com/desktouch/vision/PhoneMediaService.java");
         String sessionSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchSession.java");
         String mainSource = readProjectSource("src/main/java/com/desktouch/vision/MainActivity.java");
-        assertTrue(manifestSource.contains("mediaProjection|camera|microphone|connectedDevice"));
+        assertTrue(manifestSource.contains("mediaProjection|camera|microphone"));
+        assertFalse(manifestSource.contains("mediaProjection|camera|microphone|connectedDevice"));
         assertTrue(mediaServiceSource.contains("ACTION_START_MIC"));
         assertTrue(mediaServiceSource.contains("VOICE_COMMUNICATION"));
         assertTrue(mediaServiceSource.contains("AcousticEchoCanceler"));
         assertTrue(mediaServiceSource.contains("SecurityException"));
         assertTrue(mediaServiceSource.contains("postMicPromptNotification"));
-        assertTrue(mediaServiceSource.contains("FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE"));
+        assertFalse(mediaServiceSource.contains("FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE"));
         assertTrue(mediaServiceSource.contains("isAllZeroPcm"));
         assertTrue(mediaServiceSource.contains("standaloneMicRequested"));
         assertTrue(sessionSource.contains("sendMedia("));
@@ -1931,6 +1932,26 @@ public final class ProtocolSourceTest {
         assertTrue(runtimeSource.contains("notifyScreenPreviewUpdated"));
         assertTrue(mainSource.contains("renderLatestScreenPreviewOnly"));
         assertTrue(mainSource.contains("syncActiveScreenPreviewWatch"));
+
+        // Verify Play Protect compliance guards: no silent background mic capture fallback,
+        // no hidden shell `cmd wifi` toggling in ShellInputDaemon, and no unsolicited
+        // background WAN/MQTT polling from AutoConnectService.
+        String phoneMediaSource = readProjectSource("src/main/java/com/desktouch/vision/PhoneMediaService.java");
+        String daemonSource = readProjectSource("src/main/java/com/desktouch/vision/ShellInputDaemon.java");
+        assertFalse(phoneMediaSource.contains("startDirectMicFallback"));
+        assertFalse(daemonSource.contains("set-scan-always-available"));
+        assertFalse(autoServiceSource.contains("resolveByFingerprint"));
+
+        // Verify v0.3.96 approved Full-Screen Preview layout, popouts, 5s status hide, and persistence
+        String layoutHelperSource = readProjectSource("src/main/java/com/desktouch/vision/FullscreenPreviewLayoutHelper.java");
+        assertTrue(layoutHelperSource.contains("STATUS_AUTO_HIDE_MS = 5000L"));
+        assertTrue(layoutHelperSource.contains("overlapsMonitorRect"));
+        assertTrue(mainSource.contains("FullscreenPreviewLayoutHelper.load"));
+        assertTrue(mainSource.contains("FullscreenPreviewLayoutHelper.swapRails"));
+        assertTrue(mainSource.contains("FullscreenPreviewLayoutHelper.overlapsMonitorRect"));
+        assertTrue(mainSource.contains("STATUS_AUTO_HIDE_MS"));
+        assertTrue(mainSource.contains("\"⇄ Swap\""));
+        assertTrue(mainSource.contains("sendWindowsKeyCombo("));
     }
 
     private static String readProjectSource(String relFromAppModule) {

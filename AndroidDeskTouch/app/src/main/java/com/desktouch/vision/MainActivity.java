@@ -119,6 +119,7 @@ public final class MainActivity extends Activity {
     private boolean suppressTypedText;
 
     private TextView profilePillBtn,fgAppBanner,trackpadPresetPill,previewEmptyHint,fullscreenStatusHint;
+    private Runnable fullscreenStatusHideTask;
     private Button homeSendFileBtn,homePowerBtn,previewToggleBtn,previewFullscreenBtn;
     private LinearLayout previewWrap,shortcutStripRow,mediaBar;
     private ImageView previewImageView,fullscreenPreviewImage;
@@ -2407,9 +2408,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.95";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.96";
         }catch(Exception ignored){
-            return "0.3.95";
+            return "0.3.96";
         }
     }
 
@@ -4392,7 +4393,7 @@ public final class MainActivity extends Activity {
                 fullscreenPreviewImage.setImageBitmap(bmp);
                 lastRenderedFullscreenBmp=bmp;
             }
-            if(fullscreenStatusHint!=null){
+            if(fullscreenStatusHint!=null && fullscreenStatusHint.getVisibility()==View.VISIBLE){
                 fullscreenStatusHint.setText("Live Display "+displayNum+tagSuffix+" • Tap = Click • Drag = Move • Long-press / 2-finger tap = Right");
             }
         }
@@ -4434,12 +4435,17 @@ public final class MainActivity extends Activity {
         final Dialog dlg=new Dialog(this,android.R.style.Theme_Black_NoTitleBar_Fullscreen);
         dlg.requestWindowFeature(Window.FEATURE_NO_TITLE);
         fullscreenPreviewDialog=dlg;
-        fullscreenLandscape=true;
+
+        final FullscreenPreviewLayoutHelper.LayoutState layoutState=FullscreenPreviewLayoutHelper.load(this);
+        fullscreenLandscape=layoutState.landscape;
         try{
-            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+            setRequestedOrientation(fullscreenLandscape
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
         }catch(RuntimeException ignored){}
 
-        FrameLayout root=new FrameLayout(this);
+        final float density=Math.max(1f,getResources().getDisplayMetrics().density);
+        final FrameLayout root=new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
 
         final ImageView fullImg=new ImageView(this);
@@ -4454,6 +4460,67 @@ public final class MainActivity extends Activity {
         }
         root.addView(fullImg,new FrameLayout.LayoutParams(-1,-1));
 
+        // Blank-area drop zones and blocked-screen warning indicator for movable #2 / #6 rails
+        final FrameLayout leftBlankZone=new FrameLayout(this);
+        leftBlankZone.setBackground(dashedBox(0x1A0EA5E9,0xCC38BDF8,dp(12)));
+        leftBlankZone.setVisibility(View.GONE);
+        TextView leftZoneLbl=new TextView(this);
+        leftZoneLbl.setText("BLANK L");
+        leftZoneLbl.setTextSize(9f);
+        leftZoneLbl.setTypeface(null,Typeface.BOLD);
+        leftZoneLbl.setTextColor(0xFF7DD3FC);
+        FrameLayout.LayoutParams lzlLp=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+        lzlLp.bottomMargin=dp(6);
+        leftBlankZone.addView(leftZoneLbl,lzlLp);
+        root.addView(leftBlankZone,new FrameLayout.LayoutParams(dp(64),-1,Gravity.TOP|Gravity.START));
+
+        final FrameLayout rightBlankZone=new FrameLayout(this);
+        rightBlankZone.setBackground(dashedBox(0x1A0EA5E9,0xCC38BDF8,dp(12)));
+        rightBlankZone.setVisibility(View.GONE);
+        TextView rightZoneLbl=new TextView(this);
+        rightZoneLbl.setText("BLANK R");
+        rightZoneLbl.setTextSize(9f);
+        rightZoneLbl.setTypeface(null,Typeface.BOLD);
+        rightZoneLbl.setTextColor(0xFF7DD3FC);
+        FrameLayout.LayoutParams rzlLp=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+        rzlLp.bottomMargin=dp(6);
+        rightBlankZone.addView(rightZoneLbl,rzlLp);
+        root.addView(rightBlankZone,new FrameLayout.LayoutParams(dp(64),-1,Gravity.TOP|Gravity.START));
+
+        final FrameLayout screenBlockedOverlay=new FrameLayout(this);
+        screenBlockedOverlay.setBackground(dashedBox(0x2CF43F5E,0xF0F43F5E,dp(8)));
+        screenBlockedOverlay.setVisibility(View.GONE);
+        TextView blockedBadge=new TextView(this);
+        blockedBadge.setText("✕ Blank areas only (cannot cover screen)");
+        blockedBadge.setTextSize(11f);
+        blockedBadge.setTypeface(null,Typeface.BOLD);
+        blockedBadge.setTextColor(0xFFFECDD3);
+        blockedBadge.setPadding(dp(10),dp(6),dp(10),dp(6));
+        blockedBadge.setBackground(PhoneUiKit.roundedBox(0xE84C0519,0xFFFB7185,dp(8),Math.max(1,dp(1))));
+        screenBlockedOverlay.addView(blockedBadge,new FrameLayout.LayoutParams(-2,-2,Gravity.CENTER));
+        root.addView(screenBlockedOverlay,new FrameLayout.LayoutParams(dp(200),dp(120),Gravity.TOP|Gravity.START));
+
+        final String[] openModFlyout={null};
+        final boolean[] shiftLatched={false};
+        final Runnable[] updateModBtnHolder={null};
+        final LinearLayout modShortcutFlyout=new LinearLayout(this);
+        final Runnable closeModFlyout=()->{
+            openModFlyout[0]=null;
+            modShortcutFlyout.setVisibility(View.GONE);
+            if(updateModBtnHolder[0]!=null)updateModBtnHolder[0].run();
+        };
+
+        final java.util.function.Supplier<int[]> activeModVks=()->{
+            java.util.ArrayList<Integer> vks=new java.util.ArrayList<>(2);
+            if("ctrl".equals(openModFlyout[0]))vks.add(FullscreenPreviewLayoutHelper.VK_CONTROL);
+            else if("alt".equals(openModFlyout[0]))vks.add(FullscreenPreviewLayoutHelper.VK_MENU);
+            else if("win".equals(openModFlyout[0]))vks.add(FullscreenPreviewLayoutHelper.VK_LWIN);
+            if(shiftLatched[0])vks.add(FullscreenPreviewLayoutHelper.VK_SHIFT);
+            int[] out=new int[vks.size()];
+            for(int i=0;i<vks.size();i++)out[i]=vks.get(i);
+            return out;
+        };
+
         final float[] downXY={0f,0f};
         final float[] twoPrevY={0f};
         final float[] twoCarry={0f};
@@ -4464,6 +4531,9 @@ public final class MainActivity extends Activity {
 
         fullImg.setOnTouchListener((iv,ev)->{
             if(iv.getWidth()<=0 || iv.getHeight()<=0)return true;
+            if(ev.getActionMasked()==MotionEvent.ACTION_DOWN){
+                closeModFlyout.run();
+            }
             DeskTouchSession activeSession=DeskTouchRuntime.session(MainActivity.this);
             android.graphics.Bitmap curBmp=activeSession.currentScreenPreview();
             int bw=curBmp!=null && !curBmp.isRecycled() ? curBmp.getWidth() : 0;
@@ -4536,7 +4606,7 @@ public final class MainActivity extends Activity {
         quickKeyBar.setOrientation(LinearLayout.HORIZONTAL);
         quickKeyBar.setGravity(Gravity.CENTER_VERTICAL);
         quickKeyBar.setPadding(dp(8),dp(5),dp(8),dp(5));
-        quickKeyBar.setBackground(PhoneUiKit.roundedBox(0xCC0F172A,0xFF38BDF8,dp(12),Math.max(1,dp(1))));
+        quickKeyBar.setBackground(PhoneUiKit.roundedBox(0xDC0F172A,0xFF38BDF8,dp(12),Math.max(1,dp(1))));
         quickKeyBar.setVisibility(View.GONE);
         final EditText fsKeyInput=new EditText(this);
         fsKeyInput.setHint("Type to computer...");
@@ -4544,7 +4614,7 @@ public final class MainActivity extends Activity {
         fsKeyInput.setHintTextColor(0xFF94A3B8);
         fsKeyInput.setTextSize(12.5f);
         fsKeyInput.setSingleLine(true);
-        quickKeyBar.addView(fsKeyInput,new LinearLayout.LayoutParams(dp(190),-2));
+        quickKeyBar.addView(fsKeyInput,new LinearLayout.LayoutParams(dp(175),-2));
         final String[] prevFsTyped={""};
         final boolean[] suppressFs={false};
         fsKeyInput.addTextChangedListener(new TextWatcher(){
@@ -4555,6 +4625,19 @@ public final class MainActivity extends Activity {
                 String next=e.toString();
                 DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
                 if(!act.isActive() && !act.hasClaim())act.claimControl();
+                int[] mods=activeModVks.get();
+                if(mods.length>0 && next.length()>prevFsTyped[0].length()){
+                    char ch=next.charAt(next.length()-1);
+                    char upper=Character.toUpperCase(ch);
+                    int vk=(upper>='A' && upper<='Z') || (upper>='0' && upper<='9') ? (int)upper : 0;
+                    if(vk>0){
+                        sendWindowsKeyCombo(act,mods,vk,"");
+                        suppressFs[0]=true;fsKeyInput.setText("");prevFsTyped[0]="";suppressFs[0]=false;
+                        shiftLatched[0]=false;
+                        closeModFlyout.run();
+                        return;
+                    }
+                }
                 int common=0;
                 while(common<prevFsTyped[0].length() && common<next.length() &&
                     prevFsTyped[0].charAt(common)==next.charAt(common))common++;
@@ -4563,24 +4646,604 @@ public final class MainActivity extends Activity {
                 prevFsTyped[0]=next;
             }
         });
-        TextView fsEnterBtn=createFullscreenHudChip("↵",()->{
+        TextView fsTypeEnterBtn=createFullscreenHudChip("↵",()->{
             DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
-            act.key(0x0D,true);act.key(0x0D,false);
+            sendWindowsKeyCombo(act,activeModVks.get(),FullscreenPreviewLayoutHelper.VK_RETURN,"");
             suppressFs[0]=true;fsKeyInput.setText("");prevFsTyped[0]="";suppressFs[0]=false;
+            shiftLatched[0]=false;
+            closeModFlyout.run();
         });
         LinearLayout.LayoutParams feLp=new LinearLayout.LayoutParams(-2,-2);
         feLp.leftMargin=dp(6);
-        quickKeyBar.addView(fsEnterBtn,feLp);
+        quickKeyBar.addView(fsTypeEnterBtn,feLp);
 
         FrameLayout.LayoutParams kbBarLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START);
-        kbBarLp.leftMargin=dp(12);kbBarLp.topMargin=dp(12);
+        kbBarLp.leftMargin=dp(80);kbBarLp.topMargin=dp(12);
         root.addView(quickKeyBar,kbBarLp);
 
+        // #4 Bottom-Center Status Hint Pill (auto-closes after 5 seconds)
+        fullscreenStatusHint=new TextView(this);
+        fullscreenStatusHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Tap = Click • Drag = Move • Long-press / 2-finger tap = Right");
+        fullscreenStatusHint.setTextSize(10.5f);
+        fullscreenStatusHint.setTextColor(0xFFE2E8F0);
+        fullscreenStatusHint.setPadding(dp(10),dp(4),dp(10),dp(4));
+        fullscreenStatusHint.setBackground(PhoneUiKit.roundedBox(0xB30F172A,0x5938BDF8,dp(10),Math.max(1,dp(1))));
+        FrameLayout.LayoutParams hintLp=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
+        hintLp.bottomMargin=dp(10);
+
+        final Runnable scheduleStatusHide=()->{
+            if(fullscreenStatusHint==null)return;
+            fullscreenStatusHint.setVisibility(View.VISIBLE);
+            if(fullscreenStatusHideTask!=null)liveUiHandler.removeCallbacks(fullscreenStatusHideTask);
+            fullscreenStatusHideTask=()->{
+                if(fullscreenStatusHint!=null)fullscreenStatusHint.setVisibility(View.GONE);
+            };
+            liveUiHandler.postDelayed(fullscreenStatusHideTask,FullscreenPreviewLayoutHelper.STATUS_AUTO_HIDE_MS);
+        };
+
+        // #6 Function Keys Rail & #2 Modifier Rail containers (created before HUD Swap button references)
+        final LinearLayout fnRail=new LinearLayout(this);
+        fnRail.setOrientation(LinearLayout.VERTICAL);
+        fnRail.setGravity(Gravity.CENTER_HORIZONTAL);
+        fnRail.setPadding(dp(4),dp(4),dp(4),dp(4));
+        fnRail.setBackground(PhoneUiKit.roundedBox(0xDB0F172A,0xFF334155,dp(12),Math.max(1,dp(1))));
+
+        final LinearLayout modRail=new LinearLayout(this);
+        modRail.setOrientation(LinearLayout.VERTICAL);
+        modRail.setGravity(Gravity.CENTER_HORIZONTAL);
+        modRail.setPadding(dp(4),dp(4),dp(4),dp(4));
+        modRail.setBackground(PhoneUiKit.roundedBox(0xDB0F172A,0xFF334155,dp(12),Math.max(1,dp(1))));
+
+        // #6 header + scroll list + resize grip
+        LinearLayout fnDragHeader=new LinearLayout(this);
+        fnDragHeader.setOrientation(LinearLayout.HORIZONTAL);
+        fnDragHeader.setGravity(Gravity.CENTER_VERTICAL);
+        fnDragHeader.setPadding(dp(4),dp(3),dp(4),dp(3));
+        fnDragHeader.setBackground(PhoneUiKit.roundedBox(0xFF1E293B,0xB338BDF8,dp(8),Math.max(1,dp(1))));
+        TextView fnGripTxt=new TextView(this);
+        fnGripTxt.setText("⋮⋮");
+        fnGripTxt.setTextSize(10f);
+        fnGripTxt.setTextColor(0xFFCBD5E1);
+        final TextView fnCollapseBtn=new TextView(this);
+        fnCollapseBtn.setText("Fn ▾");
+        fnCollapseBtn.setTextSize(10.5f);
+        fnCollapseBtn.setTypeface(null,Typeface.BOLD);
+        fnCollapseBtn.setTextColor(0xFF7DD3FC);
+        fnCollapseBtn.setGravity(Gravity.END|Gravity.CENTER_VERTICAL);
+        fnCollapseBtn.setClickable(true);
+        fnDragHeader.addView(fnGripTxt,new LinearLayout.LayoutParams(-2,-2));
+        fnDragHeader.addView(fnCollapseBtn,new LinearLayout.LayoutParams(0,-2,1f));
+        fnRail.addView(fnDragHeader,new LinearLayout.LayoutParams(-1,-2));
+
+        final ScrollView fnScroll=new ScrollView(this);
+        fnScroll.setVerticalScrollBarEnabled(false);
+        LinearLayout fnKeysList=new LinearLayout(this);
+        fnKeysList.setOrientation(LinearLayout.VERTICAL);
+        for(int fk=1;fk<=12;fk++){
+            final int vk=0x70+(fk-1);
+            TextView fkBtn=createFullscreenRailKeyChip("F"+fk,0xFF1E293B,0xFF475569,()->{
+                DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                sendWindowsKeyCombo(act,activeModVks.get(),vk,"");
+                shiftLatched[0]=false;
+                closeModFlyout.run();
+            });
+            LinearLayout.LayoutParams kp=new LinearLayout.LayoutParams(-1,-2);
+            kp.bottomMargin=dp(3);
+            fnKeysList.addView(fkBtn,kp);
+        }
+        fnScroll.addView(fnKeysList,new ScrollView.LayoutParams(-1,-2));
+        LinearLayout.LayoutParams fnScrLp=new LinearLayout.LayoutParams(-1,0,1f);
+        fnScrLp.topMargin=dp(4);
+        fnRail.addView(fnScroll,fnScrLp);
+
+        final FrameLayout fnResizeHandle=new FrameLayout(this);
+        View fnResizePill=new View(this);
+        fnResizePill.setBackground(PhoneUiKit.roundedBox(0xC094A3B8,0,dp(2),0));
+        fnResizeHandle.addView(fnResizePill,new FrameLayout.LayoutParams(dp(28),Math.max(3,dp(3)),Gravity.CENTER));
+        fnRail.addView(fnResizeHandle,new LinearLayout.LayoutParams(-1,dp(14)));
+
+        // #2 header + scroll list + resize grip
+        LinearLayout modDragHeader=new LinearLayout(this);
+        modDragHeader.setOrientation(LinearLayout.HORIZONTAL);
+        modDragHeader.setGravity(Gravity.CENTER_VERTICAL);
+        modDragHeader.setPadding(dp(4),dp(3),dp(4),dp(3));
+        modDragHeader.setBackground(PhoneUiKit.roundedBox(0xFF1E293B,0xB338BDF8,dp(8),Math.max(1,dp(1))));
+        TextView modGripTxt=new TextView(this);
+        modGripTxt.setText("⋮⋮");
+        modGripTxt.setTextSize(10f);
+        modGripTxt.setTextColor(0xFFCBD5E1);
+        final TextView modCollapseBtn=new TextView(this);
+        modCollapseBtn.setText("⌘ ▾");
+        modCollapseBtn.setTextSize(10.5f);
+        modCollapseBtn.setTypeface(null,Typeface.BOLD);
+        modCollapseBtn.setTextColor(0xFF7DD3FC);
+        modCollapseBtn.setGravity(Gravity.END|Gravity.CENTER_VERTICAL);
+        modCollapseBtn.setClickable(true);
+        modDragHeader.addView(modGripTxt,new LinearLayout.LayoutParams(-2,-2));
+        modDragHeader.addView(modCollapseBtn,new LinearLayout.LayoutParams(0,-2,1f));
+        modRail.addView(modDragHeader,new LinearLayout.LayoutParams(-1,-2));
+
+        final ScrollView modScroll=new ScrollView(this);
+        modScroll.setVerticalScrollBarEnabled(false);
+        LinearLayout modKeysList=new LinearLayout(this);
+        modKeysList.setOrientation(LinearLayout.VERTICAL);
+
+        final TextView modCtrlBtn=createFullscreenRailKeyChip("Ctrl",0xFF1E293B,0xFF475569,null);
+        final TextView modAltBtn=createFullscreenRailKeyChip("Alt",0xFF1E293B,0xFF475569,null);
+        final TextView modWinBtn=createFullscreenRailKeyChip("⊞ Win",0xFF1E293B,0xFF475569,null);
+        final TextView modShiftBtn=createFullscreenRailKeyChip("⇧",0xFF1E293B,0xFF475569,null);
+
+        updateModBtnHolder[0]=()->{
+            boolean cOpen="ctrl".equals(openModFlyout[0]);
+            boolean aOpen="alt".equals(openModFlyout[0]);
+            boolean wOpen="win".equals(openModFlyout[0]);
+            modCtrlBtn.setBackground(PhoneUiKit.roundedBox(cOpen ? 0xFF0284C7 : 0xFF1E293B,cOpen ? 0xFF7DD3FC : 0xFF475569,dp(8),Math.max(1,dp(1))));
+            modAltBtn.setBackground(PhoneUiKit.roundedBox(aOpen ? 0xFF0284C7 : 0xFF1E293B,aOpen ? 0xFF7DD3FC : 0xFF475569,dp(8),Math.max(1,dp(1))));
+            modWinBtn.setBackground(PhoneUiKit.roundedBox(wOpen ? 0xFF0284C7 : 0xFF1E293B,wOpen ? 0xFF7DD3FC : 0xFF475569,dp(8),Math.max(1,dp(1))));
+            modShiftBtn.setBackground(PhoneUiKit.roundedBox(shiftLatched[0] ? 0xFF0284C7 : 0xFF1E293B,shiftLatched[0] ? 0xFF7DD3FC : 0xFF475569,dp(8),Math.max(1,dp(1))));
+        };
+
+        LinearLayout.LayoutParams modBtnLp=new LinearLayout.LayoutParams(-1,-2);
+        modBtnLp.bottomMargin=dp(3);
+        modKeysList.addView(modCtrlBtn,new LinearLayout.LayoutParams(modBtnLp));
+        modKeysList.addView(modAltBtn,new LinearLayout.LayoutParams(modBtnLp));
+        modKeysList.addView(modWinBtn,new LinearLayout.LayoutParams(modBtnLp));
+        modKeysList.addView(modShiftBtn,new LinearLayout.LayoutParams(modBtnLp));
+
+        View modDivider=new View(this);
+        modDivider.setBackgroundColor(0x99475569);
+        LinearLayout.LayoutParams divLp=new LinearLayout.LayoutParams(-1,Math.max(1,dp(1)));
+        divLp.topMargin=dp(2);
+        divLp.bottomMargin=dp(4);
+        modKeysList.addView(modDivider,divLp);
+
+        String[] specialLabels={"Esc","Tab","⌫","↵"};
+        int[] specialVks={
+            FullscreenPreviewLayoutHelper.VK_ESCAPE,
+            FullscreenPreviewLayoutHelper.VK_TAB,
+            0x08,
+            FullscreenPreviewLayoutHelper.VK_RETURN
+        };
+        for(int idx=0;idx<specialLabels.length;idx++){
+            final int svk=specialVks[idx];
+            TextView spBtn=createFullscreenRailKeyChip(specialLabels[idx],0xFF1E293B,0xFF475569,()->{
+                DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                sendWindowsKeyCombo(act,activeModVks.get(),svk,"");
+                shiftLatched[0]=false;
+                closeModFlyout.run();
+            });
+            modKeysList.addView(spBtn,new LinearLayout.LayoutParams(modBtnLp));
+        }
+
+        modScroll.addView(modKeysList,new ScrollView.LayoutParams(-1,-2));
+        LinearLayout.LayoutParams modScrLp=new LinearLayout.LayoutParams(-1,0,1f);
+        modScrLp.topMargin=dp(4);
+        modRail.addView(modScroll,modScrLp);
+
+        final FrameLayout modResizeHandle=new FrameLayout(this);
+        View modResizePill=new View(this);
+        modResizePill.setBackground(PhoneUiKit.roundedBox(0xC094A3B8,0,dp(2),0));
+        modResizeHandle.addView(modResizePill,new FrameLayout.LayoutParams(dp(28),Math.max(3,dp(3)),Gravity.CENTER));
+        modRail.addView(modResizeHandle,new LinearLayout.LayoutParams(-1,dp(14)));
+
+        // Auto-closing shortcut flyout panel (opens on Ctrl / Alt / Win tap)
+        modShortcutFlyout.setOrientation(LinearLayout.VERTICAL);
+        modShortcutFlyout.setPadding(dp(8),dp(8),dp(8),dp(8));
+        modShortcutFlyout.setBackground(PhoneUiKit.roundedBox(0xF00F172A,0xFF38BDF8,dp(14),Math.max(1,dp(1))));
+        modShortcutFlyout.setVisibility(View.GONE);
+        LinearLayout flyoutHead=new LinearLayout(this);
+        flyoutHead.setOrientation(LinearLayout.HORIZONTAL);
+        flyoutHead.setGravity(Gravity.CENTER_VERTICAL);
+        flyoutHead.setPadding(0,0,0,dp(6));
+        final TextView flyoutTitle=new TextView(this);
+        flyoutTitle.setText("Ctrl Commands");
+        flyoutTitle.setTextSize(11.5f);
+        flyoutTitle.setTypeface(null,Typeface.BOLD);
+        flyoutTitle.setTextColor(0xFF7DD3FC);
+        TextView flyoutCloseBtn=createFullscreenHudChip("✕",closeModFlyout);
+        flyoutCloseBtn.setPadding(dp(6),dp(2),dp(6),dp(2));
+        flyoutHead.addView(flyoutTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        flyoutHead.addView(flyoutCloseBtn,new LinearLayout.LayoutParams(-2,-2));
+        modShortcutFlyout.addView(flyoutHead,new LinearLayout.LayoutParams(-1,-2));
+
+        ScrollView flyoutScroll=new ScrollView(this);
+        flyoutScroll.setVerticalScrollBarEnabled(false);
+        final LinearLayout flyoutRows=new LinearLayout(this);
+        flyoutRows.setOrientation(LinearLayout.VERTICAL);
+        flyoutScroll.addView(flyoutRows,new ScrollView.LayoutParams(-1,-2));
+        modShortcutFlyout.addView(flyoutScroll,new LinearLayout.LayoutParams(-1,dp(210)));
+
+        final java.util.function.Supplier<FullscreenPreviewLayoutHelper.MonitorRect> monitorRectSupplier=()->{
+            float rootWDp=root.getWidth()>0 ? root.getWidth()/density : (fullscreenLandscape ? 860f : 380f);
+            float rootHDp=root.getHeight()>0 ? root.getHeight()/density : (fullscreenLandscape ? 390f : 740f);
+            DeskTouchSession cur=DeskTouchRuntime.session(MainActivity.this);
+            android.graphics.Bitmap b=cur.currentScreenPreview();
+            int bw=(b!=null && !b.isRecycled()) ? b.getWidth() : 0;
+            int bh=(b!=null && !b.isRecycled()) ? b.getHeight() : 0;
+            return FullscreenPreviewLayoutHelper.computeFittedMonitorRect(rootWDp,rootHDp,bw,bh);
+        };
+
+        final Runnable positionModFlyout=()->{
+            if(modShortcutFlyout.getVisibility()!=View.VISIBLE)return;
+            FullscreenPreviewLayoutHelper.MonitorRect m=monitorRectSupplier.get();
+            float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+            float maxFlyH=Math.min(250f,Math.max(150f,m.rootH-24f));
+            float flyTop=FullscreenPreviewLayoutHelper.clamp(
+                layoutState.mod.topDp,
+                12f,
+                Math.max(12f,m.rootH-maxFlyH-12f));
+            float gapX=FullscreenPreviewLayoutHelper.EDGE_PAD_DP+railW+8f;
+            float leftDp="left".equals(layoutState.mod.side)
+                ? gapX
+                : Math.max(8f,m.rootW-gapX-236f);
+            FrameLayout.LayoutParams fp=new FrameLayout.LayoutParams(
+                Math.round(236f*density),-2,Gravity.TOP|Gravity.START);
+            fp.leftMargin=Math.round(leftDp*density);
+            fp.topMargin=Math.round(flyTop*density);
+            modShortcutFlyout.setLayoutParams(fp);
+        };
+
+        final java.util.function.BiConsumer<Boolean,String> applyViews=(runResolve,priorityId)->{
+            FullscreenPreviewLayoutHelper.MonitorRect m=monitorRectSupplier.get();
+            if(runResolve){
+                FullscreenPreviewLayoutHelper.resolveLayout(layoutState,m,priorityId);
+            }
+            float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+            int railWPx=Math.round(railW*density);
+
+            FullscreenPreviewLayoutHelper.RailState[] states={layoutState.fn,layoutState.mod};
+            LinearLayout[] views={fnRail,modRail};
+            ScrollView[] scrolls={fnScroll,modScroll};
+            FrameLayout[] grips={fnResizeHandle,modResizeHandle};
+            TextView[] cBtns={fnCollapseBtn,modCollapseBtn};
+            String[] labels={"Fn","⌘"};
+
+            for(int i=0;i<2;i++){
+                FullscreenPreviewLayoutHelper.RailState rs=states[i];
+                scrolls[i].setVisibility(rs.collapsed ? View.GONE : View.VISIBLE);
+                grips[i].setVisibility(rs.collapsed ? View.GONE : View.VISIBLE);
+                int hPx=rs.collapsed ? -2 : Math.round(rs.heightDp*density);
+                FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(railWPx,hPx,Gravity.TOP|Gravity.START);
+                float xDp="left".equals(rs.side)
+                    ? FullscreenPreviewLayoutHelper.EDGE_PAD_DP
+                    : Math.max(4f,m.rootW-FullscreenPreviewLayoutHelper.EDGE_PAD_DP-railW);
+                lp.leftMargin=Math.round(xDp*density);
+                lp.topMargin=Math.round(rs.topDp*density);
+                views[i].setLayoutParams(lp);
+                if(rs.collapsed){
+                    cBtns[i].setText("left".equals(rs.side) ? labels[i]+" ▸" : labels[i]+" ◂");
+                }else{
+                    cBtns[i].setText(labels[i]+" ▾");
+                }
+            }
+
+            FrameLayout.LayoutParams kLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START);
+            kLp.leftMargin=Math.round((FullscreenPreviewLayoutHelper.EDGE_PAD_DP+railW+8f)*density);
+            kLp.topMargin=dp(12);
+            quickKeyBar.setLayoutParams(kLp);
+
+            positionModFlyout.run();
+        };
+
+        final java.util.function.Consumer<String> toggleModFlyout=(modKey)->{
+            if(layoutState.mod.collapsed){
+                layoutState.mod.collapsed=false;
+                applyViews.accept(true,"mod");
+                FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+            }
+            if(modKey.equals(openModFlyout[0])){
+                closeModFlyout.run();
+                return;
+            }
+            openModFlyout[0]=modKey;
+            flyoutTitle.setText("ctrl".equals(modKey) ? "Ctrl Commands"
+                : ("alt".equals(modKey) ? "Alt Shortcuts" : "Windows Shortcuts"));
+            flyoutRows.removeAllViews();
+            List<FullscreenPreviewLayoutHelper.ShortcutItem> items=FullscreenPreviewLayoutHelper.shortcutsFor(modKey);
+            for(int idx=0;idx<items.size();idx+=2){
+                LinearLayout row=new LinearLayout(MainActivity.this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                LinearLayout.LayoutParams rowLp=new LinearLayout.LayoutParams(-1,-2);
+                rowLp.bottomMargin=dp(4);
+                for(int col=0;col<2;col++){
+                    int itemIdx=idx+col;
+                    if(itemIdx>=items.size()){
+                        row.addView(new View(MainActivity.this),new LinearLayout.LayoutParams(0,-2,1f));
+                        continue;
+                    }
+                    final FullscreenPreviewLayoutHelper.ShortcutItem item=items.get(itemIdx);
+                    LinearLayout card=new LinearLayout(MainActivity.this);
+                    card.setOrientation(LinearLayout.HORIZONTAL);
+                    card.setGravity(Gravity.CENTER_VERTICAL);
+                    card.setPadding(dp(7),dp(6),dp(7),dp(6));
+                    card.setBackground(PhoneUiKit.roundedBox(0xFF1E293B,0xFF475569,dp(8),Math.max(1,dp(1))));
+                    TextView lblTv=new TextView(MainActivity.this);
+                    lblTv.setText(item.label);
+                    lblTv.setTextSize(10.5f);
+                    lblTv.setTypeface(null,Typeface.BOLD);
+                    lblTv.setTextColor(0xFF7DD3FC);
+                    TextView descTv=new TextView(MainActivity.this);
+                    descTv.setText(item.desc);
+                    descTv.setTextSize(9.5f);
+                    descTv.setTextColor(0xFF94A3B8);
+                    descTv.setGravity(Gravity.END);
+                    descTv.setSingleLine(true);
+                    card.addView(lblTv,new LinearLayout.LayoutParams(-2,-2));
+                    LinearLayout.LayoutParams dlp=new LinearLayout.LayoutParams(0,-2,1f);
+                    dlp.leftMargin=dp(4);
+                    card.addView(descTv,dlp);
+                    card.setClickable(true);
+                    card.setOnClickListener(v->{
+                        int[] comboMods=item.modifierVks;
+                        if(shiftLatched[0] && item.powerAction.isEmpty()){
+                            boolean hasShift=false;
+                            for(int mv:comboMods)if(mv==FullscreenPreviewLayoutHelper.VK_SHIFT)hasShift=true;
+                            if(!hasShift){
+                                int[] merged=new int[comboMods.length+1];
+                                System.arraycopy(comboMods,0,merged,0,comboMods.length);
+                                merged[comboMods.length]=FullscreenPreviewLayoutHelper.VK_SHIFT;
+                                comboMods=merged;
+                            }
+                        }
+                        DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                        sendWindowsKeyCombo(act,comboMods,item.mainVk,item.powerAction);
+                        shiftLatched[0]=false;
+                        closeModFlyout.run();
+                    });
+                    LinearLayout.LayoutParams clp=new LinearLayout.LayoutParams(0,-2,1f);
+                    if(col==0)clp.rightMargin=dp(4);
+                    row.addView(card,clp);
+                }
+                flyoutRows.addView(row,rowLp);
+            }
+            updateModBtnHolder[0].run();
+            modShortcutFlyout.setVisibility(View.VISIBLE);
+            positionModFlyout.run();
+        };
+
+        modCtrlBtn.setOnClickListener(v->toggleModFlyout.accept("ctrl"));
+        modAltBtn.setOnClickListener(v->toggleModFlyout.accept("alt"));
+        modWinBtn.setOnClickListener(v->toggleModFlyout.accept("win"));
+        modShiftBtn.setOnClickListener(v->{
+            shiftLatched[0]=!shiftLatched[0];
+            updateModBtnHolder[0].run();
+        });
+
+        fnCollapseBtn.setOnClickListener(v->{
+            layoutState.fn.collapsed=!layoutState.fn.collapsed;
+            applyViews.accept(true,"fn");
+            FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+        });
+        modCollapseBtn.setOnClickListener(v->{
+            layoutState.mod.collapsed=!layoutState.mod.collapsed;
+            if(layoutState.mod.collapsed)closeModFlyout.run();
+            applyViews.accept(true,"mod");
+            FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+        });
+
+        // Attach movable drag + bottom vertical resize touch listeners to both #6 and #2 rails
+        final String[] railIds={"fn","mod"};
+        final LinearLayout[] railViews={fnRail,modRail};
+        final View[] dragHeaders={fnDragHeader,modDragHeader};
+        final View[] resizeHandles={fnResizeHandle,modResizeHandle};
+        final FullscreenPreviewLayoutHelper.RailState[] railStates={layoutState.fn,layoutState.mod};
+
+        for(int i=0;i<2;i++){
+            final int idx=i;
+            final String rId=railIds[i];
+            final LinearLayout rView=railViews[i];
+            final FullscreenPreviewLayoutHelper.RailState rState=railStates[i];
+            final FullscreenPreviewLayoutHelper.RailState otherState=railStates[1-i];
+            final String labelTag="fn".equals(rId) ? "#6" : "#2";
+
+            final float[] dragMeta=new float[7]; // startRawX, startRawY, startLeftDp, startTopDp, effHDp, candLeftDp, candTopDp
+            final String[] dragStartSide={rState.side};
+            final boolean[] dragBlocked={false};
+            final FullscreenPreviewLayoutHelper.MonitorRect[] dragMetrics={null};
+
+            dragHeaders[i].setOnTouchListener((v,ev)->{
+                switch(ev.getActionMasked()){
+                    case MotionEvent.ACTION_DOWN:{
+                        closeModFlyout.run();
+                        FullscreenPreviewLayoutHelper.MonitorRect m=monitorRectSupplier.get();
+                        dragMetrics[0]=m;
+                        float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+                        float startLeftDp="left".equals(rState.side)
+                            ? FullscreenPreviewLayoutHelper.EDGE_PAD_DP
+                            : Math.max(4f,m.rootW-FullscreenPreviewLayoutHelper.EDGE_PAD_DP-railW);
+                        dragMeta[0]=ev.getRawX();
+                        dragMeta[1]=ev.getRawY();
+                        dragMeta[2]=startLeftDp;
+                        dragMeta[3]=rState.topDp;
+                        dragMeta[4]=FullscreenPreviewLayoutHelper.getEffectiveHeightDp(rState);
+                        dragMeta[5]=startLeftDp;
+                        dragMeta[6]=rState.topDp;
+                        dragStartSide[0]=rState.side;
+                        dragBlocked[0]=false;
+
+                        float maxBot=FullscreenPreviewLayoutHelper.getMaxAllowedBottomDp(m);
+                        int zoneWPx=Math.round((railW+4f)*density);
+                        FrameLayout.LayoutParams lbLp=new FrameLayout.LayoutParams(
+                            zoneWPx,Math.round((maxBot-12f)*density),Gravity.TOP|Gravity.START);
+                        lbLp.leftMargin=Math.round((FullscreenPreviewLayoutHelper.EDGE_PAD_DP-2f)*density);
+                        lbLp.topMargin=dp(12);
+                        leftBlankZone.setLayoutParams(lbLp);
+                        leftBlankZone.setVisibility(View.VISIBLE);
+
+                        FrameLayout.LayoutParams rbLp=new FrameLayout.LayoutParams(
+                            zoneWPx,Math.round(Math.max(40f,maxBot-FullscreenPreviewLayoutHelper.HUD_CLEARANCE_DP)*density),Gravity.TOP|Gravity.START);
+                        rbLp.leftMargin=Math.round(Math.max(4f,m.rootW-FullscreenPreviewLayoutHelper.EDGE_PAD_DP-railW-2f)*density);
+                        rbLp.topMargin=dp(56);
+                        rightBlankZone.setLayoutParams(rbLp);
+                        rightBlankZone.setVisibility(View.VISIBLE);
+
+                        FrameLayout.LayoutParams sbLp=new FrameLayout.LayoutParams(
+                            Math.round(Math.max(40f,m.monRight-m.monLeft)*density),
+                            Math.round(Math.max(40f,m.monBot-m.monTop)*density),
+                            Gravity.TOP|Gravity.START);
+                        sbLp.leftMargin=Math.round(m.monLeft*density);
+                        sbLp.topMargin=Math.round(m.monTop*density);
+                        screenBlockedOverlay.setLayoutParams(sbLp);
+
+                        rView.setBackground(PhoneUiKit.roundedBox(0xE80F172A,0xFF38BDF8,dp(12),Math.max(2,dp(2))));
+                        return true;
+                    }
+                    case MotionEvent.ACTION_MOVE:{
+                        FullscreenPreviewLayoutHelper.MonitorRect m=dragMetrics[0]!=null ? dragMetrics[0] : monitorRectSupplier.get();
+                        float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+                        float dxDp=(ev.getRawX()-dragMeta[0])/density;
+                        float dyDp=(ev.getRawY()-dragMeta[1])/density;
+                        float candLeft=FullscreenPreviewLayoutHelper.clamp(dragMeta[2]+dxDp,4f,m.rootW-railW-4f);
+                        float candTop=FullscreenPreviewLayoutHelper.clamp(dragMeta[3]+dyDp,8f,m.rootH-dragMeta[4]-8f);
+                        boolean blocked=FullscreenPreviewLayoutHelper.overlapsMonitorRect(candLeft,candTop,railW,dragMeta[4],m);
+                        dragMeta[5]=candLeft;
+                        dragMeta[6]=candTop;
+                        dragBlocked[0]=blocked;
+
+                        int hPx=rState.collapsed ? -2 : Math.round(rState.heightDp*density);
+                        FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(Math.round(railW*density),hPx,Gravity.TOP|Gravity.START);
+                        lp.leftMargin=Math.round(candLeft*density);
+                        lp.topMargin=Math.round(candTop*density);
+                        rView.setLayoutParams(lp);
+                        rView.setBackground(PhoneUiKit.roundedBox(
+                            0xE80F172A,blocked ? 0xFFF43F5E : 0xFF38BDF8,dp(12),Math.max(2,dp(2))));
+                        screenBlockedOverlay.setVisibility(blocked ? View.VISIBLE : View.GONE);
+                        boolean hoverLeft=(candLeft+railW*0.5f)<(m.rootW*0.5f);
+                        leftBlankZone.setBackground(dashedBox(
+                            !blocked && hoverLeft ? 0x380EA5E9 : 0x120EA5E9,
+                            !blocked && hoverLeft ? 0xFF38BDF8 : 0x6638BDF8,dp(12)));
+                        rightBlankZone.setBackground(dashedBox(
+                            !blocked && !hoverLeft ? 0x380EA5E9 : 0x120EA5E9,
+                            !blocked && !hoverLeft ? 0xFF38BDF8 : 0x6638BDF8,dp(12)));
+                        return true;
+                    }
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:{
+                        leftBlankZone.setVisibility(View.GONE);
+                        rightBlankZone.setVisibility(View.GONE);
+                        screenBlockedOverlay.setVisibility(View.GONE);
+                        rView.setBackground(PhoneUiKit.roundedBox(0xDB0F172A,0xFF334155,dp(12),Math.max(1,dp(1))));
+
+                        FullscreenPreviewLayoutHelper.MonitorRect m=dragMetrics[0]!=null ? dragMetrics[0] : monitorRectSupplier.get();
+                        float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+                        if(dragBlocked[0] || ev.getActionMasked()==MotionEvent.ACTION_CANCEL){
+                            rState.side=dragStartSide[0];
+                            rState.topDp=dragMeta[3];
+                            applyViews.accept(true,rId);
+                            if(dragBlocked[0]){
+                                showToast("Blocked: "+labelTag+" cannot overlap screen (blank areas only)");
+                            }
+                            return true;
+                        }
+
+                        String targetSide=(dragMeta[5]+railW*0.5f)<(m.rootW*0.5f) ? "left" : "right";
+                        rState.side=targetSide;
+                        rState.baseTopDp=Math.max(FullscreenPreviewLayoutHelper.getSideMinTopDp(targetSide),dragMeta[6]);
+                        rState.topDp=rState.baseTopDp;
+
+                        if(targetSide.equals(otherState.side)){
+                            boolean droppedAbove=(dragMeta[6]+dragMeta[4]*0.5f)
+                                <(otherState.topDp+FullscreenPreviewLayoutHelper.getEffectiveHeightDp(otherState)*0.5f);
+                            rState.stackOrder=droppedAbove ? 0 : 1;
+                            otherState.stackOrder=droppedAbove ? 1 : 0;
+                        }
+
+                        FullscreenPreviewLayoutHelper.resolveLayout(layoutState,m,rId);
+                        rState.baseTopDp=rState.topDp;
+                        if(!rState.collapsed)rState.baseHeightDp=rState.heightDp;
+                        if(targetSide.equals(otherState.side) && !rState.collapsed && !otherState.collapsed){
+                            otherState.baseTopDp=otherState.topDp;
+                            otherState.baseHeightDp=otherState.heightDp;
+                        }
+                        applyViews.accept(false,rId);
+                        FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+
+                        if(layoutState.fn.side.equals(layoutState.mod.side)){
+                            showToast("Stacked on "+targetSide+" blank: "
+                                +(layoutState.fn.stackOrder<layoutState.mod.stackOrder ? "#6 above #2" : "#2 above #6"));
+                        }else{
+                            showToast("Moved "+labelTag+" to "+targetSide+" blank area");
+                        }
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            });
+
+            final float[] resMeta=new float[2]; // startRawY, startHeightDp
+            final FullscreenPreviewLayoutHelper.MonitorRect[] resMetrics={null};
+            resizeHandles[i].setOnTouchListener((v,ev)->{
+                if(rState.collapsed)return false;
+                switch(ev.getActionMasked()){
+                    case MotionEvent.ACTION_DOWN:
+                        closeModFlyout.run();
+                        resMeta[0]=ev.getRawY();
+                        resMeta[1]=rState.heightDp;
+                        resMetrics[0]=monitorRectSupplier.get();
+                        rView.setBackground(PhoneUiKit.roundedBox(0xE80F172A,0xFFFBBF24,dp(12),Math.max(2,dp(2))));
+                        return true;
+                    case MotionEvent.ACTION_MOVE:{
+                        FullscreenPreviewLayoutHelper.MonitorRect m=resMetrics[0]!=null ? resMetrics[0] : monitorRectSupplier.get();
+                        float railW=FullscreenPreviewLayoutHelper.effectiveRailWidthDp(m);
+                        float dyDp=(ev.getRawY()-resMeta[0])/density;
+                        float maxBot=FullscreenPreviewLayoutHelper.getMaxAllowedBottomDp(m);
+                        float bandBottom=maxBot;
+                        if(!FullscreenPreviewLayoutHelper.hasSideBlankPillars(m,railW) && rState.topDp<m.monTop){
+                            bandBottom=Math.min(bandBottom,m.monTop-8f);
+                        }
+                        float maxH=bandBottom-rState.topDp;
+                        if(otherState.side.equals(rState.side) && otherState.stackOrder>rState.stackOrder){
+                            float effOther=FullscreenPreviewLayoutHelper.getEffectiveHeightDp(otherState);
+                            maxH=Math.min(maxH,maxBot-effOther-FullscreenPreviewLayoutHelper.RAIL_GAP_DP-rState.topDp);
+                        }
+                        maxH=Math.max(FullscreenPreviewLayoutHelper.MIN_RAIL_HEIGHT_DP,maxH);
+                        float nextH=FullscreenPreviewLayoutHelper.clamp(resMeta[1]+dyDp,FullscreenPreviewLayoutHelper.MIN_RAIL_HEIGHT_DP,maxH);
+                        rState.heightDp=nextH;
+                        rState.baseHeightDp=nextH;
+                        if(otherState.side.equals(rState.side) && otherState.stackOrder>rState.stackOrder){
+                            float minBotY=rState.topDp+nextH+FullscreenPreviewLayoutHelper.RAIL_GAP_DP;
+                            float maxBotY=Math.max(minBotY,maxBot-FullscreenPreviewLayoutHelper.getEffectiveHeightDp(otherState));
+                            otherState.topDp=FullscreenPreviewLayoutHelper.clamp(
+                                Math.max(otherState.baseTopDp,minBotY),minBotY,maxBotY);
+                        }
+                        applyViews.accept(false,rId);
+                        return true;
+                    }
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:{
+                        rView.setBackground(PhoneUiKit.roundedBox(0xDB0F172A,0xFF334155,dp(12),Math.max(1,dp(1))));
+                        FullscreenPreviewLayoutHelper.MonitorRect m=resMetrics[0]!=null ? resMetrics[0] : monitorRectSupplier.get();
+                        if(otherState.side.equals(rState.side) && !rState.collapsed && !otherState.collapsed
+                            && otherState.topDp>otherState.baseTopDp){
+                            otherState.baseTopDp=otherState.topDp;
+                        }
+                        FullscreenPreviewLayoutHelper.resolveLayout(layoutState,m,rId);
+                        rState.baseHeightDp=rState.heightDp;
+                        applyViews.accept(false,rId);
+                        FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+                        int hInt=Math.round(rState.heightDp);
+                        showToast("Resized "+labelTag+": "+hInt+"dp"
+                            +(hInt<=Math.round(FullscreenPreviewLayoutHelper.MIN_RAIL_HEIGHT_DP)+2 ? " (min 2 options)" : ""));
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            });
+        }
+
+        // #1 Top-Right Floating HUD Bar (collapses down to [ ‹ ] [ ✕ Exit ])
         LinearLayout hudBar=new LinearLayout(this);
         hudBar.setOrientation(LinearLayout.HORIZONTAL);
         hudBar.setGravity(Gravity.CENTER_VERTICAL);
-        hudBar.setPadding(dp(8),dp(5),dp(8),dp(5));
-        hudBar.setBackground(PhoneUiKit.roundedBox(0xB80F172A,0xFF334155,dp(14),Math.max(1,dp(1))));
+        hudBar.setPadding(dp(7),dp(5),dp(7),dp(5));
+        hudBar.setBackground(PhoneUiKit.roundedBox(0xC80F172A,0xFF334155,dp(14),Math.max(1,dp(1))));
+
+        final LinearLayout hudItemsWrap=new LinearLayout(this);
+        hudItemsWrap.setOrientation(LinearLayout.HORIZONTAL);
+        hudItemsWrap.setGravity(Gravity.CENTER_VERTICAL);
+        hudItemsWrap.setVisibility(layoutState.hudCollapsed ? View.GONE : View.VISIBLE);
 
         final TextView monBtn=createFullscreenHudChip("Display "+(s.activeMonitorIndex()+1),null);
         monBtn.setOnClickListener(v->{
@@ -4599,26 +5262,30 @@ public final class MainActivity extends Activity {
             monBtn.setText("Display "+(nextMon+1)+(count>1 ? "/"+count : ""));
             if(fullscreenStatusHint!=null){
                 fullscreenStatusHint.setText("Live Display "+(nextMon+1)+" • Tap = Click • Drag = Move • Long-press = Right");
+                scheduleStatusHide.run();
             }
         });
-        hudBar.addView(monBtn);
+        hudItemsWrap.addView(monBtn);
 
         TextView rotBtn=createFullscreenHudChip("↻ Rotate",()->{
             fullscreenLandscape=!fullscreenLandscape;
+            layoutState.landscape=fullscreenLandscape;
+            FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
             try{
                 setRequestedOrientation(fullscreenLandscape
                     ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
                     : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
             }catch(RuntimeException ignored){}
+            root.post(()->applyViews.accept(true,"mod"));
         });
         LinearLayout.LayoutParams rotLp=new LinearLayout.LayoutParams(-2,-2);
-        rotLp.leftMargin=dp(6);
-        hudBar.addView(rotBtn,rotLp);
+        rotLp.leftMargin=dp(5);
+        hudItemsWrap.addView(rotBtn,rotLp);
 
         TextView rClickBtn=createFullscreenHudChip("R-Click",()->DeskTouchRuntime.session(MainActivity.this).click(2));
         LinearLayout.LayoutParams rcLp=new LinearLayout.LayoutParams(-2,-2);
-        rcLp.leftMargin=dp(6);
-        hudBar.addView(rClickBtn,rcLp);
+        rcLp.leftMargin=dp(5);
+        hudItemsWrap.addView(rClickBtn,rcLp);
 
         TextView keysHudBtn=createFullscreenHudChip("⌨ Keys",()->{
             boolean show=quickKeyBar.getVisibility()!=View.VISIBLE;
@@ -4628,28 +5295,64 @@ public final class MainActivity extends Activity {
             }
         });
         LinearLayout.LayoutParams khLp=new LinearLayout.LayoutParams(-2,-2);
-        khLp.leftMargin=dp(6);
-        hudBar.addView(keysHudBtn,khLp);
+        khLp.leftMargin=dp(5);
+        hudItemsWrap.addView(keysHudBtn,khLp);
+
+        TextView swapBtn=createFullscreenHudChip("⇄ Swap",()->{
+            closeModFlyout.run();
+            FullscreenPreviewLayoutHelper.swapRails(layoutState);
+            applyViews.accept(true,"mod");
+            FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+            if(layoutState.fn.side.equals(layoutState.mod.side)){
+                showToast("Swapped on "+layoutState.fn.side+": "
+                    +(layoutState.fn.topDp<layoutState.mod.topDp ? "#6 above #2" : "#2 above #6"));
+            }else{
+                showToast("Interchanged: #2 ("+layoutState.mod.side+") ↔ #6 ("+layoutState.fn.side+")");
+            }
+        });
+        swapBtn.setTextColor(0xFF7DD3FC);
+        LinearLayout.LayoutParams swLp=new LinearLayout.LayoutParams(-2,-2);
+        swLp.leftMargin=dp(5);
+        hudItemsWrap.addView(swapBtn,swLp);
+        hudBar.addView(hudItemsWrap);
+
+        final TextView hudCollapseBtn=createFullscreenHudChip(layoutState.hudCollapsed ? "‹" : "›",null);
+        hudCollapseBtn.setTextColor(0xFF7DD3FC);
+        hudCollapseBtn.setBackground(PhoneUiKit.roundedBox(0xFF1E293B,0xFF38BDF8,dp(10),Math.max(1,dp(1))));
+        hudCollapseBtn.setOnClickListener(v->{
+            layoutState.hudCollapsed=!layoutState.hudCollapsed;
+            hudItemsWrap.setVisibility(layoutState.hudCollapsed ? View.GONE : View.VISIBLE);
+            hudCollapseBtn.setText(layoutState.hudCollapsed ? "‹" : "›");
+            FullscreenPreviewLayoutHelper.save(MainActivity.this,layoutState);
+        });
+        LinearLayout.LayoutParams hcLp=new LinearLayout.LayoutParams(-2,-2);
+        if(!layoutState.hudCollapsed)hcLp.leftMargin=dp(5);
+        hudBar.addView(hudCollapseBtn,hcLp);
 
         TextView closeBtn=createFullscreenHudChip("✕ Exit",dlg::dismiss);
         closeBtn.setBackground(PhoneUiKit.roundedBox(0xFF991B1B,0xFFFCA5A5,dp(10),Math.max(1,dp(1))));
         LinearLayout.LayoutParams clLp=new LinearLayout.LayoutParams(-2,-2);
-        clLp.leftMargin=dp(6);
+        clLp.leftMargin=dp(5);
         hudBar.addView(closeBtn,clLp);
 
-        FrameLayout.LayoutParams hudLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.END);
-        hudLp.rightMargin=dp(12);hudLp.topMargin=dp(12);
-        root.addView(hudBar,hudLp);
+        root.addView(fnRail,new FrameLayout.LayoutParams(dp(62),dp(300),Gravity.TOP|Gravity.START));
+        root.addView(modRail,new FrameLayout.LayoutParams(dp(62),dp(290),Gravity.TOP|Gravity.START));
+        root.addView(modShortcutFlyout,new FrameLayout.LayoutParams(dp(236),-2,Gravity.TOP|Gravity.START));
 
-        fullscreenStatusHint=new TextView(this);
-        fullscreenStatusHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Tap = Click • Drag = Move • Long-press / 2-finger tap = Right");
-        fullscreenStatusHint.setTextSize(10.5f);
-        fullscreenStatusHint.setTextColor(0xFFE2E8F0);
-        fullscreenStatusHint.setPadding(dp(10),dp(4),dp(10),dp(4));
-        fullscreenStatusHint.setBackground(PhoneUiKit.roundedBox(0x990F172A,0x4438BDF8,dp(10),Math.max(1,dp(1))));
-        FrameLayout.LayoutParams hintLp=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL);
-        hintLp.bottomMargin=dp(10);
+        FrameLayout.LayoutParams hudLp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.END);
+        hudLp.rightMargin=dp(10);hudLp.topMargin=dp(12);
+        root.addView(hudBar,hudLp);
         root.addView(fullscreenStatusHint,hintLp);
+
+        final int[] lastLayoutDim={0,0};
+        root.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+            int w=r-l,h=b-t;
+            if(w>0 && h>0 && (w!=lastLayoutDim[0] || h!=lastLayoutDim[1])){
+                lastLayoutDim[0]=w;
+                lastLayoutDim[1]=h;
+                root.post(()->applyViews.accept(true,"mod"));
+            }
+        });
 
         dlg.setContentView(root);
         Window win=dlg.getWindow();
@@ -4667,6 +5370,10 @@ public final class MainActivity extends Activity {
         int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
         s.setScreenPreviewWatch(tid,Math.max(0,s.activeMonitorIndex()),true);
         dlg.setOnDismissListener(d->{
+            if(fullscreenStatusHideTask!=null){
+                liveUiHandler.removeCallbacks(fullscreenStatusHideTask);
+                fullscreenStatusHideTask=null;
+            }
             fullscreenPreviewImage=null;
             fullscreenStatusHint=null;
             fullscreenPreviewDialog=null;
@@ -4683,6 +5390,57 @@ public final class MainActivity extends Activity {
             }
         });
         dlg.show();
+        scheduleStatusHide.run();
+        root.post(()->applyViews.accept(true,"mod"));
+    }
+
+    private void sendWindowsKeyCombo(
+            DeskTouchSession act, int[] modifierVks, int mainVk, String powerAction){
+        if(act==null || !act.isConnected())return;
+        if(!act.isActive() && !act.hasClaim())act.claimControl();
+        if("lock".equals(powerAction)){
+            int tid=act.selectedEnvironmentTarget()>0 ? act.selectedEnvironmentTarget() : 0;
+            act.sendPowerAction(tid,"lock");
+            showToast("Sent Lock to PC");
+            return;
+        }
+        if(modifierVks!=null){
+            for(int mv:modifierVks){
+                if(mv>0)act.key(mv,true);
+            }
+        }
+        if(mainVk>0){
+            act.key(mainVk,true);
+            act.key(mainVk,false);
+        }
+        if(modifierVks!=null){
+            for(int i=modifierVks.length-1;i>=0;i--){
+                if(modifierVks[i]>0)act.key(modifierVks[i],false);
+            }
+        }
+    }
+
+    private GradientDrawable dashedBox(int fillColor,int strokeColor,int radiusPx){
+        GradientDrawable d=new GradientDrawable();
+        d.setColor(fillColor);
+        d.setCornerRadius(radiusPx);
+        d.setStroke(Math.max(2,dp(2)),strokeColor,dp(6),dp(4));
+        return d;
+    }
+
+    private TextView createFullscreenRailKeyChip(String label,int bgColor,int strokeColor,Runnable onClick){
+        TextView tv=new TextView(this);
+        tv.setText(label);
+        tv.setTextSize(10.5f);
+        tv.setTypeface(null,Typeface.BOLD);
+        tv.setTextColor(Color.WHITE);
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(dp(2),dp(5),dp(2),dp(5));
+        tv.setBackground(PhoneUiKit.roundedBox(bgColor,strokeColor,dp(8),Math.max(1,dp(1))));
+        tv.setClickable(true);
+        tv.setFocusable(true);
+        if(onClick!=null)tv.setOnClickListener(v->onClick.run());
+        return tv;
     }
 
     private TextView createFullscreenHudChip(String label,Runnable onClick){

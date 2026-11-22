@@ -68,6 +68,8 @@ public final class MainActivity extends Activity {
     private LinearLayout winTaskbarCard,winTaskbarRow;
     private TextView winTaskbarTitle;
     private String lastWindowsTaskbarSig="";
+    private String lastEnvMembersSig="";
+    private String lastTrackpadPcSig="";
     private TextView findStatus,findCountTag;
     private EditText pairingCodeInput;
     private volatile List<DesktopDiscovery.Device> lastScannedDevices=new ArrayList<>();
@@ -89,6 +91,21 @@ public final class MainActivity extends Activity {
 
     private final Handler liveUiHandler=new Handler(Looper.getMainLooper());
     private boolean liveUiRunning;
+    private final java.util.concurrent.atomic.AtomicBoolean liveStatusRefreshQueued=
+        new java.util.concurrent.atomic.AtomicBoolean();
+    private long lastLiveStatusUiRefreshMs;
+    private final Runnable liveStatusRefreshTask=new Runnable(){
+        @Override public void run(){
+            liveStatusRefreshQueued.set(false);
+            if(!liveUiRunning || isFinishing() || isDestroyed())return;
+            lastLiveStatusUiRefreshMs=android.os.SystemClock.uptimeMillis();
+            refreshEnvironmentMembers();
+            refreshTrackpadPcTaskbar();
+            refreshPermissionState();
+            refreshLiveLinkAndKeyboard();
+            updateVisibleScreenAwake();
+        }
+    };
     private android.hardware.input.InputManager inputManager;
     private android.hardware.input.InputManager.InputDeviceListener inputDeviceListener;
     private final Runnable liveUiTick=new Runnable(){
@@ -184,15 +201,17 @@ public final class MainActivity extends Activity {
         applyTheme(palette.themeId);
         selectTab(0);
 
-        DeskTouchRuntime.setLiveStatusListener(()->runOnUiThread(()->{
-            if(!isFinishing()&&!isDestroyed()){
-                refreshEnvironmentMembers();
-                refreshTrackpadPcTaskbar();
-                refreshPermissionState();
-                refreshLiveLinkAndKeyboard();
-                updateVisibleScreenAwake();
+        DeskTouchRuntime.setLiveStatusListener(()->{
+            if(!liveUiRunning)return;
+            if(!liveStatusRefreshQueued.compareAndSet(false,true))return;
+            long elapsed=android.os.SystemClock.uptimeMillis()-lastLiveStatusUiRefreshMs;
+            long delayMs=elapsed>=200L ? 0L : (200L-elapsed);
+            if(delayMs==0L){
+                liveUiHandler.post(liveStatusRefreshTask);
+            }else{
+                liveUiHandler.postDelayed(liveStatusRefreshTask,delayMs);
             }
-        }));
+        });
         DeskTouchRuntime.setScreenPreviewListener(()->runOnUiThread(this::renderLatestScreenPreviewOnly));
         DeskTouchSession.setWirelessPairResultListener((ok,msg)->runOnUiThread(()->{
             if(isFinishing()||isDestroyed())return;
@@ -2680,6 +2699,9 @@ public final class MainActivity extends Activity {
         for(Consumer<PhoneUiKit.Palette> updater:themeUpdaters){
             updater.accept(palette);
         }
+        lastEnvMembersSig="";
+        lastTrackpadPcSig="";
+        lastWindowsTaskbarSig="";
         refreshEnvironmentMembers();
         refreshTrackpadPcTaskbar();
         refreshPermissionState();
@@ -2740,9 +2762,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.97";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.98";
         }catch(Exception ignored){
-            return "0.3.97";
+            return "0.3.98";
         }
     }
 
@@ -2774,6 +2796,8 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume(){
         super.onResume();
+        lastEnvMembersSig="";
+        lastTrackpadPcSig="";
         updateVisibleScreenAwake();
         if(environmentList!=null)refreshEnvironmentMembers();
         refreshTrackpadPcTaskbar();
@@ -2843,6 +2867,8 @@ public final class MainActivity extends Activity {
     private void stopLiveUiTicker(){
         liveUiRunning=false;
         liveUiHandler.removeCallbacks(liveUiTick);
+        liveUiHandler.removeCallbacks(liveStatusRefreshTask);
+        liveStatusRefreshQueued.set(false);
     }
 
     private void registerKeyboardDeviceListener(){
@@ -3451,9 +3477,32 @@ public final class MainActivity extends Activity {
 
     private void refreshEnvironmentMembers(){
         if(environmentList==null)return;
-        environmentList.removeAllViews();
         DeskTouchSession active=DeskTouchRuntime.session(this);
         List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
+        boolean isConn=active.isConnected();
+        int ownId=active.ownEnvironmentId();
+        int selectedId=active.selectedEnvironmentTarget();
+        int localNotif=DeskTouchNotificationListener.readActiveCount(this);
+        int localBatt=readLocalBatteryPercent();
+        boolean localChg=readLocalBatteryCharging();
+        StringBuilder envSig=new StringBuilder(128);
+        envSig.append(palette.themeId).append('|').append(isConn ? '1' : '0').append('|')
+            .append(ownId).append('|').append(selectedId).append('|')
+            .append(localNotif).append('|').append(localBatt).append(':').append(localChg ? '1' : '0');
+        for(DeskTouchSession.EnvironmentTarget t:targets){
+            envSig.append(';').append(t.id).append(':').append(t.name).append(':')
+                .append(t.supportsInput ? '1' : '0').append(':').append(t.notificationCount)
+                .append(':').append(t.arrangementOrder).append(':').append(t.batteryPercent)
+                .append(':').append(t.charging ? '1' : '0').append(':')
+                .append(t.layout != null ? t.layout.hashCode() : 0);
+        }
+        String nextEnvSig=envSig.toString();
+        if(nextEnvSig.equals(lastEnvMembersSig) && environmentList.getChildCount()>0){
+            refreshTrackpadPcTaskbar();
+            return;
+        }
+        lastEnvMembersSig=nextEnvSig;
+        environmentList.removeAllViews();
         if(targets.isEmpty()){
             if(connectionSummary!=null){
                 connectionSummary.setText(active.isConnected()
@@ -3501,8 +3550,6 @@ public final class MainActivity extends Activity {
         }
         List<DeskTouchSession.EnvironmentTarget> sortedTargets=LinkedDisplayHelper.sortTargetsSpatially(targets);
         List<List<DeskTouchSession.EnvironmentTarget>> rows=LinkedDisplayHelper.groupTargetsIntoRows(sortedTargets);
-        int ownId=active.ownEnvironmentId();
-        int selectedId=active.selectedEnvironmentTarget();
         for(int r=0;r<rows.size();r++){
             List<DeskTouchSession.EnvironmentTarget> rowTargets=rows.get(r);
             LinearLayout rowLayout=new LinearLayout(this);
@@ -3649,14 +3696,33 @@ public final class MainActivity extends Activity {
 
     private void refreshTrackpadPcTaskbar(){
         if(trackpadPcBar==null || trackpadScreenBar==null)return;
-        trackpadPcBar.removeAllViews();
-        trackpadScreenBar.removeAllViews();
 
         DeskTouchSession active=DeskTouchRuntime.session(this);
         List<DeskTouchSession.EnvironmentTarget> targets=active.environmentTargets();
         int ownId=active.ownEnvironmentId();
         int selectedId=active.selectedEnvironmentTarget();
+        int activeMonIdx=active.activeMonitorIndex();
+        boolean isConn=active.isConnected();
         List<LinkedDisplayHelper.DisplayTileModel> pcs=LinkedDisplayHelper.buildTrackpadPcTiles(targets,selectedId,ownId);
+
+        StringBuilder pcSig=new StringBuilder(128);
+        pcSig.append(palette.themeId).append('|').append(isConn ? '1' : '0').append('|')
+            .append(selectedId).append('|').append(activeMonIdx);
+        for(LinkedDisplayHelper.DisplayTileModel pc:pcs){
+            pcSig.append(';').append(pc.id).append(':').append(pc.shortName).append(':')
+                .append(pc.selected ? '1' : '0').append(':').append(pc.notificationCount)
+                .append(':').append(pc.monitorCount);
+        }
+        String nextPcSig=pcSig.toString();
+        if(nextPcSig.equals(lastTrackpadPcSig) && trackpadPcBar.getChildCount()>0){
+            refreshWindowsTaskbar();
+            refreshEcosystemLiveUi();
+            return;
+        }
+        lastTrackpadPcSig=nextPcSig;
+
+        trackpadPcBar.removeAllViews();
+        trackpadScreenBar.removeAllViews();
 
         if(pcs.isEmpty()){
             if(trackpadScreenScroll!=null)trackpadScreenScroll.setVisibility(View.GONE);
@@ -3698,7 +3764,6 @@ public final class MainActivity extends Activity {
 
         if(trackpadScreenScroll!=null)trackpadScreenScroll.setVisibility(View.VISIBLE);
         trackpadScreenBar.setVisibility(View.VISIBLE);
-        int activeMonIdx=active.activeMonitorIndex();
         if(screenPc.monitors!=null && !screenPc.monitors.isEmpty()){
             for(int m=0;m<screenPc.monitors.size();m++){
                 final int monIdx=m;
@@ -4524,6 +4589,7 @@ public final class MainActivity extends Activity {
         }
         DeskTouchSession.setWirelessPairResultListener(null);
         activePairResultHandler=null;
+        stopLiveUiTicker();
         DeskTouchRuntime.setScreenPreviewListener(null);
         DeskTouchRuntime.setLiveStatusListener(null);
         DeskTouchRuntime.setListener(null);

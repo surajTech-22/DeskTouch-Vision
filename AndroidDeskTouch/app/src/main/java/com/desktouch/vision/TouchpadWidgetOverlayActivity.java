@@ -12,6 +12,9 @@ import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
@@ -38,6 +41,7 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Translucent in-place floating 4x4 Touchpad card launched from the Home Screen Widget.
@@ -90,6 +94,18 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
     private Bitmap lastRenderedBmp;
     private Toast activeToast;
     private int lastPcsSignatureHash;
+    private final Handler overlayUiHandler = new Handler(Looper.getMainLooper());
+    private final AtomicBoolean overlayRefreshQueued = new AtomicBoolean(false);
+    private long lastOverlayUiRefreshMs;
+    private final Runnable overlayRefreshTask = new Runnable() {
+        @Override public void run() {
+            overlayRefreshQueued.set(false);
+            if (!isFinishing() && !isDestroyed()) {
+                lastOverlayUiRefreshMs = SystemClock.uptimeMillis();
+                refreshAllUi(false);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -118,10 +134,9 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        DeskTouchRuntime.setOverlayLiveStatusListener(() -> runOnUiThread(() -> {
-            if (!isFinishing() && !isDestroyed()) refreshAllUi(false);
-        }));
+        DeskTouchRuntime.setOverlayLiveStatusListener(this::scheduleCoalescedRefresh);
         DeskTouchRuntime.setOverlayScreenPreviewListener(() -> runOnUiThread(this::renderLatestPreview));
+        lastOverlayUiRefreshMs = SystemClock.uptimeMillis();
         refreshAllUi(true);
         if (fullscreenMode) startPreviewWatch();
         if (TouchpadWidgetHelper.OVERLAY_KEYS.equals(activeOverlay)) focusKeyboardInput();
@@ -132,7 +147,20 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
         super.onPause();
         DeskTouchRuntime.setOverlayLiveStatusListener(null);
         DeskTouchRuntime.setOverlayScreenPreviewListener(null);
+        overlayUiHandler.removeCallbacks(overlayRefreshTask);
+        overlayRefreshQueued.set(false);
         stopPreviewWatchIfNeeded();
+    }
+
+    private void scheduleCoalescedRefresh() {
+        if (!overlayRefreshQueued.compareAndSet(false, true)) return;
+        long elapsed = SystemClock.uptimeMillis() - lastOverlayUiRefreshMs;
+        long delayMs = elapsed >= 200L ? 0L : (200L - elapsed);
+        if (delayMs == 0L) {
+            overlayUiHandler.post(overlayRefreshTask);
+        } else {
+            overlayUiHandler.postDelayed(overlayRefreshTask, delayMs);
+        }
     }
 
     @Override
@@ -806,7 +834,7 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
                     if (!threeFingerHandled) {
                         float dx3 = avgPointerX(event, 3) - threeFingerStartX;
                         float dy3 = avgPointerY(event, 3) - threeFingerStartY;
-                        int tid3 = act.selectedEnvironmentTarget() > 0 ? act.selectedEnvironmentTarget() : 0;
+                        int tid3 = Math.max(0, act.selectedEnvironmentTarget());
                         if (Math.abs(dx3) > dp(42) && Math.abs(dx3) > Math.abs(dy3)) {
                             act.sendMediaAction(tid3, "switch-window", dx3 > 0 ? 1 : -1);
                             threeFingerHandled = true;
@@ -950,7 +978,7 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
     private void startPreviewWatch() {
         DeskTouchSession act = DeskTouchRuntime.session(this);
         if (!act.isConnected()) return;
-        int tid = act.selectedEnvironmentTarget() > 0 ? act.selectedEnvironmentTarget() : 0;
+        int tid = Math.max(0, act.selectedEnvironmentTarget());
         act.setScreenPreviewWatch(tid, Math.max(0, act.activeMonitorIndex()), true);
         renderLatestPreview();
     }

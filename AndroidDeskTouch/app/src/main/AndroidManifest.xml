@@ -37,7 +37,7 @@
         <activity android:name=".TouchpadWidgetOverlayActivity" android:exported="false"
             android:launchMode="singleTop"
             android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:theme="@style/Theme.DeskTouch.WidgetOverlay"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize" />
         <service android:name=".AutoConnectService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />

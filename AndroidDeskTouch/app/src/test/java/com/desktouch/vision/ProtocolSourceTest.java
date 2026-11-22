@@ -1984,6 +1984,30 @@ public final class ProtocolSourceTest {
         assertTrue(widgetOverlaySource.contains("\"⟳ Horizontal\""));
         assertTrue(widgetOverlaySource.contains("\"⟳ Vertical\""));
         assertTrue(widgetOverlaySource.contains("TouchpadWidgetHelper.togglePcSelection"));
+
+        // Verify v0.3.98: Hub PC id == 0 widget fix, non-translucent wallpaper theme for horizontal rotation,
+        // async coalesced widget updates off the Fast UDP thread, and MainActivity background/coalescing guards.
+        String widgetHelperSource = readProjectSource("src/main/java/com/desktouch/vision/TouchpadWidgetHelper.java");
+        String stylesXml = readProjectSource("src/main/res/values/styles.xml");
+        assertTrue(widgetHelperSource.contains("if (clickedTargetId < 0) return UNSELECTED;"));
+        assertTrue(widgetHelperSource.contains("if (selectedId < 0 || pcs == null || pcs.isEmpty()) return false;"));
+        assertTrue(widgetHelperSource.contains("pc.id >= 0"));
+        assertTrue(widgetProviderSource.contains("if (!connected || clickedId < 0)"));
+        assertTrue(widgetProviderSource.contains("scheduleUpdateIfChanged("));
+        assertTrue(widgetProviderSource.contains("WIDGET_EXECUTOR"));
+        assertTrue(runtimeSource.contains("TouchpadWidgetProvider.scheduleUpdateIfChanged(ctx)"));
+        assertFalse(runtimeSource.contains("updateAllIfChanged"));
+        assertTrue(runtimeSource.contains("notifyLiveMetricsTick()"));
+        assertTrue(runtimeSource.contains("ANDROID_CONTROL_LOCK"));
+        assertTrue(sessionSource.contains("DeskTouchRuntime.notifyLiveMetricsTick()"));
+        assertTrue(autoServiceSource.contains("TouchpadWidgetProvider.scheduleUpdateIfChanged(context)"));
+        assertFalse(autoServiceSource.contains("updateAllIfChanged"));
+        assertTrue(mainSource.contains("liveStatusRefreshQueued"));
+        assertTrue(mainSource.contains("if(!liveUiRunning)return;"));
+        assertTrue(stylesXml.contains("Theme.DeskTouch.WidgetOverlay"));
+        assertTrue(stylesXml.contains("<item name=\"android:windowIsTranslucent\">false</item>"));
+        assertTrue(stylesXml.contains("<item name=\"android:windowShowWallpaper\">true</item>"));
+        assertTrue(manifestSource.contains("@style/Theme.DeskTouch.WidgetOverlay"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

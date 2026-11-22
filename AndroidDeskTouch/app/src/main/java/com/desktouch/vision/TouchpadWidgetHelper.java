@@ -74,7 +74,7 @@ final class TouchpadWidgetHelper {
 
     /** Toggles selection for a PC pill: tapping the active PC again unselects it. */
     static int togglePcSelection(int currentSelectedId, int clickedTargetId) {
-        if (clickedTargetId <= 0) return UNSELECTED;
+        if (clickedTargetId < 0) return UNSELECTED;
         return currentSelectedId == clickedTargetId ? UNSELECTED : clickedTargetId;
     }
 
@@ -94,7 +94,7 @@ final class TouchpadWidgetHelper {
 
     static boolean isTargetStillAvailable(
             int selectedId, List<LinkedDisplayHelper.DisplayTileModel> pcs) {
-        if (selectedId <= 0 || pcs == null || pcs.isEmpty()) return false;
+        if (selectedId < 0 || pcs == null || pcs.isEmpty()) return false;
         for (LinkedDisplayHelper.DisplayTileModel pc : pcs) {
             if (pc != null && pc.id == selectedId) return true;
         }
@@ -112,10 +112,10 @@ final class TouchpadWidgetHelper {
             return storedSelectedId;
         }
         for (LinkedDisplayHelper.DisplayTileModel pc : pcs) {
-            if (pc != null && pc.selected && pc.id > 0) return pc.id;
+            if (pc != null && pc.selected && pc.id >= 0) return pc.id;
         }
         LinkedDisplayHelper.DisplayTileModel first = pcs.get(0);
-        return first != null && first.id > 0 ? first.id : UNSELECTED;
+        return first != null && first.id >= 0 ? first.id : UNSELECTED;
     }
 
     static List<FullscreenPreviewLayoutHelper.ShortcutItem> shortcutsForCategory(String category) {
@@ -141,7 +141,7 @@ final class TouchpadWidgetHelper {
         SharedPreferences p = prefs(context);
         if (p == null) return;
         p.edit()
-            .putInt(KEY_SELECTED_TARGET_ID, targetId > 0 ? targetId : UNSELECTED)
+            .putInt(KEY_SELECTED_TARGET_ID, targetId >= 0 ? targetId : UNSELECTED)
             .putBoolean(KEY_EXPLICIT_UNSELECTED, explicitlyUnselected)
             .apply();
     }
@@ -184,7 +184,7 @@ final class TouchpadWidgetHelper {
         if (act == null || !act.isConnected()) return false;
         if (!act.isActive() && !act.hasClaim()) act.claimControl();
         if ("lock".equals(powerAction)) {
-            int tid = act.selectedEnvironmentTarget() > 0 ? act.selectedEnvironmentTarget() : 0;
+            int tid = Math.max(0, act.selectedEnvironmentTarget());
             act.sendPowerAction(tid, "lock");
             return true;
         }

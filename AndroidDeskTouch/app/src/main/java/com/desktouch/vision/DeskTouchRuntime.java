@@ -22,7 +22,10 @@ final class DeskTouchRuntime {
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
     private static volatile Context appContext;
+    private static final Object ANDROID_CONTROL_LOCK=new Object();
     private static DeskTouchSession androidController;
+    private static volatile long lastMetricsNotifyNanos;
+    private static final long METRICS_NOTIFY_MIN_INTERVAL_NANOS=250_000_000L;
     private DeskTouchRuntime(){}
 
     static void rememberPeerHost(String fingerprint, String host){
@@ -45,7 +48,18 @@ final class DeskTouchRuntime {
         Runnable overlay=overlayLiveStatusListener;
         if(overlay!=null)overlay.run();
         Context ctx=appContext;
-        if(ctx!=null)TouchpadWidgetProvider.updateAllIfChanged(ctx);
+        if(ctx!=null)TouchpadWidgetProvider.scheduleUpdateIfChanged(ctx);
+    }
+    static void notifyLiveMetricsTick(){
+        Runnable current=liveStatusListener;
+        Runnable overlay=overlayLiveStatusListener;
+        if(current==null && overlay==null)return;
+        long now=System.nanoTime();
+        long prev=lastMetricsNotifyNanos;
+        if(prev!=0L && now-prev<METRICS_NOTIFY_MIN_INTERVAL_NANOS)return;
+        lastMetricsNotifyNanos=now;
+        if(current!=null)current.run();
+        if(overlay!=null)overlay.run();
     }
     static void setScreenPreviewListener(Runnable observer){
         screenPreviewListener=observer;
@@ -331,21 +345,24 @@ final class DeskTouchRuntime {
         }
         notifyLiveStatusChanged();
     }
-    static synchronized DeskTouchSession.LiveStatusSnapshot liveSnapshot(Context context){
-        if(context!=null)appContext=context.getApplicationContext();
+    static DeskTouchSession.LiveStatusSnapshot liveSnapshot(Context context){
         DeskTouchSession chosen=null;
-        String sel=selectedFingerprint;
-        if(sel!=null){
-            DeskTouchSession s=sessions.get(sel);
-            if(s!=null && s.isConnected())chosen=s;
-        }
-        if(chosen==null){
-            for(DeskTouchSession s:sessions.values()){
-                if(s.isConnected()){ chosen=s; break; }
+        Context ctx;
+        synchronized(DeskTouchRuntime.class){
+            if(context!=null)appContext=context.getApplicationContext();
+            ctx=appContext;
+            String sel=selectedFingerprint;
+            if(sel!=null){
+                DeskTouchSession s=sessions.get(sel);
+                if(s!=null && s.isConnected())chosen=s;
+            }
+            if(chosen==null){
+                for(DeskTouchSession s:sessions.values()){
+                    if(s.isConnected()){ chosen=s; break; }
+                }
             }
         }
         if(chosen!=null)return chosen.getLiveSnapshot();
-        Context ctx=appContext;
         if(ctx==null)return null;
         WifiLinkMonitor.LinkSnapshot link=WifiLinkMonitor.inspect(ctx,false,0);
         KeyboardBindingInspector.KeyboardReport kb=KeyboardBindingInspector.inspect(
@@ -355,13 +372,17 @@ final class DeskTouchRuntime {
     }
     // Multiple trusted PCs remain connected, but only one may remotely
     // control Android at any moment. Switching needs a fresh lease handshake.
-    static synchronized boolean claimAndroidControl(DeskTouchSession requester){
-        if(androidController!=null && androidController!=requester)return false;
-        androidController=requester;
-        return true;
+    static boolean claimAndroidControl(DeskTouchSession requester){
+        synchronized(ANDROID_CONTROL_LOCK){
+            if(androidController!=null && androidController!=requester)return false;
+            androidController=requester;
+            return true;
+        }
     }
-    static synchronized void releaseAndroidControl(DeskTouchSession requester){
-        if(androidController==requester)androidController=null;
+    static void releaseAndroidControl(DeskTouchSession requester){
+        synchronized(ANDROID_CONTROL_LOCK){
+            if(androidController==requester)androidController=null;
+        }
     }
     static void publishPhoneGeometry(){
         for(DeskTouchSession session:sessions.values())session.publishPhoneGeometry();
@@ -592,6 +613,9 @@ final class DeskTouchRuntime {
         pendingMakeBeforeBreak.clear();
         for(DeskTouchSession s:sessions.values())s.close();
         sessions.clear();
-        selectedFingerprint=null;androidController=null;listener=null;
+        synchronized(ANDROID_CONTROL_LOCK){
+            androidController=null;
+        }
+        selectedFingerprint=null;listener=null;
     }
 }

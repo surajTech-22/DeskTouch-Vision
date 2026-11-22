@@ -6,12 +6,17 @@ import android.appwidget.AppWidgetProvider;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.View;
 import android.widget.RemoteViews;
 import android.widget.Toast;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Fixed 4x4 Home Screen Touchpad Widget with toggle-select / unselect PC pills,
@@ -23,6 +28,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
     static final String ACTION_TOGGLE_PC = "com.desktouch.vision.ACTION_WIDGET_TOGGLE_PC";
     static final String ACTION_MOUSE_CLICK = "com.desktouch.vision.ACTION_WIDGET_MOUSE_CLICK";
     static final String ACTION_SCROLL = "com.desktouch.vision.ACTION_WIDGET_SCROLL";
+    static final String ACTION_REFRESH = "com.desktouch.vision.ACTION_WIDGET_REFRESH";
 
     static final String EXTRA_TARGET_ID = "target_id";
     static final String EXTRA_TARGET_NAME = "target_name";
@@ -30,121 +36,204 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
     static final String EXTRA_WHEEL = "wheel";
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final Object WIDGET_UPDATE_LOCK = new Object();
+    private static final ScheduledExecutorService WIDGET_EXECUTOR =
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "DeskTouch WidgetUpdate");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        });
+    private static final AtomicBoolean pendingScheduledUpdate = new AtomicBoolean(false);
+    private static final AtomicBoolean widgetsDisabled = new AtomicBoolean(false);
     private static volatile String lastRenderSignature = "";
+    private static Toast activeToast;
+
+    @Override
+    public void onEnabled(Context context) {
+        super.onEnabled(context);
+        widgetsDisabled.set(false);
+        lastRenderSignature = "";
+        scheduleUpdateIfChanged(context);
+    }
+
+    @Override
+    public void onDisabled(Context context) {
+        super.onDisabled(context);
+        widgetsDisabled.set(true);
+        lastRenderSignature = "";
+    }
 
     @Override
     public void onUpdate(Context context, AppWidgetManager appWidgetManager, int[] appWidgetIds) {
-        if (context == null || appWidgetIds == null || appWidgetIds.length == 0) return;
-        RemoteViews views = buildViews(context);
-        for (int appWidgetId : appWidgetIds) {
-            appWidgetManager.updateAppWidget(appWidgetId, views);
+        if (context == null || appWidgetManager == null || appWidgetIds == null || appWidgetIds.length == 0) {
+            return;
         }
+        widgetsDisabled.set(false);
+        Context app = context.getApplicationContext();
+        try {
+            RemoteViews views = buildViews(app);
+            for (int appWidgetId : appWidgetIds) {
+                appWidgetManager.updateAppWidget(appWidgetId, views);
+            }
+        } catch (Throwable ignored) {
+            try {
+                RemoteViews fallback = new RemoteViews(app.getPackageName(), R.layout.touchpad_home_widget);
+                for (int appWidgetId : appWidgetIds) {
+                    appWidgetManager.updateAppWidget(appWidgetId, fallback);
+                }
+            } catch (Throwable ignoredFallback) {}
+        }
+    }
+
+    @Override
+    public void onAppWidgetOptionsChanged(
+            Context context, AppWidgetManager appWidgetManager, int appWidgetId, Bundle newOptions) {
+        try {
+            super.onAppWidgetOptionsChanged(context, appWidgetManager, appWidgetId, newOptions);
+            scheduleUpdateIfChanged(context);
+        } catch (Throwable ignored) {}
     }
 
     @Override
     public void onReceive(Context context, Intent intent) {
-        super.onReceive(context, intent);
-        if (context == null || intent == null || intent.getAction() == null) return;
-        Context app = context.getApplicationContext();
-        String action = intent.getAction();
+        try {
+            super.onReceive(context, intent);
+            if (context == null || intent == null || intent.getAction() == null) return;
+            Context app = context.getApplicationContext();
+            String action = intent.getAction();
 
-        if (ACTION_TOGGLE_PC.equals(action)) {
-            int clickedId = intent.getIntExtra(EXTRA_TARGET_ID, TouchpadWidgetHelper.UNSELECTED);
-            String clickedName = intent.getStringExtra(EXTRA_TARGET_NAME);
-            if (clickedName == null || clickedName.isEmpty()) clickedName = "PC";
-
-            DeskTouchSession active = DeskTouchRuntime.session(app);
-            DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
-            boolean connected = snap != null && snap.connected;
-            if (!connected || clickedId <= 0) {
-                showToast(app, "Connect to a computer in DeskTouch Find first");
+            if (ACTION_REFRESH.equals(action)) {
+                AutoConnectService.nudgeReconnect(app);
                 updateAll(app);
                 return;
             }
 
-            List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
-                active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
-            int curSelected = TouchpadWidgetHelper.resolveEffectiveSelection(
-                TouchpadWidgetHelper.loadSelectedTargetId(app),
-                TouchpadWidgetHelper.isExplicitlyUnselected(app),
-                pcs);
-            int nextSelected = TouchpadWidgetHelper.togglePcSelection(curSelected, clickedId);
-            if (nextSelected == TouchpadWidgetHelper.UNSELECTED) {
-                TouchpadWidgetHelper.saveSelectedTarget(app, TouchpadWidgetHelper.UNSELECTED, true);
-                active.releaseControl();
-                showToast(app, "Unselected " + clickedName);
-            } else {
-                TouchpadWidgetHelper.saveSelectedTarget(app, nextSelected, false);
-                active.switchTargetAndClaim(nextSelected, 0);
-                showToast(app, "Selected → " + clickedName);
-            }
-            updateAll(app);
-            DeskTouchRuntime.notifyLiveStatusChanged();
-            return;
-        }
+            if (ACTION_TOGGLE_PC.equals(action)) {
+                int clickedId = intent.getIntExtra(EXTRA_TARGET_ID, TouchpadWidgetHelper.UNSELECTED);
+                String clickedName = intent.getStringExtra(EXTRA_TARGET_NAME);
+                if (clickedName == null || clickedName.isEmpty()) clickedName = "PC";
 
-        if (ACTION_MOUSE_CLICK.equals(action) || ACTION_SCROLL.equals(action)) {
-            DeskTouchSession active = DeskTouchRuntime.session(app);
-            DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
-            if (snap == null || !snap.connected) {
-                showToast(app, "No computer connected — open DeskTouch Find");
+                DeskTouchSession active = DeskTouchRuntime.session(app);
+                DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
+                boolean connected = snap != null && snap.connected;
+                if (!connected || clickedId < 0) {
+                    showToast(app, "Connect to a computer in DeskTouch Find first");
+                    updateAll(app);
+                    return;
+                }
+
+                List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
+                    active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
+                int curSelected = TouchpadWidgetHelper.resolveEffectiveSelection(
+                    TouchpadWidgetHelper.loadSelectedTargetId(app),
+                    TouchpadWidgetHelper.isExplicitlyUnselected(app),
+                    pcs);
+                int nextSelected = TouchpadWidgetHelper.togglePcSelection(curSelected, clickedId);
+                if (nextSelected == TouchpadWidgetHelper.UNSELECTED) {
+                    TouchpadWidgetHelper.saveSelectedTarget(app, TouchpadWidgetHelper.UNSELECTED, true);
+                    active.releaseControl();
+                    showToast(app, "Unselected " + clickedName);
+                } else {
+                    TouchpadWidgetHelper.saveSelectedTarget(app, nextSelected, false);
+                    active.switchTargetAndClaim(nextSelected, 0);
+                    showToast(app, "Selected → " + clickedName);
+                }
                 updateAll(app);
+                DeskTouchRuntime.notifyLiveStatusChanged();
                 return;
             }
-            List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
-                active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
-            int selectedId = TouchpadWidgetHelper.resolveEffectiveSelection(
-                TouchpadWidgetHelper.loadSelectedTargetId(app),
-                TouchpadWidgetHelper.isExplicitlyUnselected(app),
-                pcs);
-            if (selectedId == TouchpadWidgetHelper.UNSELECTED) {
-                showToast(app, "Select a computer above first");
-                updateAll(app);
-                return;
+
+            if (ACTION_MOUSE_CLICK.equals(action) || ACTION_SCROLL.equals(action)) {
+                DeskTouchSession active = DeskTouchRuntime.session(app);
+                DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
+                if (snap == null || !snap.connected) {
+                    showToast(app, "No computer connected — open DeskTouch Find");
+                    updateAll(app);
+                    return;
+                }
+                List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
+                    active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
+                int selectedId = TouchpadWidgetHelper.resolveEffectiveSelection(
+                    TouchpadWidgetHelper.loadSelectedTargetId(app),
+                    TouchpadWidgetHelper.isExplicitlyUnselected(app),
+                    pcs);
+                if (selectedId == TouchpadWidgetHelper.UNSELECTED) {
+                    showToast(app, "Select a computer above first");
+                    updateAll(app);
+                    return;
+                }
+                if (active.selectedEnvironmentTarget() != selectedId || (!active.isActive() && !active.hasClaim())) {
+                    active.switchTargetAndClaim(selectedId, 0);
+                }
+                if (ACTION_MOUSE_CLICK.equals(action)) {
+                    int btn = intent.getIntExtra(EXTRA_BUTTON, 1);
+                    active.click(btn);
+                } else {
+                    int wheel = intent.getIntExtra(EXTRA_WHEEL, 120);
+                    active.wheel(wheel, false);
+                }
             }
-            if (active.selectedEnvironmentTarget() != selectedId || (!active.isActive() && !active.hasClaim())) {
-                active.switchTargetAndClaim(selectedId, 0);
-            }
-            if (ACTION_MOUSE_CLICK.equals(action)) {
-                int btn = intent.getIntExtra(EXTRA_BUTTON, 1);
-                active.click(btn);
-            } else {
-                int wheel = intent.getIntExtra(EXTRA_WHEEL, 120);
-                active.wheel(wheel, false);
-            }
-        }
+        } catch (Throwable ignored) {}
     }
 
     static void updateAll(Context context) {
         if (context == null) return;
+        final Context app = context.getApplicationContext();
+        widgetsDisabled.set(false);
         lastRenderSignature = "";
-        updateAllInternal(context);
+        try {
+            WIDGET_EXECUTOR.execute(() -> updateAllInternal(app, true));
+        } catch (Throwable ignored) {}
     }
 
     static void updateAllIfChanged(Context context) {
-        if (context == null) return;
-        updateAllInternal(context);
+        scheduleUpdateIfChanged(context);
     }
 
-    private static void updateAllInternal(Context context) {
-        Context app = context.getApplicationContext();
-        AppWidgetManager manager = AppWidgetManager.getInstance(app);
-        if (manager == null) return;
-        int[] ids = manager.getAppWidgetIds(new ComponentName(app, TouchpadWidgetProvider.class));
-        if (ids == null || ids.length == 0) return;
+    static void scheduleUpdateIfChanged(Context context) {
+        if (context == null || widgetsDisabled.get()) return;
+        if (!pendingScheduledUpdate.compareAndSet(false, true)) return;
+        final Context app = context.getApplicationContext();
+        try {
+            WIDGET_EXECUTOR.schedule(() -> {
+                pendingScheduledUpdate.set(false);
+                if (!widgetsDisabled.get()) {
+                    updateAllInternal(app, false);
+                }
+            }, 300L, TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {
+            pendingScheduledUpdate.set(false);
+        }
+    }
 
-        WidgetModel model = buildModel(app);
-        if (model.signature.equals(lastRenderSignature)) return;
-        lastRenderSignature = model.signature;
+    private static void updateAllInternal(Context app, boolean force) {
+        synchronized (WIDGET_UPDATE_LOCK) {
+            try {
+                AppWidgetManager manager = AppWidgetManager.getInstance(app);
+                if (manager == null) return;
+                int[] ids = manager.getAppWidgetIds(new ComponentName(app, TouchpadWidgetProvider.class));
+                if (ids == null || ids.length == 0) {
+                    if (!force) widgetsDisabled.set(true);
+                    return;
+                }
+                widgetsDisabled.set(false);
 
-        RemoteViews views = applyModelToViews(app, model);
-        for (int id : ids) {
-            manager.updateAppWidget(id, views);
+                WidgetModel model = buildModel(app);
+                if (!force && model.signature.equals(lastRenderSignature)) return;
+                lastRenderSignature = model.signature;
+
+                RemoteViews views = applyModelToViews(app, model);
+                for (int id : ids) {
+                    manager.updateAppWidget(id, views);
+                }
+            } catch (Throwable ignored) {}
         }
     }
 
     static boolean requestPin(Context context) {
         if (context == null) return false;
+        widgetsDisabled.set(false);
         AppWidgetManager manager = AppWidgetManager.getInstance(context);
         if (manager == null || !manager.isRequestPinAppWidgetSupported()) {
             return false;
@@ -272,6 +361,11 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
             views.setTextColor(R.id.widget_pc_1, 0xFFCBD5E1);
             views.setViewVisibility(R.id.widget_pc_1, View.VISIBLE);
             views.setViewVisibility(R.id.widget_pc_2, View.GONE);
+            Intent refreshIntent = new Intent(context, TouchpadWidgetProvider.class)
+                .setAction(ACTION_REFRESH);
+            PendingIntent refreshPending = PendingIntent.getBroadcast(
+                context, 37410, refreshIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+            views.setOnClickPendingIntent(R.id.widget_pc_1, refreshPending);
             views.setTextViewText(R.id.widget_pad_subtitle, "Waiting for Windows display roster");
         } else {
             bindPcPill(context, views, R.id.widget_pc_1, 37410, model.pcs.get(0), model.effectiveSelectedId);
@@ -364,6 +458,10 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
     }
 
     private static void showToast(Context app, String msg) {
-        MAIN.post(() -> Toast.makeText(app, msg, Toast.LENGTH_SHORT).show());
+        MAIN.post(() -> {
+            if (activeToast != null) activeToast.cancel();
+            activeToast = Toast.makeText(app, msg, Toast.LENGTH_SHORT);
+            activeToast.show();
+        });
     }
 }

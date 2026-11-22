@@ -1370,7 +1370,7 @@ final class DeskTouchSession implements AutoCloseable {
                                 liveRttMs=rttMs;
                             }
                         }
-                        DeskTouchRuntime.notifyLiveStatusChanged();
+                        DeskTouchRuntime.notifyLiveMetricsTick();
                     }
                 } else if("display-metrics".equals(p.type)){
                     if(p.a>=24 && p.a<=360){
@@ -2811,7 +2811,7 @@ final class DeskTouchSession implements AutoCloseable {
                     syncAdaptiveMetrics(activeCh);
                 }
                 evaluateLossTriggeredStreams();
-                DeskTouchRuntime.notifyLiveStatusChanged();
+                DeskTouchRuntime.notifyLiveMetricsTick();
             }
             @Override public void onLinkFeedback(int echoToken, int packedLossJitter, int packedDisplayRate, int lease) {
                 if (!running) return;
@@ -2821,7 +2821,7 @@ final class DeskTouchSession implements AutoCloseable {
                         syncAdaptiveMetrics(activeCh);
                     }
                     evaluateLossTriggeredStreams();
-                    DeskTouchRuntime.notifyLiveStatusChanged();
+                    DeskTouchRuntime.notifyLiveMetricsTick();
                 }
             }
             @Override public void onMediaDatagram(FastUdpChannel.MediaDatagram d) {

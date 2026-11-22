@@ -121,7 +121,7 @@ public final class AutoConnectService extends Service {
         AutoConnectService service=activeInstance;
         if(service!=null) service.evaluateDisconnectAutoPause();
         refreshNotification();
-        if(context!=null) TouchpadWidgetProvider.updateAllIfChanged(context);
+        if(context!=null) TouchpadWidgetProvider.scheduleUpdateIfChanged(context);
     }
 
     static void onMobileUdpCredentialsReady(Context context) {

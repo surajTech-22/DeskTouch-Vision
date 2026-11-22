@@ -1870,6 +1870,43 @@ public final class ProtocolSourceTest {
             "DT1|192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6|" + sampleFp + "|00112233445566778899AABBCCDDEEFF");
         assertNotNull(multiQr);
         assertEquals("192.168.1.6,2401:4900:1cba:3a75:f1c5:4ab:4cdf:ccf6", multiQr.address);
+
+        // Verify v0.3.93: Cross-network endpoint ordering, DTK1 Knock AES-256-GCM envelope, MQTT PUBLISH parser, & Android scan race fix
+        java.util.List<String> orderedWan = LinkedDisplayHelper.orderEndpointsForCrossNetwork(
+            java.util.Arrays.asList("192.168.1.6", "100.64.5.9", "203.0.113.88", "2401:4900:1cba:3a75::1"));
+        assertEquals("2401:4900:1cba:3a75::1", orderedWan.get(0));
+        assertEquals("203.0.113.88", orderedWan.get(1));
+        assertEquals("100.64.5.9", orderedWan.get(2));
+        assertEquals("192.168.1.6", orderedWan.get(3));
+
+        String sealedKnock = LinkedDisplayHelper.sealWanKnock(
+            "0123456789abcdef0123456789abcdef",
+            MqttTlsRelayTunnel.DEFAULT_BROKER_HOST,
+            MqttTlsRelayTunnel.DEFAULT_BROKER_PORT,
+            "",
+            nowUnix,
+            sampleCode);
+        assertTrue(sealedKnock.startsWith("DTK1|"));
+        assertTrue(LinkedDisplayHelper.tryOpenWanKnock(sealedKnock, sampleCode));
+        assertFalse(LinkedDisplayHelper.tryOpenWanKnock(sealedKnock, "WRONGCODE"));
+
+        byte[] topicBytes = "dtv/r/abc123/s2c".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] payloadBytes = new byte[] { 0x16, 0x03, 0x01, 0x42 };
+        byte[] pubBody = new byte[2 + topicBytes.length + payloadBytes.length];
+        pubBody[0] = (byte) (topicBytes.length >> 8);
+        pubBody[1] = (byte) (topicBytes.length & 0xFF);
+        System.arraycopy(topicBytes, 0, pubBody, 2, topicBytes.length);
+        System.arraycopy(payloadBytes, 0, pubBody, 2 + topicBytes.length, payloadBytes.length);
+        MqttTlsRelayTunnel.ParsedPublish parsedPub = MqttTlsRelayTunnel.tryParsePublish(pubBody);
+        assertNotNull(parsedPub);
+        assertEquals("dtv/r/abc123/s2c", parsedPub.topic);
+        assertArrayEquals(payloadBytes, parsedPub.payload);
+
+        String helperSource = readProjectSource("src/main/java/com/desktouch/vision/LinkedDisplayHelper.java");
+        assertTrue(helperSource.contains("since=12h"));
+        assertTrue(helperSource.contains("sendWanKnock"));
+        assertTrue(mainSource.contains("pairingCodeLookupRunning"));
+        assertTrue(sessionSource.contains("MqttTlsRelayTunnel.openClientBridge"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

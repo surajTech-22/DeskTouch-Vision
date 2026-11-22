@@ -352,6 +352,7 @@ final class DeskTouchSession implements AutoCloseable {
     private volatile String peerHostAddress;
     private volatile boolean cableSession;
     private volatile boolean cellularSession;
+    private volatile MqttTlsRelayTunnel activeRelayTunnel;
     private volatile android.net.Network boundNetwork;
     private volatile SSLSocket socket;
     private volatile DataInputStream input;
@@ -862,10 +863,13 @@ final class DeskTouchSession implements AutoCloseable {
                     DeskTouchRuntime.rememberPeerEndpoints(application, pinned, learnedV6);
                 }
                 String connectedHost = candidateHosts.get(0);
+                boolean relaySession = false;
                 for(int attempt=0;attempt<2;attempt++){
                     boolean tryTrusted=attempt==0 && saved!=null;
                     IOException lastConnectErr = null;
-                    int perHostTimeout = candidateHosts.size() > 1 ? 3200 : (cellular ? 3500 : 5000);
+                    int perHostTimeout = (candidateHosts.size() > 1 || device.relaySessionId != null)
+                        ? 2400
+                        : (cellular ? 3500 : 5000);
                     for (String candidateHost : candidateHosts) {
                         try {
                             if (effectiveNetwork != null) {
@@ -893,32 +897,75 @@ final class DeskTouchSession implements AutoCloseable {
                     }
                     // If on a different Wi-Fi with no direct route to the PC, try cellular 5G fallback for IPv6/public endpoints.
                     if (ssl == null && effectiveNetwork == null && !device.cable) {
+                        CellularLinkHelper cellHelper = null;
+                        android.net.Network cellNet = null;
                         for (String candidateHost : candidateHosts) {
                             if (candidateHost.startsWith("192.168.") || candidateHost.startsWith("10.")) continue;
-                            CellularLinkHelper cellHelper = new CellularLinkHelper(application);
-                            android.net.Network cellNet = cellHelper.acquireCellularNetwork(2800L);
-                            if (cellNet == null) break;
+                            if (cellHelper == null) {
+                                cellHelper = new CellularLinkHelper(application);
+                                cellNet = cellHelper.acquireCellularNetwork(2500L);
+                                if (cellNet == null) break;
+                            }
                             try {
                                 java.net.Socket raw = new java.net.Socket();
                                 cellNet.bindSocket(raw);
                                 raw.setTcpNoDelay(true);
                                 raw.setKeepAlive(true);
                                 raw.connect(new java.net.InetSocketAddress(
-                                    java.net.InetAddress.getByName(candidateHost), 37377), 3200);
+                                    java.net.InetAddress.getByName(candidateHost), 37377), 2400);
                                 ssl = (SSLSocket) pinnedFactory.createSocket(raw, candidateHost, 37377, true);
                                 boundNetwork = cellNet;
                                 effectiveNetwork = cellNet;
                                 cellularSession = true;
+                                lastCellularHelper = cellHelper;
                                 connectedHost = candidateHost;
                                 break;
                             } catch (IOException cellEx) {
                                 lastConnectErr = cellEx;
-                                cellHelper.releaseCellularNetwork();
                                 if (ssl != null) {
                                     try { ssl.close(); } catch (Exception ignored) {}
                                     ssl = null;
                                 }
                             }
+                        }
+                        if (ssl == null && cellHelper != null) {
+                            cellHelper.releaseCellularNetwork();
+                        }
+                    }
+                    // Final fallback when direct TCP is blocked by router NAT / stateful IPv6 firewall:
+                    // open an outbound-only end-to-end TLS-over-MQTT relay bridge.
+                    if (ssl == null && !device.cable) {
+                        status("Direct connection blocked by router firewall; opening encrypted cross-network relay...");
+                        String relaySid = (device.relaySessionId != null && !device.relaySessionId.isEmpty())
+                            ? device.relaySessionId
+                            : null;
+                        if (relaySid == null) {
+                            byte[] b = new byte[16];
+                            new java.security.SecureRandom().nextBytes(b);
+                            StringBuilder sb = new StringBuilder(32);
+                            for (byte v : b) sb.append(String.format(Locale.ROOT, "%02x", v & 0xFF));
+                            relaySid = sb.toString();
+                            LinkedDisplayHelper.sendWanKnock(pinned, relaySid, 2500);
+                        }
+                        String broker = (device.relayBroker != null && !device.relayBroker.isEmpty())
+                            ? device.relayBroker
+                            : MqttTlsRelayTunnel.DEFAULT_BROKER_HOST;
+                        MqttTlsRelayTunnel prevRelay = activeRelayTunnel;
+                        if (prevRelay != null) {
+                            try { prevRelay.close(); } catch (Exception ignored) {}
+                        }
+                        MqttTlsRelayTunnel relay = MqttTlsRelayTunnel.openClientBridge(
+                            relaySid, broker, MqttTlsRelayTunnel.DEFAULT_BROKER_PORT, 7500);
+                        activeRelayTunnel = relay;
+                        try {
+                            ssl = (SSLSocket) pinnedFactory.createSocket();
+                            ssl.connect(new java.net.InetSocketAddress("127.0.0.1", relay.localPort), 3000);
+                            connectedHost = broker;
+                            relaySession = true;
+                        } catch (IOException relayEx) {
+                            activeRelayTunnel = null;
+                            try { relay.close(); } catch (Exception ignored) {}
+                            throw relayEx;
                         }
                     }
                     if (ssl == null) {
@@ -1017,16 +1064,18 @@ final class DeskTouchSession implements AutoCloseable {
                     DeskTouchAccessibilityService.setDisplayRefreshHz(info.refreshHz);
                 }
                 peerInetAddress=ssl.getInetAddress();
-                cableSession=device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress());
+                cableSession=!relaySession && (device.cable || (peerInetAddress!=null && peerInetAddress.isLoopbackAddress()));
                 peerName=device.name;
-                peerHostAddress=peerInetAddress!=null ? peerInetAddress.getHostAddress() : connectedHost;
-                if(!cableSession && peerHostAddress!=null && !peerHostAddress.isEmpty()
+                peerHostAddress=relaySession
+                    ? connectedHost
+                    : (peerInetAddress!=null ? peerInetAddress.getHostAddress() : connectedHost);
+                if(!cableSession && !relaySession && peerHostAddress!=null && !peerHostAddress.isEmpty()
                     && !"127.0.0.1".equals(peerHostAddress)) {
                     DeskTouchRuntime.rememberPeerHost(pinned,peerHostAddress);
                 }
                 liveLinkBand=cableSession
                     ? WifiLinkMonitor.BAND_CABLE
-                    : (cellularSession ? WifiLinkMonitor.BAND_CELLULAR : WifiLinkMonitor.BAND_WIRELESS);
+                    : (relaySession ? "wan-relay" : (cellularSession ? WifiLinkMonitor.BAND_CELLULAR : WifiLinkMonitor.BAND_WIRELESS));
                 liveLinkSpeedMbps=0;
                 liveRttMs=0.0;
                 missedPings=0;
@@ -1043,11 +1092,11 @@ final class DeskTouchSession implements AutoCloseable {
                     !DeskTouchAccessibilityService.isPausedForBanking(application))
                     RemoteInputPower.begin(application);
                 // Keep TLS timeout moderate (~15s); heartbeat fast-fail catches dead cable/Wi-Fi in ~4s.
-                ssl.setSoTimeout(15000);
+                ssl.setSoTimeout(relaySession ? 30000 : 15000);
                 if(cableSession) DeskTouchAccessibilityService.setLinkMetrics(0.0,0.0);
                 String transportLabel = cableSession
                     ? " via data cable"
-                    : (cellularSession ? " via mobile network" : "");
+                    : (relaySession ? " via encrypted cross-network relay" : (cellularSession ? " via mobile network" : ""));
                 status("Connected to "+device.name+transportLabel+". Windows approved pairing.");
                 if(cellularSession) {
                     liveLinkBand=WifiLinkMonitor.BAND_CELLULAR;
@@ -3395,6 +3444,8 @@ final class DeskTouchSession implements AutoCloseable {
         DeskTouchRuntime.notifyLiveStatusChanged();
         SSLSocket sock=socket;socket=null;
         if(sock!=null)try{sock.close();}catch(Exception ignored){}
+        MqttTlsRelayTunnel relay=activeRelayTunnel;activeRelayTunnel=null;
+        if(relay!=null)try{relay.close();}catch(Exception ignored){}
     }
     void disconnect(){
         closeConnection();

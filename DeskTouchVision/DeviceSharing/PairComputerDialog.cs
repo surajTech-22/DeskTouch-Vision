@@ -32,6 +32,7 @@ internal sealed class PairComputerDialog : Form
     private readonly Button _repair = new() { Text = "Fix LAN access", Dock = DockStyle.Right, Width = 125,
         FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(240, 241, 243) };
     private readonly CancellationTokenSource _cancel = new();
+    private readonly string? _localFingerprint;
     private bool _searching;
 
     internal string Address { get; private set; } = "";
@@ -39,9 +40,12 @@ internal sealed class PairComputerDialog : Form
     internal string Secret { get; private set; } = "";
     internal string ComputerName { get; private set; } = "";
     internal bool UseRemoteApproval { get; private set; }
+    internal string? RelaySessionId { get; private set; }
+    internal string? RelayBroker { get; private set; }
 
-    internal PairComputerDialog()
+    internal PairComputerDialog(string? localFingerprint = null)
     {
+        _localFingerprint = localFingerprint;
         Text = "Add devices";
         BackColor = Color.FromArgb(244, 244, 247);
         ForeColor = Color.FromArgb(26, 27, 30);
@@ -218,9 +222,9 @@ internal sealed class PairComputerDialog : Form
                     out bool matchedCustomTag);
                 if (codeMatched == null)
                 {
-                    _discoveryStatus.Text = "Not on same Wi-Fi — resolving pairing code across networks...";
+                    _discoveryStatus.Text = "Not on same Wi-Fi — contacting remote computer across networks...";
                     _error.Text = "";
-                    codeMatched = await CrossNetworkRendezvous.ResolveByCodeAsync(manual, _cancel.Token);
+                    codeMatched = await CrossNetworkRendezvous.ResolveByCodeAsync(manual, _localFingerprint, _cancel.Token);
                     if (codeMatched != null)
                         matchedCustomTag = true;
                 }
@@ -237,6 +241,8 @@ internal sealed class PairComputerDialog : Form
                 Address = codeMatched.Address;
                 Fingerprint = codeMatched.Fingerprint;
                 ComputerName = codeMatched.Name;
+                RelaySessionId = codeMatched.RelaySessionId;
+                RelayBroker = codeMatched.RelayBroker;
                 if (matchedCustomTag)
                 {
                     Secret = PairingCodeHelper.NormalizeCustomCode(manual);

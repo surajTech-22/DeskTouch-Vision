@@ -2409,9 +2409,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.92";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.93";
         }catch(Exception ignored){
-            return "0.3.92";
+            return "0.3.93";
         }
     }
 
@@ -3988,6 +3988,8 @@ public final class MainActivity extends Activity {
         onHubGatewaySelected(gateway,directCustomMatch ? customCode : null);
     }
 
+    private volatile boolean pairingCodeLookupRunning;
+
     private void pairByEnteredCode(){
         if(pairingCodeInput==null)return;
         String rawInput=pairingCodeInput.getText()==null ? "" : pairingCodeInput.getText().toString().trim();
@@ -4019,9 +4021,12 @@ public final class MainActivity extends Activity {
             pairWithMatchedDevice(snapshot,cached,customCode);
             return;
         }
+        if(pairingCodeLookupRunning){
+            setFeedback("Already looking up pairing code...",false);
+            return;
+        }
+        pairingCodeLookupRunning=true;
         setDiscoveryStatus("Searching Wi-Fi, cable, and cross-network rendezvous for pairing code...");
-        if(scanning)return;
-        scanning=true;
         new Thread(()->{
             try{
                 List<DesktopDiscovery.Device> list=DesktopDiscovery.scan();
@@ -4030,14 +4035,14 @@ public final class MainActivity extends Activity {
                 if(matched==null && !customCode.isEmpty()){
                     runOnUiThread(()->{
                         if(!isFinishing()&&!isDestroyed())
-                            setDiscoveryStatus("Not on same Wi-Fi — resolving pairing code across networks...");
+                            setDiscoveryStatus("Not on same Wi-Fi — contacting remote PC across networks...");
                     });
                     matched=LinkedDisplayHelper.resolveByCode(customCode,4000);
                 }
                 final DesktopDiscovery.Device finalMatched=matched;
                 runOnUiThread(()->{
                     if(isFinishing()||isDestroyed())return;
-                    renderScannedHubs(list);
+                    if(!list.isEmpty()) renderScannedHubs(list);
                     if(finalMatched==null){
                         setDiscoveryStatus("No reachable hub or PC matched that pairing code on Wi-Fi or cross-network rendezvous.");
                         return;
@@ -4049,7 +4054,7 @@ public final class MainActivity extends Activity {
                     if(!isFinishing()&&!isDestroyed())
                         setDiscoveryStatus("Pairing lookup failed: "+e.getMessage());
                 });
-            }finally{scanning=false;}
+            }finally{pairingCodeLookupRunning=false;}
         },"DeskTouch pairing code lookup").start();
     }
 

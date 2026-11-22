@@ -1830,6 +1830,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
             _receiver.Start();
             _receiver.SetCustomPairingCode(_customPairingCode);
             TriggerCrossNetworkRendezvousPublish();
+            StartRendezvousAgentOnce();
             _receiver.SetLocalNotificationCount(_notificationCounter.CurrentCount);
             if (_adbBridge?.CurrentShellBridge is { } existingBridge)
                 _receiver.SetShellBridgeAuth(existingBridge.Port, existingBridge.Secret, forceBroadcast: true);
@@ -2166,6 +2167,24 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
 
     private long _lastRendezvousPublishMs;
     private long _lastWanTrustedProbeMs;
+    private int _rendezvousAgentStarted;
+
+    private void StartRendezvousAgentOnce()
+    {
+        if (Interlocked.CompareExchange(ref _rendezvousAgentStarted, 1, 0) != 0)
+            return;
+        _ = Task.Run(() => CrossNetworkRendezvous.RunReceiverRendezvousAgentAsync(
+            () =>
+            {
+                var recv = _receiver;
+                if (recv == null || _closing.IsCancellationRequested) return null;
+                return (recv.Fingerprint, _customPairingCode, _host == null, Math.Max(1, recv.ActiveEnvironmentDeviceCount));
+            },
+            ReceiverServer.RegisterRelayLocalPort,
+            ReceiverServer.UnregisterRelayLocalPort,
+            LogDiagnostic,
+            _closing.Token));
+    }
 
     private void TriggerCrossNetworkRendezvousPublish(bool force = false)
     {
@@ -2416,7 +2435,7 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 MessageBoxIcon.Information);
             return;
         }
-        using var dialog = new PairComputerDialog();
+        using var dialog = new PairComputerDialog(_receiver?.Fingerprint);
         _manualPairDialogOpen = true;
         DialogResult choice;
         try { choice = dialog.ShowDialog(this); }
@@ -2451,7 +2470,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 try
                 {
                     candidate = await HostSession.ConnectTrustedAsync(dialog.Address,
-                        dialog.Fingerprint, savedTrust.Token, OnFailure, _closing.Token);
+                        dialog.Fingerprint, savedTrust.Token, OnFailure, _closing.Token,
+                        dialog.RelaySessionId, dialog.RelayBroker);
                     if (_trusted != null)
                     {
                         _trusted.SetAutoConnect(dialog.Fingerprint, true);
@@ -2464,18 +2484,21 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 {
                     Status("Saved trust was not recognized on that computer; requesting fresh approval...");
                     candidate = await HostSession.ConnectWithApprovalAsync(dialog.Address,
-                        dialog.Fingerprint, OnFailure, _closing.Token);
+                        dialog.Fingerprint, OnFailure, _closing.Token,
+                        dialog.RelaySessionId, dialog.RelayBroker);
                 }
             }
             else if (dialog.UseRemoteApproval)
             {
                 candidate = await HostSession.ConnectWithApprovalAsync(dialog.Address,
-                    dialog.Fingerprint, OnFailure, _closing.Token);
+                    dialog.Fingerprint, OnFailure, _closing.Token,
+                    dialog.RelaySessionId, dialog.RelayBroker);
             }
             else
             {
                 candidate = await HostSession.ConnectAsync(dialog.Address,
-                    dialog.Fingerprint, dialog.Secret, OnFailure, _closing.Token);
+                    dialog.Fingerprint, dialog.Secret, OnFailure, _closing.Token,
+                    dialog.RelaySessionId, dialog.RelayBroker);
             }
             if (IsDisposed || _closing.IsCancellationRequested)
             {
@@ -2763,7 +2786,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 _lastWanTrustedProbeMs = Environment.TickCount64;
                 foreach (string targetFp in targetFingerprints)
                 {
-                    var wanPeer = await CrossNetworkRendezvous.ResolveByFingerprintAsync(targetFp, _closing.Token);
+                    var wanPeer = await CrossNetworkRendezvous.ResolveByFingerprintAsync(
+                        targetFp, _receiver.Fingerprint, _closing.Token);
                     if (wanPeer != null)
                         peers.Add(wanPeer);
                 }
@@ -2802,7 +2826,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 {
                     using var probeSession = await HostSession.ConnectTrustedAsync(
                         found.Peer.Address, found.Saved!.Fingerprint, found.Saved.Token,
-                        _ => { }, _closing.Token);
+                        _ => { }, _closing.Token,
+                        found.Peer.RelaySessionId, found.Peer.RelayBroker);
                     await probeSession.TryEnsureMutualTrustAsync(_trusted, found.Saved.Name, _closing.Token);
                     probeSession.SendHubYieldInvite(localCount);
                     await Task.Delay(250, _closing.Token);
@@ -2828,7 +2853,8 @@ internal sealed class DisplaySettingsForm : Form, IUpdateCloseHost
                 // Never use a matching name or previously seen IP as proof.
                 var session = await HostSession.ConnectTrustedAsync(
                     found.Peer.Address, found.Saved.Fingerprint, found.Saved.Token,
-                    OnFailure, _closing.Token);
+                    OnFailure, _closing.Token,
+                    found.Peer.RelaySessionId, found.Peer.RelayBroker);
                 if (IsDisposed || _closing.IsCancellationRequested ||
                     !_trusted.AutoConnectEnabled)
                 {

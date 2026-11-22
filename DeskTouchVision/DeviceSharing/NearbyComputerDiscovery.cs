@@ -10,7 +10,7 @@ namespace DeskTouch.DeviceShare;
 /// proof of authorization. TLS pairing must still verify it and obtain consent.</summary>
 internal sealed record NearbyComputer(string Name, string Address, string Fingerprint,
     bool IsAndroid = false, bool CanReceive = true, bool IsHub = false, int MemberCount = 1,
-    string? PairingTag = null);
+    string? PairingTag = null, string? RelaySessionId = null, string? RelayBroker = null);
 
 /// <summary>
 /// Persistent LAN discovery. Respond while paired/busy too, so two PCs and

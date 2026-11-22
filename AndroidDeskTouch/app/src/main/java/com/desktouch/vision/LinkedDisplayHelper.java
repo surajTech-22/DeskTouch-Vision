@@ -397,8 +397,10 @@ final class LinkedDisplayHelper {
     }
 
     private static final String WAN_RECORD_PREFIX = "DTR1|";
+    private static final String WAN_KNOCK_PREFIX = "DTK1|";
     private static final String WAN_RELAY_BASE_URL = "https://ntfy.sh";
     private static final byte[] WAN_AAD = "DTR1".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] WAN_KNOCK_AAD = "DTK1".getBytes(StandardCharsets.UTF_8);
 
     static String computeWanTopic(String lookupKey) {
         if (lookupKey == null) return "";
@@ -532,6 +534,119 @@ final class LinkedDisplayHelper {
         }
     }
 
+    static String sealWanKnock(
+            String sessionId, String brokerHost, int brokerPort,
+            String requesterFingerprint, long timestampUnixSeconds, String lookupKey) {
+        try {
+            byte[] key = deriveWanAesKey(lookupKey);
+            JSONObject obj = new JSONObject()
+                .put("sid", sessionId)
+                .put("broker", brokerHost)
+                .put("port", brokerPort)
+                .put("req", requesterFingerprint != null ? requesterFingerprint.trim().toUpperCase(Locale.ROOT) : "")
+                .put("ts", timestampUnixSeconds);
+            byte[] plain = obj.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] nonce = new byte[12];
+            new SecureRandom().nextBytes(nonce);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+            cipher.updateAAD(WAN_KNOCK_AAD);
+            byte[] sealed = cipher.doFinal(plain);
+            byte[] combined = new byte[12 + sealed.length];
+            System.arraycopy(nonce, 0, combined, 0, 12);
+            System.arraycopy(sealed, 0, combined, 12, sealed.length);
+            return WAN_KNOCK_PREFIX + Base64.getEncoder().encodeToString(combined);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    static boolean tryOpenWanKnock(String envelope, String lookupKey) {
+        if (envelope == null || lookupKey == null) return false;
+        String trimmed = envelope.trim();
+        if (!trimmed.startsWith(WAN_KNOCK_PREFIX)) return false;
+        try {
+            byte[] combined = Base64.getDecoder().decode(trimmed.substring(WAN_KNOCK_PREFIX.length()));
+            if (combined.length < 30 || combined.length > 2048) return false;
+            byte[] key = deriveWanAesKey(lookupKey);
+            byte[] nonce = new byte[12];
+            System.arraycopy(combined, 0, nonce, 0, 12);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+            cipher.updateAAD(WAN_KNOCK_AAD);
+            byte[] plain = cipher.doFinal(combined, 12, combined.length - 12);
+            JSONObject root = new JSONObject(new String(plain, StandardCharsets.UTF_8));
+            String sid = root.optString("sid", "").trim();
+            String broker = root.optString("broker", "").trim();
+            int port = root.optInt("port", 0);
+            long ts = root.optLong("ts", 0L);
+            if (!sid.matches("[A-Za-z0-9]{16,48}") || broker.isEmpty() || port <= 0 || port > 65535) return false;
+            long nowUnix = System.currentTimeMillis() / 1000L;
+            return ts <= 0L || Math.abs(nowUnix - ts) <= 600L;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static int scoreCrossNetworkEndpoint(String addr) {
+        if (addr == null) return 9;
+        if (addr.contains(":")) return 0; // Global IPv6 first
+        if (addr.startsWith("10.") || addr.startsWith("192.168.") || addr.startsWith("169.254.") ||
+            addr.matches("^172\\.(1[6-9]|2\\d|3[0-1])\\..*")) {
+            return 3; // Private LAN last when connecting from another network
+        }
+        if (addr.matches("^100\\.(6[4-9]|[7-9]\\d|1([01]\\d|2[0-7]))\\..*")) {
+            return 2; // Tailscale / overlay VPN
+        }
+        return 1; // Public STUN IPv4 second
+    }
+
+    static List<String> orderEndpointsForCrossNetwork(List<String> validAddrs) {
+        if (validAddrs == null || validAddrs.isEmpty()) return Collections.emptyList();
+        ArrayList<String> copy = new ArrayList<>(validAddrs);
+        Collections.sort(copy, Comparator.comparingInt(LinkedDisplayHelper::scoreCrossNetworkEndpoint));
+        return copy;
+    }
+
+    static void sendWanKnock(String lookupKey, String sessionId, int timeoutMs) {
+        String topic = computeWanTopic(lookupKey);
+        if (topic.isEmpty() || sessionId == null || sessionId.isEmpty()) return;
+        HttpURLConnection conn = null;
+        try {
+            String body = sealWanKnock(
+                sessionId,
+                MqttTlsRelayTunnel.DEFAULT_BROKER_HOST,
+                MqttTlsRelayTunnel.DEFAULT_BROKER_PORT,
+                "",
+                System.currentTimeMillis() / 1000L,
+                lookupKey);
+            URL url = new URL(WAN_RELAY_BASE_URL + "/" + topic);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            int t = Math.max(1200, Math.min(timeoutMs, 4000));
+            conn.setConnectTimeout(t);
+            conn.setReadTimeout(t);
+            conn.setRequestProperty("Content-Type", "text/plain");
+            byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+            conn.getOutputStream().write(payload);
+            conn.getResponseCode();
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) try { conn.disconnect(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static String randomRelaySessionId() {
+        byte[] bytes = new byte[16];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder sb = new StringBuilder(32);
+        for (byte b : bytes) {
+            sb.append(String.format(Locale.ROOT, "%02x", b & 0xFF));
+        }
+        return sb.toString();
+    }
+
     static DesktopDiscovery.Device resolveByCode(String rawCode, int timeoutMs) {
         String code = normalizeCustomPairingCode(rawCode);
         if (code.length() < 4) return null;
@@ -548,41 +663,64 @@ final class LinkedDisplayHelper {
     private static DesktopDiscovery.Device resolveWanCore(String lookupKey, int timeoutMs) {
         String topic = computeWanTopic(lookupKey);
         if (topic.isEmpty()) return null;
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(WAN_RELAY_BASE_URL + "/" + topic + "/json?poll=1&since=45m");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("GET");
-            int t = Math.max(1500, Math.min(timeoutMs, 8000));
-            conn.setConnectTimeout(t);
-            conn.setReadTimeout(t);
-            if (conn.getResponseCode() != 200) return null;
+        final String relaySid = randomRelaySessionId();
+        Thread knockThread = new Thread(() -> sendWanKnock(lookupKey, relaySid, 2600), "DeskTouch-WanKnock");
+        knockThread.setDaemon(true);
+        knockThread.start();
 
-            DesktopDiscovery.Device newest = null;
-            long newestTime = Long.MIN_VALUE;
-            try (BufferedReader br = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    line = line.trim();
-                    if (line.isEmpty()) continue;
-                    try {
-                        JSONObject event = new JSONObject(line);
-                        String msg = event.optString("message", "");
-                        long evTime = event.optLong("time", 0L);
-                        DesktopDiscovery.Device opened = tryOpenWanRecord(msg, lookupKey);
-                        if (opened != null && evTime >= newestTime) {
-                            newest = opened;
-                            newestTime = evTime;
-                        }
-                    } catch (Exception ignored) {}
-                }
+        int[] retryDelaysMs = { 0, 900, 1500 };
+        for (int waitMs : retryDelaysMs) {
+            if (waitMs > 0) {
+                try { Thread.sleep(waitMs); }
+                catch (InterruptedException ie) { break; }
             }
-            return newest;
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (conn != null) try { conn.disconnect(); } catch (Exception ignored) {}
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(WAN_RELAY_BASE_URL + "/" + topic + "/json?poll=1&since=12h");
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                int t = Math.max(1500, Math.min(timeoutMs, 8000));
+                conn.setConnectTimeout(t);
+                conn.setReadTimeout(t);
+                if (conn.getResponseCode() != 200) continue;
+
+                DesktopDiscovery.Device newest = null;
+                long newestTime = Long.MIN_VALUE;
+                try (BufferedReader br = new BufferedReader(
+                        new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        line = line.trim();
+                        if (line.isEmpty()) continue;
+                        try {
+                            JSONObject event = new JSONObject(line);
+                            String msg = event.optString("message", "");
+                            long evTime = event.optLong("time", 0L);
+                            DesktopDiscovery.Device opened = tryOpenWanRecord(msg, lookupKey);
+                            if (opened != null && evTime >= newestTime) {
+                                newest = opened;
+                                newestTime = evTime;
+                            }
+                        } catch (Exception ignored) {}
+                    }
+                }
+                if (newest != null) {
+                    List<String> ordered = orderEndpointsForCrossNetwork(parseCandidateAddresses(newest.address));
+                    String orderedJoined = ordered.isEmpty() ? newest.address : String.join(",", ordered);
+                    DesktopDiscovery.Device readyDev = new DesktopDiscovery.Device(
+                        newest.name, orderedJoined, newest.fingerprint, true, false, false);
+                    readyDev.isHub = newest.isHub;
+                    readyDev.hubMemberCount = newest.hubMemberCount;
+                    readyDev.pairingTag = newest.pairingTag;
+                    readyDev.relaySessionId = relaySid;
+                    readyDev.relayBroker = MqttTlsRelayTunnel.DEFAULT_BROKER_HOST;
+                    return readyDev;
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (conn != null) try { conn.disconnect(); } catch (Exception ignored) {}
+            }
         }
+        return null;
     }
 }

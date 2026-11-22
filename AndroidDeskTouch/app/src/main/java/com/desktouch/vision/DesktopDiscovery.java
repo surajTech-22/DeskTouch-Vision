@@ -14,6 +14,8 @@ final class DesktopDiscovery {
         boolean isHub;
         int hubMemberCount = 1;
         String pairingTag;
+        String relaySessionId;
+        String relayBroker;
         Device(String n,String a,String f,boolean ready,boolean android) {
             this(n,a,f,ready,android,false);
         }

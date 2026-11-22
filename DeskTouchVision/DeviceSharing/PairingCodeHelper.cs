@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
 using System.Net.NetworkInformation;
@@ -102,11 +103,17 @@ internal static class PairingCodeHelper
 internal static class CrossNetworkRendezvous
 {
     private const string RecordPrefix = "DTR1|";
+    private const string KnockPrefix = "DTK1|";
     private const string RelayBaseUrl = "https://ntfy.sh";
     private static readonly byte[] RecordAad = "DTR1"u8.ToArray();
+    private static readonly byte[] KnockAad = "DTK1"u8.ToArray();
     private static readonly HttpClient Http = new()
     {
         Timeout = TimeSpan.FromSeconds(5)
+    };
+    private static readonly HttpClient SseHttp = new()
+    {
+        Timeout = Timeout.InfiniteTimeSpan
     };
 
     private static readonly object StunCacheGate = new();
@@ -120,6 +127,13 @@ internal static class CrossNetworkRendezvous
         string PairingTag,
         bool IsHub,
         int MemberCount,
+        long TimestampUnixSeconds);
+
+    internal sealed record KnockPayload(
+        string SessionId,
+        string BrokerHost,
+        int BrokerPort,
+        string RequesterFingerprint,
         long TimestampUnixSeconds);
 
     internal static string ComputeTopic(string? lookupKey)
@@ -413,6 +427,126 @@ internal static class CrossNetworkRendezvous
         }
     }
 
+    internal static string SealKnock(KnockPayload knock, string lookupKey)
+    {
+        byte[] key = DeriveAesKey(lookupKey);
+        string json = JsonSerializer.Serialize(new
+        {
+            sid = knock.SessionId,
+            broker = knock.BrokerHost,
+            port = knock.BrokerPort,
+            req = (knock.RequesterFingerprint ?? "").Trim().ToUpperInvariant(),
+            ts = knock.TimestampUnixSeconds
+        });
+        byte[] plain = Encoding.UTF8.GetBytes(json);
+        byte[] nonce = new byte[12];
+        RandomNumberGenerator.Fill(nonce);
+        byte[] cipher = new byte[plain.Length];
+        byte[] tag = new byte[16];
+        using (var aes = new AesGcm(key, 16))
+        {
+            aes.Encrypt(nonce, plain, cipher, tag, KnockAad);
+        }
+        byte[] combined = new byte[12 + cipher.Length + 16];
+        Buffer.BlockCopy(nonce, 0, combined, 0, 12);
+        Buffer.BlockCopy(cipher, 0, combined, 12, cipher.Length);
+        Buffer.BlockCopy(tag, 0, combined, 12 + cipher.Length, 16);
+        return KnockPrefix + Convert.ToBase64String(combined);
+    }
+
+    internal static bool TryOpenKnock(string? envelope, string? lookupKey, out KnockPayload? knock)
+    {
+        knock = null;
+        if (string.IsNullOrWhiteSpace(envelope) || string.IsNullOrWhiteSpace(lookupKey))
+            return false;
+        string trimmed = envelope.Trim();
+        if (!trimmed.StartsWith(KnockPrefix, StringComparison.Ordinal))
+            return false;
+        try
+        {
+            byte[] combined = Convert.FromBase64String(trimmed[KnockPrefix.Length..]);
+            if (combined.Length < 12 + 16 + 2 || combined.Length > 2048)
+                return false;
+            byte[] key = DeriveAesKey(lookupKey);
+            int cipherLen = combined.Length - 28;
+            byte[] plain = new byte[cipherLen];
+            using (var aes = new AesGcm(key, 16))
+            {
+                aes.Decrypt(
+                    combined.AsSpan(0, 12),
+                    combined.AsSpan(12, cipherLen),
+                    combined.AsSpan(12 + cipherLen, 16),
+                    plain,
+                    KnockAad);
+            }
+            using var doc = JsonDocument.Parse(plain);
+            var root = doc.RootElement;
+            string sid = root.TryGetProperty("sid", out var sEl) ? (sEl.GetString() ?? "").Trim() : "";
+            string broker = root.TryGetProperty("broker", out var bEl) ? (bEl.GetString() ?? "").Trim() : MqttTlsRelayTunnel.DefaultBrokerHost;
+            int port = root.TryGetProperty("port", out var pEl) && pEl.TryGetInt32(out int bp) ? bp : MqttTlsRelayTunnel.DefaultBrokerPort;
+            string req = root.TryGetProperty("req", out var rEl) ? (rEl.GetString() ?? "").Trim().ToUpperInvariant() : "";
+            long ts = root.TryGetProperty("ts", out var tsEl) && tsEl.TryGetInt64(out long unix) ? unix : 0;
+
+            if (sid.Length is < 16 or > 48 || !sid.All(char.IsAsciiLetterOrDigit))
+                return false;
+            if (string.IsNullOrWhiteSpace(broker) || port is <= 0 or > 65535)
+                return false;
+            long nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            if (ts > 0 && Math.Abs(nowUnix - ts) > 600)
+                return false;
+
+            knock = new KnockPayload(sid, broker, port, req, ts);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    internal static string OrderEndpointsForCrossNetwork(string? rawAddressList)
+    {
+        var parsed = ParseCandidateAddresses(rawAddressList);
+        if (parsed.Count == 0) return "";
+        static int Score(IPAddress ip)
+        {
+            if (ip.AddressFamily == AddressFamily.InterNetworkV6) return 0; // Global IPv6 first
+            byte[] b = ip.GetAddressBytes();
+            bool isPriv = (b[0] == 10) || (b[0] == 172 && b[1] is >= 16 and <= 31) ||
+                          (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
+            bool isOverlay = b[0] == 100 && b[1] is >= 64 and <= 127;
+            if (!isPriv && !isOverlay) return 1; // Public STUN IPv4 second
+            if (isOverlay) return 2;             // Tailscale/overlay third
+            return 3;                            // Private LAN last
+        }
+        return string.Join(",", parsed.OrderBy(Score).Select(a => a.ToString()));
+    }
+
+    internal static async Task SendKnockAsync(
+        string lookupKey,
+        string sessionId,
+        string? requesterFingerprint = null,
+        CancellationToken cancellation = default)
+    {
+        string topic = ComputeTopic(lookupKey);
+        if (string.IsNullOrEmpty(topic)) return;
+        try
+        {
+            var knock = new KnockPayload(
+                sessionId,
+                MqttTlsRelayTunnel.DefaultBrokerHost,
+                MqttTlsRelayTunnel.DefaultBrokerPort,
+                requesterFingerprint ?? "",
+                DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            string sealedBody = SealKnock(knock, lookupKey);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            cts.CancelAfter(3000);
+            using var content = new StringContent(sealedBody, Encoding.UTF8, "text/plain");
+            using var _ = await Http.PostAsync($"{RelayBaseUrl}/{topic}", content, cts.Token).ConfigureAwait(false);
+        }
+        catch { }
+    }
+
     internal static async Task PublishPresenceAsync(
         string fingerprint,
         string? customPairingCode,
@@ -458,66 +592,241 @@ internal static class CrossNetworkRendezvous
         catch { }
     }
 
-    internal static Task<NearbyComputer?> ResolveByCodeAsync(string? rawCode, CancellationToken cancellation = default)
+    internal static Task<NearbyComputer?> ResolveByCodeAsync(string? rawCode, CancellationToken cancellation = default) =>
+        ResolveByCodeAsync(rawCode, excludeFingerprint: null, cancellation);
+
+    internal static Task<NearbyComputer?> ResolveByCodeAsync(
+        string? rawCode,
+        string? excludeFingerprint,
+        CancellationToken cancellation = default)
     {
         string code = PairingCodeHelper.NormalizeCustomCode(rawCode);
         if (code.Length < 4) return Task.FromResult<NearbyComputer?>(null);
-        return ResolveCoreAsync(code, cancellation);
+        return ResolveCoreAsync(code, excludeFingerprint, cancellation);
     }
 
-    internal static Task<NearbyComputer?> ResolveByFingerprintAsync(string? fingerprint, CancellationToken cancellation = default)
+    internal static Task<NearbyComputer?> ResolveByFingerprintAsync(string? fingerprint, CancellationToken cancellation = default) =>
+        ResolveByFingerprintAsync(fingerprint, excludeFingerprint: null, cancellation);
+
+    internal static Task<NearbyComputer?> ResolveByFingerprintAsync(
+        string? fingerprint,
+        string? excludeFingerprint,
+        CancellationToken cancellation = default)
     {
         string fp = (fingerprint ?? "").Trim().ToUpperInvariant();
         if (fp.Length != 64 || !fp.All(Uri.IsHexDigit))
             return Task.FromResult<NearbyComputer?>(null);
-        return ResolveCoreAsync(fp, cancellation);
+        return ResolveCoreAsync(fp, excludeFingerprint, cancellation);
     }
 
-    private static async Task<NearbyComputer?> ResolveCoreAsync(string lookupKey, CancellationToken cancellation)
+    private static async Task<NearbyComputer?> ResolveCoreAsync(
+        string lookupKey,
+        string? excludeFingerprint,
+        CancellationToken cancellation)
     {
         string topic = ComputeTopic(lookupKey);
         if (string.IsNullOrEmpty(topic)) return null;
-        try
-        {
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
-            cts.CancelAfter(3800);
-            string body = await Http.GetStringAsync($"{RelayBaseUrl}/{topic}/json?poll=1&since=45m", cts.Token)
-                .ConfigureAwait(false);
-            if (string.IsNullOrWhiteSpace(body))
-                return null;
+        string excludeNorm = (excludeFingerprint ?? "").Trim().ToUpperInvariant();
+        string relaySid = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        // Wake up the receiving PC immediately via encrypted DTK1 Knock so it both
+        // republishes fresh endpoints and stands up an outbound MQTT TLS relay bridge if needed.
+        _ = SendKnockAsync(lookupKey, relaySid, excludeNorm, cancellation);
 
-            RendezvousPayload? newest = null;
-            foreach (string line in body.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        int[] retryDelaysMs = [0, 900, 1500];
+        foreach (int waitMs in retryDelaysMs)
+        {
+            if (waitMs > 0)
+            {
+                try { await Task.Delay(waitMs, cancellation).ConfigureAwait(false); }
+                catch { break; }
+            }
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                cts.CancelAfter(3800);
+                string body = await Http.GetStringAsync($"{RelayBaseUrl}/{topic}/json?poll=1&since=12h", cts.Token)
+                    .ConfigureAwait(false);
+                if (string.IsNullOrWhiteSpace(body))
+                    continue;
+
+                RendezvousPayload? newest = null;
+                foreach (string line in body.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(line);
+                        if (!doc.RootElement.TryGetProperty("message", out var msgEl))
+                            continue;
+                        string? msg = msgEl.GetString();
+                        if (TryOpenRecord(msg, lookupKey, out var opened) && opened != null)
+                        {
+                            if (excludeNorm.Length == 64 &&
+                                string.Equals(opened.Fingerprint, excludeNorm, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            if (newest == null || opened.TimestampUnixSeconds >= newest.TimestampUnixSeconds)
+                                newest = opened;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (newest != null)
+                {
+                    string orderedAddrs = OrderEndpointsForCrossNetwork(newest.Addresses);
+                    if (string.IsNullOrEmpty(orderedAddrs))
+                        orderedAddrs = newest.Addresses;
+                    return new NearbyComputer(
+                        newest.Name,
+                        orderedAddrs,
+                        newest.Fingerprint,
+                        IsAndroid: false,
+                        CanReceive: true,
+                        IsHub: newest.IsHub,
+                        MemberCount: newest.MemberCount,
+                        PairingTag: newest.PairingTag,
+                        RelaySessionId: relaySid,
+                        RelayBroker: MqttTlsRelayTunnel.DefaultBrokerHost);
+                }
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    internal static async Task RunReceiverRendezvousAgentAsync(
+        Func<(string Fingerprint, string CustomCode, bool IsHub, int MemberCount)?> getState,
+        Action<int> registerRelayPort,
+        Action<int> unregisterRelayPort,
+        Action<string>? log,
+        CancellationToken cancellation)
+    {
+        var seenKnocks = new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        var heartbeatTask = Task.Run(async () =>
+        {
+            while (!cancellation.IsCancellationRequested)
             {
                 try
                 {
-                    using var doc = JsonDocument.Parse(line);
-                    if (!doc.RootElement.TryGetProperty("message", out var msgEl))
-                        continue;
-                    string? msg = msgEl.GetString();
-                    if (TryOpenRecord(msg, lookupKey, out var opened) && opened != null)
+                    var st = getState();
+                    if (st is { } state && state.Fingerprint.Length == 64)
                     {
-                        if (newest == null || opened.TimestampUnixSeconds >= newest.TimestampUnixSeconds)
-                            newest = opened;
+                        await PublishPresenceAsync(
+                            state.Fingerprint, state.CustomCode, state.IsHub, state.MemberCount, cancellation)
+                            .ConfigureAwait(false);
                     }
                 }
                 catch { }
+                try { await Task.Delay(TimeSpan.FromMinutes(5), cancellation).ConfigureAwait(false); }
+                catch (OperationCanceledException) { break; }
             }
+        });
 
-            if (newest == null) return null;
-            return new NearbyComputer(
-                newest.Name,
-                newest.Addresses,
-                newest.Fingerprint,
-                IsAndroid: false,
-                CanReceive: true,
-                IsHub: newest.IsHub,
-                MemberCount: newest.MemberCount,
-                PairingTag: newest.PairingTag);
-        }
-        catch
+        var sseTask = Task.Run(async () =>
         {
-            return null;
-        }
+            while (!cancellation.IsCancellationRequested)
+            {
+                string subscribedTopics = "";
+                try
+                {
+                    var st = getState();
+                    if (st is not { } state || state.Fingerprint.Length != 64)
+                    {
+                        await Task.Delay(1500, cancellation).ConfigureAwait(false);
+                        continue;
+                    }
+                    var topics = new List<string> { ComputeTopic(state.Fingerprint) };
+                    string codeTopic = ComputeTopic(PairingCodeHelper.NormalizeCustomCode(state.CustomCode));
+                    if (!string.IsNullOrEmpty(codeTopic) && !topics.Contains(codeTopic))
+                        topics.Add(codeTopic);
+                    subscribedTopics = string.Join(",", topics);
+
+                    using var sseCts = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+                    using var req = new HttpRequestMessage(HttpMethod.Get, $"{RelayBaseUrl}/{subscribedTopics}/sse?since=15s");
+                    req.Headers.Accept.ParseAdd("text/event-stream");
+                    using var resp = await SseHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, sseCts.Token)
+                        .ConfigureAwait(false);
+                    resp.EnsureSuccessStatusCode();
+                    await using var stream = await resp.Content.ReadAsStreamAsync(sseCts.Token).ConfigureAwait(false);
+                    using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                    while (!sseCts.IsCancellationRequested)
+                    {
+                        using var idleWatch = new CancellationTokenSource(TimeSpan.FromSeconds(110));
+                        using var linked = CancellationTokenSource.CreateLinkedTokenSource(sseCts.Token, idleWatch.Token);
+                        string? line = await reader.ReadLineAsync(linked.Token).ConfigureAwait(false);
+                        if (line == null) break;
+                        var cur = getState();
+                        string curCode = PairingCodeHelper.NormalizeCustomCode(cur?.CustomCode);
+                        string curTopics = ComputeTopic(cur?.Fingerprint) +
+                            (curCode.Length >= 4 ? "," + ComputeTopic(curCode) : "");
+                        if (!string.Equals(curTopics, subscribedTopics, StringComparison.Ordinal))
+                            break;
+
+                        if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+                        string json = line[5..].Trim();
+                        if (json.Length == 0 || !json.StartsWith('{')) continue;
+
+                        string? msg = null;
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(json);
+                            if (doc.RootElement.TryGetProperty("message", out var msgEl))
+                                msg = msgEl.GetString();
+                        }
+                        catch { }
+                        if (string.IsNullOrWhiteSpace(msg) || !msg.StartsWith(KnockPrefix, StringComparison.Ordinal))
+                            continue;
+
+                        var live = getState();
+                        if (live is not { } ls || ls.Fingerprint.Length != 64) continue;
+
+                        KnockPayload? knock = null;
+                        string liveCode = PairingCodeHelper.NormalizeCustomCode(ls.CustomCode);
+                        if (liveCode.Length >= 4 && TryOpenKnock(msg, liveCode, out var byCode))
+                            knock = byCode;
+                        else if (TryOpenKnock(msg, ls.Fingerprint, out var byFp))
+                            knock = byFp;
+                        if (knock == null) continue;
+
+                        if (!string.IsNullOrEmpty(knock.RequesterFingerprint) &&
+                            string.Equals(knock.RequesterFingerprint, ls.Fingerprint, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        long nowMs = Environment.TickCount64;
+                        if (!seenKnocks.TryAdd(knock.SessionId, nowMs))
+                            continue;
+                        if (seenKnocks.Count > 128)
+                        {
+                            foreach (var kv in seenKnocks)
+                            {
+                                if (nowMs - kv.Value > 120_000)
+                                    seenKnocks.TryRemove(kv.Key, out _);
+                            }
+                        }
+
+                        log?.Invoke($"Cross-network pairing request received; refreshing endpoints and arming encrypted relay bridge.");
+                        _ = Task.Run(() => PublishPresenceAsync(ls.Fingerprint, ls.CustomCode, ls.IsHub, ls.MemberCount, cancellation));
+                        var capturedKnock = knock;
+                        _ = Task.Run(() => MqttTlsRelayTunnel.RunServerBridgeAsync(
+                            capturedKnock.SessionId,
+                            capturedKnock.BrokerHost,
+                            capturedKnock.BrokerPort,
+                            Wire.Port,
+                            registerRelayPort,
+                            unregisterRelayPort,
+                            cancellation));
+                    }
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { break; }
+                catch
+                {
+                    try { await Task.Delay(5000, cancellation).ConfigureAwait(false); }
+                    catch { break; }
+                }
+            }
+        });
+
+        await Task.WhenAll(heartbeatTask, sseTask).ConfigureAwait(false);
     }
 }

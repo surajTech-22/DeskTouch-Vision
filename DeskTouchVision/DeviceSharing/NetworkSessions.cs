@@ -470,6 +470,18 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
 
     internal static IPAddress? UnmapAddress(IPAddress? address) =>
         address != null && address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+
+    private static readonly ConcurrentDictionary<int, byte> ActiveRelayLocalPorts = new();
+    internal static void RegisterRelayLocalPort(int port)
+    {
+        if (port > 0) ActiveRelayLocalPorts[port] = 1;
+    }
+    internal static void UnregisterRelayLocalPort(int port)
+    {
+        if (port > 0) ActiveRelayLocalPorts.TryRemove(port, out _);
+    }
+    internal static bool IsRelayLocalPort(int port) =>
+        port > 0 && ActiveRelayLocalPorts.ContainsKey(port);
     private readonly X509Certificate2 _certificate;
     private readonly TrustedDeviceStore? _trusted;
     private readonly LocalInputPriority _priority;
@@ -3775,17 +3787,21 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         // A saved trusted-device alias may be stale after the PC was renamed;
         // keep the actual announced system name in the display diagram.
         IPAddress? remoteAddress = UnmapAddress((client.Client.RemoteEndPoint as IPEndPoint)?.Address);
+        int remotePort = (client.Client.RemoteEndPoint as IPEndPoint)?.Port ?? 0;
         bool isLoopbackRemote = remoteAddress != null && IPAddress.IsLoopback(remoteAddress);
-        bool isCable = string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
+        bool isRelayRemote = isLoopbackRemote && IsRelayLocalPort(remotePort);
+        bool isCable = !isRelayRemote && string.Equals(peer.Platform, "Android", StringComparison.Ordinal) &&
             isLoopbackRemote;
         var (localBand, localSpeed) = DetectInterfaceForLocalAddress(
             client.Client.LocalEndPoint is IPEndPoint localEp ? UnmapAddress(localEp.Address) : null);
         string initialBand = isCable
             ? "cable"
-            : (localBand == "ethernet" && string.Equals(peer.Platform, "Windows", StringComparison.Ordinal)
-                ? "ethernet"
-                : "wireless");
-        int initialSpeed = isCable ? 0 : localSpeed;
+            : (isRelayRemote
+                ? "wan-relay"
+                : (localBand == "ethernet" && string.Equals(peer.Platform, "Windows", StringComparison.Ordinal)
+                    ? "ethernet"
+                    : "wireless"));
+        int initialSpeed = (isCable || isRelayRemote) ? 0 : localSpeed;
         var session=new Session{
             Id=id,Client=client,Stream=ssl,Peer=peer,IsCableSession=isCable,
             RemoteAddress=remoteAddress,
@@ -3794,7 +3810,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             LastPongTicks=Stopwatch.GetTimestamp(),
             TrustedTokenHash=trustedSource?.TokenSha256
         };
-        session.UdpPeer = isCable ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint, initialBand, initialSpeed);
+        session.UdpPeer = (isCable || isRelayRemote) ? null : _udpHub?.AddPeer(id, client.Client.RemoteEndPoint, initialBand, initialSpeed);
         session.MobileUdpPeer = (!isCable && string.Equals(peer.Platform, "Android", StringComparison.Ordinal) && _udpHub != null && remoteAddress != null)
             ? _udpHub.AddAuxiliaryPeer(id, remoteAddress, "cellular")
             : null;
@@ -5954,6 +5970,7 @@ internal sealed class HostSession : IInputSession, IDisposable
     private readonly TcpClient _client;
     private readonly SslStream _ssl;
     private readonly IPAddress _serverAddress;
+    private readonly IDisposable? _relayTunnel;
     private FastUdpClient? _udpClient;
     private FastMovePacer? _movePacer;
     private int _forwardClaimLease;
@@ -6516,9 +6533,11 @@ internal sealed class HostSession : IInputSession, IDisposable
     private HostSession(TcpClient client, SslStream ssl, IPAddress serverAddress,
         string pinnedFingerprint, bool trustedConnection,
         MonitorTopology monitors, Action<string> onFailure,
-        string linkBand = "wireless", int linkSpeedMbps = 0)
+        string linkBand = "wireless", int linkSpeedMbps = 0,
+        IDisposable? relayTunnel = null)
     {
         _client = client; _ssl = ssl; _serverAddress = serverAddress;
+        _relayTunnel = relayTunnel;
         _pinnedFingerprint = pinnedFingerprint;
         _isTrustedConnection = trustedConnection;
         _remoteAppVersion = monitors.Monitors.FirstOrDefault()?.AppVersion;
@@ -6592,19 +6611,25 @@ internal sealed class HostSession : IInputSession, IDisposable
 
     internal static Task<HostSession> ConnectAsync(
         string ip, string pinnedFingerprint, string secret, Action<string> onFailure,
-        CancellationToken cancellation) =>
-            ConnectCoreAsync(ip, pinnedFingerprint, secret, false, onFailure, cancellation);
+        CancellationToken cancellation,
+        string? relaySessionId = null, string? relayBroker = null) =>
+            ConnectCoreAsync(ip, pinnedFingerprint, secret, false, onFailure, cancellation,
+                trustedConnection: false, relaySessionId: relaySessionId, relayBroker: relayBroker);
 
     internal static Task<HostSession> ConnectWithApprovalAsync(
         string ip, string pinnedFingerprint, Action<string> onFailure,
-        CancellationToken cancellation) =>
-            ConnectCoreAsync(ip, pinnedFingerprint, "", true, onFailure, cancellation);
+        CancellationToken cancellation,
+        string? relaySessionId = null, string? relayBroker = null) =>
+            ConnectCoreAsync(ip, pinnedFingerprint, "", true, onFailure, cancellation,
+                trustedConnection: false, relaySessionId: relaySessionId, relayBroker: relayBroker);
 
     internal static Task<HostSession> ConnectTrustedAsync(
         string ip, string pinnedFingerprint, string trustToken,
-        Action<string> onFailure, CancellationToken cancellation) =>
+        Action<string> onFailure, CancellationToken cancellation,
+        string? relaySessionId = null, string? relayBroker = null) =>
             ConnectCoreAsync(ip, pinnedFingerprint, trustToken, false,
-                onFailure, cancellation, trustedConnection: true);
+                onFailure, cancellation, trustedConnection: true,
+                relaySessionId: relaySessionId, relayBroker: relayBroker);
 
     internal async Task<string?> RequestTrustAsync(CancellationToken cancellation)
     {
@@ -6783,7 +6808,9 @@ internal sealed class HostSession : IInputSession, IDisposable
     private static async Task<HostSession> ConnectCoreAsync(
         string ip, string pinnedFingerprint, string secret, bool askReceiver,
         Action<string> onFailure, CancellationToken cancellation,
-        bool trustedConnection = false)
+        bool trustedConnection = false,
+        string? relaySessionId = null,
+        string? relayBroker = null)
     {
         pinnedFingerprint = new string(pinnedFingerprint.Where(Uri.IsHexDigit).ToArray()).ToUpperInvariant();
         secret = secret.Trim().ToUpperInvariant();
@@ -6794,17 +6821,19 @@ internal sealed class HostSession : IInputSession, IDisposable
         if (!askReceiver && !validFixedSecret && !validCustomCode)
             throw new ArgumentException("Invalid authenticated pairing credential.");
         var candidateAddresses = CrossNetworkRendezvous.ParseCandidateAddresses(ip, allowLoopback: true);
-        if (candidateAddresses.Count == 0)
+        if (candidateAddresses.Count == 0 && string.IsNullOrEmpty(relaySessionId))
             throw new ArgumentException("Enter the receiver's IPv4 or IPv6 address.");
 
         TcpClient? client = null;
-        IPAddress address = candidateAddresses[0];
+        IPAddress address = candidateAddresses.Count > 0 ? candidateAddresses[0] : IPAddress.Loopback;
         SslStream? ssl = null;
+        MqttTlsRelayTunnel? relayTunnel = null;
+        bool usedRelay = false;
         string stage = "TCP connection";
         try
         {
             Exception? lastConnectError = null;
-            int perAttemptSeconds = candidateAddresses.Count > 1 ? 5 : 15;
+            int perAttemptSeconds = (candidateAddresses.Count > 1 || !string.IsNullOrEmpty(relaySessionId)) ? 3 : 15;
             foreach (var candidateAddr in candidateAddresses)
             {
                 var attemptClient = new TcpClient(candidateAddr.AddressFamily) { NoDelay = true };
@@ -6830,6 +6859,24 @@ internal sealed class HostSession : IInputSession, IDisposable
                     lastConnectError = ex;
                     attemptClient.Dispose();
                 }
+            }
+            if (client == null && !(candidateAddresses.Count > 0 && IPAddress.IsLoopback(candidateAddresses[0])))
+            {
+                string effectiveSid = !string.IsNullOrWhiteSpace(relaySessionId)
+                    ? relaySessionId
+                    : Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+                if (string.IsNullOrWhiteSpace(relaySessionId))
+                    await CrossNetworkRendezvous.SendKnockAsync(pinnedFingerprint, effectiveSid, null, cancellation);
+                relayTunnel = await MqttTlsRelayTunnel.OpenClientBridgeAsync(
+                    effectiveSid,
+                    relayBroker ?? MqttTlsRelayTunnel.DefaultBrokerHost,
+                    MqttTlsRelayTunnel.DefaultBrokerPort,
+                    cancellation);
+                var relayClient = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+                await relayClient.ConnectAsync(IPAddress.Loopback, relayTunnel.LocalPort, cancellation);
+                client = relayClient;
+                address = IPAddress.Loopback;
+                usedRelay = true;
             }
             if (client == null)
                 throw lastConnectError ?? new SocketException((int)SocketError.HostUnreachable);
@@ -6881,8 +6928,10 @@ internal sealed class HostSession : IInputSession, IDisposable
                     HasMicrophone: localMic));
             await Wire.WriteAsync(ssl, new Packet("hello", Text: hello),
                 acceptedLimit.Token);
-            var (outBand, outSpeed) = ReceiverServer.DetectInterfaceForLocalAddress(
-                client.Client.LocalEndPoint is IPEndPoint outEp ? ReceiverServer.UnmapAddress(outEp.Address) : null);
+            var (outBand, outSpeed) = usedRelay
+                ? ("wan-relay", 0)
+                : ReceiverServer.DetectInterfaceForLocalAddress(
+                    client.Client.LocalEndPoint is IPEndPoint outEp ? ReceiverServer.UnmapAddress(outEp.Address) : null);
             if (outBand == "ethernet")
             {
                 await Wire.WriteAsync(ssl, new Packet("link-info", Text: outBand, A: outSpeed), acceptedLimit.Token);
@@ -6892,12 +6941,13 @@ internal sealed class HostSession : IInputSession, IDisposable
             {
                 await Wire.WriteAsync(ssl, new Packet("mac-addresses", Text: string.Join(",", hostMacs)), acceptedLimit.Token);
             }
-            return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure, outBand, outSpeed);
+            return new HostSession(client, ssl, address, pinnedFingerprint, trustedConnection, monitors, onFailure, outBand, outSpeed, relayTunnel);
         }
         catch (Exception ex)
         {
             ssl?.Dispose();
             client?.Dispose();
+            relayTunnel?.Dispose();
             string guidance = stage switch
             {
                 "TCP connection" =>
@@ -7635,6 +7685,7 @@ internal sealed class HostSession : IInputSession, IDisposable
         ReleaseReverseAuthority();
         _ssl.Dispose();
         _client.Dispose();
+        try { _relayTunnel?.Dispose(); } catch { }
         // Don't dispose the CancellationTokenSource while async workers may still be unwinding.
     }
 }

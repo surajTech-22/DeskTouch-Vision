@@ -1023,6 +1023,41 @@ Console.WriteLine("PASS: Accessibility-free Shell Bridge ADB parsers and launch 
         stunResp[31] = (byte)(88 ^ 0x42);
         Check(CrossNetworkRendezvous.TryParseStunXorMappedIpv4(stunResp, fakeTx) == "203.0.113.88",
               "TryParseStunXorMappedIpv4 must decode RFC 5389 XOR-MAPPED-ADDRESS accurately");
+
+        // Verify v0.3.93: DTK1 encrypted Knock, cross-network endpoint ordering (Global IPv6 / Public first), & MQTT PUBLISH parsing.
+        string orderedWan = CrossNetworkRendezvous.OrderEndpointsForCrossNetwork(
+            "192.168.1.6,100.64.5.9,203.0.113.88,2401:4900:1cba:3a75::1");
+        Check(orderedWan == "2401:4900:1cba:3a75::1,203.0.113.88,100.64.5.9,192.168.1.6",
+              "OrderEndpointsForCrossNetwork must prioritize Global IPv6 -> Public IPv4 -> Overlay VPN -> Private LAN");
+
+        var knock = new CrossNetworkRendezvous.KnockPayload(
+            "0123456789abcdef0123456789abcdef",
+            MqttTlsRelayTunnel.DefaultBrokerHost,
+            MqttTlsRelayTunnel.DefaultBrokerPort,
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            nowUnix);
+        string sealedKnock = CrossNetworkRendezvous.SealKnock(knock, sampleCode);
+        Check(sealedKnock.StartsWith("DTK1|", StringComparison.Ordinal) &&
+              CrossNetworkRendezvous.TryOpenKnock(sealedKnock, sampleCode, out var openedKnock) &&
+              openedKnock != null &&
+              openedKnock.SessionId == knock.SessionId &&
+              openedKnock.BrokerHost == MqttTlsRelayTunnel.DefaultBrokerHost &&
+              openedKnock.BrokerPort == 8883,
+              "CrossNetworkRendezvous.TryOpenKnock must decrypt authentic DTK1 knock envelopes");
+        Check(!CrossNetworkRendezvous.TryOpenKnock(sealedKnock, "WRONGCODE", out _),
+              "CrossNetworkRendezvous.TryOpenKnock must reject wrong pairing codes");
+
+        byte[] sampleTopicBytes = System.Text.Encoding.UTF8.GetBytes("dtv/r/abc123/c2s");
+        byte[] samplePayloadBytes = [0x16, 0x03, 0x01, 0x00, 0x2A];
+        byte[] pubBody = new byte[2 + sampleTopicBytes.Length + samplePayloadBytes.Length];
+        pubBody[0] = (byte)(sampleTopicBytes.Length >> 8);
+        pubBody[1] = (byte)(sampleTopicBytes.Length & 0xFF);
+        Buffer.BlockCopy(sampleTopicBytes, 0, pubBody, 2, sampleTopicBytes.Length);
+        Buffer.BlockCopy(samplePayloadBytes, 0, pubBody, 2 + sampleTopicBytes.Length, samplePayloadBytes.Length);
+        Check(MqttTlsRelayTunnel.TryParsePublish(pubBody, out string parsedTopic, out byte[] parsedPayload) &&
+              parsedTopic == "dtv/r/abc123/c2s" &&
+              parsedPayload.SequenceEqual(samplePayloadBytes),
+              "MqttTlsRelayTunnel.TryParsePublish must extract MQTT topic and binary TLS payload cleanly");
     }
 
     Console.WriteLine("PASS: DTM1 Fast UDP media codec/assembler, WinMM CALLBACK_EVENT smoke test, virtual mic bridge, and capability negotiation.");
@@ -3464,6 +3499,17 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               updateClientText.Contains("DownloadArchiveWithResumeAndStallGuardAsync", StringComparison.Ordinal) &&
               updateClientText.Contains("RangeHeaderValue", StringComparison.Ordinal),
               "v0.3.91 must include 256-pkt DTM1 window, DTM1 hub confirmation, dual-path mic UDP, and HTTP Range updater retry");
+
+        string pairHelperText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "PairingCodeHelper.cs"));
+        string relayText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "CrossNetworkRelayTunnel.cs"));
+        Check(pairHelperText.Contains("RunReceiverRendezvousAgentAsync", StringComparison.Ordinal) &&
+              pairHelperText.Contains("since=12h", StringComparison.Ordinal) &&
+              pairHelperText.Contains("OrderEndpointsForCrossNetwork", StringComparison.Ordinal) &&
+              sessionsText.Contains("IsRelayLocalPort", StringComparison.Ordinal) &&
+              sessionsText.Contains("MqttTlsRelayTunnel.OpenClientBridgeAsync", StringComparison.Ordinal) &&
+              relayText.Contains("RunServerBridgeAsync", StringComparison.Ordinal) &&
+              formText.Contains("StartRendezvousAgentOnce", StringComparison.Ordinal),
+              "v0.3.93 cross-network pairing must include live SSE Knock agent, self-exclusion, endpoint ordering, and TLS-over-MQTT relay fallback");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

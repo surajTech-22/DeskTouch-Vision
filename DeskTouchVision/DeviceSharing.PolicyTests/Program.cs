@@ -2581,8 +2581,13 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
         // Verify Windows-initiated inbound trust offer saves deduplicated trust on both ends.
         var trustStore = new TrustedDeviceStore(cableIn);
         var offerTask = cableReceiver.OfferTrustToConnectedAsync(trustStore, deadline.Token);
-        Packet offerPkt = await Wire.ReadAsync(cableSsl, deadline.Token);
-        Check(offerPkt.Type == "trust-offer" && !string.IsNullOrEmpty(offerPkt.Text) && offerPkt.Text.Contains('\n'),
+        Packet? offerPkt = null;
+        while (offerPkt == null)
+        {
+            var pkt = await Wire.ReadAsync(cableSsl, deadline.Token);
+            if (pkt.Type == "trust-offer") offerPkt = pkt;
+        }
+        Check(!string.IsNullOrEmpty(offerPkt.Text) && offerPkt.Text.Contains('\n'),
             "Inbound trust offer must carry receiver fingerprint and 256-bit secret");
         await Wire.WriteAsync(cableSsl, new Packet("trust-accepted", offerPkt.A), deadline.Token);
         bool offerSaved = await offerTask.WaitAsync(TimeSpan.FromSeconds(2), deadline.Token);

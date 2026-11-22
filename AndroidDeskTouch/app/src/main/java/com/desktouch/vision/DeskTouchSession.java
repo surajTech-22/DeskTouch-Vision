@@ -231,6 +231,11 @@ final class DeskTouchSession implements AutoCloseable {
         t.setDaemon(true);
         return t;
     });
+    private final ExecutorService screenPreviewDecoder=Executors.newSingleThreadExecutor(r->{
+        Thread t=new Thread(r,"DeskTouch PreviewDecode");
+        t.setDaemon(true);
+        return t;
+    });
     private final Object writeLock=new Object();
     private final Object pingTrackLock=new Object();
     private final Object udpPacerLock=new Object();
@@ -431,9 +436,31 @@ final class DeskTouchSession implements AutoCloseable {
     private final java.util.concurrent.ConcurrentHashMap<Integer,java.util.List<EcosystemFeatures.NotificationItem>> peerNotifications =
         new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<Integer,EcosystemFeatures.InboundFileWriter> inboundFiles = new HashMap<>();
+    private static final class PendingPreviewFrame {
+        final byte[] jpeg;
+        final int frameId;
+        final boolean fromUdp;
+        final String transportLabel;
+        PendingPreviewFrame(byte[] jpeg, int frameId, boolean fromUdp, String transportLabel) {
+            this.jpeg = jpeg;
+            this.frameId = frameId;
+            this.fromUdp = fromUdp;
+            this.transportLabel = transportLabel;
+        }
+    }
+    private final java.util.concurrent.atomic.AtomicReference<PendingPreviewFrame> pendingPreviewFrame =
+        new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicBoolean previewDecodeScheduled =
+        new java.util.concurrent.atomic.AtomicBoolean();
     private volatile android.graphics.Bitmap latestScreenPreview;
     private volatile int screenPreviewWatchTarget = -1;
     private volatile int screenPreviewWatchMonitor = -1;
+    private volatile boolean screenPreviewWatchHighRes;
+    private volatile String previewTransportLabel = "";
+    private volatile int previewFps;
+    private volatile long previewFpsWindowStartMs;
+    private volatile int previewFpsFrames;
+    private volatile long lastPreviewAckSentMs;
     private volatile String activeForegroundProc = "";
     private volatile String activeForegroundTitle = "";
     private volatile EcosystemFeatures.ProfileSummary profileSummary = EcosystemFeatures.parseProfileState("");
@@ -1258,6 +1285,7 @@ final class DeskTouchSession implements AutoCloseable {
                             AutoConnectService.resumePeer(application,fingerprint);
                             AutoConnectService.setEnabled(application,true);
                             AutoConnectService.setReconnect(application,true);
+                            AutoConnectService.armTrustedBackgroundMicFromForeground(application);
                             status("Trusted Windows PC saved securely, without storing its IP address");
                             DeskTouchRuntime.notifyLiveStatusChanged();
                         }catch(Exception ex){
@@ -1281,6 +1309,7 @@ final class DeskTouchSession implements AutoCloseable {
                                 AutoConnectService.resumePeer(application,fingerprint);
                                 AutoConnectService.setEnabled(application,true);
                                 AutoConnectService.setReconnect(application,true);
+                                AutoConnectService.armTrustedBackgroundMicFromForeground(application);
                                 savedOffer=true;
                                 status("Trusted Windows PC saved securely, without storing its IP address");
                                 DeskTouchRuntime.notifyLiveStatusChanged();
@@ -1403,11 +1432,7 @@ final class DeskTouchSession implements AutoCloseable {
                         EcosystemFeatures.ChunkAssembler.Result res=screenPreviewAssembler.addChunk(
                             p.a,p.b,p.c,w,h,p.text,"");
                         if(res!=null && res.data!=null){
-                            android.graphics.Bitmap bmp=android.graphics.BitmapFactory.decodeByteArray(res.data,0,res.data.length);
-                            if(bmp!=null){
-                                latestScreenPreview=bmp;
-                                DeskTouchRuntime.notifyLiveStatusChanged();
-                            }
+                            enqueueScreenPreviewDecode(res.data,p.a,false,"TCP");
                         }
                     }
                 } else if("foreground-app".equals(p.type) && p.text!=null){
@@ -1851,13 +1876,94 @@ final class DeskTouchSession implements AutoCloseable {
     }
 
     void setScreenPreviewWatch(int targetId, int monitorIndex, boolean highRes){
+        int prevTarget=screenPreviewWatchTarget;
+        int prevMonitor=screenPreviewWatchMonitor;
         screenPreviewWatchTarget=targetId;
         screenPreviewWatchMonitor=monitorIndex;
-        if(monitorIndex<0) latestScreenPreview=null;
+        screenPreviewWatchHighRes=highRes;
+        if(monitorIndex<0 || prevTarget!=targetId || prevMonitor!=monitorIndex){
+            screenPreviewAssembler.reset();
+            pendingPreviewFrame.set(null);
+        }
+        if(monitorIndex<0){
+            latestScreenPreview=null;
+            previewTransportLabel="";
+            previewFps=0;
+            previewFpsWindowStartMs=0L;
+            previewFpsFrames=0;
+            lastPreviewAckSentMs=0L;
+        }
         if(running) send(new Packet("screen-preview-watch",targetId,monitorIndex,highRes ? 1 : 0,0));
     }
 
+    private void enqueueScreenPreviewDecode(byte[] jpeg, int frameId, boolean fromUdp, String transportLabel){
+        if(!running || screenPreviewWatchMonitor<0 || jpeg==null || jpeg.length==0) return;
+        pendingPreviewFrame.set(new PendingPreviewFrame(jpeg,frameId,fromUdp,transportLabel));
+        schedulePreviewDecodeWorker();
+    }
+
+    private void schedulePreviewDecodeWorker(){
+        if(!previewDecodeScheduled.compareAndSet(false,true) || screenPreviewDecoder.isShutdown()) return;
+        try {
+            screenPreviewDecoder.execute(()->{
+                try {
+                    while(true){
+                        PendingPreviewFrame next=pendingPreviewFrame.getAndSet(null);
+                        if(next==null) break;
+                        if(!running || screenPreviewWatchMonitor<0) continue;
+                        android.graphics.Bitmap bmp=android.graphics.BitmapFactory.decodeByteArray(
+                            next.jpeg,0,next.jpeg.length);
+                        if(bmp!=null){
+                            if(!running || screenPreviewWatchMonitor<0){
+                                bmp.recycle();
+                                continue;
+                            }
+                            latestScreenPreview=bmp;
+                            String prevLabel=previewTransportLabel;
+                            previewTransportLabel=next.transportLabel!=null ? next.transportLabel : "";
+                            long nowMs=SystemClock.uptimeMillis();
+                            long winStart=previewFpsWindowStartMs;
+                            if(winStart<=0L){
+                                previewFpsWindowStartMs=nowMs;
+                                previewFpsFrames=1;
+                            }else{
+                                int count=++previewFpsFrames;
+                                long elapsed=nowMs-winStart;
+                                if(elapsed>=1000L){
+                                    previewFps=Math.max(1,Math.round(count*1000f/elapsed));
+                                    previewFpsWindowStartMs=nowMs;
+                                    previewFpsFrames=0;
+                                }else if(previewFps==0 && count>=2){
+                                    previewFps=Math.max(1,Math.round(count*1000f/Math.max(120L,elapsed)));
+                                }
+                            }
+                            boolean transportChanged=!previewTransportLabel.equals(prevLabel);
+                            if(lastPreviewAckSentMs==0L || transportChanged || nowMs-lastPreviewAckSentMs>=350L){
+                                lastPreviewAckSentMs=nowMs;
+                                send(new Packet("screen-preview-ack",next.frameId,next.fromUdp ? 1 : 0,0,0));
+                            }
+                            DeskTouchRuntime.notifyScreenPreviewUpdated();
+                        }
+                    }
+                }finally{
+                    previewDecodeScheduled.set(false);
+                    if(running && screenPreviewWatchMonitor>=0 && pendingPreviewFrame.get()!=null){
+                        schedulePreviewDecodeWorker();
+                    }
+                }
+            });
+        }catch(RuntimeException ignored){
+            previewDecodeScheduled.set(false);
+        }
+    }
+
     android.graphics.Bitmap currentScreenPreview(){ return latestScreenPreview; }
+    String screenPreviewTransportSummary(){
+        String label=previewTransportLabel;
+        int fps=previewFps;
+        if(label==null || label.isEmpty()) return "";
+        return fps>0 ? (label+" • "+fps+" fps") : label;
+    }
     boolean isScreenPreviewWatching(){ return running && screenPreviewWatchMonitor>=0; }
     String activeForegroundProc(){ return activeForegroundProc; }
     String activeForegroundTitle(){ return activeForegroundTitle; }
@@ -2150,19 +2256,32 @@ final class DeskTouchSession implements AutoCloseable {
         }
     }
 
+    boolean isCurrentPeerTrusted(){
+        String fp=fingerprint;
+        return fp!=null && !fp.isEmpty() && trust!=null && trust.get(fp)!=null;
+    }
+
     private void handlePhoneMicWatch(boolean enable){
         if(!enable){
             PhoneMediaService.stopMicShare(application);
             return;
         }
         registerPhoneMediaSink();
+        boolean trusted=isCurrentPeerTrusted();
         boolean hasMic=application.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
             == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if(!trusted){
+            PhoneMediaService.postMicPromptNotification(application);
+            send(new Packet("phone-mic-status",2,0,0,0,"Confirm microphone access on phone for untrusted PC"));
+            MediaRequestListener l=mediaRequestListener;
+            if(l!=null) l.onMicShareRequested();
+            return;
+        }
         if(hasMic){
             PhoneMediaService.startMicShare(application);
         }else{
             PhoneMediaService.postMicPromptNotification(application);
-            send(new Packet("phone-mic-status",2,0,0,0,"Tap DeskTouch notification on phone to grant mic permission"));
+            send(new Packet("phone-mic-status",2,0,0,0,"Grant one-time Microphone permission on phone"));
             MediaRequestListener l=mediaRequestListener;
             if(l!=null) l.onMicShareRequested();
         }
@@ -2716,12 +2835,9 @@ final class DeskTouchSession implements AutoCloseable {
                     EcosystemFeatures.ChunkAssembler.Result res = screenPreviewAssembler.addRawChunk(
                         d.frameOrAudioId, d.indexOrSampleRate, d.totalOrChannels, w, h, d.payload);
                     if (res != null && res.data != null) {
-                        android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeByteArray(
-                            res.data, 0, res.data.length);
-                        if (bmp != null) {
-                            latestScreenPreview = bmp;
-                            DeskTouchRuntime.notifyLiveStatusChanged();
-                        }
+                        String transportLabel = isMobile ? "Fast UDP (Mobile)"
+                            : (cableSession ? "Fast UDP (Cable)" : "Fast UDP (Wi-Fi)");
+                        enqueueScreenPreviewDecode(res.data, d.frameOrAudioId, true, transportLabel);
                     }
                 }
             }
@@ -3424,7 +3540,9 @@ final class DeskTouchSession implements AutoCloseable {
         environmentTargets=java.util.Collections.emptyList();
         selectedEnvironmentId=0;environmentOwnId=0;
         taskbarTargetId=-1;taskbarItems=java.util.Collections.emptyList();
-        screenPreviewWatchTarget=-1;screenPreviewWatchMonitor=-1;latestScreenPreview=null;
+        screenPreviewWatchTarget=-1;screenPreviewWatchMonitor=-1;screenPreviewWatchHighRes=false;
+        latestScreenPreview=null;pendingPreviewFrame.set(null);screenPreviewAssembler.reset();
+        previewTransportLabel="";previewFps=0;previewFpsWindowStartMs=0L;previewFpsFrames=0;lastPreviewAckSentMs=0L;
         activeForegroundProc="";activeForegroundTitle="";
         lastPublishedBatteryPct=-1;peerNotifications.clear();
         synchronized(inboundFiles){
@@ -3453,6 +3571,7 @@ final class DeskTouchSession implements AutoCloseable {
     }
     @Override public void close(){
         closeConnection();
+        screenPreviewDecoder.shutdownNow();
         udpPacer.shutdownNow();
         controlSender.shutdownNow();
         sender.shutdownNow();

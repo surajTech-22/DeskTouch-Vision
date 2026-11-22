@@ -315,6 +315,12 @@ final class EcosystemFeatures {
             long createdMs;
         }
         private final Map<Integer, Slot> pending = new HashMap<>();
+        private int lastCompletedFrameId = 0;
+
+        synchronized void reset() {
+            pending.clear();
+            lastCompletedFrameId = 0;
+        }
 
         static final class Result {
             final byte[] data;
@@ -349,12 +355,18 @@ final class EcosystemFeatures {
                 part == null || part.length == 0) {
                 return null;
             }
-            return addBinaryChunk(frameId, index, total, width, height, part, "", 450L);
+            return addBinaryChunk(frameId, index, total, width, height, part, "", 900L);
         }
 
         private Result addBinaryChunk(int frameId, int index, int total, int width, int height,
                 byte[] part, String tag, long maxAgeMs) {
+            if (lastCompletedFrameId > 0 && frameId <= lastCompletedFrameId &&
+                (lastCompletedFrameId - frameId) < 10000) {
+                return null;
+            }
             if (total == 1) {
+                lastCompletedFrameId = frameId;
+                pending.entrySet().removeIf(e -> e.getKey() < frameId);
                 return new Result(part, tag == null ? "" : tag, width, height);
             }
             long now = System.nanoTime() / 1_000_000L;
@@ -383,6 +395,8 @@ final class EcosystemFeatures {
             slot.parts[index] = part;
             if (slot.received < total) return null;
             pending.remove(frameId);
+            lastCompletedFrameId = frameId;
+            pending.entrySet().removeIf(e -> e.getKey() < frameId);
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             for (byte[] p : slot.parts) {
                 if (p == null) return null;

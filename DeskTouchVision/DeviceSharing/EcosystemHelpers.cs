@@ -470,6 +470,22 @@ internal static class ScreenPreviewHelper
     private static readonly ImageCodecInfo? JpegCodec = ImageCodecInfo.GetImageEncoders()
         .FirstOrDefault(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
+    private static byte[] EncodeJpeg(Bitmap dstBmp, long quality)
+    {
+        using var ms = new MemoryStream();
+        if (JpegCodec != null)
+        {
+            using var ep = new EncoderParameters(1);
+            ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, quality);
+            dstBmp.Save(ms, JpegCodec, ep);
+        }
+        else
+        {
+            dstBmp.Save(ms, ImageFormat.Jpeg);
+        }
+        return ms.ToArray();
+    }
+
     internal static (int FrameId, int PackedDims, byte[] JpegBytes) CaptureMonitorPreviewRaw(
         int monitorIndex = 0, bool highRes = false)
     {
@@ -481,9 +497,11 @@ internal static class ScreenPreviewHelper
             Rectangle bounds = screens[idx].Bounds;
             if (bounds.Width < 16 || bounds.Height < 16) return default;
 
-            int targetMaxWidth = highRes ? 1120 : 560;
-            long jpegQuality = highRes ? 66L : 58L;
-            int maxBytes = highRes ? 240 * 1024 : 140 * 1024;
+            int targetMaxWidth = highRes ? 1040 : 540;
+            long initialQuality = highRes ? 60L : 54L;
+            int softUdpTargetBytes = highRes ? 52 * 1024 : 26 * 1024;
+            int secondPassThreshold = highRes ? 96 * 1024 : 56 * 1024;
+            int hardMaxBytes = highRes ? 200 * 1024 : 120 * 1024;
             int dstW = Math.Min(targetMaxWidth, bounds.Width);
             int dstH = Math.Max(40, (int)Math.Round(bounds.Height * (dstW / (double)bounds.Width)));
 
@@ -498,20 +516,15 @@ internal static class ScreenPreviewHelper
                 gDst.InterpolationMode = highRes ? InterpolationMode.HighQualityBicubic : InterpolationMode.Bilinear;
                 gDst.DrawImage(srcBmp, 0, 0, dstW, dstH);
             }
-            using var ms = new MemoryStream();
-            if (JpegCodec != null)
-            {
-                using var ep = new EncoderParameters(1);
-                ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, jpegQuality);
-                dstBmp.Save(ms, JpegCodec, ep);
-            }
-            else
-            {
-                dstBmp.Save(ms, ImageFormat.Jpeg);
-            }
 
-            byte[] jpeg = ms.ToArray();
-            if (jpeg.Length == 0 || jpeg.Length > maxBytes)
+            byte[] jpeg = EncodeJpeg(dstBmp, initialQuality);
+            if (jpeg.Length > softUdpTargetBytes)
+            {
+                jpeg = EncodeJpeg(dstBmp, highRes ? 44L : 38L);
+                if (jpeg.Length > secondPassThreshold)
+                    jpeg = EncodeJpeg(dstBmp, 32L);
+            }
+            if (jpeg.Length == 0 || jpeg.Length > hardMaxBytes)
                 return default;
             int frameId = Interlocked.Increment(ref _nextFrameId);
             int packedDims = (dstW << 16) | (dstH & 0xFFFF);

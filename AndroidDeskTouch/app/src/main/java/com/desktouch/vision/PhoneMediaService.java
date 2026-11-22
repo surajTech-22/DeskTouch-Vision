@@ -170,11 +170,19 @@ public final class PhoneMediaService extends Service {
             emitMicStatus(2, "Tap DeskTouch notification on phone to grant microphone permission");
             return;
         }
+        if (AutoConnectService.isMicCapabilityArmed() && !screenRunning && !cameraRunning) {
+            cancelMicPromptNotification(ctx);
+            micRunning = true;
+            startStaticMicLoop(ctx.getApplicationContext());
+            AutoConnectService.refreshNotification();
+            return;
+        }
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_START_MIC);
         if (!startForegroundCompat(ctx, i)) {
             startDirectMicFallback(ctx);
         }
+        AutoConnectService.refreshNotification();
     }
 
     static void stopMicShare(Context ctx) {
@@ -182,11 +190,15 @@ public final class PhoneMediaService extends Service {
         desiredMic = false;
         stopStaticMicLoop();
         cancelMicPromptNotification(ctx);
-        if (!micRunning && !cameraRunning && !screenRunning) return;
+        if (!micRunning && !cameraRunning && !screenRunning) {
+            AutoConnectService.refreshNotification();
+            return;
+        }
         micRunning = false;
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_STOP_MIC);
         try { ctx.startService(i); } catch (Throwable ignored) {}
+        AutoConnectService.refreshNotification();
     }
 
     static void stopAll(Context ctx) {
@@ -201,6 +213,7 @@ public final class PhoneMediaService extends Service {
             try { ctx.stopService(new Intent(ctx, PhoneMediaService.class)); }
             catch (Throwable ignored) {}
         }
+        AutoConnectService.refreshNotification();
     }
 
     private static boolean startForegroundCompat(Context ctx, Intent i) {
@@ -681,8 +694,8 @@ public final class PhoneMediaService extends Service {
                 try {
                     int[] candidateRates = { 16000, 24000, 48000 };
                     int[] candidateSources = {
-                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                         MediaRecorder.AudioSource.MIC,
+                        MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                         MediaRecorder.AudioSource.DEFAULT
                     };
                     for (int r : candidateRates) {
@@ -750,18 +763,21 @@ public final class PhoneMediaService extends Service {
                                     cancelMicPromptNotification(appCtx);
                                 } else {
                                     consecutiveZeroChunks++;
-                                    // Silence watchdog #1: Xiaomi/MIUI HALs sometimes return 100% digital zeros on VOICE_COMMUNICATION
-                                    // outside a cellular/VoIP call; seamlessly hot-swap to MIC after ~900ms of all-zeros.
+                                    // Silence watchdog #1: swap between MIC and VOICE_COMMUNICATION after ~900ms of all-zeros.
                                     if (consecutiveZeroChunks == 45 &&
-                                        selectedSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION) {
+                                        (selectedSource == MediaRecorder.AudioSource.MIC ||
+                                         selectedSource == MediaRecorder.AudioSource.VOICE_COMMUNICATION)) {
+                                        int nextSource = selectedSource == MediaRecorder.AudioSource.MIC
+                                            ? MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                                            : MediaRecorder.AudioSource.MIC;
                                         if (aec != null) { try { aec.release(); } catch (Throwable ignored) {} aec = null; }
                                         if (ns != null) { try { ns.release(); } catch (Throwable ignored) {} ns = null; }
                                         if (agc != null) { try { agc.release(); } catch (Throwable ignored) {} agc = null; }
                                         try { rec.stop(); } catch (Throwable ignored) {}
                                         try { rec.release(); } catch (Throwable ignored) {}
-                                        rec = tryOpenAudioRecord(selectedRate, MediaRecorder.AudioSource.MIC);
+                                        rec = tryOpenAudioRecord(selectedRate, nextSource);
                                         if (rec == null) {
-                                            rec = tryOpenAudioRecord(16000, MediaRecorder.AudioSource.MIC);
+                                            rec = tryOpenAudioRecord(16000, nextSource);
                                             if (rec != null) {
                                                 selectedRate = 16000;
                                                 frameBytes = (selectedRate * 2) / 50;
@@ -769,7 +785,7 @@ public final class PhoneMediaService extends Service {
                                             }
                                         }
                                         if (rec != null) {
-                                            selectedSource = MediaRecorder.AudioSource.MIC;
+                                            selectedSource = nextSource;
                                             rec.startRecording();
                                             continue;
                                         } else {
@@ -806,6 +822,7 @@ public final class PhoneMediaService extends Service {
                         try { rec.stop(); } catch (Throwable ignored) {}
                         try { rec.release(); } catch (Throwable ignored) {}
                     }
+                    AutoConnectService.refreshNotification();
                 }
             }, "DeskTouch-MicStream");
             staticMicThread.setDaemon(true);

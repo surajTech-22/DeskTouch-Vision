@@ -252,6 +252,11 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
         internal int ScreenPreviewTarget = -1;
         internal int ScreenPreviewMonitor = -1;
         internal int ScreenPreviewHighRes = 0;
+        internal long LastPreviewUdpSentMs;
+        internal long LastPreviewUdpAckMs;
+        internal int PreviewUdpStallStrikes;
+        internal int PreviewPreferAlternateUdp;
+        internal long LastPreviewUdpRetryMs;
         internal int LowBatteryAlertSent;
         internal int WatchingCameraTargetId = -1;
         internal int WatchingMicTargetId = -1;
@@ -581,6 +586,8 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
     internal event Action? ShellBridgeRefreshRequested;
     internal event Func<string?, int, string, int, Task<(bool Ok, string Message)>>? WirelessAdbPairRequested;
 
+    internal const int PreviewUdpChunkBytes = 960;
+
     private static FastUdpHub.Peer? ActiveMediaUdpPeer(Session session)
     {
         var wifi = session.UdpPeer is { Confirmed: true } u ? u : null;
@@ -603,6 +610,24 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             return mob;
 
         return wifi;
+    }
+
+    private static FastUdpHub.Peer? ActivePreviewUdpPeer(Session session)
+    {
+        var wifi = session.UdpPeer is { Confirmed: true } u ? u : null;
+        var mob = session.MobileUdpPeer is { Confirmed: true } m ? m : null;
+        if (wifi == null) return mob;
+        if (mob == null) return wifi;
+
+        double wifiLoss = wifi.LinkTracker.CombinedLossPermille;
+        double wifiRtt = wifi.LinkTracker.SmoothedRttMs;
+        double mobRtt = mob.LinkTracker.SmoothedRttMs;
+        var preferred = (wifiLoss < 45.0 && (wifiRtt <= 0 || mobRtt <= 0 || wifiRtt <= mobRtt + 10.0))
+            ? wifi
+            : mob;
+        if (Volatile.Read(ref session.PreviewPreferAlternateUdp) != 0)
+            return ReferenceEquals(preferred, wifi) ? mob : wifi;
+        return preferred;
     }
 
     internal bool IsFastMediaUdpActive(int peerId) =>
@@ -673,6 +698,51 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             int len = Math.Min(maxChunk, payload.Length - offset);
             client.SendMedia(kind, frameId, i, total, metaOrRouteId, payload.Slice(offset, len));
             if ((i & 7) == 7) Thread.Yield();
+        }
+    }
+
+    internal static async Task SendUdpPreviewChunksAsync(
+        FastUdpHub hub,
+        FastUdpHub.Peer udpPeer,
+        int frameId,
+        byte[] payload,
+        int packedDims,
+        CancellationToken token)
+    {
+        int maxChunk = PreviewUdpChunkBytes;
+        int total = (payload.Length + maxChunk - 1) / maxChunk;
+        if (total is < 1 or > 256) return;
+        for (int i = 0; i < total; i++)
+        {
+            if (token.IsCancellationRequested) return;
+            int offset = i * maxChunk;
+            int len = Math.Min(maxChunk, payload.Length - offset);
+            hub.SendMedia(udpPeer, FastUdpMediaKind.PcScreenPreviewChunk,
+                frameId, i, total, packedDims, payload.AsSpan(offset, len));
+            if (i + 1 < total && ((i + 1) & 7) == 0)
+                await Task.Delay(1, token);
+        }
+    }
+
+    internal static async Task SendUdpClientPreviewChunksAsync(
+        FastUdpClient client,
+        int frameId,
+        byte[] payload,
+        int packedDims,
+        CancellationToken token)
+    {
+        int maxChunk = PreviewUdpChunkBytes;
+        int total = (payload.Length + maxChunk - 1) / maxChunk;
+        if (total is < 1 or > 256) return;
+        for (int i = 0; i < total; i++)
+        {
+            if (token.IsCancellationRequested) return;
+            int offset = i * maxChunk;
+            int len = Math.Min(maxChunk, payload.Length - offset);
+            client.SendMedia(FastUdpMediaKind.PcScreenPreviewChunk,
+                frameId, i, total, packedDims, payload.AsSpan(offset, len));
+            if (i + 1 < total && ((i + 1) & 7) == 0)
+                await Task.Delay(1, token);
         }
     }
 
@@ -2233,8 +2303,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                 {
                     if (s.Peer.Platform == "Android" &&
                         Volatile.Read(ref s.ScreenPreviewTarget) == 0 &&
-                        Volatile.Read(ref s.ScreenPreviewMonitor) >= 0 &&
-                        Volatile.Read(ref s.UrgentControlWaiters) == 0)
+                        Volatile.Read(ref s.ScreenPreviewMonitor) >= 0)
                     {
                         (watchers ??= new List<Session>()).Add(s);
                     }
@@ -2263,14 +2332,48 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     if (shot.JpegBytes == null || shot.JpegBytes.Length == 0) continue;
 
-                    if (hub != null && ActiveMediaUdpPeer(android) is { } udpPeer)
+                    var udpPeer = hub != null ? ActivePreviewUdpPeer(android) : null;
+                    long nowMs = Environment.TickCount64;
+                    long lastSent = Volatile.Read(ref android.LastPreviewUdpSentMs);
+                    long lastAck = Volatile.Read(ref android.LastPreviewUdpAckMs);
+                    bool udpHealthy = lastAck > 0 && (nowMs - lastAck) < 2500;
+                    bool udpTimedOut = lastSent > 0 && (lastAck == 0 || lastAck < lastSent) && (nowMs - lastSent) > 900;
+                    if (udpPeer != null && udpTimedOut)
                     {
-                        SendUdpMediaChunks(hub, udpPeer, FastUdpMediaKind.PcScreenPreviewChunk,
-                            shot.FrameId, shot.JpegBytes, shot.PackedDims);
+                        int strikes = Interlocked.Increment(ref android.PreviewUdpStallStrikes);
+                        if (strikes == 1 &&
+                            android.UdpPeer is { Confirmed: true } &&
+                            android.MobileUdpPeer is { Confirmed: true })
+                        {
+                            Volatile.Write(ref android.PreviewPreferAlternateUdp,
+                                Volatile.Read(ref android.PreviewPreferAlternateUdp) == 0 ? 1 : 0);
+                            Volatile.Write(ref android.LastPreviewUdpSentMs, 0);
+                            lastSent = 0;
+                            udpPeer = ActivePreviewUdpPeer(android);
+                        }
+                    }
+
+                    bool udpStalled = Volatile.Read(ref android.PreviewUdpStallStrikes) >= 2 && !udpHealthy;
+                    bool retryUdpProbe = udpStalled && udpPeer != null &&
+                        (nowMs - Volatile.Read(ref android.LastPreviewUdpRetryMs)) >= 4000;
+
+                    if (udpPeer != null && (!udpStalled || retryUdpProbe))
+                    {
+                        await SendUdpPreviewChunksAsync(hub!, udpPeer, shot.FrameId, shot.JpegBytes, shot.PackedDims, token);
+                        if (lastSent == 0 || lastAck >= lastSent)
+                            Volatile.Write(ref android.LastPreviewUdpSentMs, nowMs);
+                        if (retryUdpProbe)
+                            Volatile.Write(ref android.LastPreviewUdpRetryMs, nowMs);
                         anyUdp = true;
                     }
-                    else
+
+                    if (udpPeer == null || udpStalled)
                     {
+                        if (Volatile.Read(ref android.UrgentControlWaiters) > 0)
+                        {
+                            anyTcp = true;
+                            continue;
+                        }
                         const int chunkSize = 3600;
                         int total = (shot.JpegBytes.Length + chunkSize - 1) / chunkSize;
                         for (int i = 0; i < total; i++)
@@ -2291,7 +2394,7 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                 }
 
-                await Task.Delay(anyTcp && !anyUdp ? 220 : 65, token);
+                await Task.Delay(anyTcp && !anyUdp ? 110 : 50, token);
             }
         }
         catch (OperationCanceledException) { }
@@ -4917,6 +5020,14 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     {
                         try { await SendToAsync(oldWin, new Packet("screen-preview-watch", 0, -1, 0), token); } catch { }
                     }
+                    if (mon >= 0)
+                    {
+                        Volatile.Write(ref session.LastPreviewUdpSentMs, 0);
+                        Volatile.Write(ref session.LastPreviewUdpAckMs, 0);
+                        Volatile.Write(ref session.PreviewUdpStallStrikes, 0);
+                        Volatile.Write(ref session.PreviewPreferAlternateUdp, 0);
+                        Volatile.Write(ref session.LastPreviewUdpRetryMs, 0);
+                    }
                     Volatile.Write(ref session.ScreenPreviewTarget, targetRoute);
                     Volatile.Write(ref session.ScreenPreviewMonitor, mon);
                     Volatile.Write(ref session.ScreenPreviewHighRes, highRes);
@@ -4930,14 +5041,22 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
                     }
                     continue;
                 }
+                if (p.Type == "screen-preview-ack" && session.Peer.Platform == "Android")
+                {
+                    if (p.B != 0)
+                    {
+                        Volatile.Write(ref session.LastPreviewUdpAckMs, Environment.TickCount64);
+                        Volatile.Write(ref session.PreviewUdpStallStrikes, 0);
+                    }
+                    continue;
+                }
                 if (p.Type == "screen-preview-chunk" && session.Peer.Platform == "Windows")
                 {
                     foreach (var android in _sessions.Values)
                     {
                         if (android.Peer.Platform == "Android" &&
                             Volatile.Read(ref android.ScreenPreviewTarget) == session.Id &&
-                            Volatile.Read(ref android.ScreenPreviewMonitor) >= 0 &&
-                            Volatile.Read(ref android.UrgentControlWaiters) == 0)
+                            Volatile.Read(ref android.ScreenPreviewMonitor) >= 0)
                         {
                             try { await SendToAsync(android, p, token); } catch { }
                         }
@@ -5533,21 +5652,53 @@ internal sealed class ReceiverServer : IInputSession, IDisposable
             {
                 if (session.Peer.Platform != "Windows") return;
                 List<Session>? tcpAndroids = null;
+                long nowMs = Environment.TickCount64;
+                bool isFirstChunk = media.IndexOrSampleRate == 0;
                 foreach (var android in _sessions.Values)
                 {
                     if (android.Peer.Platform != "Android" ||
                         Volatile.Read(ref android.ScreenPreviewTarget) != session.Id ||
-                        Volatile.Read(ref android.ScreenPreviewMonitor) < 0 ||
-                        Volatile.Read(ref android.UrgentControlWaiters) != 0)
+                        Volatile.Read(ref android.ScreenPreviewMonitor) < 0)
                         continue;
 
-                    if (hub != null && ActiveMediaUdpPeer(android) is { } aUdp)
+                    var aUdp = hub != null ? ActivePreviewUdpPeer(android) : null;
+                    long lastSent = Volatile.Read(ref android.LastPreviewUdpSentMs);
+                    long lastAck = Volatile.Read(ref android.LastPreviewUdpAckMs);
+                    bool udpHealthy = lastAck > 0 && (nowMs - lastAck) < 2500;
+                    if (isFirstChunk && aUdp != null &&
+                        lastSent > 0 && (lastAck == 0 || lastAck < lastSent) && (nowMs - lastSent) > 900)
                     {
-                        hub.SendMedia(aUdp, FastUdpMediaKind.PcScreenPreviewChunk,
+                        int strikes = Interlocked.Increment(ref android.PreviewUdpStallStrikes);
+                        if (strikes == 1 &&
+                            android.UdpPeer is { Confirmed: true } &&
+                            android.MobileUdpPeer is { Confirmed: true })
+                        {
+                            Volatile.Write(ref android.PreviewPreferAlternateUdp,
+                                Volatile.Read(ref android.PreviewPreferAlternateUdp) == 0 ? 1 : 0);
+                            Volatile.Write(ref android.LastPreviewUdpSentMs, 0);
+                            lastSent = 0;
+                            aUdp = ActivePreviewUdpPeer(android);
+                        }
+                    }
+
+                    bool udpStalled = Volatile.Read(ref android.PreviewUdpStallStrikes) >= 2 && !udpHealthy;
+                    bool retryUdpProbe = isFirstChunk && udpStalled && aUdp != null &&
+                        (nowMs - Volatile.Read(ref android.LastPreviewUdpRetryMs)) >= 4000;
+
+                    if (aUdp != null && (!udpStalled || retryUdpProbe))
+                    {
+                        hub!.SendMedia(aUdp, FastUdpMediaKind.PcScreenPreviewChunk,
                             media.FrameOrAudioId, media.IndexOrSampleRate, media.TotalOrChannels,
                             media.MetaOrRouteId, media.Payload);
+                        if (isFirstChunk)
+                        {
+                            if (lastSent == 0 || lastAck >= lastSent)
+                                Volatile.Write(ref android.LastPreviewUdpSentMs, nowMs);
+                            if (retryUdpProbe)
+                                Volatile.Write(ref android.LastPreviewUdpRetryMs, nowMs);
+                        }
                     }
-                    else
+                    else if (Volatile.Read(ref android.UrgentControlWaiters) == 0)
                     {
                         (tcpAndroids ??= new List<Session>()).Add(android);
                     }
@@ -7470,8 +7621,8 @@ internal sealed class HostSession : IInputSession, IDisposable
                     var client = Volatile.Read(ref _udpClient);
                     if (client is { Confirmed: true })
                     {
-                        ReceiverServer.SendUdpClientMediaChunks(client, FastUdpMediaKind.PcScreenPreviewChunk,
-                            shot.FrameId, shot.JpegBytes, shot.PackedDims);
+                        await ReceiverServer.SendUdpClientPreviewChunksAsync(client,
+                            shot.FrameId, shot.JpegBytes, shot.PackedDims, _cancel.Token);
                         usedUdp = true;
                     }
                     else
@@ -7489,7 +7640,7 @@ internal sealed class HostSession : IInputSession, IDisposable
                         }
                     }
                 }
-                await Task.Delay(usedUdp ? 65 : 220, _cancel.Token);
+                await Task.Delay(usedUdp ? 50 : 120, _cancel.Token);
             }
         }
         catch (OperationCanceledException) { }

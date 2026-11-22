@@ -16,6 +16,7 @@ final class DeskTouchRuntime {
     private static final Map<String,String> lastKnownPeerHosts=new ConcurrentHashMap<>();
     private static volatile Consumer<String> listener;
     private static volatile Runnable liveStatusListener;
+    private static volatile Runnable screenPreviewListener;
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
     private static volatile Context appContext;
@@ -35,6 +36,13 @@ final class DeskTouchRuntime {
     }
     static void notifyLiveStatusChanged(){
         Runnable current=liveStatusListener;
+        if(current!=null)current.run();
+    }
+    static void setScreenPreviewListener(Runnable observer){
+        screenPreviewListener=observer;
+    }
+    static void notifyScreenPreviewUpdated(){
+        Runnable current=screenPreviewListener;
         if(current!=null)current.run();
     }
 

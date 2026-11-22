@@ -187,6 +187,7 @@ public final class MainActivity extends Activity {
                 updateVisibleScreenAwake();
             }
         }));
+        DeskTouchRuntime.setScreenPreviewListener(()->runOnUiThread(this::renderLatestScreenPreviewOnly));
         DeskTouchSession.setWirelessPairResultListener((ok,msg)->runOnUiThread(()->{
             if(isFinishing()||isDestroyed())return;
             java.util.function.BiConsumer<Boolean,String> handler=activePairResultHandler;
@@ -248,6 +249,7 @@ public final class MainActivity extends Activity {
             boolean hasMic = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED;
             if(hasMic){
+                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
                 setFeedback("Streaming phone microphone over fast UDP.",true);
@@ -273,10 +275,12 @@ public final class MainActivity extends Activity {
             boolean hasCam=checkSelfPermission(android.Manifest.permission.CAMERA)==android.content.pm.PackageManager.PERMISSION_GRANTED;
             boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED;
             if(hasCam){
+                if(pendingCamMic && hasMic) AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startCameraShare(this,pendingCamLens,pendingCamTorch,pendingCamMic && hasMic);
                 if(pendingCamMic && !hasMic) setFeedback("Camera started; grant Microphone permission to stream audio.",true);
                 refreshLiveShareButtons();
             }else if(pendingCamMic && hasMic){
+                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
                 setFeedback("Camera permission denied; streaming microphone only.",true);
@@ -287,6 +291,7 @@ public final class MainActivity extends Activity {
             boolean goBack = autoBackAfterMicPermission;
             autoBackAfterMicPermission = false;
             if(checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED){
+                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.cancelMicPromptNotification(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
@@ -2303,10 +2308,7 @@ public final class MainActivity extends Activity {
             refreshTrackpadPcTaskbar();
             refreshLiveLinkAndKeyboard();
             if(previewExpanded){
-                DeskTouchSession s=DeskTouchRuntime.session(this);
-                int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
-                boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
-                s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),fullOpen);
+                syncActiveScreenPreviewWatch();
             }
         }else if(fullscreenPreviewDialog==null || !fullscreenPreviewDialog.isShowing()){
             DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1,false);
@@ -2409,9 +2411,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.93";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.94";
         }catch(Exception ignored){
-            return "0.3.93";
+            return "0.3.94";
         }
     }
 
@@ -2455,6 +2457,10 @@ public final class MainActivity extends Activity {
         startLiveUiTicker();
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
+        AutoConnectService.armTrustedBackgroundMicFromForeground(this);
+        if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD){
+            syncActiveScreenPreviewWatch();
+        }
         if(DeskTouchRuntime.connectedCount()>0 && ShellInputClient.allowed(this) && !ShellInputClient.ready(this)){
             lastBridgeAutoProbeMs=android.os.SystemClock.uptimeMillis();
             ShellInputClient.warmConnectIfConfigured(this);
@@ -3349,6 +3355,9 @@ public final class MainActivity extends Activity {
                 sel,
                 v->{
                     active.switchTargetAndClaim(pc.id,0);
+                    if(previewExpanded || (fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing())){
+                        syncActiveScreenPreviewWatch();
+                    }
                     refreshEnvironmentMembers();
                     refreshLiveLinkAndKeyboard();
                 });
@@ -4187,6 +4196,7 @@ public final class MainActivity extends Activity {
         }
         DeskTouchSession.setWirelessPairResultListener(null);
         activePairResultHandler=null;
+        DeskTouchRuntime.setScreenPreviewListener(null);
         DeskTouchRuntime.setLiveStatusListener(null);
         DeskTouchRuntime.setListener(null);
         // The foreground reconnect service owns the authenticated TLS sessions.
@@ -4356,6 +4366,43 @@ public final class MainActivity extends Activity {
         return (float)Math.hypot(dx,dy);
     }
 
+    private void syncActiveScreenPreviewWatch(){
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        if(!s.isConnected())return;
+        int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
+        int mon=Math.max(0,s.activeMonitorIndex());
+        boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
+        s.setScreenPreviewWatch(tid,mon,fullOpen);
+    }
+
+    private void renderLatestScreenPreviewOnly(){
+        if(isFinishing() || isDestroyed())return;
+        DeskTouchSession s=DeskTouchRuntime.session(this);
+        android.graphics.Bitmap bmp=s.currentScreenPreview();
+        if(bmp==null || bmp.isRecycled())return;
+        int displayNum=Math.max(0,s.activeMonitorIndex())+1;
+        String tag=s.screenPreviewTransportSummary();
+        String tagSuffix=tag!=null && !tag.isEmpty() ? (" • "+tag) : "";
+        if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && previewImageView!=null){
+            if(bmp!=lastRenderedPreviewBmp){
+                previewImageView.setImageBitmap(bmp);
+                lastRenderedPreviewBmp=bmp;
+            }
+            if(previewEmptyHint!=null){
+                previewEmptyHint.setText("Live Display "+displayNum+tagSuffix+" • Double-tap or use ⛶ Full Screen");
+            }
+        }
+        if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing() && fullscreenPreviewImage!=null){
+            if(bmp!=lastRenderedFullscreenBmp){
+                fullscreenPreviewImage.setImageBitmap(bmp);
+                lastRenderedFullscreenBmp=bmp;
+            }
+            if(fullscreenStatusHint!=null){
+                fullscreenStatusHint.setText("Live Display "+displayNum+tagSuffix+" • Tap = Click • Drag = Move • Long-press / 2-finger tap = Right");
+            }
+        }
+    }
+
     private void toggleTrackpadScreenPreview(){
         previewExpanded=!previewExpanded;
         DeskTouchSession s=DeskTouchRuntime.session(this);
@@ -4368,10 +4415,8 @@ public final class MainActivity extends Activity {
                 previewExpanded ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE,this);
         }
         if(previewExpanded){
-            int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
-            boolean fullOpen=fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing();
-            s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),fullOpen);
-            if(previewEmptyHint!=null)previewEmptyHint.setText("Requesting live monitor snapshot...");
+            syncActiveScreenPreviewWatch();
+            if(previewEmptyHint!=null)previewEmptyHint.setText("Requesting live monitor snapshot over Fast UDP...");
             refreshEcosystemLiveUi();
         }else{
             if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing()){
@@ -4625,7 +4670,7 @@ public final class MainActivity extends Activity {
         }
 
         int tid=s.selectedEnvironmentTarget()>0 ? s.selectedEnvironmentTarget() : 0;
-        s.setScreenPreviewWatch(tid,s.activeMonitorIndex(),true);
+        s.setScreenPreviewWatch(tid,Math.max(0,s.activeMonitorIndex()),true);
         dlg.setOnDismissListener(d->{
             fullscreenPreviewImage=null;
             fullscreenStatusHint=null;
@@ -4637,7 +4682,7 @@ public final class MainActivity extends Activity {
             DeskTouchSession cs=DeskTouchRuntime.session(MainActivity.this);
             if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && !isFinishing() && !isDestroyed()){
                 int curTid=cs.selectedEnvironmentTarget()>0 ? cs.selectedEnvironmentTarget() : 0;
-                cs.setScreenPreviewWatch(curTid,cs.activeMonitorIndex(),false);
+                cs.setScreenPreviewWatch(curTid,Math.max(0,cs.activeMonitorIndex()),false);
             }else{
                 cs.setScreenPreviewWatch(-1,-1,false);
             }
@@ -4767,24 +4812,12 @@ public final class MainActivity extends Activity {
             fgAppBanner.setText(base);
         }
         refreshShortcutStrip();
-        android.graphics.Bitmap bmp=s.currentScreenPreview();
-        if(bmp!=null && !bmp.isRecycled()){
-            if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && previewImageView!=null){
-                if(bmp!=lastRenderedPreviewBmp){
-                    previewImageView.setImageBitmap(bmp);
-                    lastRenderedPreviewBmp=bmp;
-                }
-                if(previewEmptyHint!=null){
-                    previewEmptyHint.setText("Live Display "+(s.activeMonitorIndex()+1)+" • Double-tap or use ⛶ Full Screen");
-                }
-            }
-            if(fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing() && fullscreenPreviewImage!=null){
-                if(bmp!=lastRenderedFullscreenBmp){
-                    fullscreenPreviewImage.setImageBitmap(bmp);
-                    lastRenderedFullscreenBmp=bmp;
-                }
-            }
+        if(((previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD) ||
+            (fullscreenPreviewDialog!=null && fullscreenPreviewDialog.isShowing())) &&
+            s.isConnected() && !s.isScreenPreviewWatching()){
+            syncActiveScreenPreviewWatch();
         }
+        renderLatestScreenPreviewOnly();
     }
 
     private void showProfilePickerDialog(){
@@ -5102,6 +5135,7 @@ public final class MainActivity extends Activity {
         boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
             == android.content.pm.PackageManager.PERMISSION_GRANTED;
         if(hasMic){
+            AutoConnectService.armTrustedBackgroundMicFromForeground(this);
             PhoneMediaService.startMicShare(this);
             refreshLiveShareButtons();
             setFeedback("Streaming phone microphone over fast UDP.",true);

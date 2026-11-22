@@ -1907,6 +1907,30 @@ public final class ProtocolSourceTest {
         assertTrue(helperSource.contains("sendWanKnock"));
         assertTrue(mainSource.contains("pairingCodeLookupRunning"));
         assertTrue(sessionSource.contains("MqttTlsRelayTunnel.openClientBridge"));
+
+        // Verify v0.3.94: Fast UDP trackpad screen preview decoder/UI sync, ChunkAssembler monotonicity,
+        // and trusted-device background mic arming on AutoConnectService.
+        EcosystemFeatures.ChunkAssembler previewAssembler = new EcosystemFeatures.ChunkAssembler();
+        byte[] dummy1 = new byte[] { 1, 2, 3 };
+        byte[] dummy2 = new byte[] { 4, 5, 6 };
+        assertNotNull(previewAssembler.addRawChunk(10, 0, 1, 320, 180, dummy2));
+        assertNull(previewAssembler.addRawChunk(9, 0, 1, 320, 180, dummy1));
+        assertNull(previewAssembler.addRawChunk(10, 0, 1, 320, 180, dummy2));
+        previewAssembler.reset();
+        assertNotNull(previewAssembler.addRawChunk(9, 0, 1, 320, 180, dummy1));
+
+        String autoServiceSource = readProjectSource("src/main/java/com/desktouch/vision/AutoConnectService.java");
+        String runtimeSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchRuntime.java");
+        assertTrue(manifestSource.contains("connectedDevice|microphone"));
+        assertTrue(autoServiceSource.contains("armTrustedBackgroundMicFromForeground"));
+        assertTrue(autoServiceSource.contains("isMicCapabilityArmed"));
+        assertTrue(sessionSource.contains("isCurrentPeerTrusted"));
+        assertTrue(sessionSource.contains("screenPreviewDecoder"));
+        assertTrue(sessionSource.contains("enqueueScreenPreviewDecode"));
+        assertTrue(sessionSource.contains("\"screen-preview-ack\""));
+        assertTrue(runtimeSource.contains("notifyScreenPreviewUpdated"));
+        assertTrue(mainSource.contains("renderLatestScreenPreviewOnly"));
+        assertTrue(mainSource.contains("syncActiveScreenPreviewWatch"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

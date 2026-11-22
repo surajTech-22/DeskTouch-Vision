@@ -3510,6 +3510,16 @@ Console.WriteLine("PASS: Single-instance desktop visibility check and stuck/othe
               relayText.Contains("RunServerBridgeAsync", StringComparison.Ordinal) &&
               formText.Contains("StartRendezvousAgentOnce", StringComparison.Ordinal),
               "v0.3.93 cross-network pairing must include live SSE Knock agent, self-exclusion, endpoint ordering, and TLS-over-MQTT relay fallback");
+
+        // Verify v0.3.94: MTU-safe paced Fast UDP trackpad screen preview & ack-driven failover without UrgentControlWaiters gating.
+        string ecoHelperText = File.ReadAllText(Path.Combine(Path.GetDirectoryName(issPath!)!, "DeviceSharing", "EcosystemHelpers.cs"));
+        Check(sessionsText.Contains("PreviewUdpChunkBytes", StringComparison.Ordinal) &&
+              sessionsText.Contains("ActivePreviewUdpPeer", StringComparison.Ordinal) &&
+              sessionsText.Contains("SendUdpPreviewChunksAsync", StringComparison.Ordinal) &&
+              sessionsText.Contains("SendUdpClientPreviewChunksAsync", StringComparison.Ordinal) &&
+              sessionsText.Contains("\"screen-preview-ack\"", StringComparison.Ordinal) &&
+              ecoHelperText.Contains("softUdpTargetBytes", StringComparison.Ordinal),
+              "v0.3.94 must stream trackpad screen preview over paced 960B DTM1 UDP chunks with screen-preview-ack health tracking and adaptive JPEG encoding");
     }
 
     Console.WriteLine("PASS: Cable click urgency, low-RTT drop pacing, cellular/IPv6 dual-stack, and all DeviceSharing policy invariants verified.");

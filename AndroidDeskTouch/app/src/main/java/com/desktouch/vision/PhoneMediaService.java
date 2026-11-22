@@ -170,19 +170,11 @@ public final class PhoneMediaService extends Service {
             emitMicStatus(2, "Tap DeskTouch notification on phone to grant microphone permission");
             return;
         }
-        if (AutoConnectService.isMicCapabilityArmed() && !screenRunning && !cameraRunning) {
-            cancelMicPromptNotification(ctx);
-            micRunning = true;
-            startStaticMicLoop(ctx.getApplicationContext());
-            AutoConnectService.refreshNotification();
-            return;
-        }
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_START_MIC);
         if (!startForegroundCompat(ctx, i)) {
             startDirectMicFallback(ctx);
         }
-        AutoConnectService.refreshNotification();
     }
 
     static void stopMicShare(Context ctx) {
@@ -190,15 +182,11 @@ public final class PhoneMediaService extends Service {
         desiredMic = false;
         stopStaticMicLoop();
         cancelMicPromptNotification(ctx);
-        if (!micRunning && !cameraRunning && !screenRunning) {
-            AutoConnectService.refreshNotification();
-            return;
-        }
+        if (!micRunning && !cameraRunning && !screenRunning) return;
         micRunning = false;
         Intent i = new Intent(ctx, PhoneMediaService.class);
         i.setAction(ACTION_STOP_MIC);
         try { ctx.startService(i); } catch (Throwable ignored) {}
-        AutoConnectService.refreshNotification();
     }
 
     static void stopAll(Context ctx) {
@@ -213,7 +201,6 @@ public final class PhoneMediaService extends Service {
             try { ctx.stopService(new Intent(ctx, PhoneMediaService.class)); }
             catch (Throwable ignored) {}
         }
-        AutoConnectService.refreshNotification();
     }
 
     private static boolean startForegroundCompat(Context ctx, Intent i) {
@@ -822,7 +809,6 @@ public final class PhoneMediaService extends Service {
                         try { rec.stop(); } catch (Throwable ignored) {}
                         try { rec.release(); } catch (Throwable ignored) {}
                     }
-                    AutoConnectService.refreshNotification();
                 }
             }, "DeskTouch-MicStream");
             staticMicThread.setDaemon(true);

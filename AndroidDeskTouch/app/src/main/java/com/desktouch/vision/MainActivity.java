@@ -249,7 +249,6 @@ public final class MainActivity extends Activity {
             boolean hasMic = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED;
             if(hasMic){
-                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
                 setFeedback("Streaming phone microphone over fast UDP.",true);
@@ -275,12 +274,10 @@ public final class MainActivity extends Activity {
             boolean hasCam=checkSelfPermission(android.Manifest.permission.CAMERA)==android.content.pm.PackageManager.PERMISSION_GRANTED;
             boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED;
             if(hasCam){
-                if(pendingCamMic && hasMic) AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startCameraShare(this,pendingCamLens,pendingCamTorch,pendingCamMic && hasMic);
                 if(pendingCamMic && !hasMic) setFeedback("Camera started; grant Microphone permission to stream audio.",true);
                 refreshLiveShareButtons();
             }else if(pendingCamMic && hasMic){
-                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
                 setFeedback("Camera permission denied; streaming microphone only.",true);
@@ -291,7 +288,6 @@ public final class MainActivity extends Activity {
             boolean goBack = autoBackAfterMicPermission;
             autoBackAfterMicPermission = false;
             if(checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)==android.content.pm.PackageManager.PERMISSION_GRANTED){
-                AutoConnectService.armTrustedBackgroundMicFromForeground(this);
                 PhoneMediaService.cancelMicPromptNotification(this);
                 PhoneMediaService.startMicShare(this);
                 refreshLiveShareButtons();
@@ -2411,9 +2407,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.94";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.95";
         }catch(Exception ignored){
-            return "0.3.94";
+            return "0.3.95";
         }
     }
 
@@ -2457,7 +2453,6 @@ public final class MainActivity extends Activity {
         startLiveUiTicker();
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
         AutoConnectService.nudgeReconnect(this);
-        AutoConnectService.armTrustedBackgroundMicFromForeground(this);
         if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD){
             syncActiveScreenPreviewWatch();
         }
@@ -5135,7 +5130,6 @@ public final class MainActivity extends Activity {
         boolean hasMic=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
             == android.content.pm.PackageManager.PERMISSION_GRANTED;
         if(hasMic){
-            AutoConnectService.armTrustedBackgroundMicFromForeground(this);
             PhoneMediaService.startMicShare(this);
             refreshLiveShareButtons();
             setFeedback("Streaming phone microphone over fast UDP.",true);

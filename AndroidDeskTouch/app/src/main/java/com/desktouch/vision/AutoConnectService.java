@@ -28,8 +28,6 @@ public final class AutoConnectService extends Service {
     static final String RECONNECT="reconnect";
     static final String ACTION_PAUSE_BANKING="com.desktouch.vision.ACTION_PAUSE_BANKING";
     static final String ACTION_RESUME_CONTROL="com.desktouch.vision.ACTION_RESUME_CONTROL";
-    static final String ACTION_ARM_TRUSTED_MIC="com.desktouch.vision.ACTION_ARM_TRUSTED_MIC";
-    static final String ACTION_STOP_BG_MIC="com.desktouch.vision.ACTION_STOP_BG_MIC";
     private static final String CHANNEL="desktouch_connected_devices";
     private static final String PAYMENT_NOTICE_CHANNEL="desktouch_payment_mode";
     private static final int NOTIFICATION_ID=37377;
@@ -37,7 +35,6 @@ public final class AutoConnectService extends Service {
     private static final long DISCONNECT_AUTO_PAUSE_DELAY_MS=15_000L;
     private static final long HUB_RECHECK_INTERVAL_MS=8_000L;
     private static volatile AutoConnectService activeInstance;
-    private static volatile boolean micCapabilityArmed;
     private ScheduledExecutorService scheduler;
     private MobileDiscoveryResponder responder;
     private TrustedWindows trust;
@@ -100,35 +97,6 @@ public final class AutoConnectService extends Service {
         Intent intent=new Intent(context,AutoConnectService.class);
         if(Build.VERSION.SDK_INT>=26) context.startForegroundService(intent);
         else context.startService(intent);
-    }
-
-    static boolean isMicCapabilityArmed() {
-        return activeInstance != null && micCapabilityArmed;
-    }
-
-    static void armTrustedBackgroundMicFromForeground(Context context) {
-        if (context == null) return;
-        Context app = context.getApplicationContext();
-        if (app.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            return;
-        }
-        try {
-            if (new TrustedWindows(app).fingerprints().isEmpty()) return;
-        } catch (Throwable ignored) {
-            return;
-        }
-        AutoConnectService service = activeInstance;
-        if (service != null) {
-            service.promoteForegroundTypes(true);
-            return;
-        }
-        if (!enabled(app)) return;
-        try {
-            Intent intent = new Intent(app, AutoConnectService.class).setAction(ACTION_ARM_TRUSTED_MIC);
-            if (Build.VERSION.SDK_INT >= 26) app.startForegroundService(intent);
-            else app.startService(intent);
-        } catch (Throwable ignored) {}
     }
 
     static void refreshNotification() {
@@ -311,8 +279,7 @@ public final class AutoConnectService extends Service {
                 ? "Payment-safe mode (Accessibility OFF) • Connections stay ready"
                 : "Accessibility OFF (payment apps work) • Connections stay ready";
         String connSummary=DeskTouchRuntime.connectedNotificationSummary(this);
-        String micTag=PhoneMediaService.isMicSharingActive() ? " • Mic live" : "";
-        String fullText=(connSummary.isEmpty() ? subtitle : (connSummary+" • "+subtitle))+micTag;
+        String fullText=connSummary.isEmpty() ? subtitle : (connSummary+" • "+subtitle);
         Notification.Builder builder=new Notification.Builder(this,CHANNEL)
             .setSmallIcon(com.desktouch.vision.R.drawable.ic_desktouch)
             .setContentTitle(connSummary.isEmpty() ? "DeskTouch Vision" : "DeskTouch • "+connSummary)
@@ -335,48 +302,7 @@ public final class AutoConnectService extends Service {
             builder.addAction(new Notification.Action.Builder(
                 null,"Resume Control",resumePending).build());
         }
-        if(PhoneMediaService.isMicSharingActive()) {
-            Intent stopMic=new Intent(this,AutoConnectService.class)
-                .setAction(ACTION_STOP_BG_MIC);
-            PendingIntent stopMicPending=PendingIntent.getService(this,5,stopMic,
-                PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
-            builder.addAction(new Notification.Action.Builder(
-                null,"Stop Mic",stopMicPending).build());
-        }
         return builder.build();
-    }
-
-    private synchronized void promoteForegroundTypes(boolean tryMicType) {
-        Notification notification=buildNotification();
-        boolean hasMicPerm=checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-            == android.content.pm.PackageManager.PERMISSION_GRANTED;
-        boolean hasTrusted=trust!=null && !trust.fingerprints().isEmpty();
-        if(Build.VERSION.SDK_INT>=30) {
-            if(tryMicType && hasMicPerm && hasTrusted) {
-                try {
-                    startForeground(NOTIFICATION_ID,notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                        | ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
-                    micCapabilityArmed=true;
-                    return;
-                } catch(SecurityException ignored) {
-                    micCapabilityArmed=false;
-                } catch(RuntimeException ignored) {
-                    micCapabilityArmed=false;
-                }
-            } else {
-                micCapabilityArmed=false;
-            }
-            startForeground(NOTIFICATION_ID,notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-        } else if(Build.VERSION.SDK_INT>=29) {
-            startForeground(NOTIFICATION_ID,notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-            micCapabilityArmed=hasMicPerm;
-        } else {
-            startForeground(NOTIFICATION_ID,notification);
-            micCapabilityArmed=hasMicPerm;
-        }
     }
 
     @Override public void onCreate() {
@@ -400,7 +326,11 @@ public final class AutoConnectService extends Service {
             "DeskTouch payment-safe mode", NotificationManager.IMPORTANCE_LOW);
         paymentChannel.setShowBadge(false);
         manager.createNotificationChannel(paymentChannel);
-        promoteForegroundTypes(true);
+        Notification notification=buildNotification();
+        if(Build.VERSION.SDK_INT>=29)
+            startForeground(NOTIFICATION_ID,notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+        else startForeground(NOTIFICATION_ID,notification);
         responder=new MobileDiscoveryResponder();
         responder.setOnlineListener(device->{
             if(device==null || trust==null) return;
@@ -860,18 +790,12 @@ public final class AutoConnectService extends Service {
             DeskTouchAccessibilityService.setAllowed(this,true);
             DeskTouchRuntime.accessibilityPermissionChanged(this);
             DeskTouchAccessibilityService.openAccessibilitySettings(this,true);
-        } else if(ACTION_ARM_TRUSTED_MIC.equals(action)) {
-            promoteForegroundTypes(true);
-        } else if(ACTION_STOP_BG_MIC.equals(action)) {
-            PhoneMediaService.stopMicShare(this);
-            refreshNotification();
         }
         if(!enabled(this)) { stopSelf();return START_NOT_STICKY; }
         return START_STICKY;
     }
     @Override public android.os.IBinder onBind(Intent intent) {return null;}
     @Override public void onDestroy() {
-        micCapabilityArmed=false;
         if(activeInstance==this)activeInstance=null;
         cancelDisconnectAutoPauseLocked();
         if(cellularExecutor!=null)cellularExecutor.shutdownNow();

@@ -1285,7 +1285,6 @@ final class DeskTouchSession implements AutoCloseable {
                             AutoConnectService.resumePeer(application,fingerprint);
                             AutoConnectService.setEnabled(application,true);
                             AutoConnectService.setReconnect(application,true);
-                            AutoConnectService.armTrustedBackgroundMicFromForeground(application);
                             status("Trusted Windows PC saved securely, without storing its IP address");
                             DeskTouchRuntime.notifyLiveStatusChanged();
                         }catch(Exception ex){
@@ -1309,7 +1308,6 @@ final class DeskTouchSession implements AutoCloseable {
                                 AutoConnectService.resumePeer(application,fingerprint);
                                 AutoConnectService.setEnabled(application,true);
                                 AutoConnectService.setReconnect(application,true);
-                                AutoConnectService.armTrustedBackgroundMicFromForeground(application);
                                 savedOffer=true;
                                 status("Trusted Windows PC saved securely, without storing its IP address");
                                 DeskTouchRuntime.notifyLiveStatusChanged();

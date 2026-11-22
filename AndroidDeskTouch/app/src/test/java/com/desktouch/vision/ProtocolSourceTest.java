@@ -1921,9 +1921,9 @@ public final class ProtocolSourceTest {
 
         String autoServiceSource = readProjectSource("src/main/java/com/desktouch/vision/AutoConnectService.java");
         String runtimeSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchRuntime.java");
-        assertTrue(manifestSource.contains("connectedDevice|microphone"));
-        assertTrue(autoServiceSource.contains("armTrustedBackgroundMicFromForeground"));
-        assertTrue(autoServiceSource.contains("isMicCapabilityArmed"));
+        assertFalse(manifestSource.contains("connectedDevice|microphone"));
+        assertFalse(autoServiceSource.contains("FOREGROUND_SERVICE_TYPE_MICROPHONE"));
+        assertTrue(manifestSource.contains("android:foregroundServiceType=\"connectedDevice\""));
         assertTrue(sessionSource.contains("isCurrentPeerTrusted"));
         assertTrue(sessionSource.contains("screenPreviewDecoder"));
         assertTrue(sessionSource.contains("enqueueScreenPreviewDecode"));

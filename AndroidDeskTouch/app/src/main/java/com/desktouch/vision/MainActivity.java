@@ -28,6 +28,9 @@ import java.util.function.Consumer;
 public final class MainActivity extends Activity {
     private static final String PREFS="desktouch_prefs";
     private static final String PREF_POINTER_PROGRESS="pointer_sensitivity_progress";
+    static final String EXTRA_OPEN_TAB="com.desktouch.vision.EXTRA_OPEN_TAB";
+    static final String EXTRA_OPEN_FULLSCREEN="com.desktouch.vision.EXTRA_OPEN_FULLSCREEN";
+    static final String EXTRA_TRACKPAD_HORIZONTAL="com.desktouch.vision.EXTRA_TRACKPAD_HORIZONTAL";
     private static final int TAB_COUNT=5;
     private static final int REQ_SEND_FILE=38201;
     private static final int REQ_QR_CAMERA=38202;
@@ -119,8 +122,8 @@ public final class MainActivity extends Activity {
     private boolean suppressTypedText;
 
     private TextView profilePillBtn,fgAppBanner,trackpadPresetPill,previewEmptyHint,fullscreenStatusHint;
-    private Runnable fullscreenStatusHideTask;
-    private Button homeSendFileBtn,homePowerBtn,previewToggleBtn,previewFullscreenBtn;
+    private Runnable fullscreenStatusHideTask,closeNormalModPopout,refreshNormalKeyBarStyles;
+    private Button homeSendFileBtn,homePowerBtn,previewToggleBtn,previewFullscreenBtn,trackpadOrientBtn;
     private LinearLayout previewWrap,shortcutStripRow,mediaBar;
     private ImageView previewImageView,fullscreenPreviewImage;
     private Dialog fullscreenPreviewDialog;
@@ -128,6 +131,7 @@ public final class MainActivity extends Activity {
     private final List<Runnable> dynamicEcoButtonThemeUpdaters=new ArrayList<>();
     private String lastShortcutSig="";
     private boolean previewExpanded;
+    private boolean trackpadLandscape;
     private boolean fullscreenLandscape=true;
     private boolean suppressClipboardPush;
     private String lastLocalClipHash="";
@@ -138,6 +142,7 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle savedState){
         super.onCreate(savedState);
         palette=PhoneUiKit.palette(PhoneUiKit.readTheme(this));
+        trackpadLandscape=TouchpadWidgetHelper.isTrackpadHorizontal(this);
         int savedProgress=getSharedPreferences(PREFS,MODE_PRIVATE)
             .getInt(PREF_POINTER_PROGRESS,180);
         savedProgress=Math.max(0,Math.min(400,savedProgress));
@@ -208,6 +213,7 @@ public final class MainActivity extends Activity {
         refreshLiveLinkAndKeyboard();
         handleShareIntent(getIntent());
         handleAutoMediaActionIntent(getIntent());
+        handleNavigationIntent(getIntent());
         DeskTouchSession.setMediaRequestListener(new DeskTouchSession.MediaRequestListener(){
             @Override public void onScreenShareRequested(){
                 runOnUiThread(()->{
@@ -236,6 +242,58 @@ public final class MainActivity extends Activity {
         setIntent(intent);
         handleShareIntent(intent);
         handleAutoMediaActionIntent(intent);
+        handleNavigationIntent(intent);
+    }
+
+    private void handleNavigationIntent(Intent intent){
+        if(intent == null) return;
+        if(intent.hasExtra(EXTRA_TRACKPAD_HORIZONTAL)){
+            trackpadLandscape = intent.getBooleanExtra(EXTRA_TRACKPAD_HORIZONTAL, false);
+            TouchpadWidgetHelper.setTrackpadHorizontal(this, trackpadLandscape);
+            intent.removeExtra(EXTRA_TRACKPAD_HORIZONTAL);
+            updateTrackpadOrientControl();
+        }
+        String tab = intent.getStringExtra(EXTRA_OPEN_TAB);
+        boolean openFs = intent.getBooleanExtra(EXTRA_OPEN_FULLSCREEN, false);
+        intent.removeExtra(EXTRA_OPEN_TAB);
+        intent.removeExtra(EXTRA_OPEN_FULLSCREEN);
+        if("find".equals(tab)){
+            selectTab(PhoneUiKit.TAB_FIND);
+        }else if("home".equals(tab)){
+            selectTab(PhoneUiKit.TAB_HOME);
+        }else if("speed".equals(tab)){
+            selectTab(PhoneUiKit.TAB_SPEED);
+        }else if("setup".equals(tab)){
+            selectTab(PhoneUiKit.TAB_SETUP);
+        }else if("trackpad".equals(tab) || openFs){
+            selectTab(PhoneUiKit.TAB_TRACKPAD);
+            if(openFs){
+                liveUiHandler.post(() -> {
+                    if(!isFinishing() && !isDestroyed()) openFullscreenScreenPreview();
+                });
+            }
+        }
+    }
+
+    private void applyTrackpadOrientation(){
+        if(fullscreenPreviewDialog != null && fullscreenPreviewDialog.isShowing()) return;
+        try{
+            setRequestedOrientation(trackpadLandscape
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+        }catch(RuntimeException ignored){}
+    }
+
+    private void updateTrackpadOrientControl(){
+        if(trackpadOrientBtn != null && palette != null){
+            trackpadOrientBtn.setText(trackpadLandscape ? "⟳ Vertical" : "⟳ Horizontal");
+            PhoneUiKit.styleButton(trackpadOrientBtn, palette,
+                trackpadLandscape ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE, this);
+        }
+        if(pointerPad != null && pointerPad.getLayoutParams() != null){
+            pointerPad.getLayoutParams().height = dp(trackpadLandscape ? 220 : 190);
+            pointerPad.requestLayout();
+        }
     }
 
     private boolean autoBackAfterMicPermission;
@@ -994,10 +1052,6 @@ public final class MainActivity extends Activity {
         LinearLayout padCard=PhoneUiKit.createCard(this,palette,14);
         page.addView(padCard,cardParams(10));
 
-        LinearLayout padHeader=new LinearLayout(this);
-        padHeader.setOrientation(LinearLayout.HORIZONTAL);
-        padHeader.setGravity(Gravity.CENTER_VERTICAL);
-
         LinearLayout padTitleCol=new LinearLayout(this);
         padTitleCol.setOrientation(LinearLayout.VERTICAL);
         TextView padSurfaceTitle=new TextView(this);
@@ -1011,29 +1065,54 @@ public final class MainActivity extends Activity {
         trackpadReadout.setTextSize(11.5f);
         trackpadReadout.setPadding(0,dp(2),0,0);
         padTitleCol.addView(trackpadReadout);
+        padCard.addView(padTitleCol,new LinearLayout.LayoutParams(-1,-2));
 
-        LinearLayout.LayoutParams padColLp=new LinearLayout.LayoutParams(0,-2,1f);
-        padColLp.rightMargin=dp(8);
-        padHeader.addView(padTitleCol,padColLp);
+        LinearLayout padHeader=new LinearLayout(this);
+        padHeader.setOrientation(LinearLayout.HORIZONTAL);
+        padHeader.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams phLp=new LinearLayout.LayoutParams(-1,-2);
+        phLp.topMargin=dp(8);
+
+        trackpadOrientBtn=PhoneUiKit.createButton(this,
+            trackpadLandscape ? "⟳ Vertical" : "⟳ Horizontal",
+            palette,
+            trackpadLandscape ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE);
+        trackpadOrientBtn.setTextSize(10.5f);
+        trackpadOrientBtn.setSingleLine(true);
+        trackpadOrientBtn.setPadding(dp(6),dp(7),dp(6),dp(7));
+        trackpadOrientBtn.setOnClickListener(v->{
+            trackpadLandscape=!trackpadLandscape;
+            TouchpadWidgetHelper.setTrackpadHorizontal(MainActivity.this,trackpadLandscape);
+            updateTrackpadOrientControl();
+            applyTrackpadOrientation();
+        });
+        LinearLayout.LayoutParams toBtnLp=new LinearLayout.LayoutParams(0,-2,1f);
+        toBtnLp.rightMargin=dp(4);
+        padHeader.addView(trackpadOrientBtn,toBtnLp);
 
         previewToggleBtn=PhoneUiKit.createButton(this,"Preview",palette,PhoneUiKit.BTN_SUBTLE);
-        previewToggleBtn.setTextSize(11f);
-        previewToggleBtn.setPadding(dp(9),dp(7),dp(9),dp(7));
+        previewToggleBtn.setTextSize(10.5f);
+        previewToggleBtn.setSingleLine(true);
+        previewToggleBtn.setPadding(dp(6),dp(7),dp(6),dp(7));
         previewToggleBtn.setOnClickListener(v->toggleTrackpadScreenPreview());
-        LinearLayout.LayoutParams pvBtnLp=new LinearLayout.LayoutParams(-2,-2);
-        pvBtnLp.rightMargin=dp(6);
+        LinearLayout.LayoutParams pvBtnLp=new LinearLayout.LayoutParams(0,-2,1f);
+        pvBtnLp.leftMargin=dp(4);
+        pvBtnLp.rightMargin=dp(4);
         padHeader.addView(previewToggleBtn,pvBtnLp);
 
         captureMouseBtn=PhoneUiKit.createButton(this,"Capture Mouse",palette,PhoneUiKit.BTN_SUBTLE);
-        captureMouseBtn.setTextSize(11.5f);
-        captureMouseBtn.setPadding(dp(10),dp(7),dp(10),dp(7));
+        captureMouseBtn.setTextSize(10.5f);
+        captureMouseBtn.setSingleLine(true);
+        captureMouseBtn.setPadding(dp(6),dp(7),dp(6),dp(7));
         captureMouseBtn.setOnClickListener(v->{
             pointerPad.requestFocus();
             pointerPad.requestPointerCapture();
             setFeedback("Physical mouse captured; use Back to release it.",true);
         });
-        padHeader.addView(captureMouseBtn,new LinearLayout.LayoutParams(-2,-2));
-        padCard.addView(padHeader);
+        LinearLayout.LayoutParams cmBtnLp=new LinearLayout.LayoutParams(0,-2,1f);
+        cmBtnLp.leftMargin=dp(4);
+        padHeader.addView(captureMouseBtn,cmBtnLp);
+        padCard.addView(padHeader,phLp);
 
         previewWrap=new LinearLayout(this);
         previewWrap.setOrientation(LinearLayout.VERTICAL);
@@ -1140,6 +1219,252 @@ public final class MainActivity extends Activity {
         tpLp.leftMargin=dp(6);
         shortcutHeaderRow.addView(trackpadPresetPill,tpLp);
 
+        // Normal Touchpad Fn (F1-F12) & auto-closing Ctrl/Alt/Win key strip
+        final boolean[] normalFnOpen={false};
+        final String[] normalOpenMod={null};
+        final boolean[] normalShiftLatched={false};
+
+        HorizontalScrollView keyBarScroll=new HorizontalScrollView(this);
+        keyBarScroll.setHorizontalScrollBarEnabled(false);
+        LinearLayout keyBarRow=new LinearLayout(this);
+        keyBarRow.setOrientation(LinearLayout.HORIZONTAL);
+        keyBarRow.setGravity(Gravity.CENTER_VERTICAL);
+        keyBarScroll.addView(keyBarRow,new HorizontalScrollView.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams kbBarLp=new LinearLayout.LayoutParams(-1,-2);
+        kbBarLp.topMargin=dp(8);
+        padCard.addView(keyBarScroll,kbBarLp);
+
+        HorizontalScrollView fnDrawerScroll=new HorizontalScrollView(this);
+        fnDrawerScroll.setHorizontalScrollBarEnabled(false);
+        fnDrawerScroll.setVisibility(View.GONE);
+        LinearLayout normalFnRow=new LinearLayout(this);
+        normalFnRow.setOrientation(LinearLayout.HORIZONTAL);
+        normalFnRow.setGravity(Gravity.CENTER_VERTICAL);
+        fnDrawerScroll.addView(normalFnRow,new HorizontalScrollView.LayoutParams(-2,-2));
+        LinearLayout.LayoutParams fnScrLp=new LinearLayout.LayoutParams(-1,-2);
+        fnScrLp.topMargin=dp(6);
+        padCard.addView(fnDrawerScroll,fnScrLp);
+
+        LinearLayout normalModPopoutCard=new LinearLayout(this);
+        normalModPopoutCard.setOrientation(LinearLayout.VERTICAL);
+        normalModPopoutCard.setPadding(dp(8),dp(8),dp(8),dp(8));
+        normalModPopoutCard.setVisibility(View.GONE);
+        LinearLayout.LayoutParams nmpLp=new LinearLayout.LayoutParams(-1,-2);
+        nmpLp.topMargin=dp(6);
+        padCard.addView(normalModPopoutCard,nmpLp);
+
+        LinearLayout nmpHdr=new LinearLayout(this);
+        nmpHdr.setOrientation(LinearLayout.HORIZONTAL);
+        nmpHdr.setGravity(Gravity.CENTER_VERTICAL);
+        TextView normalModTitle=new TextView(this);
+        normalModTitle.setText("Ctrl Commands");
+        normalModTitle.setTextSize(11.5f);
+        normalModTitle.setTypeface(null,Typeface.BOLD);
+        nmpHdr.addView(normalModTitle,new LinearLayout.LayoutParams(0,-2,1f));
+        TextView normalModClose=new TextView(this);
+        normalModClose.setText("✕");
+        normalModClose.setTextSize(11f);
+        normalModClose.setTypeface(null,Typeface.BOLD);
+        normalModClose.setPadding(dp(8),dp(3),dp(8),dp(3));
+        normalModClose.setClickable(true);
+        normalModClose.setFocusable(true);
+        nmpHdr.addView(normalModClose);
+        normalModPopoutCard.addView(nmpHdr,new LinearLayout.LayoutParams(-1,-2));
+
+        ScrollView normalModGridScroll=new ScrollView(this);
+        normalModGridScroll.setVerticalScrollBarEnabled(false);
+        LinearLayout normalModGridRows=new LinearLayout(this);
+        normalModGridRows.setOrientation(LinearLayout.VERTICAL);
+        normalModGridScroll.addView(normalModGridRows,new ScrollView.LayoutParams(-1,-2));
+        LinearLayout.LayoutParams nmgsLp=new LinearLayout.LayoutParams(-1,dp(146));
+        nmgsLp.topMargin=dp(6);
+        normalModPopoutCard.addView(normalModGridScroll,nmgsLp);
+
+        TextView normalFnBtn=createTaskbarChip("Fn ▸",false,null);
+        TextView normalCtrlBtn=createTaskbarChip("Ctrl",false,null);
+        TextView normalAltBtn=createTaskbarChip("Alt",false,null);
+        TextView normalWinBtn=createTaskbarChip("⊞ Win",false,null);
+        TextView normalShiftBtn=createTaskbarChip("⇧",false,null);
+
+        final List<TextView> normalQuickAndFnChips=new ArrayList<>();
+        final Runnable styleNormalKeyBar=()->{
+            PhoneUiKit.Palette curP=palette;
+            normalModPopoutCard.setBackground(PhoneUiKit.roundedBox(
+                curP.subcardBg,curP.accent,dp(12),Math.max(1,dp(1))));
+            normalModTitle.setTextColor(curP.accentText);
+            PhoneUiKit.stylePill(normalModClose,curP.subtleBtnBg,curP.border,curP.textSecondary,this);
+            TextView[] togBtns={normalFnBtn,normalCtrlBtn,normalAltBtn,normalWinBtn,normalShiftBtn};
+            boolean[] togStates={
+                normalFnOpen[0],
+                "ctrl".equals(normalOpenMod[0]),
+                "alt".equals(normalOpenMod[0]),
+                "win".equals(normalOpenMod[0]),
+                normalShiftLatched[0]
+            };
+            for(int i=0;i<togBtns.length;i++){
+                boolean on=togStates[i];
+                PhoneUiKit.stylePill(togBtns[i],
+                    on ? curP.accent : curP.subtleBtnBg,
+                    on ? curP.accentText : curP.border,
+                    on ? Color.WHITE : curP.textPrimary,
+                    this);
+            }
+            for(TextView chip:normalQuickAndFnChips){
+                PhoneUiKit.stylePill(chip,curP.subtleBtnBg,curP.border,curP.textPrimary,this);
+            }
+        };
+        refreshNormalKeyBarStyles=styleNormalKeyBar;
+
+        closeNormalModPopout=()->{
+            normalOpenMod[0]=null;
+            normalModPopoutCard.setVisibility(View.GONE);
+            styleNormalKeyBar.run();
+        };
+        normalModClose.setOnClickListener(v->closeNormalModPopout.run());
+
+        final java.util.function.Supplier<int[]> normalActiveModVks=()->{
+            java.util.ArrayList<Integer> list=new java.util.ArrayList<>(2);
+            if("ctrl".equals(normalOpenMod[0]))list.add(FullscreenPreviewLayoutHelper.VK_CONTROL);
+            else if("alt".equals(normalOpenMod[0]))list.add(FullscreenPreviewLayoutHelper.VK_MENU);
+            else if("win".equals(normalOpenMod[0]))list.add(FullscreenPreviewLayoutHelper.VK_LWIN);
+            if(normalShiftLatched[0])list.add(FullscreenPreviewLayoutHelper.VK_SHIFT);
+            int[] res=new int[list.size()];
+            for(int i=0;i<list.size();i++)res[i]=list.get(i);
+            return res;
+        };
+
+        final java.util.function.Consumer<String> toggleNormalPopout=modKey->{
+            if(modKey.equals(normalOpenMod[0])){
+                closeNormalModPopout.run();
+                return;
+            }
+            normalOpenMod[0]=modKey;
+            normalModTitle.setText("ctrl".equals(modKey) ? "Ctrl Commands"
+                : ("alt".equals(modKey) ? "Alt Shortcuts" : "Windows Shortcuts"));
+            normalModGridRows.removeAllViews();
+            List<FullscreenPreviewLayoutHelper.ShortcutItem> scItems=FullscreenPreviewLayoutHelper.shortcutsFor(modKey);
+            PhoneUiKit.Palette curP=palette;
+            for(int idx=0;idx<scItems.size();idx+=2){
+                LinearLayout pair=new LinearLayout(this);
+                pair.setOrientation(LinearLayout.HORIZONTAL);
+                for(int col=0;col<2 && (idx+col)<scItems.size();col++){
+                    final FullscreenPreviewLayoutHelper.ShortcutItem item=scItems.get(idx+col);
+                    LinearLayout cell=new LinearLayout(this);
+                    cell.setOrientation(LinearLayout.HORIZONTAL);
+                    cell.setGravity(Gravity.CENTER_VERTICAL);
+                    cell.setPadding(dp(8),dp(6),dp(8),dp(6));
+                    cell.setBackground(PhoneUiKit.roundedBox(
+                        curP.cardBg,curP.border,dp(8),Math.max(1,dp(1))));
+                    TextView lTv=new TextView(this);
+                    lTv.setText(item.label);
+                    lTv.setTextSize(10.5f);
+                    lTv.setTypeface(null,Typeface.BOLD);
+                    lTv.setTextColor(curP.accentText);
+                    TextView dTv=new TextView(this);
+                    dTv.setText(item.desc);
+                    dTv.setTextSize(10f);
+                    dTv.setTextColor(curP.textSecondary);
+                    dTv.setGravity(Gravity.END);
+                    cell.addView(lTv,new LinearLayout.LayoutParams(-2,-2));
+                    cell.addView(dTv,new LinearLayout.LayoutParams(0,-2,1f));
+                    cell.setClickable(true);
+                    cell.setFocusable(true);
+                    cell.setOnClickListener(v->{
+                        DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                        int[] mods=item.modifierVks;
+                        if(normalShiftLatched[0]){
+                            boolean hasS=false;
+                            for(int mv:mods)if(mv==FullscreenPreviewLayoutHelper.VK_SHIFT)hasS=true;
+                            if(!hasS){
+                                int[] merged=new int[mods.length+1];
+                                System.arraycopy(mods,0,merged,0,mods.length);
+                                merged[mods.length]=FullscreenPreviewLayoutHelper.VK_SHIFT;
+                                mods=merged;
+                            }
+                        }
+                        sendWindowsKeyCombo(act,mods,item.mainVk,item.powerAction);
+                        normalShiftLatched[0]=false;
+                        closeNormalModPopout.run();
+                    });
+                    LinearLayout.LayoutParams cLp=new LinearLayout.LayoutParams(0,-2,1f);
+                    if(col==0)cLp.rightMargin=dp(3); else cLp.leftMargin=dp(3);
+                    pair.addView(cell,cLp);
+                }
+                if(idx+1>=scItems.size()){
+                    pair.addView(new View(this),new LinearLayout.LayoutParams(0,dp(1),1f));
+                }
+                LinearLayout.LayoutParams prLp=new LinearLayout.LayoutParams(-1,-2);
+                prLp.bottomMargin=dp(5);
+                normalModGridRows.addView(pair,prLp);
+            }
+            normalModPopoutCard.setVisibility(View.VISIBLE);
+            styleNormalKeyBar.run();
+        };
+
+        normalFnBtn.setOnClickListener(v->{
+            normalFnOpen[0]=!normalFnOpen[0];
+            fnDrawerScroll.setVisibility(normalFnOpen[0] ? View.VISIBLE : View.GONE);
+            normalFnBtn.setText(normalFnOpen[0] ? "Fn ▾" : "Fn ▸");
+            styleNormalKeyBar.run();
+        });
+        normalCtrlBtn.setOnClickListener(v->toggleNormalPopout.accept("ctrl"));
+        normalAltBtn.setOnClickListener(v->toggleNormalPopout.accept("alt"));
+        normalWinBtn.setOnClickListener(v->toggleNormalPopout.accept("win"));
+        normalShiftBtn.setOnClickListener(v->{
+            normalShiftLatched[0]=!normalShiftLatched[0];
+            styleNormalKeyBar.run();
+        });
+
+        TextView[] barMainBtns={normalFnBtn,normalCtrlBtn,normalAltBtn,normalWinBtn,normalShiftBtn};
+        for(int i=0;i<barMainBtns.length;i++){
+            LinearLayout.LayoutParams kp=new LinearLayout.LayoutParams(-2,-2);
+            if(i>0)kp.leftMargin=dp(5);
+            keyBarRow.addView(barMainBtns[i],kp);
+        }
+
+        View kDiv=new View(this);
+        kDiv.setBackgroundColor(0x8064748B);
+        LinearLayout.LayoutParams kdLp=new LinearLayout.LayoutParams(Math.max(1,dp(1)),dp(18));
+        kdLp.leftMargin=dp(7);
+        kdLp.rightMargin=dp(7);
+        keyBarRow.addView(kDiv,kdLp);
+
+        String[] qLabels={"Esc","Tab","⌫","↵"};
+        int[] qVks={
+            FullscreenPreviewLayoutHelper.VK_ESCAPE,
+            FullscreenPreviewLayoutHelper.VK_TAB,
+            TouchpadWidgetHelper.VK_BACK,
+            FullscreenPreviewLayoutHelper.VK_RETURN
+        };
+        for(int idx=0;idx<qLabels.length;idx++){
+            final int qvk=qVks[idx];
+            TextView qb=createTaskbarChip(qLabels[idx],false,v->{
+                DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                sendWindowsKeyCombo(act,normalActiveModVks.get(),qvk,"");
+                normalShiftLatched[0]=false;
+                closeNormalModPopout.run();
+            });
+            normalQuickAndFnChips.add(qb);
+            LinearLayout.LayoutParams qlp=new LinearLayout.LayoutParams(-2,-2);
+            if(idx>0)qlp.leftMargin=dp(5);
+            keyBarRow.addView(qb,qlp);
+        }
+
+        for(int fk=1;fk<=12;fk++){
+            final int fvk=0x70+(fk-1);
+            TextView fb=createTaskbarChip("F"+fk,false,v->{
+                DeskTouchSession act=DeskTouchRuntime.session(MainActivity.this);
+                sendWindowsKeyCombo(act,normalActiveModVks.get(),fvk,"");
+                normalShiftLatched[0]=false;
+                closeNormalModPopout.run();
+            });
+            normalQuickAndFnChips.add(fb);
+            LinearLayout.LayoutParams flp=new LinearLayout.LayoutParams(-2,-2);
+            if(fk>1)flp.leftMargin=dp(5);
+            normalFnRow.addView(fb,flp);
+        }
+        styleNormalKeyBar.run();
+
         pointerPad=new View(this){
             final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
             final RectF bounds=new RectF();
@@ -1203,12 +1528,13 @@ public final class MainActivity extends Activity {
         };
         pointerPad.setFocusable(true);
         pointerPad.setFocusableInTouchMode(true);
-        LinearLayout.LayoutParams padLp=new LinearLayout.LayoutParams(-1,dp(190));
+        LinearLayout.LayoutParams padLp=new LinearLayout.LayoutParams(-1,dp(trackpadLandscape ? 220 : 190));
         padLp.topMargin=dp(10);
         padCard.addView(pointerPad,padLp);
         pointerPad.setOnTouchListener((v,event)->{
             switch(event.getActionMasked()){
                 case MotionEvent.ACTION_DOWN:
+                    if(closeNormalModPopout!=null)closeNormalModPopout.run();
                     if(v.getParent()!=null)v.getParent().requestDisallowInterceptTouchEvent(true);
                     DeskTouchSession touchSession=DeskTouchRuntime.session(MainActivity.this);
                     if(touchSession.isConnected() && !touchSession.isActive() && !touchSession.hasClaim()){
@@ -1516,6 +1842,8 @@ public final class MainActivity extends Activity {
             padSurfaceTitle.setTextColor(p.textPrimary);
             trackpadReadout.setTextColor(p.textSecondary);
             PhoneUiKit.styleButton(returnControlBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            updateTrackpadOrientControl();
+            if(refreshNormalKeyBarStyles!=null)refreshNormalKeyBarStyles.run();
             PhoneUiKit.styleButton(previewToggleBtn,p,previewExpanded ? PhoneUiKit.BTN_TINT_ACCENT : PhoneUiKit.BTN_SUBTLE,this);
             PhoneUiKit.styleButton(previewFullscreenBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
             PhoneUiKit.styleSubcard(previewWrap,p,this);
@@ -1900,12 +2228,12 @@ public final class MainActivity extends Activity {
         accLp.rightMargin=dp(4);
         safetyBtns1.addView(accBtn,accLp);
 
-        Button pinWidgetBtn=PhoneUiKit.createButton(this,"Pin Pay Widget",palette,PhoneUiKit.BTN_SUBTLE);
+        Button pinWidgetBtn=PhoneUiKit.createButton(this,"Pin 4×4 Touchpad Widget",palette,PhoneUiKit.BTN_TINT_ACCENT);
         pinWidgetBtn.setOnClickListener(v->{
-            boolean requested=PaymentPauseWidgetProvider.requestPin(this);
+            boolean requested=TouchpadWidgetProvider.requestPin(this);
             setFeedback(requested
-                ? "Confirm adding the DeskTouch Pay Mode button on your home screen."
-                : "Long-press your Home screen -> Widgets -> add DeskTouch Pay Mode.",true);
+                ? "Confirm adding the DeskTouch 4×4 Touchpad widget on your home screen."
+                : "Long-press your Home screen -> Widgets -> add DeskTouch 4×4 Touchpad.",true);
         });
         LinearLayout.LayoutParams pinLp=new LinearLayout.LayoutParams(0,-2,1f);
         pinLp.leftMargin=dp(4);
@@ -2202,7 +2530,7 @@ public final class MainActivity extends Activity {
                     needsPair ? PhoneUiKit.BTN_TINT_AMBER : PhoneUiKit.BTN_SUBTLE,this);
             }
             PhoneUiKit.styleButton(accBtn,p,PhoneUiKit.BTN_SUBTLE,this);
-            PhoneUiKit.styleButton(pinWidgetBtn,p,PhoneUiKit.BTN_SUBTLE,this);
+            PhoneUiKit.styleButton(pinWidgetBtn,p,PhoneUiKit.BTN_TINT_ACCENT,this);
             PhoneUiKit.styleButton(stopCtrlBtn,p,PhoneUiKit.BTN_DANGER,this);
             refreshNotificationAccessButton();
 
@@ -2307,8 +2635,12 @@ public final class MainActivity extends Activity {
             if(previewExpanded){
                 syncActiveScreenPreviewWatch();
             }
+            applyTrackpadOrientation();
         }else if(fullscreenPreviewDialog==null || !fullscreenPreviewDialog.isShowing()){
             DeskTouchRuntime.session(this).setScreenPreviewWatch(-1,-1,false);
+            try{
+                setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+            }catch(RuntimeException ignored){}
         }
         refreshTabBarStyles();
     }
@@ -2408,9 +2740,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.96";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.97";
         }catch(Exception ignored){
-            return "0.3.96";
+            return "0.3.97";
         }
     }
 
@@ -2855,7 +3187,7 @@ public final class MainActivity extends Activity {
         if(autoStartSwitch!=null)autoStartSwitch.setChecked(AutoConnectService.enabled(this));
     }
 
-    private static void sendRemoteTextWithNewlines(DeskTouchSession target,String added){
+    static void sendRemoteTextWithNewlines(DeskTouchSession target,String added){
         int start=0;
         for(int i=0;i<added.length();i++){
             if(added.charAt(i)=='\n'){
@@ -5378,9 +5710,13 @@ public final class MainActivity extends Activity {
             fullscreenStatusHint=null;
             fullscreenPreviewDialog=null;
             lastRenderedFullscreenBmp=null;
-            try{
-                setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
-            }catch(RuntimeException ignored){}
+            if(activeTab==PhoneUiKit.TAB_TRACKPAD){
+                applyTrackpadOrientation();
+            }else{
+                try{
+                    setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                }catch(RuntimeException ignored){}
+            }
             DeskTouchSession cs=DeskTouchRuntime.session(MainActivity.this);
             if(previewExpanded && activeTab==PhoneUiKit.TAB_TRACKPAD && !isFinishing() && !isDestroyed()){
                 int curTid=cs.selectedEnvironmentTarget()>0 ? cs.selectedEnvironmentTarget() : 0;
@@ -5396,27 +5732,8 @@ public final class MainActivity extends Activity {
 
     private void sendWindowsKeyCombo(
             DeskTouchSession act, int[] modifierVks, int mainVk, String powerAction){
-        if(act==null || !act.isConnected())return;
-        if(!act.isActive() && !act.hasClaim())act.claimControl();
-        if("lock".equals(powerAction)){
-            int tid=act.selectedEnvironmentTarget()>0 ? act.selectedEnvironmentTarget() : 0;
-            act.sendPowerAction(tid,"lock");
+        if(TouchpadWidgetHelper.sendWindowsKeyCombo(act,modifierVks,mainVk,powerAction)){
             showToast("Sent Lock to PC");
-            return;
-        }
-        if(modifierVks!=null){
-            for(int mv:modifierVks){
-                if(mv>0)act.key(mv,true);
-            }
-        }
-        if(mainVk>0){
-            act.key(mainVk,true);
-            act.key(mainVk,false);
-        }
-        if(modifierVks!=null){
-            for(int i=modifierVks.length-1;i>=0;i--){
-                if(modifierVks[i]>0)act.key(modifierVks[i],false);
-            }
         }
     }
 

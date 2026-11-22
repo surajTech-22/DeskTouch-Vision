@@ -34,6 +34,11 @@
                 <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
+        <activity android:name=".TouchpadWidgetOverlayActivity" android:exported="false"
+            android:launchMode="singleTop"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize" />
         <service android:name=".AutoConnectService" android:exported="false"
             android:foregroundServiceType="connectedDevice" />
         <service android:name=".PhoneMediaService" android:exported="false"
@@ -56,6 +61,16 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/payment_pause_widget" />
+        </receiver>
+        <receiver android:name=".TouchpadWidgetProvider"
+            android:exported="true"
+            android:label="@string/touchpad_widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/touchpad_home_widget" />
         </receiver>
         <!-- Optional system keyboard: user must enable and select it manually. -->
         <service android:name=".DeskTouchInputMethod"

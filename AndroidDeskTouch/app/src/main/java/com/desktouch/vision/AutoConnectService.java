@@ -121,6 +121,7 @@ public final class AutoConnectService extends Service {
         AutoConnectService service=activeInstance;
         if(service!=null) service.evaluateDisconnectAutoPause();
         refreshNotification();
+        if(context!=null) TouchpadWidgetProvider.updateAllIfChanged(context);
     }
 
     static void onMobileUdpCredentialsReady(Context context) {
@@ -287,6 +288,23 @@ public final class AutoConnectService extends Service {
             .setStyle(new Notification.BigTextStyle().bigText(fullText))
             .setContentIntent(open)
             .setOngoing(true);
+        Intent openPadIntent=new Intent(this,MainActivity.class)
+            .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP|Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(MainActivity.EXTRA_OPEN_TAB,"trackpad");
+        PendingIntent openPadPending=PendingIntent.getActivity(this,5,openPadIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        builder.addAction(new Notification.Action.Builder(
+            null,"Open Touchpad",openPadPending).build());
+
+        Intent openFullIntent=new Intent(this,MainActivity.class)
+            .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP|Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            .putExtra(MainActivity.EXTRA_OPEN_TAB,"trackpad")
+            .putExtra(MainActivity.EXTRA_OPEN_FULLSCREEN,true);
+        PendingIntent openFullPending=PendingIntent.getActivity(this,6,openFullIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        builder.addAction(new Notification.Action.Builder(
+            null,"Full Screen",openFullPending).build());
+
         if(sysEnabled) {
             Intent pause=new Intent(this,AutoConnectService.class)
                 .setAction(ACTION_PAUSE_BANKING);

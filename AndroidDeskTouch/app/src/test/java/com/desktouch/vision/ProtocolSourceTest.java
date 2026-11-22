@@ -1952,6 +1952,38 @@ public final class ProtocolSourceTest {
         assertTrue(mainSource.contains("STATUS_AUTO_HIDE_MS"));
         assertTrue(mainSource.contains("\"⇄ Swap\""));
         assertTrue(mainSource.contains("sendWindowsKeyCombo("));
+
+        // Verify v0.3.97 Direct Notification Touchpad, Fixed 4x4 Home Touchpad Widget, Horizontal mode & Normal Touchpad Fn/Ctrl keys
+        assertTrue(autoServiceSource.contains("\"Open Touchpad\""));
+        assertTrue(autoServiceSource.contains("MainActivity.EXTRA_OPEN_TAB"));
+        assertTrue(manifestSource.contains("TouchpadWidgetProvider"));
+        assertTrue(manifestSource.contains("TouchpadWidgetOverlayActivity"));
+        assertTrue(manifestSource.contains("android:exported=\"false\""));
+        assertFalse(manifestSource.contains("SYSTEM_ALERT_WINDOW"));
+
+        assertTrue(mainSource.contains("EXTRA_OPEN_TAB"));
+        assertTrue(mainSource.contains("Pin 4×4 Touchpad Widget"));
+        assertTrue(mainSource.contains("TouchpadWidgetProvider.requestPin"));
+        assertTrue(mainSource.contains("\"Ctrl Commands\""));
+        assertTrue(mainSource.contains("\"Alt Shortcuts\""));
+        assertTrue(mainSource.contains("\"Windows Shortcuts\""));
+        assertTrue(mainSource.contains("trackpadOrientBtn"));
+        assertTrue(mainSource.contains("\"⟳ Horizontal\""));
+
+        String widgetProviderSource = readProjectSource("src/main/java/com/desktouch/vision/TouchpadWidgetProvider.java");
+        String widgetOverlaySource = readProjectSource("src/main/java/com/desktouch/vision/TouchpadWidgetOverlayActivity.java");
+        String widgetLayoutXml = readProjectSource("src/main/res/layout/touchpad_home_widget.xml");
+        assertFalse(widgetLayoutXml.contains("Pay Safe"));
+        assertFalse(widgetLayoutXml.contains("Pay Mode"));
+        assertTrue(widgetLayoutXml.contains("widget_btn_ctrl"));
+        assertTrue(widgetLayoutXml.contains("widget_btn_keys"));
+        assertTrue(widgetLayoutXml.contains("widget_btn_horizontal"));
+        assertTrue(widgetLayoutXml.contains("widget_btn_fullscreen"));
+        assertTrue(widgetProviderSource.contains("TouchpadWidgetHelper.togglePcSelection"));
+        assertTrue(widgetOverlaySource.contains("HorizontalScrollView"));
+        assertTrue(widgetOverlaySource.contains("\"⟳ Horizontal\""));
+        assertTrue(widgetOverlaySource.contains("\"⟳ Vertical\""));
+        assertTrue(widgetOverlaySource.contains("TouchpadWidgetHelper.togglePcSelection"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

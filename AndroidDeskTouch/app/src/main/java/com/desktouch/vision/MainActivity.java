@@ -2762,9 +2762,9 @@ public final class MainActivity extends Activity {
     private String readVersionName(){
         try{
             String ver=getPackageManager().getPackageInfo(getPackageName(),0).versionName;
-            return ver!=null && !ver.isEmpty() ? ver : "0.3.98";
+            return ver!=null && !ver.isEmpty() ? ver : "0.3.99";
         }catch(Exception ignored){
-            return "0.3.98";
+            return "0.3.99";
         }
     }
 

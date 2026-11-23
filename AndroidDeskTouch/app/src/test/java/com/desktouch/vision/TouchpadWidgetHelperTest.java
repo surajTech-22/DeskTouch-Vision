@@ -95,4 +95,31 @@ public final class TouchpadWidgetHelperTest {
         assertEquals("Esc", nav.get(0).label);
         assertEquals("PgDn", nav.get(9).label);
     }
+
+    @Test
+    public void inlineWidgetGatingAndBoundsChecksEnforceHomeSelectionAndVisibility() {
+        // Inline direct touchpad is enabled ONLY when connected, a valid PC (>= 0) is selected,
+        // not explicitly unselected, currently on Home screen, and Windows isn't reverse-controlling.
+        assertTrue(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, 0, false, true, false));
+        assertTrue(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, 2, false, true, false));
+        assertFalse(TouchpadWidgetHelper.shouldEnableInlineTouchpad(false, 0, false, true, false));
+        assertFalse(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, TouchpadWidgetHelper.UNSELECTED, false, true, false));
+        assertFalse(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, 0, true, true, false));
+        assertFalse(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, 0, false, false, false));
+        assertFalse(TouchpadWidgetHelper.shouldEnableInlineTouchpad(true, 0, false, true, true));
+
+        // Valid centered 4x4 widget touchpad bounds
+        assertTrue(TouchpadWidgetHelper.isValidInlinePadBounds(80, 480, 1000, 1180, 1080, 2460, 200, 120));
+        // Tiny bounds (< minWidth or < minHeight) must be rejected
+        assertFalse(TouchpadWidgetHelper.isValidInlinePadBounds(80, 480, 200, 1180, 1080, 2460, 200, 120));
+        assertFalse(TouchpadWidgetHelper.isValidInlinePadBounds(80, 480, 1000, 560, 1080, 2460, 200, 120));
+        // Scrolled > 20% off-screen left/right during home page swipe must be rejected
+        assertFalse(TouchpadWidgetHelper.isValidInlinePadBounds(-350, 480, 570, 1180, 1080, 2460, 200, 120));
+        assertFalse(TouchpadWidgetHelper.isValidInlinePadBounds(500, 480, 1420, 1180, 1080, 2460, 200, 120));
+        // Invalid screen size
+        assertFalse(TouchpadWidgetHelper.isValidInlinePadBounds(80, 480, 1000, 1180, 0, 2460, 200, 120));
+
+        assertTrue(TouchpadWidgetHelper.isPointInsideRect(150f, 30f, 100, 10, 220, 60));
+        assertFalse(TouchpadWidgetHelper.isPointInsideRect(50f, 30f, 100, 10, 220, 60));
+    }
 }

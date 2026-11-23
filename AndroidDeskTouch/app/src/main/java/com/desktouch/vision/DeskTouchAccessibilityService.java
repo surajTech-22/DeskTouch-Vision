@@ -7,9 +7,11 @@ import android.text.InputType;
 import android.view.inputmethod.EditorInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.os.Build;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Canvas;
@@ -56,6 +58,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
     private FrameLayout cursorRoot;
     private PointerDotView pointerDot;
     private View refreshVoteView;
+    private InlineWidgetTouchpadController inlineWidgetController;
+    private BroadcastReceiver screenOffReceiver;
     private int pointerDotSize;
     private float pointerDotHalf;
     private WindowManager.LayoutParams pointerParams;
@@ -241,6 +245,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             service.remoteActive=false;
             service.ui.post(()->{
                 service.removePointer();
+                if(service.inlineWidgetController!=null)service.inlineWidgetController.detach();
                 service.disableSelf();
             });
             service.ui.postDelayed(()->{
@@ -270,8 +275,31 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
                 .remove(LAST_PAUSE_REASON).apply();
         AutoConnectService.cancelPaymentNotice(this);
         windows=(WindowManager)getSystemService(WINDOW_SERVICE);
+        inlineWidgetController=new InlineWidgetTouchpadController(this,ui,windows);
+        if(screenOffReceiver==null){
+            screenOffReceiver=new BroadcastReceiver(){
+                @Override public void onReceive(Context ctx,Intent intent){
+                    if(intent!=null && Intent.ACTION_SCREEN_OFF.equals(intent.getAction())
+                        && inlineWidgetController!=null){
+                        ui.post(()->{
+                            if(inlineWidgetController!=null)inlineWidgetController.detach();
+                        });
+                    }
+                }
+            };
+            IntentFilter offFilter=new IntentFilter(Intent.ACTION_SCREEN_OFF);
+            try{
+                if(Build.VERSION.SDK_INT>=33)registerReceiver(screenOffReceiver,offFilter,Context.RECEIVER_NOT_EXPORTED);
+                else registerReceiver(screenOffReceiver,offFilter);
+            }catch(RuntimeException ignored){}
+        }
         refreshDisplayGeometry();
         DeskTouchRuntime.accessibilityPermissionChanged(this);
+        ui.postDelayed(()->{
+            if(!unbinding && inlineWidgetController!=null){
+                inlineWidgetController.sync(DeskTouchAccessibilityService.this);
+            }
+        },200L);
     }
     private void refreshDisplayGeometry(){
         PhoneScreenGeometry.Info info=PhoneScreenGeometry.readInfo(this);
@@ -287,6 +315,7 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         super.onConfigurationChanged(config);
         fullOverlayRejected=false;
         removePointer(); // Old overlay size is wrong after rotation.
+        if(inlineWidgetController!=null)inlineWidgetController.detach();
         refreshDisplayGeometry();
         DeskTouchRuntime.publishPhoneGeometry();
     }
@@ -297,12 +326,23 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             if(!unbinding && autoPausePaymentAppsEnabled(this)){
                 CharSequence pkg=event.getPackageName();
                 if(PaymentAppDetector.isPaymentOrBankingPackage(pkg)){
+                    if(inlineWidgetController!=null)inlineWidgetController.detach();
                     String appName=PaymentAppDetector.friendlyAppName(this,pkg);
                     String reason="Auto-turned off when opening "+appName;
                     Log.i("DeskTouch","Auto-turning off Accessibility for "+appName);
                     pauseForBanking(this,reason);
                     AutoConnectService.notifyAutoPausedForPayment(this,appName);
+                    return;
                 }
+            }
+            if(!unbinding && inlineWidgetController!=null){
+                inlineWidgetController.onWindowStateChanged(event.getPackageName());
+            }
+            return;
+        }
+        if(type==AccessibilityEvent.TYPE_VIEW_SCROLLED){
+            if(!unbinding && inlineWidgetController!=null){
+                inlineWidgetController.onViewScrolled(event.getPackageName());
             }
             return;
         }
@@ -311,11 +351,15 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(type==AccessibilityEvent.TYPE_TOUCH_INTERACTION_START && !remoteGesture){
             DeskTouchRuntime.remoteNativeTouch();
             hidePointer();
+            if(!unbinding && inlineWidgetController!=null){
+                inlineWidgetController.onReverseRemoteStateChanged(false);
+            }
         }
     }
     @Override public void onInterrupt(){
         DeskTouchRuntime.remoteNativeTouch();
         removePointer();
+        if(inlineWidgetController!=null)inlineWidgetController.detach();
     }
     @Override public void onDestroy(){
         unbinding=false;
@@ -324,6 +368,15 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
             try{choreographer.removeFrameCallback(frameCallback);}
             catch(Throwable ignored){}
             choreographer=null;
+        }
+        if(inlineWidgetController!=null){
+            inlineWidgetController.detach();
+            inlineWidgetController=null;
+        }
+        if(screenOffReceiver!=null){
+            try{unregisterReceiver(screenOffReceiver);}
+            catch(RuntimeException ignored){}
+            screenOffReceiver=null;
         }
         DeskTouchRuntime.accessibilityPermissionChanged();
         DeskTouchRuntime.remoteNativeTouch();
@@ -627,13 +680,93 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         return service!=null ? service.smoother.getEffectiveFrameTenthsMs() : 0;
     }
 
+    static boolean isInlineOverlayAvailable(){
+        DeskTouchAccessibilityService service=instance;
+        return service!=null && !unbinding && service.windows!=null
+            && service.inlineWidgetController!=null && allowed(service);
+    }
+    static void syncInlineWidgetOverlay(Context context){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || unbinding || service.inlineWidgetController==null)return;
+        Context app=context!=null ? context.getApplicationContext() : service.getApplicationContext();
+        if(Looper.myLooper()==service.ui.getLooper()){
+            service.inlineWidgetController.sync(app);
+        }else{
+            service.ui.post(()->{
+                if(!unbinding && service.inlineWidgetController!=null)
+                    service.inlineWidgetController.sync(app);
+            });
+        }
+    }
+    static boolean activateInlineTouchpad(Context context,Rect sourceBoundsHint){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || unbinding || service.inlineWidgetController==null || !allowed(service))
+            return false;
+        Context app=context!=null ? context.getApplicationContext() : service.getApplicationContext();
+        if(Looper.myLooper()==service.ui.getLooper()){
+            return service.inlineWidgetController.activateAt(app,sourceBoundsHint);
+        }
+        service.ui.post(()->{
+            if(!unbinding && service.inlineWidgetController!=null)
+                service.inlineWidgetController.activateAt(app,sourceBoundsHint);
+        });
+        return true;
+    }
+    static boolean toggleInlineFullscreen(Context context,Rect sourceBoundsHint){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || unbinding || service.inlineWidgetController==null || !allowed(service))
+            return false;
+        Context app=context!=null ? context.getApplicationContext() : service.getApplicationContext();
+        if(Looper.myLooper()==service.ui.getLooper()){
+            return service.inlineWidgetController.toggleFullscreen(app,sourceBoundsHint);
+        }
+        service.ui.post(()->{
+            if(!unbinding && service.inlineWidgetController!=null)
+                service.inlineWidgetController.toggleFullscreen(app,sourceBoundsHint);
+        });
+        return true;
+    }
+    static boolean toggleInlineCtrl(Context context,Rect sourceBoundsHint){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || unbinding || service.inlineWidgetController==null || !allowed(service))
+            return false;
+        Context app=context!=null ? context.getApplicationContext() : service.getApplicationContext();
+        if(Looper.myLooper()==service.ui.getLooper()){
+            return service.inlineWidgetController.toggleCtrl(app,sourceBoundsHint);
+        }
+        service.ui.post(()->{
+            if(!unbinding && service.inlineWidgetController!=null)
+                service.inlineWidgetController.toggleCtrl(app,sourceBoundsHint);
+        });
+        return true;
+    }
+    static void hideInlineWidgetOverlay(){
+        DeskTouchAccessibilityService service=instance;
+        if(service==null || service.inlineWidgetController==null)return;
+        if(Looper.myLooper()==service.ui.getLooper()){
+            service.inlineWidgetController.detach();
+        }else{
+            service.ui.post(()->{
+                if(service.inlineWidgetController!=null)
+                    service.inlineWidgetController.detach();
+            });
+        }
+    }
+
     static boolean pointer(int px,int py,Runnable applied){
         return pointer(px,py,px,py,applied);
     }
     static boolean pointer(int prevX,int prevY,int px,int py,Runnable applied){
         DeskTouchAccessibilityService service=instance;
         if(service==null||!ready(service))return false;
+        boolean becameRemote=!service.remoteActive;
         service.remoteActive=true;
+        if(becameRemote && service.inlineWidgetController!=null){
+            service.ui.post(()->{
+                if(service.inlineWidgetController!=null)
+                    service.inlineWidgetController.onReverseRemoteStateChanged(true);
+            });
+        }
         // Retain the newest position on fast mice/touchpads instead of
         // filling Android's UI queue with hundreds of obsolete moves.
         long priorPacked=service.pendingPos.getAndSet(packCoords(px,py));
@@ -733,6 +866,8 @@ public final class DeskTouchAccessibilityService extends AccessibilityService {
         if(service!=null)service.ui.post(()->{
             service.hidePointer();
             service.removeRefreshVoteOverlay();
+            if(service.inlineWidgetController!=null)
+                service.inlineWidgetController.onReverseRemoteStateChanged(false);
         });
     }
     static long gestureDurationMs(int dx,int dy){

@@ -204,4 +204,43 @@ final class TouchpadWidgetHelper {
         }
         return false;
     }
+
+    /** Returns true only when an active connected PC is selected on the Home screen and Windows isn't reverse-controlling. */
+    static boolean shouldEnableInlineTouchpad(
+            boolean connected,
+            int effectiveSelectedId,
+            boolean explicitlyUnselected,
+            boolean onHomeScreen,
+            boolean reverseRemoteActive) {
+        return connected
+            && effectiveSelectedId >= 0
+            && !explicitlyUnselected
+            && onHomeScreen
+            && !reverseRemoteActive;
+    }
+
+    /** Ensures widget touchpad bounds are large enough and >= 80% visible inside the current screen. */
+    static boolean isValidInlinePadBounds(
+            int left, int top, int right, int bottom,
+            int screenWidth, int screenHeight,
+            int minWidthPx, int minHeightPx) {
+        if (screenWidth <= 0 || screenHeight <= 0) return false;
+        int w = right - left;
+        int h = bottom - top;
+        if (w < Math.max(1, minWidthPx) || h < Math.max(1, minHeightPx)) return false;
+        if (left < -24 || top < 0 || right > screenWidth + 24 || bottom > screenHeight + 24) {
+            return false;
+        }
+        int visLeft = Math.max(0, left);
+        int visTop = Math.max(0, top);
+        int visRight = Math.min(screenWidth, right);
+        int visBottom = Math.min(screenHeight, bottom);
+        int visW = Math.max(0, visRight - visLeft);
+        int visH = Math.max(0, visBottom - visTop);
+        return (long) visW * 5L >= (long) w * 4L && (long) visH * 5L >= (long) h * 4L;
+    }
+
+    static boolean isPointInsideRect(float x, float y, int left, int top, int right, int bottom) {
+        return x >= left && x <= right && y >= top && y <= bottom;
+    }
 }

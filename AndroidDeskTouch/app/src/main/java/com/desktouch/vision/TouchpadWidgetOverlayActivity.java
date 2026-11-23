@@ -91,6 +91,7 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
 
     private boolean suppressTypedText;
     private String previousTyped = "";
+    private DeskTouchSession activeTouchSession;
     private Bitmap lastRenderedBmp;
     private Toast activeToast;
     private int lastPcsSignatureHash;
@@ -134,6 +135,7 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        DeskTouchAccessibilityService.hideInlineWidgetOverlay();
         DeskTouchRuntime.setOverlayLiveStatusListener(this::scheduleCoalescedRefresh);
         DeskTouchRuntime.setOverlayScreenPreviewListener(() -> runOnUiThread(this::renderLatestPreview));
         lastOverlayUiRefreshMs = SystemClock.uptimeMillis();
@@ -797,6 +799,7 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
                     syncOverlayState();
                 }
                 if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(true);
+                activeTouchSession = !resolveActivePcName().isEmpty() ? requireSelectedActiveSession() : null;
                 prevX = downX = event.getX();
                 prevY = downY = event.getY();
                 touchGlowX = event.getX();
@@ -826,9 +829,8 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
                 touchGlowY = event.getY();
                 touchGlowActive = true;
                 v.invalidate();
-                if (resolveActivePcName().isEmpty()) return true;
-                DeskTouchSession act = requireSelectedActiveSession();
-                if (act == null) return true;
+                DeskTouchSession act = activeTouchSession;
+                if (act == null || !act.isConnected()) return true;
                 if (event.getPointerCount() >= 3) {
                     maxPointerCount = Math.max(maxPointerCount, event.getPointerCount());
                     if (!threeFingerHandled) {
@@ -887,20 +889,21 @@ public final class TouchpadWidgetOverlayActivity extends Activity {
                 if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(false);
                 touchGlowActive = false;
                 v.invalidate();
-                if (maxPointerCount >= 2) {
-                    if (!twoFingerMoved) {
-                        DeskTouchSession rs = requireSelectedActiveSession();
-                        if (rs != null) rs.click(2);
+                DeskTouchSession upSession = activeTouchSession;
+                activeTouchSession = null;
+                if (upSession != null && upSession.isConnected()) {
+                    if (maxPointerCount >= 2) {
+                        if (!twoFingerMoved) upSession.click(2);
+                    } else if (!dragged) {
+                        upSession.click(1);
                     }
-                } else if (!dragged) {
-                    DeskTouchSession ls = requireSelectedActiveSession();
-                    if (ls != null) ls.click(1);
                 }
                 return true;
             case MotionEvent.ACTION_CANCEL:
                 if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(false);
                 touchGlowActive = false;
                 v.invalidate();
+                activeTouchSession = null;
                 return true;
             default:
                 return true;

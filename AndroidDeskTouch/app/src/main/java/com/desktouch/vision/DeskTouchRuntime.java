@@ -19,6 +19,7 @@ final class DeskTouchRuntime {
     private static volatile Runnable screenPreviewListener;
     private static volatile Runnable overlayLiveStatusListener;
     private static volatile Runnable overlayScreenPreviewListener;
+    private static volatile Runnable inlineWidgetPreviewListener;
     private static volatile String lastStatus="DeskTouch ready to find trusted devices.";
     private static volatile String selectedFingerprint;
     private static volatile Context appContext;
@@ -67,11 +68,16 @@ final class DeskTouchRuntime {
     static void setOverlayScreenPreviewListener(Runnable observer){
         overlayScreenPreviewListener=observer;
     }
+    static void setInlineWidgetPreviewListener(Runnable observer){
+        inlineWidgetPreviewListener=observer;
+    }
     static void notifyScreenPreviewUpdated(){
         Runnable current=screenPreviewListener;
         if(current!=null)current.run();
         Runnable overlay=overlayScreenPreviewListener;
         if(overlay!=null)overlay.run();
+        Runnable inlineWidget=inlineWidgetPreviewListener;
+        if(inlineWidget!=null)inlineWidget.run();
     }
 
     private static DeskTouchSession newSession(Context context,String id) {

@@ -2008,6 +2008,29 @@ public final class ProtocolSourceTest {
         assertTrue(stylesXml.contains("<item name=\"android:windowIsTranslucent\">false</item>"));
         assertTrue(stylesXml.contains("<item name=\"android:windowShowWallpaper\">true</item>"));
         assertTrue(manifestSource.contains("@style/Theme.DeskTouch.WidgetOverlay"));
+
+        // Verify v0.3.99: Direct in-place Home Screen widget touchpad, PC-selection gating,
+        // TYPE_ACCESSIBILITY_OVERLAY inline controller, and Home swipe/app-switch auto-detach.
+        String inlineCtrlSource = readProjectSource("src/main/java/com/desktouch/vision/InlineWidgetTouchpadController.java");
+        String accServiceSource = readProjectSource("src/main/java/com/desktouch/vision/DeskTouchAccessibilityService.java");
+        String accXml = readProjectSource("src/main/res/xml/desktouch_accessibility.xml");
+        assertTrue(inlineCtrlSource.contains("TYPE_ACCESSIBILITY_OVERLAY"));
+        assertTrue(inlineCtrlSource.contains("FLAG_WATCH_OUTSIDE_TOUCH"));
+        assertTrue(inlineCtrlSource.contains("MotionEvent.ACTION_OUTSIDE"));
+        assertTrue(inlineCtrlSource.contains("widget_touch_surface"));
+        assertTrue(inlineCtrlSource.contains("TouchpadWidgetHelper.isValidInlinePadBounds"));
+        assertTrue(inlineCtrlSource.contains("TouchpadWidgetHelper.shouldEnableInlineTouchpad"));
+        assertTrue(runtimeSource.contains("setInlineWidgetPreviewListener"));
+        assertTrue(accServiceSource.contains("syncInlineWidgetOverlay"));
+        assertTrue(accServiceSource.contains("activateInlineTouchpad"));
+        assertTrue(accServiceSource.contains("toggleInlineFullscreen"));
+        assertTrue(accServiceSource.contains("toggleInlineCtrl"));
+        assertTrue(accXml.contains("typeViewScrolled"));
+        assertTrue(widgetProviderSource.contains("ACTION_TOUCHPAD_TAP"));
+        assertTrue(widgetProviderSource.contains("ACTION_TOGGLE_FULLSCREEN"));
+        assertTrue(widgetProviderSource.contains("ACTION_TOGGLE_CTRL"));
+        assertTrue(widgetProviderSource.contains("ACTION_SELECT_PC_REQUIRED"));
+        assertFalse(manifestSource.contains("SYSTEM_ALERT_WINDOW"));
     }
 
     private static String readProjectSource(String relFromAppModule) {

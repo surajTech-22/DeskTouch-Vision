@@ -29,6 +29,10 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
     static final String ACTION_MOUSE_CLICK = "com.desktouch.vision.ACTION_WIDGET_MOUSE_CLICK";
     static final String ACTION_SCROLL = "com.desktouch.vision.ACTION_WIDGET_SCROLL";
     static final String ACTION_REFRESH = "com.desktouch.vision.ACTION_WIDGET_REFRESH";
+    static final String ACTION_TOUCHPAD_TAP = "com.desktouch.vision.ACTION_WIDGET_TOUCHPAD_TAP";
+    static final String ACTION_TOGGLE_FULLSCREEN = "com.desktouch.vision.ACTION_WIDGET_TOGGLE_FULLSCREEN";
+    static final String ACTION_TOGGLE_CTRL = "com.desktouch.vision.ACTION_WIDGET_TOGGLE_CTRL";
+    static final String ACTION_SELECT_PC_REQUIRED = "com.desktouch.vision.ACTION_WIDGET_SELECT_PC_REQUIRED";
 
     static final String EXTRA_TARGET_ID = "target_id";
     static final String EXTRA_TARGET_NAME = "target_name";
@@ -62,6 +66,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
         super.onDisabled(context);
         widgetsDisabled.set(true);
         lastRenderSignature = "";
+        DeskTouchAccessibilityService.hideInlineWidgetOverlay();
     }
 
     @Override
@@ -76,6 +81,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
             for (int appWidgetId : appWidgetIds) {
                 appWidgetManager.updateAppWidget(appWidgetId, views);
             }
+            DeskTouchAccessibilityService.syncInlineWidgetOverlay(app);
         } catch (Throwable ignored) {
             try {
                 RemoteViews fallback = new RemoteViews(app.getPackageName(), R.layout.touchpad_home_widget);
@@ -141,31 +147,61 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
                 }
                 updateAll(app);
                 DeskTouchRuntime.notifyLiveStatusChanged();
+                DeskTouchAccessibilityService.syncInlineWidgetOverlay(app);
+                return;
+            }
+
+            if (ACTION_SELECT_PC_REQUIRED.equals(action)
+                || ACTION_TOUCHPAD_TAP.equals(action)
+                || ACTION_TOGGLE_FULLSCREEN.equals(action)
+                || ACTION_TOGGLE_CTRL.equals(action)) {
+                int selectedId = resolveSelectedPcOrToast(app);
+                if (selectedId == TouchpadWidgetHelper.UNSELECTED) {
+                    DeskTouchAccessibilityService.hideInlineWidgetOverlay();
+                    return;
+                }
+                if (ACTION_TOUCHPAD_TAP.equals(action)) {
+                    if (DeskTouchAccessibilityService.isInlineOverlayAvailable()) {
+                        boolean ok = DeskTouchAccessibilityService.activateInlineTouchpad(app, intent.getSourceBounds());
+                        if (ok) {
+                            showToast(app, "Live Touchpad active on widget — drag here directly");
+                        } else {
+                            showToast(app, "Return to Home widget to drag directly");
+                        }
+                    } else {
+                        showToast(app, "Enable DeskTouch Accessibility in Setup for direct on-widget touchpad");
+                    }
+                    return;
+                }
+                if (ACTION_TOGGLE_FULLSCREEN.equals(action)) {
+                    if (DeskTouchAccessibilityService.isInlineOverlayAvailable()) {
+                        if (!DeskTouchAccessibilityService.toggleInlineFullscreen(app, intent.getSourceBounds())) {
+                            showToast(app, "Tap the Live Touchpad box once first to anchor it here");
+                        }
+                    } else {
+                        showToast(app, "Enable DeskTouch Accessibility in Setup to preview inside widget");
+                    }
+                    return;
+                }
+                if (ACTION_TOGGLE_CTRL.equals(action)) {
+                    if (DeskTouchAccessibilityService.isInlineOverlayAvailable()) {
+                        if (!DeskTouchAccessibilityService.toggleInlineCtrl(app, null)) {
+                            showToast(app, "Tap the Live Touchpad box once first to open shortcuts here");
+                        }
+                    } else {
+                        showToast(app, "Enable DeskTouch Accessibility in Setup to use shortcuts inside widget");
+                    }
+                    return;
+                }
                 return;
             }
 
             if (ACTION_MOUSE_CLICK.equals(action) || ACTION_SCROLL.equals(action)) {
-                DeskTouchSession active = DeskTouchRuntime.session(app);
-                DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
-                if (snap == null || !snap.connected) {
-                    showToast(app, "No computer connected — open DeskTouch Find");
-                    updateAll(app);
-                    return;
-                }
-                List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
-                    active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
-                int selectedId = TouchpadWidgetHelper.resolveEffectiveSelection(
-                    TouchpadWidgetHelper.loadSelectedTargetId(app),
-                    TouchpadWidgetHelper.isExplicitlyUnselected(app),
-                    pcs);
+                int selectedId = resolveSelectedPcOrToast(app);
                 if (selectedId == TouchpadWidgetHelper.UNSELECTED) {
-                    showToast(app, "Select a computer above first");
-                    updateAll(app);
                     return;
                 }
-                if (active.selectedEnvironmentTarget() != selectedId || (!active.isActive() && !active.hasClaim())) {
-                    active.switchTargetAndClaim(selectedId, 0);
-                }
+                DeskTouchSession active = DeskTouchRuntime.session(app);
                 if (ACTION_MOUSE_CLICK.equals(action)) {
                     int btn = intent.getIntExtra(EXTRA_BUTTON, 1);
                     active.click(btn);
@@ -175,6 +211,31 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
                 }
             }
         } catch (Throwable ignored) {}
+    }
+
+    private static int resolveSelectedPcOrToast(Context app) {
+        DeskTouchSession active = DeskTouchRuntime.session(app);
+        DeskTouchSession.LiveStatusSnapshot snap = DeskTouchRuntime.liveSnapshot(app);
+        if (snap == null || !snap.connected) {
+            showToast(app, "No computer connected — open DeskTouch Find");
+            updateAll(app);
+            return TouchpadWidgetHelper.UNSELECTED;
+        }
+        List<LinkedDisplayHelper.DisplayTileModel> pcs = LinkedDisplayHelper.buildTrackpadPcTiles(
+            active.environmentTargets(), active.selectedEnvironmentTarget(), active.ownEnvironmentId());
+        int selectedId = TouchpadWidgetHelper.resolveEffectiveSelection(
+            TouchpadWidgetHelper.loadSelectedTargetId(app),
+            TouchpadWidgetHelper.isExplicitlyUnselected(app),
+            pcs);
+        if (selectedId == TouchpadWidgetHelper.UNSELECTED) {
+            showToast(app, "Select a computer above first");
+            updateAll(app);
+            return TouchpadWidgetHelper.UNSELECTED;
+        }
+        if (active.selectedEnvironmentTarget() != selectedId || (!active.isActive() && !active.hasClaim())) {
+            active.switchTargetAndClaim(selectedId, 0);
+        }
+        return selectedId;
     }
 
     static void updateAll(Context context) {
@@ -227,6 +288,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
                 for (int id : ids) {
                     manager.updateAppWidget(id, views);
                 }
+                DeskTouchAccessibilityService.syncInlineWidgetOverlay(app);
             } catch (Throwable ignored) {}
         }
     }
@@ -257,6 +319,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
         final String selectedName;
         final boolean explicitUnselected;
         final boolean horizontalPref;
+        final boolean inlineAvailable;
         final String signature;
 
         WidgetModel(
@@ -268,6 +331,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
                 String selectedName,
                 boolean explicitUnselected,
                 boolean horizontalPref,
+                boolean inlineAvailable,
                 String signature) {
             this.connected = connected;
             this.linkLabel = linkLabel;
@@ -277,6 +341,7 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
             this.selectedName = selectedName;
             this.explicitUnselected = explicitUnselected;
             this.horizontalPref = horizontalPref;
+            this.inlineAvailable = inlineAvailable;
             this.signature = signature;
         }
     }
@@ -318,19 +383,21 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
         }
 
         boolean horizPref = TouchpadWidgetHelper.isWidgetHorizontal(context);
+        boolean inlineAvail = DeskTouchAccessibilityService.isInlineOverlayAvailable();
         StringBuilder sig = new StringBuilder();
         sig.append(connected ? '1' : '0').append('|')
             .append(linkLabel).append('|')
             .append(effectiveId).append('|')
             .append(explicitUnselected ? '1' : '0').append('|')
-            .append(horizPref ? '1' : '0');
+            .append(horizPref ? '1' : '0').append('|')
+            .append(inlineAvail ? '1' : '0');
         for (int i = 0; i < Math.min(2, pcs.size()); i++) {
             sig.append(';').append(pcs.get(i).id).append(':').append(pcs.get(i).shortName);
         }
 
         return new WidgetModel(
             connected, linkLabel, badgeOk, pcs, effectiveId, selectedName,
-            explicitUnselected, horizPref, sig.toString());
+            explicitUnselected, horizPref, inlineAvail, sig.toString());
     }
 
     private static RemoteViews applyModelToViews(Context context, WidgetModel model) {
@@ -378,25 +445,34 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
             views.setTextViewText(
                 R.id.widget_pad_subtitle,
                 model.effectiveSelectedId != TouchpadWidgetHelper.UNSELECTED && !model.selectedName.isEmpty()
-                    ? ("Controlling " + model.selectedName + " • Tap to drag")
-                    : "Tap a computer above to select & control");
+                    ? (model.inlineAvailable
+                        ? ("Controlling " + model.selectedName + " • Drag here directly")
+                        : ("Controlling " + model.selectedName + " • Tap to control"))
+                    : "Tap a computer above to enable touchpad");
         }
 
-        views.setOnClickPendingIntent(
-            R.id.widget_touch_surface,
-            overlayPendingIntent(context, 37412, TouchpadWidgetOverlayActivity.MODE_TOUCHPAD, model.horizontalPref));
-        views.setOnClickPendingIntent(
-            R.id.widget_btn_fullscreen,
-            overlayPendingIntent(context, 37413, TouchpadWidgetOverlayActivity.MODE_FULLSCREEN, model.horizontalPref));
-        views.setOnClickPendingIntent(
-            R.id.widget_btn_horizontal,
-            overlayPendingIntent(context, 37414, TouchpadWidgetOverlayActivity.MODE_TOUCHPAD, !model.horizontalPref));
-        views.setOnClickPendingIntent(
-            R.id.widget_btn_keys,
-            overlayPendingIntent(context, 37415, TouchpadWidgetOverlayActivity.MODE_KEYS, model.horizontalPref));
-        views.setOnClickPendingIntent(
-            R.id.widget_btn_ctrl,
-            overlayPendingIntent(context, 37416, TouchpadWidgetOverlayActivity.MODE_CTRL, model.horizontalPref));
+        boolean pcSelected = model.connected && model.effectiveSelectedId != TouchpadWidgetHelper.UNSELECTED;
+        PendingIntent padPending = (!pcSelected || model.inlineAvailable)
+            ? actionBroadcastIntent(context, 37412, ACTION_TOUCHPAD_TAP)
+            : overlayPendingIntent(context, 37412, TouchpadWidgetOverlayActivity.MODE_TOUCHPAD, model.horizontalPref);
+        PendingIntent fsPending = (!pcSelected || model.inlineAvailable)
+            ? actionBroadcastIntent(context, 37413, ACTION_TOGGLE_FULLSCREEN)
+            : overlayPendingIntent(context, 37413, TouchpadWidgetOverlayActivity.MODE_FULLSCREEN, model.horizontalPref);
+        PendingIntent ctrlPending = (!pcSelected || model.inlineAvailable)
+            ? actionBroadcastIntent(context, 37416, ACTION_TOGGLE_CTRL)
+            : overlayPendingIntent(context, 37416, TouchpadWidgetOverlayActivity.MODE_CTRL, model.horizontalPref);
+        PendingIntent horizPending = pcSelected
+            ? overlayPendingIntent(context, 37414, TouchpadWidgetOverlayActivity.MODE_TOUCHPAD, !model.horizontalPref)
+            : actionBroadcastIntent(context, 37414, ACTION_SELECT_PC_REQUIRED);
+        PendingIntent keysPending = pcSelected
+            ? overlayPendingIntent(context, 37415, TouchpadWidgetOverlayActivity.MODE_KEYS, model.horizontalPref)
+            : actionBroadcastIntent(context, 37415, ACTION_SELECT_PC_REQUIRED);
+
+        views.setOnClickPendingIntent(R.id.widget_touch_surface, padPending);
+        views.setOnClickPendingIntent(R.id.widget_btn_fullscreen, fsPending);
+        views.setOnClickPendingIntent(R.id.widget_btn_horizontal, horizPending);
+        views.setOnClickPendingIntent(R.id.widget_btn_keys, keysPending);
+        views.setOnClickPendingIntent(R.id.widget_btn_ctrl, ctrlPending);
 
         views.setOnClickPendingIntent(
             R.id.widget_btn_left, clickBroadcastIntent(context, 37417, 1));
@@ -453,6 +529,12 @@ public final class TouchpadWidgetProvider extends AppWidgetProvider {
         Intent intent = new Intent(context, TouchpadWidgetProvider.class)
             .setAction(ACTION_SCROLL)
             .putExtra(EXTRA_WHEEL, wheelAmount);
+        return PendingIntent.getBroadcast(
+            context, reqCode, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    private static PendingIntent actionBroadcastIntent(Context context, int reqCode, String action) {
+        Intent intent = new Intent(context, TouchpadWidgetProvider.class).setAction(action);
         return PendingIntent.getBroadcast(
             context, reqCode, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
